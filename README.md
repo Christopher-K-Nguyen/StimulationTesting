@@ -65,6 +65,14 @@ instead — both layouts are auto-discovered by
 > the machine (for the kernel-mode USB driver). Without the SDK
 > installer the GUI still launches in simulator mode.
 
+> **Close the Plexon Sim-2 / Stimulator V2 GUI before connecting.**
+> Plexon's own application holds an exclusive USB lock; while it's
+> open, every `PS_InitAllStim` call from the SDK fails with *"No
+> Plexon Stimulator is detected."* even though the device is plugged
+> in and powered. The Python driver surfaces a hint in its error
+> message, but it's faster to just keep the Plexon GUI closed during
+> Python sessions.
+
 ### NI-VISA (or any IVI VISA runtime)
 
 Optional but recommended — required for `pyvisa` to drive the

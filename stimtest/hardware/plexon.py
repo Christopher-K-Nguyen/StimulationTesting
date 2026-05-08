@@ -89,7 +89,25 @@ class PlexonStimulator(Stimulator):
         res = self._lib.ps_init_all_stim()
         if res != self._PS_OK:
             info, _ = self._lib.ps_get_extended_error_info(res)
-            raise RuntimeError(f"PS_InitAllStim failed: {info}")
+            # Decode the C string that the SDK returns so the message
+            # is readable, not bytes-prefixed garbage.
+            info_text = (info.decode(errors="replace")
+                         if isinstance(info, (bytes, bytearray)) else str(info))
+            # Plexon's own GUI ("Sim-2" / "Stimulator V2 Application")
+            # holds an exclusive USB lock on the stimulator. While that
+            # window is open, every PS_InitAllStim call from the SDK
+            # comes back with "No Plexon Stimulator is detected." even
+            # though the device is plugged in and powered. Surface the
+            # most common fix in the error itself so users don't have
+            # to guess — or grep through the codebase — when the
+            # connection fails.
+            hint = ""
+            if "no plexon stimulator" in info_text.lower() or "not detected" in info_text.lower():
+                hint = (" Hint: close the Plexon Sim-2 / Stimulator V2 "
+                        "application if it's open — it holds an "
+                        "exclusive USB lock on the device. Power-cycle "
+                        "the stimulator if the SDK still can't see it.")
+            raise RuntimeError(f"PS_InitAllStim failed: {info_text}.{hint}")
 
         n_stim, _ = self._lib.ps_get_n_stim()
         if n_stim < self._stim_n:
