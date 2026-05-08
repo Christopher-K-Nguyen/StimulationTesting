@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Claude Code local config ---
+.claude/
+
+# --- Session captures and generated artefacts ---
+# data/ holds .npz session files, exported xlsx, plot folders, ML
+# models — none of that belongs in the source tree. If you need a
+# small sample to ship, force-add it explicitly with `git add -f`.
+data/
+*.npz
+*.pkl
+*.xlsx
+*_plots/
+qinj_dataset.csv
+
+# --- Installer build outputs ---
+installer/build/
+installer/dist/
+installer/*.spec
+*.exe
+
+# --- Reference scope manual dumps ---
+# Leave these out of git — they're 1 MB+ of static reference text
+# pulled from the Tek manual. Keep locally for offline lookup.
+tbs_full.txt
+TBS2000B_manual.txt
+
+# --- Email / SMTP secrets ---
+# Belt-and-braces — the config path is in $HOME, but if anyone ever
+# drops one here by mistake, don't push it.
+email_config.json
+.stimtest/
