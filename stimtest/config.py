@@ -14,7 +14,10 @@ from typing import Dict
 # ---------------------------------------------------------------------------
 # From initializeStimulator.m: certain serial numbers belong to the "NIL"
 # devices which use different monitor scaling.
-NIL_SERIAL_NUMBERS = ("PLX00078", "PLX00089", "PLX00161")
+# - PLX00078, PLX00089, PLX00161: original NIL list inherited from MATLAB.
+# - PLX00180: confirmed bench-tested 2026-05; outputs 1 V/V on V_mon and
+#   1 mV/µA on I_mon (matches the NIL constants below).
+NIL_SERIAL_NUMBERS = ("PLX00078", "PLX00089", "PLX00161", "PLX00180")
 
 #: Default voltage-monitor scaling, V/V (V_mon = stim_voltage * scale)
 VMON_SCALING_DEFAULT = 0.25
