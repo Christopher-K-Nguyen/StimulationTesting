@@ -7,8 +7,20 @@ drops:
 * the USB driver that exposes the stimulator as a Plexon-vendor device,
 * a "Plexon Inc / PlexStim 2.0" entry in the Windows registry under
   ``HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall``,
-* a ``PlexStim64.dll`` (and 32-bit ``PlexStim.dll``) under the install
-  folder — typically ``C:\\Program Files\\Plexon Inc\\PlexStim 2.0\\``.
+* a ``PlexStim64.dll`` (and 32-bit ``PlexStim.dll``) under one of the
+  following install folders, depending on the Plexon installer
+  version:
+
+  * ``C:\\PlexonSDKs\\<sdk-name>\\`` — current default (modern
+    installer; the data folder ``C:\\PlexonData`` is created
+    alongside),
+  * ``C:\\Program Files\\Plexon Inc\\PlexStim 2.0\\`` — older
+    layout still seen on long-lived workstations.
+
+  The Python wrapper (PyPlexStim) is **NOT** part of the SDK
+  installer — it ships separately. This package vendors a copy
+  under ``stimtest/hardware/pyplexstim/`` so an end-user only
+  needs to install the Plexon SDK itself.
 
 The application *itself* ships with a vendored copy of ``PlexStim64.dll``
 (see ``stimtest/hardware/pyplexstim/bin/``), but the DLL alone isn't
@@ -164,6 +176,16 @@ def _try_get_value(key, name: str) -> Optional[str]:
         return None
 
 
+#: Plexon's modern installer drops SDKs under ``C:\PlexonSDKs\<sdk-name>``
+#: (with a sibling ``C:\PlexonData`` for runtime data). The folder name
+#: under ``PlexonSDKs`` varies by version — e.g. ``PlexStim 2.0``,
+#: ``PlexStim_SDK_v2.0_x64``, ``Stimulator V2 SDK``. Rather than hard-code
+#: a guess, we walk every direct subdirectory and accept any whose name
+#: hints at PlexStim / Stimulator.
+_PLEXON_SDKS_ROOTS = (Path(r"C:\PlexonSDKs"),)
+_SDK_FOLDER_NAME_HINTS = ("plexstim", "stimulator")
+
+
 def _common_install_paths() -> List[Path]:
     """Filesystem fallbacks if the registry lookup didn't pan out."""
     candidates: List[Path] = []
@@ -176,6 +198,24 @@ def _common_install_paths() -> List[Path]:
             continue
         candidates.append(Path(root) / "Plexon Inc" / "PlexStim 2.0")
         candidates.append(Path(root) / "Plexon Inc" / "PlexStim")
+    # Modern Plexon installers default to C:\PlexonSDKs\<sdk-name> rather
+    # than under Program Files. The exact subfolder name varies across
+    # SDK versions, so accept any direct child whose name mentions
+    # "PlexStim" or "Stimulator". This makes auto-discovery work without
+    # requiring the user to point at the DLL manually.
+    for plex_root in _PLEXON_SDKS_ROOTS:
+        try:
+            if not plex_root.is_dir():
+                continue
+            for sub in plex_root.iterdir():
+                if (sub.is_dir() and
+                        any(h in sub.name.lower()
+                            for h in _SDK_FOLDER_NAME_HINTS)):
+                    candidates.append(sub)
+        except OSError:
+            # Permission / network-drive timeout / etc. — never let a
+            # filesystem hiccup take down detection.
+            continue
     return candidates
 
 

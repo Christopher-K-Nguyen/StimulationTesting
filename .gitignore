@@ -33,7 +33,7 @@ qinj_dataset.csv
 # --- Installer build outputs ---
 installer/build/
 installer/dist/
-installer/*.spec
+installer/Output/
 *.exe
 
 # --- Reference scope manual dumps ---

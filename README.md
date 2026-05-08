@@ -41,13 +41,38 @@ python run_gui.py
 python run_gui.py --simulate
 ```
 
-To work with real hardware on Windows you need:
+## Prerequisites for real hardware (Windows)
 
-- **Plexon PlexStim 2.0** (the PyPlexStim wrapper is vendored in
-  `stimtest/hardware/pyplexstim/`; the 64-bit `PlexStim64.dll` is included).
-- **NI-VISA** (or equivalent) installed for `pyvisa` to find the Tektronix scope over
-  USB-TMC. The scope is auto-detected and parsed from `*IDN?` — works with TBS1000,
-  TDS2000, MSO/MDO/DPO series.
+### Plexon PlexStim 2.0 SDK
+
+Download `StimulatorV2Setup.exe` from
+[plexon.com](https://plexon.com/wp-content/uploads/2017/06/StimulatorV2Setup.exe)
+and run it. The installer drops two folders by default:
+
+| Path             | Contents |
+|------------------|----------|
+| `C:\PlexonSDKs`  | `PlexStim64.dll`, `PlexStim.dll`, headers, MATLAB SDK, USB driver |
+| `C:\PlexonData`  | Plexon's default runtime / capture data folder (this app does **not** write here — its save path is configurable on the Setup tab). |
+
+Older installers used `C:\Program Files\Plexon Inc\PlexStim 2.0\`
+instead — both layouts are auto-discovered by
+`stimtest/hardware/plexstim_detect.py` at startup.
+
+> **PyPlexStim is *not* shipped by the SDK installer.** This repo
+> vendors its own copy under `stimtest/hardware/pyplexstim/` (Python
+> wrapper + bundled `PlexStim64.dll`), so a fresh checkout works
+> end-to-end as long as the Plexon SDK installer has been run on
+> the machine (for the kernel-mode USB driver). Without the SDK
+> installer the GUI still launches in simulator mode.
+
+### NI-VISA (or any IVI VISA runtime)
+
+Optional but recommended — required for `pyvisa` to drive the
+Tektronix scope over USB-TMC at full performance. The scope is
+auto-detected and parsed from `*IDN?` — works with TBS1000, TBS2000,
+TDS2000, MSO / MDO / DPO series. Without a VISA runtime the app falls
+back to the bundled `pyvisa-py` backend (works for most USB-TMC
+scopes, slightly slower).
 
 ## Project layout
 

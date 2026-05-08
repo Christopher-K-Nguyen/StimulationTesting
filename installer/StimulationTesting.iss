@@ -11,10 +11,17 @@
 ;        the frozen .exe will fail with "api-ms-win-crt-runtime-l1-1-0.dll
 ;        is missing" without this.
 ;
-;   2. Plexon PlexStim 2.0 SDK                              -- RECOMMENDED
+;   2. Plexon PlexStim 2.0 SDK ("Sim-2")                    -- RECOMMENDED
 ;        Required to drive a real PlexStim. Without it the GUI still
 ;        launches in simulator mode. Plexon's setup is interactive; we
 ;        download StimulatorV2Setup.exe and exec it for the user.
+;        Detection probes the registry uninstall hive first, then falls
+;        back to a filesystem check of:
+;          - C:\PlexonSDKs\<sdk-name>     (modern installer default)
+;          - C:\Program Files\Plexon Inc\PlexStim 2.0 (older default)
+;        PyPlexStim is NOT shipped by the SDK installer; this app
+;        vendors its own Python wrapper, so end-users only need the
+;        SDK installer (for the kernel-mode USB driver).
 ;
 ;   3. NI-VISA (or any IVI VISA implementation, e.g. TekVISA)  -- OPTIONAL
 ;        Required to drive a real Tektronix scope over USB-TMC at full
@@ -214,7 +221,66 @@ end;
 
 { ----- Prereq 2: Plexon PlexStim 2.0 SDK ----------------------------------- }
 
+function PlexonSdkFolderExists(): Boolean;
+{ Modern Plexon installers (Stimulator V2 / Sim-2) drop their SDK
+  folder under C:\PlexonSDKs and a sibling C:\PlexonData for runtime
+  data. Walk PlexonSDKs and look for any subdirectory whose name
+  mentions "plexstim" or "stimulator" (case-insensitive) — Plexon's
+  exact SDK folder name has varied across releases. Older installers
+  used C:\Program Files\Plexon Inc\PlexStim 2.0\; that's checked too.
+
+  Used as a filesystem fallback for IsPlexStimInstalled when the
+  registry uninstall entry is missing (e.g. user-mode install, manual
+  copy, or registry was wiped). }
+var
+  FindRec: TFindRec;
+  RootDir, Lower: String;
+  ProgramFiles64, ProgramFiles32: String;
+begin
+  Result := False;
+
+  RootDir := 'C:\PlexonSDKs';
+  if DirExists(RootDir) then
+  begin
+    if FindFirst(RootDir + '\*', FindRec) then
+    begin
+      try
+        repeat
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          begin
+            if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+            begin
+              Lower := LowerCase(FindRec.Name);
+              if (Pos('plexstim', Lower) > 0) or
+                 (Pos('stimulator', Lower) > 0) then
+              begin
+                Result := True;
+                Exit;
+              end;
+            end;
+          end;
+        until not FindNext(FindRec);
+      finally
+        FindClose(FindRec);
+      end;
+    end;
+  end;
+
+  ProgramFiles64 := ExpandConstant('{commonpf64}');
+  ProgramFiles32 := ExpandConstant('{commonpf32}');
+  if DirExists(ProgramFiles64 + '\Plexon Inc\PlexStim 2.0') or
+     DirExists(ProgramFiles32 + '\Plexon Inc\PlexStim 2.0') or
+     DirExists(ProgramFiles64 + '\Plexon Inc\PlexStim') or
+     DirExists(ProgramFiles32 + '\Plexon Inc\PlexStim') then
+    Result := True;
+end;
+
 function IsPlexStimInstalled(): Boolean;
+{ True if the PlexStim 2.0 SDK ("Sim-2") looks installed. We check
+  the registry uninstall hive first (most reliable, gives us the
+  install version too) and fall back to a filesystem probe of
+  C:\PlexonSDKs / C:\Program Files for users where the registry
+  entry is missing or stale. }
 var
   Needles: array of String;
 begin
@@ -226,7 +292,8 @@ begin
     lives under WOW6432Node on 64-bit Windows. We check both hives so the
     detection works whether Plexon ships a 32- or 64-bit installer. }
   Result := UninstallEntryMatches(HKLM, Needles) or
-            UninstallEntryMatches(HKLM32, Needles);
+            UninstallEntryMatches(HKLM32, Needles) or
+            PlexonSdkFolderExists();
 end;
 
 procedure InstallPlexStimIfMissing();
