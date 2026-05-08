@@ -150,6 +150,16 @@ class SimulatedStimulator(Stimulator):
         for ch in list(self._running):
             self._running[ch] = False
 
+    def start_all(self) -> None:
+        """Synchronous-start mirror — flag every loaded channel running.
+
+        The simulator doesn't model trigger jitter, so the start is
+        instantaneous. Mirrors PlexonStimulator.start_all so callers
+        can use the same code path against either backend.
+        """
+        for ch in list(self._patterns):
+            self._running[ch] = True
+
     def set_repetitions(self, channel: int, n: int) -> None:
         if channel in self._patterns:
             self._patterns[channel].repetitions = n

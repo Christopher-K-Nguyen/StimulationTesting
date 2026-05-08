@@ -390,6 +390,23 @@ class PlexonStimulator(Stimulator):
             self._lib.ps_stop_stim_all_channels(self._stim_n),
             "stop_stim_all_channels")
 
+    def start_all(self) -> None:
+        """Synchronously start every loaded channel.
+
+        Wraps ``PS_StartStimAllChannels``: a single SDK / USB round
+        trip that fires every channel on the same firmware tick. The
+        per-channel ``start_channel`` loop staggers starts by tens to
+        hundreds of microseconds (one round-trip each), which makes
+        the device's digital sync output fire 16 times per pulse
+        cycle when all channels are programmed — chaotic on the scope.
+        Use this whenever multiple channels share a pattern and the
+        downstream consumer (scope trigger, TTL gating) expects one
+        edge per cycle.
+        """
+        self._check(
+            self._lib.ps_start_stim_all_channels(self._stim_n),
+            "start_stim_all_channels")
+
     def set_repetitions(self, channel: int, n: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
         if n < 0:

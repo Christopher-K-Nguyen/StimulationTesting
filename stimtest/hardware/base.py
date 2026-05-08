@@ -87,6 +87,22 @@ class Stimulator(ABC):
     @abstractmethod
     def stop_all(self) -> None: ...
 
+    def start_all(self) -> None:
+        """Start every loaded channel on the same firmware clock tick.
+
+        Default implementation falls back to a per-channel loop, which
+        is the right behaviour for the simulator. The Plexon driver
+        overrides this with ``PS_StartStimAllChannels`` so all enabled
+        channels fire synchronously — important for any workflow that
+        watches the device's digital sync output, which otherwise
+        receives one edge per channel and looks chaotic when 16
+        channels are programmed.
+        """
+        # Subclasses without a synchronous-start primitive can fall
+        # back to per-channel starts; this is a no-op for the
+        # simulator since loaded patterns auto-fire on demand.
+        raise NotImplementedError
+
     # ----- advanced -----
     def reinit(self) -> None:
         """Close and re-open the hardware connection.
