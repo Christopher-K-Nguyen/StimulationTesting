@@ -6,7 +6,7 @@ metric drift within a step is captured. Continues until any of:
 
 * the configured ``max_ua`` ceiling is reached (default = the PlexStim
   hardware limit, ~1 mA/channel);
-* V_mon hits the stimulator's voltage compliance rail (~±9 V) — beyond
+* V_mon hits the stimulator's voltage compliance rail (~±12 V) — beyond
   this the device is no longer actually delivering the programmed current,
   so further steps are meaningless;
 * the user aborts.
@@ -65,7 +65,7 @@ class StressPolicy:
     sampling_period_s: float = 12.0
 
     #: When True, stop the ramp as soon as V_mon hits the stimulator's
-    #: voltage compliance rail (~±9 V) — beyond which the programmed current
+    #: voltage compliance rail (~±12 V) — beyond which the programmed current
     #: is no longer actually being delivered. Default True; set False if you
     #: explicitly want to push the device into compliance to characterize
     #: rail behavior.

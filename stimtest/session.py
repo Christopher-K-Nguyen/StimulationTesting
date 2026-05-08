@@ -39,7 +39,7 @@ class CaptureMetrics:
 class CaptureStatus:
     good: bool = True
     reached_potential_limit: bool = False
-    voltage_compliance: bool = False    # stim hit ±9 V rail
+    voltage_compliance: bool = False    # stim hit ±12 V rail
     aborted: bool = False
     notes: str = ""
 

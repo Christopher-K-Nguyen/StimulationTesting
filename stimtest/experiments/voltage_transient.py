@@ -21,7 +21,7 @@ but distilled into the much smaller form below):
                - If *any* E_pol crossed the SIROF water window (E_lc = -0.6 V,
                  E_la = +0.8 V vs Ag|AgCl), mark this capture as having
                  reached_potential_limit and STOP the sweep.
-               - If V_mon hit the stimulator's compliance rail (~±9 V),
+               - If V_mon hit the stimulator's compliance rail (~±12 V),
                  mark voltage_compliance and STOP.
                - Otherwise pick the next step size: coarse step if we're far
                  from the limit, fine step if |E_pol| / |limit| > 0.7. This
@@ -42,7 +42,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from ..config import COATINGS
+from ..config import COATINGS, STIM_VOLTAGE_COMPLIANCE_V
 from ..electrode import Configuration, ElectrodeArray
 from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
@@ -345,8 +345,14 @@ class VoltageTransientExperiment(ExperimentRunner):
             e_act_v=np.asarray(e_act) if e_act is not None and e_act.size else None,
             e_ret_v=np.asarray(e_ret) if e_ret is not None and e_ret.size else None,
         )
-        # Voltage compliance check (Plexon rail ≈ ±9.5 V on V_mon)
-        cap.status.voltage_compliance = bool(np.max(np.abs(v_mon_v)) > 9.0)
+        # Voltage compliance check. PlexStim 2.0 V_mon saturates at
+        # roughly ±STIM_VOLTAGE_COMPLIANCE_V; crossing it means the
+        # device couldn't push the programmed current any further.
+        # The constant lives in ``stimtest.config`` so a hardware-rev
+        # change updates one place rather than every experiment runner.
+        cap.status.voltage_compliance = bool(
+            np.max(np.abs(v_mon_v)) > STIM_VOLTAGE_COMPLIANCE_V
+        )
         compute_metrics(cap, surface_area_um2=self.surface_area_um2,
                         polarization_source=self.polarization_source)
         return cap

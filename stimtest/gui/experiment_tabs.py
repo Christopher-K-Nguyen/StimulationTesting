@@ -1856,11 +1856,11 @@ class ProgressiveStressTab(_BaseExperimentTab):
         self.sampling_period.setDecimals(1)
         self.sampling_period.setValue(10.0)
         self.sampling_period.setSuffix(" s")
-        # Hardware-level stop: V_mon hits the ±9 V compliance rail and the
+        # Hardware-level stop: V_mon hits the ±12 V compliance rail and the
         # device stops actually delivering the programmed current. There's no
         # point ramping further past that point.
         self.stop_on_compliance = QtWidgets.QCheckBox(
-            "Stop when V_mon hits voltage compliance (±9 V rail)")
+            "Stop when V_mon hits voltage compliance (±12 V rail)")
         self.stop_on_compliance.setChecked(True)
 
         # Stress-specific ramp parameters live below the pattern panel
