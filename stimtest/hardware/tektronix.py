@@ -93,6 +93,22 @@ def select_dialect(model: str) -> TekDialect:
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+#: Default record length applied to every scope on connect.
+#: Sweet spot for stim-pulse characterization on the TBS2204B
+#: (and TBS-series in general), where the supported quantized set is
+#: {1 k, 2 k, 20 k, 200 k, 2 M, 5 M}. 20 k gives ~50 ns/pt at a 1 ms
+#: window — 4 000 pts per 200 µs phase, well above what the metric
+#: math needs (Cisnal-derivative access edge needs ~50 pts/phase,
+#: E_pol-at-12-µs sampling needs ~5 pts/phase) and well below the
+#: scope's 200 MHz analog bandwidth so we're not just sampling
+#: front-end noise. 200 k and 2 M push the per-capture USB-TMC
+#: transfer into the 1-3 second range with no information gain
+#: (those rates are 100x and 1000x oversampled vs the scope's own
+#: bandwidth). 1 k / 2 k would *downgrade* from the legacy
+#: TBS1104B's 2 500-point default.
+DEFAULT_RECORD_LENGTH = 20_000
+
+
 class TektronixOscilloscope(Oscilloscope):
     """pyvisa-backed scope driver."""
 
@@ -191,7 +207,23 @@ class TektronixOscilloscope(Oscilloscope):
         # so set once at open and let set_record_length() refresh on demand.
         self._inst.write("DATa:STARt 1")
         self._record_length = None
-        self._refresh_record_length()
+        # Enforce DEFAULT_RECORD_LENGTH (20 k) instead of inheriting
+        # whatever the front panel was last set to. Two reasons:
+        #   1. The TBS2204B can sit at 2 M from a previous user, which
+        #      would multiply per-capture USB-TMC transfer time by 100x
+        #      with no information gain (see the comment on the constant).
+        #   2. The TBS-series quantises record length to a fixed set
+        #      (1k / 2k / 20k / 200k / 2M / 5M), so the scope rounds our
+        #      request silently to the nearest legal value — set_record
+        #      _length reads it back and updates the cache to whatever
+        #      actually landed.
+        # If we can't write the record length (older firmware, scope
+        # mid-acquisition), fall back to whatever's currently configured
+        # rather than failing the connection.
+        try:
+            self.set_record_length(DEFAULT_RECORD_LENGTH)
+        except Exception:
+            self._refresh_record_length()
 
     def close(self) -> None:
         if self._inst is not None:
