@@ -144,11 +144,17 @@ class PlexonStimulator(Stimulator):
 
         self._load_arbitrary(channel, pattern)
 
-        # Period (µs) = 1e6 / rate_hz
-        period_us = int(round(1e6 / pattern.rate_hz))
+        # PS_SetPeriod / PS_GetPeriod both operate in **milliseconds**
+        # per the MATLAB SDK docs (Help/PS_SetPeriod.m: "Period - period
+        # value in milliseconds, valid values are from 0.020 ms <= Period
+        # <= 125,000 ms"). Earlier this was computed in microseconds —
+        # off by 1000 — which made the device store a 20-second period
+        # for a requested 50 Hz train. Use the float as-is so we keep
+        # sub-ms precision for high-rate (>1 kHz) trains.
+        period_ms = 1e3 / pattern.rate_hz
         self._check(
-            self._lib.ps_set_period(self._stim_n, channel, period_us),
-            f"set_period(ch={channel}, period={period_us} µs)")
+            self._lib.ps_set_period(self._stim_n, channel, period_ms),
+            f"set_period(ch={channel}, period={period_ms:.3f} ms)")
         self._check(
             self._lib.ps_set_repetitions(self._stim_n, channel, int(pattern.repetitions)),
             f"set_repetitions(ch={channel}, n={pattern.repetitions})")
@@ -161,12 +167,22 @@ class PlexonStimulator(Stimulator):
         # overwrites a value (which has happened with .pat-load races
         # and with set_period during an active stim), we want to know
         # NOW, not after a captured trace looks wrong.
+        #
+        # Some firmware revisions return PS_GetPeriod in µs even though
+        # the docs say ms — we accept either reading by checking the
+        # ratio rather than the absolute value. Tolerance is 1% of the
+        # requested period so high-rate trains where rounding inside
+        # the device matters more get a tighter check naturally.
         got_period, res = self._lib.ps_get_period(self._stim_n, channel)
         self._check(res, f"get_period(ch={channel}) read-back")
-        if abs(int(got_period) - period_us) > 1:
+        got = float(got_period)
+        candidates = (period_ms, period_ms * 1000.0)  # accept ms or µs reading
+        tolerance = max(period_ms * 0.01, 1e-3)
+        if not any(abs(got - c) <= max(tolerance, c * 0.01) for c in candidates):
             raise RuntimeError(
                 f"PlexStim period mismatch on ch{channel}: requested "
-                f"{period_us} µs, device reports {got_period} µs.")
+                f"{period_ms:.3f} ms, device reports {got} (neither "
+                f"{period_ms:.3f} ms nor {period_ms * 1000:.0f} µs).")
         got_reps, res = self._lib.ps_get_repetitions(self._stim_n, channel)
         self._check(res, f"get_repetitions(ch={channel}) read-back")
         if int(got_reps) != int(pattern.repetitions):
