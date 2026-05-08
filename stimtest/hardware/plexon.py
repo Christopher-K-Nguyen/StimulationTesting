@@ -83,31 +83,95 @@ class PlexonStimulator(Stimulator):
                 f"Channel {channel} out of range — device has "
                 f"{n_channels} channels (1-based).")
 
+    def _extended_error_text(self, res) -> str:
+        """Read PS_GetExtendedErrorInfo and decode the C string.
+
+        The SDK returns the error string as ``bytes`` on most builds;
+        decoding lets the caller log a human-readable message rather
+        than ``b'No Plexon...'``. Errors during the readback itself
+        fall back to the integer error code so we never lose the
+        original failure context.
+        """
+        try:
+            info, _ = self._lib.ps_get_extended_error_info(res)
+        except Exception:
+            return f"code={res}"
+        if isinstance(info, (bytes, bytearray)):
+            return info.decode(errors="replace").strip()
+        return str(info).strip()
+
+    @staticmethod
+    def _error_means_locked(message: str) -> bool:
+        """True if the SDK message points at the Sim-2 USB-lock case.
+
+        Two variants seen in practice: ``"No Plexon Stimulator is
+        detected."`` (most common) and a generic ``"not detected"``
+        suffix on some firmware revisions. Match both.
+        """
+        m = message.lower()
+        return ("no plexon stimulator" in m) or ("not detected" in m)
+
+    def _auto_recover_locked_device(self) -> None:
+        """Force-close the Plexon GUI (if running) and pause briefly.
+
+        Imported lazily so a non-Windows environment, or one without
+        the lock module, doesn't break the rest of the driver. Logs
+        a brief notice to stderr so the user sees what happened — the
+        upstream caller (GUI or CLI) doesn't get a structured signal
+        otherwise. Failures here are swallowed: recovery is a
+        best-effort step, and the caller will re-raise the original
+        SDK error if the retry also fails.
+        """
+        try:
+            from .plexstim_lock import close_blocking_processes
+        except Exception:
+            return
+        try:
+            closed = close_blocking_processes()
+        except Exception:
+            return
+        if closed:
+            import sys
+            names = ", ".join(p.display() for p in closed)
+            print(
+                f"[plexon] SDK reported 'no stimulator detected'; "
+                f"force-closed Plexon GUI process(es) holding the USB "
+                f"lock: {names}. Retrying PS_InitAllStim...",
+                file=sys.stderr, flush=True,
+            )
+
     # ----- lifecycle -----
     def open(self) -> None:
         self._lib.ps_close_all_stim()
         res = self._lib.ps_init_all_stim()
         if res != self._PS_OK:
-            info, _ = self._lib.ps_get_extended_error_info(res)
-            # Decode the C string that the SDK returns so the message
-            # is readable, not bytes-prefixed garbage.
-            info_text = (info.decode(errors="replace")
-                         if isinstance(info, (bytes, bytearray)) else str(info))
+            info_text = self._extended_error_text(res)
             # Plexon's own GUI ("Sim-2" / "Stimulator V2 Application")
-            # holds an exclusive USB lock on the stimulator. While that
-            # window is open, every PS_InitAllStim call from the SDK
-            # comes back with "No Plexon Stimulator is detected." even
-            # though the device is plugged in and powered. Surface the
-            # most common fix in the error itself so users don't have
-            # to guess — or grep through the codebase — when the
-            # connection fails.
-            hint = ""
-            if "no plexon stimulator" in info_text.lower() or "not detected" in info_text.lower():
-                hint = (" Hint: close the Plexon Sim-2 / Stimulator V2 "
-                        "application if it's open — it holds an "
-                        "exclusive USB lock on the device. Power-cycle "
-                        "the stimulator if the SDK still can't see it.")
-            raise RuntimeError(f"PS_InitAllStim failed: {info_text}.{hint}")
+            # holds an exclusive USB lock on the stimulator. While
+            # that window is open, every PS_InitAllStim call from the
+            # SDK comes back with "No Plexon Stimulator is detected."
+            # even though the device is plugged in and powered. Try
+            # to auto-recover: force-close the Plexon GUI (limited to
+            # processes whose binary lives under a Plexon install
+            # root) and retry the init exactly once. This mirrors what
+            # the user would have to do manually via Task Manager.
+            if self._error_means_locked(info_text):
+                self._auto_recover_locked_device()
+                self._lib.ps_close_all_stim()
+                res = self._lib.ps_init_all_stim()
+                if res != self._PS_OK:
+                    info_text = self._extended_error_text(res)
+            if res != self._PS_OK:
+                hint = ""
+                if self._error_means_locked(info_text):
+                    hint = (" Hint: the Plexon Sim-2 / Stimulator V2 "
+                            "application appears to still be holding "
+                            "the USB lock. Close it manually via Task "
+                            "Manager (or run "
+                            "`python -m stimtest.hardware.plexstim_lock "
+                            "--close`), then retry. Power-cycle the "
+                            "stimulator if it's still not detected.")
+                raise RuntimeError(f"PS_InitAllStim failed: {info_text}.{hint}")
 
         n_stim, _ = self._lib.ps_get_n_stim()
         if n_stim < self._stim_n:
