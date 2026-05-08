@@ -114,6 +114,11 @@ const
   VCRuntimesPath = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
   NiVisaPath     = 'SOFTWARE\National Instruments\NI-VISA';
   IviVisaPath    = 'SOFTWARE\IVI Foundation\VISA\Win64\CurrentVersion';
+  { Inno Setup's Pascal scripting layer doesn't predeclare Win32 file
+    attribute constants. We only need DIRECTORY here for the FindFirst
+    walk in PlexonSdkFolderExists. Value matches the Win32 SDK header
+    (0x10). }
+  FILE_ATTRIBUTE_DIRECTORY = $00000010;
 
 { ----- Generic helpers ----------------------------------------------------- }
 
