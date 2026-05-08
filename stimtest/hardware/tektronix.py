@@ -242,6 +242,49 @@ class TektronixOscilloscope(Oscilloscope):
     def set_channel_scale(self, channel: str, volts_per_div: float) -> None:
         self._w(f"{channel}:SCAle {volts_per_div:g}")
 
+    # MATLAB ``setOscilloscope_Tek.m`` per-channel block, lines 381-446.
+    # The MATLAB code enforces these on every channel the user enables
+    # so the bench setup is reproducible regardless of front-panel
+    # state from a previous session. We mirror the same set plus an
+    # explicit BANdwidth FULl (the MATLAB code doesn't set this, but
+    # the lab convention is full bandwidth — no 20 MHz hardware filter,
+    # which would round the leading edges of stim pulses).
+    _CHANNEL_DEFAULT_COMMANDS = (
+        ("{ch}:COUPling DC",      "DC coupling (no AC blocking cap)"),
+        ("{ch}:INVert OFF",       "no waveform inversion"),
+        ("{ch}:POSition 0",       "vertical position 0 div"),
+        ('{ch}:YUNit "V"',        "report data in volts"),
+        # Probe attenuation. TBS2000B/MSO/MDO firmware uses
+        # ``CH<x>:PRObe:GAIN <NRf>`` where gain = 1/attenuation, so
+        # gain=1 means 1X probe. Older TBS1000/TDS2000 firmware uses
+        # ``CH<x>:PRObe <NR1>`` with the attenuation value directly.
+        # Send both — whichever the scope rejects errors silently and
+        # the next one applies.
+        ("{ch}:PRObe:GAIN 1",     "1X probe (modern firmware)"),
+        ("{ch}:PRObe 1",          "1X probe (legacy firmware)"),
+        ("{ch}:BANdwidth FULl",   "full bandwidth (no 20 MHz filter)"),
+    )
+
+    def apply_channel_defaults(self, channel: str) -> None:
+        """Force DC / 1X / no-invert / full-BW / 0-pos / V-units on one channel.
+
+        Tolerant: each SCPI write is wrapped in try/except because the
+        TBS family's older firmware will reject the modern ``PRObe:GAIN``
+        form (and vice versa); skipping a rejected line lets the next
+        one run. The probe-gain pair is intentional belt-and-braces.
+
+        Idempotent: safe to re-call before each acquisition. The user's
+        bench convention is that NO channel ever has AC coupling, an
+        inverted waveform, a non-1X probe, or a 20 MHz BW filter.
+        """
+        for tmpl, _why in self._CHANNEL_DEFAULT_COMMANDS:
+            try:
+                self._w(tmpl.format(ch=channel))
+            except Exception:
+                # Continue with the next setting — defensive setup
+                # mustn't fail the whole connection on one bad SCPI.
+                pass
+
     def set_horizontal_scale(self, seconds_per_div: float) -> None:
         self._w(f"HORizontal:SCAle {seconds_per_div:g}")
 
@@ -346,11 +389,26 @@ class TektronixOscilloscope(Oscilloscope):
         self._w("TRIGger:A:TYPe EDGE")
         self._w(f"TRIGger:A:EDGE:SOUrce {source}")
         self._w(f"TRIGger:A:EDGE:SLOpe {slope_word}")
+        # Trigger-edge coupling DC matches MATLAB ``setOscilloscope_Tek.m``
+        # line 478. AC coupling on the trigger path would hide low-rate
+        # digital edges, which is exactly what we use for stim sync.
+        try:
+            self._w("TRIGger:A:EDGE:COUPling DC")
+        except Exception:
+            pass
         try:
             self._w(f"TRIGger:A:LEVel {level_v:g}")
         except Exception:
             self._w(f"TRIGger:LEVel {level_v:g}")
         self._w(f"TRIGger:A:MODe {mode.upper()}")
+        # If the trigger source is one of the input channels, force the
+        # same bench defaults on that channel that we apply to mapped
+        # data channels — otherwise a 10X probe attenuation or AC
+        # coupling on the trigger channel will quietly make us miss
+        # edges from a 3.3 V digital sync line.
+        src_u = source.upper()
+        if src_u.startswith("CH") and src_u[2:].isdigit():
+            self.apply_channel_defaults(src_u)
         # Stash the requested settings so a periodic sanity check
         # (see ``_periodic_acq_check``) can verify nothing's drifted.
         self._expected_trigger_source = source.upper()
@@ -558,9 +616,13 @@ class TektronixOscilloscope(Oscilloscope):
     # ----- adapt aliases to physical channels --
     def configure_channels(self, alias_to_phys: Dict[str, str]) -> None:
         super().configure_channels(alias_to_phys)
-        # Make sure each wanted channel is enabled
+        # Make sure each wanted channel is enabled, then enforce the
+        # canonical bench settings (DC / 1X / no-invert / full-BW /
+        # 0-pos / V-units) so the run starts from a known state
+        # regardless of front-panel leftovers.
         for ch in set(alias_to_phys.values()):
             try:
                 self._w(f"SELect:{ch} ON")
             except Exception:
                 pass
+            self.apply_channel_defaults(ch)
