@@ -104,6 +104,9 @@ class ChannelRun:
 @dataclass
 class TestParameters:
     """Top-level experiment parameters (mirrors MATLAB ``File.Test``/``File.Parameters``)."""
+    # Stop pytest from treating this as a test class because the name
+    # begins with "Test". The dataclass is data, not a fixture.
+    __test__ = False
     experiment: str                         # 'VT' | 'TV' | 'SP' | 'LP' | 'PS'
     pattern: PulsePattern                   # initial / template pulse pattern
     configuration: Configuration            # for single-channel runs

@@ -44,8 +44,15 @@ def test_vt_runner_end_to_end_finds_max_q_inj():
     )
     result = runner.run()
     assert len(result.captures) > 0
-    # The simulator's water window should clamp the sweep before max_ua
-    assert result.captures[-1].status.reached_potential_limit or \
-           result.captures[-1].pattern.excitation_phase.amplitude_ua >= 0
+    # The sweep should stop at a safety limit — either the SIROF water
+    # window (reached_potential_limit) or the stimulator's voltage
+    # compliance rail. Whichever fires first depends on the access
+    # resistance of the simulator's electrode model and is fine either
+    # way for this end-to-end test; we just want to confirm the runner
+    # honours its safety stops instead of running off to max_ua.
+    final = result.captures[-1].status
+    assert final.reached_potential_limit or final.voltage_compliance, (
+        f"sweep ended without hitting a safety limit: {final}"
+    )
     assert np.isfinite(result.max_q_inj)
     stim.close(); scope.close()
