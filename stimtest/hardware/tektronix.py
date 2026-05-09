@@ -11,23 +11,40 @@ On :meth:`open`, we send ``*IDN?`` and parse the comma-separated response:
 
     TEKTRONIX,TBS2204B,C019999,CF:91.1CT FV:v1.16
 
-The model field (``TBS2204B``) is matched against
-:data:`_MODERN_MODELS` to choose the SCPI dialect. The differences between
-"modern" and "legacy" dialects are small but matter:
+The driver is **adaptive across the Tek family** — it doesn't rely on
+matching every model in a regex. Two complementary mechanisms:
 
-* **Modern dialect** (``TBS2000B``, ``MSO``, ``MDO``, ``DPO`` series):
-  uses ``WFMOutpre:`` for waveform preamble queries (XINcr?, YMUlt?, etc.)
-  and supports ``DATa:SOUrce <ch>`` for picking the channel to read.
-* **Legacy dialect** (``TBS1000``, ``TDS2000``, ``TDS3000``):
-  uses ``WFMPre:`` for the same queries; the rest of the command surface is
-  shared.
+* **Dialect probing** (:meth:`_probe_dialect`): we send a cheap test
+  query (``WFMOutpre:NR_Pt?``) and pick the modern dialect if it
+  answers; fall back to ``WFMPre:NR_Pt?`` otherwise. Modern firmware
+  on a future model we haven't heard of will Just Work; legacy
+  firmware on a "modern" model number is still recognised correctly.
+  We also probe whether ``ACQuire:NUMAVg`` is supported so the
+  acquisition setup path doesn't error on the oldest TDS firmware.
+* **Channel-count parsing** (:func:`channel_count_from_model`): the
+  Tek naming convention encodes channel count as the last digit of
+  the 4-digit numeric part of the model name (TBS1072C = 2-channel,
+  TBS2204B = 4-channel). Used by the GUI's Setup tab to grey out
+  unavailable channels.
+
+Dialect differences (used by the same single driver class):
+
+* **Modern dialect** (``TBS1000C``, ``TBS2000B/C``, ``MSO``, ``MDO``,
+  ``DPO``): uses ``WFMOutpre:`` for waveform preamble queries (XINcr?,
+  YMUlt?, etc.) and supports ``DATa:SOUrce <ch>`` for picking the
+  channel to read.
+* **Legacy dialect** (``TBS1000``, ``TBS1000B``, ``TDS2000``,
+  ``TDS3000``): uses ``WFMPre:`` for the same queries; the rest of
+  the command surface is shared.
 
 Adding new models
 -----------------
-If a future scope needs different commands, extend :class:`TekDialect` with
-the new field, add the model to :data:`_MODERN_MODELS` (or define a new
-dialect constant), and update :func:`select_dialect` to dispatch correctly.
-The rest of the driver, and all experiment / GUI code, is untouched.
+For a new Tek model: usually nothing is needed — the probe at
+:meth:`_probe_dialect` figures out the right dialect. If the model
+also has a non-standard channel count or new SCPI surface, extend
+:func:`channel_count_from_model` and the relevant section of the
+driver. Non-Tek vendors need a brand-new driver class implementing
+:class:`stimtest.hardware.base.Oscilloscope`.
 
 Acquisition flow
 ----------------
@@ -96,6 +113,13 @@ _MODERN_MODELS = re.compile(
 
 
 def select_dialect(model: str) -> TekDialect:
+    """Best-guess dialect from the model-name string alone.
+
+    Used as a fallback before a live probe is available (e.g. unit
+    tests). Production code path goes through
+    :meth:`TektronixOscilloscope._probe_dialect`, which sends test
+    queries to the live device and is robust against unknown models.
+    """
     if _MODERN_MODELS.search(model or ""):
         return MODERN
     return LEGACY
@@ -244,7 +268,12 @@ class TektronixOscilloscope(Oscilloscope):
             make=make, model=model, serial=serial, firmware=firmware,
             resource=rsrc, n_channels=n_ch, is_simulated=False,
         )
-        self._dialect = select_dialect(model)
+        # Probe the live scope for its actual dialect rather than
+        # guessing from the model-name regex. Any unknown future Tek
+        # model that speaks the modern WFMOutpre command set will Just
+        # Work; legacy firmware drops cleanly to LEGACY without any
+        # code change. Falls back to the regex if probing throws.
+        self._dialect = self._probe_dialect(fallback_model=model)
         # Sane defaults — set once so per-capture work is just CURVe? + the
         # preamble query.
         self._inst.write("HEADer OFF")
@@ -324,6 +353,83 @@ class TektronixOscilloscope(Oscilloscope):
         if code != 0:
             raise RuntimeError(
                 f"Tek SCPI error after {cmd!r}: {err}")
+
+    # ----- capability probing ------------------------------------------
+    def _probe_dialect(self, *, fallback_model: str = "") -> TekDialect:
+        """Auto-detect the Tek SCPI dialect from live probe queries.
+
+        Two forms exist for the same data:
+
+        * **Modern** (``WFMOutpre:...``) — TBS1000C, TBS2000B/C,
+          MSO/MDO/DPO, the unified Tek programmer-manual command set
+          released ~2018+.
+        * **Legacy** (``WFMPre:...``) — TBS1000 / TBS1000B / TBS1000B-EDU,
+          TDS2000/3000.
+
+        Some firmware revs accept both for backward compat; we prefer
+        the modern form when both work because it has more capabilities
+        (longer record reads, richer preamble fields).
+
+        We also probe whether ``ACQuire:NUMAVg`` is supported — almost
+        every Tek scope has it, but the very oldest TDS firmware lacks
+        it. Using a probe means we don't have to maintain a list of
+        which models have which features.
+
+        Always succeeds: on probe failure we fall back to
+        :func:`select_dialect` keyed on the model-name regex, so we
+        never block ``open()`` on a single SCPI hiccup.
+        """
+        if self._inst is None:
+            return select_dialect(fallback_model)
+
+        def _probes_ok(prefix: str) -> bool:
+            """Send ``<prefix>:NR_Pt?`` and return True iff it answers
+            with a parseable number. Any exception or non-numeric
+            response means this dialect doesn't apply. Drains the
+            scope's error queue afterward so a probe miss doesn't
+            leak into subsequent _w_checked calls."""
+            try:
+                resp = self._inst.query(f"{prefix}:NR_Pt?").strip()
+                int(float(resp))   # raises if it's an error message
+                return True
+            except Exception:
+                # Best-effort error-queue clear (any Tek firmware that
+                # recognises *CLS will have already accepted it).
+                try:
+                    self._inst.write("*CLS")
+                except Exception:
+                    pass
+                return False
+
+        # Probe both forms; prefer modern when both work. NR_Pt? is a
+        # cheap, side-effect-free query present in both dialects.
+        if _probes_ok("WFMOutpre"):
+            base = MODERN
+        elif _probes_ok("WFMPre"):
+            base = LEGACY
+        else:
+            base = select_dialect(fallback_model)
+
+        # Probe NUMAVg support independently. Most Tek scopes have
+        # it; this catches the corner case of very old TDS firmware
+        # that doesn't, so set_acquisition_mode doesn't fail
+        # mid-experiment with an "Undefined header" error.
+        try:
+            self._inst.query("ACQuire:NUMAVg?")
+            has_acq_numavg = True
+        except Exception:
+            try:
+                self._inst.write("*CLS")
+            except Exception:
+                pass
+            has_acq_numavg = False
+
+        return TekDialect(
+            preamble=base.preamble,
+            horiz_record=base.horiz_record,
+            use_data_source=base.use_data_source,
+            has_acq_numavg=has_acq_numavg,
+        )
 
     # ----- configuration -----
     def set_channel_scale(self, channel: str, volts_per_div: float) -> None:
