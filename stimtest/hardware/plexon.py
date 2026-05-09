@@ -308,20 +308,33 @@ class PlexonStimulator(Stimulator):
         import tempfile
 
         # PlexStim .pat: list of (time_us, amplitude_µA) breakpoints.
+        # The DLL linearly interpolates between breakpoints, so any
+        # waveform — rectangular, ramp, sine, halfpipe, bowtie,
+        # speedbumps — reduces to a sufficiently-fine breakpoint
+        # sequence. ``waveforms.shape_breakpoints`` does that
+        # rendering; we just compose the per-phase output with the
+        # running cursor and append zero markers across the
+        # interphase / discharge delays.
+        #
+        # Per the PlexStim 2.0 SDK, the pattern caps at 999 fixed
+        # points or 499 paired values. With our default 50 samples
+        # per curved phase × 2 phases = 100 + 4 zero markers, we sit
+        # comfortably within budget for biphasic; rectangular and
+        # linear-ramp shapes use only 2-3 points per phase.
+        from ..waveforms import shape_breakpoints
+
         # The signature short-circuits identical reloads but MUST cover
         # every parameter that affects the device's runtime behaviour
-        # — not just the file-on-disk shape. Two patterns with
-        # identical phases but different ``rate_hz`` or
-        # ``repetitions`` need separate cache entries: the file
-        # content matches, but the period/repetitions DLL calls below
-        # apply different settings, so reusing the cache without
-        # bumping it would leave the device in a state that doesn't
-        # match the runner's intent.
+        # — not just the rectangular phase tuple. ``shape`` and
+        # ``bump_count`` change the file content, so they're part of
+        # the signature too.
         signature = (
             tuple(
                 (int(round(ph.amplitude_ua)),
                  round(ph.width_us, 3),
-                 round(ph.delay_after_us, 3))
+                 round(ph.delay_after_us, 3),
+                 ph.shape,
+                 int(ph.bump_count))
                 for ph in pattern.phases
             ),
             round(float(pattern.rate_hz), 6),
@@ -334,11 +347,22 @@ class PlexonStimulator(Stimulator):
             lines = ["0,0"]
             t = 0.0
             for ph in pattern.phases:
-                t_start = t
-                t_end = t + ph.width_us
-                lines.append(f"{t_start:.0f},{int(round(ph.amplitude_ua))}")
-                lines.append(f"{t_end:.0f},{int(round(ph.amplitude_ua))}")
-                t = t_end + ph.delay_after_us
+                # Breakpoints from the shape generator are
+                # phase-relative; offset by the running cursor so the
+                # device sees absolute pulse-start times.
+                bps = shape_breakpoints(
+                    amplitude_ua=ph.amplitude_ua,
+                    width_us=ph.width_us,
+                    shape=ph.shape,
+                    bump_count=ph.bump_count,
+                )
+                for offset_us, amp_ua in bps:
+                    lines.append(f"{t + offset_us:.0f},"
+                                 f"{int(round(amp_ua))}")
+                t += ph.width_us + ph.delay_after_us
+                # Idle the channel during the inter-phase / post-phase
+                # delay so the next phase's first breakpoint sits on
+                # a clean 0 baseline.
                 lines.append(f"{t:.0f},0")
             content = "\n".join(lines)
             # Flush + fsync after every write so the bytes are

@@ -19,25 +19,207 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Phase shapes
+# ---------------------------------------------------------------------------
+# String constants instead of an Enum so prefs / .npz round-trip through JSON
+# without a custom encoder. Every constant must be matched in
+# ``shape_breakpoints`` below; adding a new shape there + here is the whole
+# extension point.
+SHAPE_RECTANGULAR       = "rectangular"
+SHAPE_LINEAR_INCREASING = "linear_increasing"
+SHAPE_LINEAR_DECREASING = "linear_decreasing"
+SHAPE_SINUSOIDAL        = "sinusoidal"
+SHAPE_SPEEDBUMPS        = "speedbumps"
+SHAPE_BOWTIE            = "bowtie"
+SHAPE_HALFPIPE          = "halfpipe"
+
+PHASE_SHAPES = (
+    SHAPE_RECTANGULAR,
+    SHAPE_LINEAR_INCREASING,
+    SHAPE_LINEAR_DECREASING,
+    SHAPE_SINUSOIDAL,
+    SHAPE_SPEEDBUMPS,
+    SHAPE_BOWTIE,
+    SHAPE_HALFPIPE,
+)
+
+#: Sample count for curved shapes (sinusoidal / halfpipe / bowtie). The
+#: PlexStim 2.0 ``PS_LoadArbPattern`` cap is 999 fixed points or 499 paired
+#: values per channel — at 50 points per phase × 2 phases = 100 points, plus
+#: leading/trailing zero markers, we're well within budget. 50 points samples
+#: a 200 µs phase at 4 µs per breakpoint, fine enough that the linear
+#: interpolation between breakpoints is visually indistinguishable from the
+#: continuous curve.
+_DEFAULT_CURVED_SAMPLES = 50
+
+
 @dataclass
 class Phase:
-    """One phase of a stimulus pulse."""
+    """One phase of a stimulus pulse.
+
+    ``shape`` selects the per-phase current waveform — rectangular by
+    default for backwards compatibility. ``bump_count`` is only consulted
+    when ``shape == "speedbumps"``; ignored otherwise.
+    """
     amplitude_ua: float        # signed (µA); negative = cathodic
     width_us: float            # phase width
     delay_after_us: float = 0.0  # interphase or discharge delay following this phase
+    shape: str = SHAPE_RECTANGULAR
+    bump_count: int = 3        # speedbumps only
 
     @property
     def charge_nc(self) -> float:
-        """Charge per phase, nanocoulombs (signed)."""
-        return self.amplitude_ua * 1e-3 * self.width_us  # µA·µs * 1e-3 -> nC
+        """Charge per phase, nanocoulombs (signed).
+
+        For non-rectangular shapes this is the *integral* of the
+        current over the phase width — equal to ``amplitude * width``
+        only when the shape spends 100 % of its width at the peak
+        (rectangular). Non-rectangular shapes carry less charge for
+        the same peak amplitude:
+
+          * Linear (increasing/decreasing): 0.5
+          * Sinusoidal half-sine: 2/π ≈ 0.637
+          * Halfpipe (1−cos)/2: 0.5
+          * Bowtie (V-shape): 0.5
+          * Speedbumps (N pulses at ``bump_count`` ratio): 0.5 of a
+            fully-active phase (N pulses + N gaps, each duty-cycle).
+
+        The rest of the codebase uses ``charge_per_phase_nc`` from
+        ``PulsePattern`` to label captures; that's still based on
+        amplitude × width (peak·width) for traceability against the
+        MATLAB-era convention. Per-shape "effective charge" is
+        available from this property when needed.
+        """
+        return self.amplitude_ua * 1e-3 * self.width_us * _shape_duty(self.shape)
+
+    @property
+    def peak_charge_nc(self) -> float:
+        """Charge as if the phase ran at peak amplitude for the full width.
+
+        Mirrors the historical pre-shape definition (``amplitude × width``)
+        so the rest of the codebase, which keys captures off "Q_ph",
+        keeps reporting a value comparable to MATLAB-era data.
+        """
+        return self.amplitude_ua * 1e-3 * self.width_us
 
     def scaled(self, factor: float) -> "Phase":
-        return Phase(self.amplitude_ua * factor, self.width_us, self.delay_after_us)
+        return Phase(
+            amplitude_ua=self.amplitude_ua * factor,
+            width_us=self.width_us,
+            delay_after_us=self.delay_after_us,
+            shape=self.shape,
+            bump_count=self.bump_count,
+        )
+
+
+def _shape_duty(shape: str) -> float:
+    """Fractional area under the unit-amplitude waveform for each shape.
+
+    Used by :meth:`Phase.charge_nc` to scale peak amplitude × width into
+    the actual charge that flows through the electrode.
+    """
+    if shape == SHAPE_RECTANGULAR:
+        return 1.0
+    if shape == SHAPE_SINUSOIDAL:
+        return 2.0 / np.pi          # ∫ sin(πt)dt over [0,1] = 2/π
+    if shape in (SHAPE_LINEAR_INCREASING, SHAPE_LINEAR_DECREASING,
+                 SHAPE_HALFPIPE, SHAPE_BOWTIE):
+        return 0.5                  # triangle / (1−cos)/2 / V-shape
+    if shape == SHAPE_SPEEDBUMPS:
+        return 0.5                  # equal-width pulse/gap → 50% duty
+    return 1.0
+
+
+def shape_breakpoints(*, amplitude_ua: float, width_us: float,
+                      shape: str = SHAPE_RECTANGULAR,
+                      bump_count: int = 3,
+                      n_samples: int = _DEFAULT_CURVED_SAMPLES,
+                      ) -> List[Tuple[float, float]]:
+    """Generate (offset_us, amp_ua) breakpoints for a single phase.
+
+    The returned list is **relative to the start of the phase** — the
+    first breakpoint is at ``offset_us = 0`` and the last at
+    ``offset_us = width_us``. The Plexon ``.pat`` writer composes
+    multiple phases by adding the running cursor to each offset.
+
+    All shapes are rendered into linearly-interpolated breakpoint
+    sequences so a single waveform-loader code path handles every
+    case. The PlexStim DLL linearly interpolates between breakpoints,
+    so curved shapes are sampled at ``n_samples`` evenly-spaced points
+    across the phase width — visually indistinguishable from the
+    continuous curve at 50 samples per 200 µs phase.
+
+    The scaled amplitude at each breakpoint is signed: positive for
+    anodic, negative for cathodic. ``amplitude_ua`` is the **peak**
+    magnitude (signed) — shape factors of [-1, +1] multiply it.
+    """
+    if width_us <= 0:
+        return [(0.0, 0.0)]
+    s = shape.lower().strip()
+    A = float(amplitude_ua)
+    W = float(width_us)
+
+    if s == SHAPE_RECTANGULAR:
+        # Two breakpoints — start and end at peak. Existing behaviour.
+        return [(0.0, A), (W, A)]
+
+    if s == SHAPE_LINEAR_INCREASING:
+        # Ramp from 0 to A across the phase.
+        return [(0.0, 0.0), (W, A)]
+
+    if s == SHAPE_LINEAR_DECREASING:
+        # Ramp from A to 0 across the phase.
+        return [(0.0, A), (W, 0.0)]
+
+    if s == SHAPE_SINUSOIDAL:
+        # Half-sine: amp(t) = A · sin(π · t / W). Zero at endpoints,
+        # peak at midpoint.
+        ts = np.linspace(0.0, W, n_samples)
+        amps = A * np.sin(np.pi * ts / W)
+        return list(zip(ts.tolist(), amps.tolist()))
+
+    if s == SHAPE_HALFPIPE:
+        # Smooth bowl: amp(t) = A · (1 − cos(2π · t / W)) / 2. Zero at
+        # endpoints, peak at midpoint, smoother edges than sine.
+        ts = np.linspace(0.0, W, n_samples)
+        amps = A * (1 - np.cos(2 * np.pi * ts / W)) / 2
+        return list(zip(ts.tolist(), amps.tolist()))
+
+    if s == SHAPE_BOWTIE:
+        # V-shape (or ^-shape): linear up to peak at midpoint, then
+        # linear back to 0. Three breakpoints exactly capture it.
+        return [(0.0, 0.0), (W / 2.0, A), (W, 0.0)]
+
+    if s == SHAPE_SPEEDBUMPS:
+        # bump_count sub-pulses of equal width at peak amplitude,
+        # alternating with equal-width gaps at 0. For N bumps the
+        # phase splits into 2N−1 equal segments: N pulses + (N−1)
+        # gaps so the first and last segments are pulses (no leading
+        # silence). Total active = N/(2N−1) · W; total gap =
+        # (N−1)/(2N−1) · W.
+        n = max(1, int(bump_count))
+        if n == 1:
+            return [(0.0, A), (W, A)]
+        n_segments = 2 * n - 1
+        seg_w = W / n_segments
+        bps: List[Tuple[float, float]] = []
+        for i in range(n_segments):
+            t_start = i * seg_w
+            t_end = (i + 1) * seg_w
+            amp_here = A if (i % 2 == 0) else 0.0
+            bps.append((t_start, amp_here))
+            bps.append((t_end, amp_here))
+        return bps
+
+    # Unknown shape — fall back to rectangular so an old-prefs string
+    # we don't recognise doesn't crash the runner.
+    return [(0.0, A), (W, A)]
 
 
 @dataclass
@@ -62,21 +244,77 @@ class PulsePattern:
         symmetric: bool = True,
         amplitude2_ua: Optional[float] = None,
         phase_width2_us: Optional[float] = None,
+        shape: str = SHAPE_RECTANGULAR,
+        shape2: Optional[str] = None,
+        bump_count: int = 3,
+        bump_count2: Optional[int] = None,
     ) -> "PulsePattern":
-        """Symmetric biphasic by default, with optional asymmetric override."""
+        """Symmetric biphasic by default, with optional asymmetric override.
+
+        Phase shapes (``shape`` / ``shape2``) are **only available in
+        asymmetric mode** (``symmetric=False``). Symmetric patterns
+        are always rectangular — passing a non-rectangular ``shape``
+        with ``symmetric=True`` raises ``ValueError`` so the
+        misconfiguration is caught at construction rather than
+        silently coerced. The lab convention is that fancy phase
+        shapes (sinusoidal / halfpipe / bowtie / speedbumps / ramps)
+        are research workflows that always involve asymmetric
+        cathodic / anodic widths or amplitudes anyway, so coupling
+        them to asymmetric mode keeps the GUI surface area small.
+
+        In asymmetric mode:
+          * ``shape`` sets the cathodic (first) phase's waveform.
+          * ``shape2`` sets the anodic (recharge) phase's waveform;
+            falls back to ``shape`` when omitted so a single dropdown
+            can drive both phases if the user wants matching shapes
+            with mismatched amplitudes / widths.
+          * ``bump_count`` / ``bump_count2`` set the per-phase
+            speedbump count when the corresponding shape is
+            ``SHAPE_SPEEDBUMPS``.
+        """
         if polarity not in (-1, +1):
             raise ValueError("polarity must be -1 (cathodic) or +1 (anodic)")
+        if shape not in PHASE_SHAPES:
+            raise ValueError(
+                f"shape must be one of {PHASE_SHAPES}, got {shape!r}")
+        # Symmetric mode is rectangular-only by lab convention. Reject
+        # non-rectangular shape requests at construction time so the
+        # user sees the error in the prefs / GUI form path rather
+        # than getting a silently-rectangular pattern.
+        if symmetric and shape != SHAPE_RECTANGULAR:
+            raise ValueError(
+                f"Symmetric biphasic only supports the rectangular shape; "
+                f"got {shape!r}. Set symmetric=False to use a non-"
+                f"rectangular phase shape.")
+        if symmetric and shape2 is not None and shape2 != SHAPE_RECTANGULAR:
+            raise ValueError(
+                f"Symmetric biphasic ignores shape2 — pass symmetric="
+                f"False to give the two phases different shapes "
+                f"({shape2!r} requested).")
         a1 = polarity * abs(amplitude_ua)
         if symmetric or amplitude2_ua is None:
             a2 = -a1
             w2 = phase_width_us
+            sh1 = SHAPE_RECTANGULAR     # forced by symmetric branch
+            sh2 = SHAPE_RECTANGULAR
+            bc1 = 1                     # bump_count irrelevant; clamp to 1
+            bc2 = 1
         else:
             a2 = -np.sign(a1) * abs(amplitude2_ua)
             w2 = phase_width2_us if phase_width2_us is not None else phase_width_us
+            sh1 = shape
+            sh2 = shape2 if shape2 is not None else shape
+            if sh2 not in PHASE_SHAPES:
+                raise ValueError(
+                    f"shape2 must be one of {PHASE_SHAPES}, got {sh2!r}")
+            bc1 = int(bump_count)
+            bc2 = int(bump_count2 if bump_count2 is not None else bump_count)
         return cls(
             phases=[
-                Phase(a1, phase_width_us, interphase_us),
-                Phase(a2, w2, discharge_us),
+                Phase(a1, phase_width_us, interphase_us,
+                      shape=sh1, bump_count=bc1),
+                Phase(a2, w2, discharge_us,
+                      shape=sh2, bump_count=bc2),
             ],
             rate_hz=rate_hz,
         )
@@ -182,15 +420,33 @@ class PulsePattern:
     # ------------------------------------------------------------------
     def to_timeseries(self, t_pre_us: float = 100.0, t_post_us: float = 200.0,
                       sample_period_us: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(time_us, current_ua)`` for one full pulse including padding."""
+        """Return ``(time_us, current_ua)`` for one full pulse including padding.
+
+        Shaped phases (sinusoidal / halfpipe / bowtie / speedbumps /
+        ramps) are rendered by linearly interpolating
+        :func:`shape_breakpoints` onto the sample grid — the same
+        breakpoints the Plexon ``.pat`` writer uses, so the on-screen
+        preview matches what's actually programmed onto the device.
+        """
         total = t_pre_us + self.total_pulse_us + t_post_us
         n = int(round(total / sample_period_us)) + 1
         t = np.linspace(-t_pre_us, total - t_pre_us, n)
         i = np.zeros_like(t)
         cursor = 0.0
         for ph in self.phases:
+            bps = shape_breakpoints(
+                amplitude_ua=ph.amplitude_ua, width_us=ph.width_us,
+                shape=ph.shape, bump_count=ph.bump_count,
+            )
+            # Interpolate the breakpoint sequence onto the sample grid
+            # for this phase. ``np.interp`` does linear interpolation
+            # which matches the PlexStim DLL's behaviour between
+            # breakpoints — preview and device output stay consistent.
             mask_phase = (t >= cursor) & (t < cursor + ph.width_us)
-            i[mask_phase] = ph.amplitude_ua
+            if mask_phase.any():
+                bp_times = np.array([cursor + b[0] for b in bps])
+                bp_amps  = np.array([b[1] for b in bps])
+                i[mask_phase] = np.interp(t[mask_phase], bp_times, bp_amps)
             cursor += ph.width_us + ph.delay_after_us
         return t, i
 
@@ -262,6 +518,14 @@ class PulsePattern:
                 raise ValueError(
                     f"Phase {n}: delay_after_us {ph.delay_after_us} µs "
                     f"is negative.")
+            if ph.shape not in PHASE_SHAPES:
+                raise ValueError(
+                    f"Phase {n}: shape {ph.shape!r} is not a recognised "
+                    f"phase shape. Expected one of {PHASE_SHAPES}.")
+            if ph.shape == SHAPE_SPEEDBUMPS and ph.bump_count < 1:
+                raise ValueError(
+                    f"Phase {n}: speedbumps shape requires bump_count ≥ 1, "
+                    f"got {ph.bump_count}.")
         if self.rate_hz <= 0:
             raise ValueError(f"rate_hz must be positive, got {self.rate_hz}.")
         period_us = 1e6 / self.rate_hz
