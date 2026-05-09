@@ -274,6 +274,16 @@ class TektronixOscilloscope(Oscilloscope):
         # Work; legacy firmware drops cleanly to LEGACY without any
         # code change. Falls back to the regex if probing throws.
         self._dialect = self._probe_dialect(fallback_model=model)
+        # Detect whether the scope has an EXT trigger BNC. TBS1000C
+        # and other 2-channel basic scopes don't; without the probe
+        # the GUI would offer EXT as a trigger source and the user
+        # would discover it doesn't work mid-experiment. Cached on
+        # info so the Setup tab can adjust its hint and fall back to
+        # the channel-Trigger path automatically.
+        try:
+            self.info.has_ext_trigger = self.probe_external_trigger()
+        except Exception:
+            self.info.has_ext_trigger = True   # safe default for older Tek scopes
         # Sane defaults — set once so per-capture work is just CURVe? + the
         # preamble query.
         self._inst.write("HEADer OFF")
@@ -430,6 +440,63 @@ class TektronixOscilloscope(Oscilloscope):
             use_data_source=base.use_data_source,
             has_acq_numavg=has_acq_numavg,
         )
+
+    def probe_external_trigger(self) -> bool:
+        """Detect whether the scope has an EXT trigger BNC input.
+
+        TBS2000B / TBS2000C / MSO / MDO / DPO scopes have an external
+        trigger input on the rear BNC; TBS1000C and TBS1000B-EDU
+        (the 2-channel basic scopes) do *not* — their valid trigger
+        sources are CH1, CH2, and AC LINE only.
+
+        Probe technique: save the current ``TRIGger:A:EDGE:SOUrce``,
+        try setting it to ``EXT``, read back. If the scope accepted
+        the value the readback returns ``EXT``; if it didn't, the
+        readback either stays at the previous source or returns the
+        scope's default fallback (typically ``CH1``). Either way we
+        treat anything other than ``EXT`` as "no EXT input".
+
+        Always restores the previous source on exit so an open()
+        probe doesn't disrupt user-configured trigger state.
+        Best-effort: any SCPI failure returns ``False`` so the GUI
+        falls back to the channel-trigger path.
+        """
+        if self._inst is None:
+            return False
+        try:
+            prev = self._q("TRIGger:A:EDGE:SOUrce?").strip()
+        except Exception:
+            return False
+        result = False
+        try:
+            # Clear the error queue so we can attribute any new error
+            # to the EXT write specifically.
+            try:
+                self._inst.write("*CLS")
+            except Exception:
+                pass
+            self._inst.write("TRIGger:A:EDGE:SOUrce EXT")
+            try:
+                got = self._q("TRIGger:A:EDGE:SOUrce?").strip().upper()
+            except Exception:
+                got = ""
+            # Tek echoes the source as ``EXT``, ``EXT5``, ``EXT10`` —
+            # any of those means an EXT input is present (the "/5" and
+            # "/10" suffixes are attenuation-mode variants, not
+            # absence). Treat ``CH1``..``CH4``, ``ACLINE``, etc. as
+            # "rejected, no EXT input".
+            result = got.startswith("EXT")
+        finally:
+            if prev:
+                try:
+                    self._inst.write(f"TRIGger:A:EDGE:SOUrce {prev}")
+                except Exception:
+                    pass
+            try:
+                self._inst.write("*CLS")
+            except Exception:
+                pass
+        return result
 
     # ----- configuration -----
     def set_channel_scale(self, channel: str, volts_per_div: float) -> None:

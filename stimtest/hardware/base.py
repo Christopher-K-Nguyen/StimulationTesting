@@ -137,6 +137,13 @@ class ScopeInfo:
     resource: str = ""
     n_channels: int = 4
     is_simulated: bool = False
+    #: True if the scope has an external-trigger BNC input
+    #: (``TRIGger:A:EDGE:SOUrce EXT`` is accepted). TBS2000B/MSO/MDO/DPO
+    #: have it; TBS1000C and TBS1000B-EDU don't (trigger sources are
+    #: CH1, CH2, AC LINE only on those models). Probed at open time and
+    #: cached here so the GUI / runners can fall back to an internal
+    #: channel trigger when EXT is unavailable.
+    has_ext_trigger: bool = True
 
 
 @dataclass

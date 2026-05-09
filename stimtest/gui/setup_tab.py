@@ -502,12 +502,12 @@ class SetupTab(QtWidgets.QWidget):
         sv = QtWidgets.QVBoxLayout(scope_box)
         sv.addLayout(sf)
         # Helper line explaining the Trigger / fallback behaviour.
-        hint = QtWidgets.QLabel(
-            "Pick <b>Trigger</b> on a channel if your scope has no external "
-            "trigger input. If no channel is set to Trigger, the channel "
-            f"carrying {rich.I_MON} is used as the trigger source."
-        )
-        hint.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        # Text gets refreshed by ``apply_scope_capabilities`` when a
+        # scope without an EXT input connects (e.g. TBS1000C family).
+        self._scope_trigger_hint = QtWidgets.QLabel()
+        self._scope_trigger_hint.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._refresh_scope_trigger_hint(has_ext=True)
+        hint = self._scope_trigger_hint
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #555; font-size: 9pt;")
         sv.addWidget(hint)
@@ -740,6 +740,38 @@ class SetupTab(QtWidgets.QWidget):
                 return int(self.acq_navg_spin.value())
         return int(self.acq_navg_spin.value())
 
+    def _refresh_scope_trigger_hint(self, *, has_ext: bool) -> None:
+        """Update the helper text under the channel-mapping form.
+
+        With EXT available (TBS2000B/MSO/MDO/DPO):
+          "Pick Trigger on a channel if your scope has no external
+           trigger input ..."
+
+        Without EXT (TBS1000C / TBS1000B-EDU):
+          "This scope has no EXT trigger input. Set Trigger on the
+           channel wired to your sync source ..."
+
+        The hint is shown verbatim under the channel-mapping group
+        box, so it should read like prose for the lab user, not a
+        SCPI / driver-implementation comment.
+        """
+        if not hasattr(self, "_scope_trigger_hint"):
+            return
+        if has_ext:
+            txt = (
+                "Pick <b>Trigger</b> on a channel if your scope has no "
+                "external trigger input. If no channel is set to "
+                f"Trigger, the channel carrying {rich.I_MON} is used as "
+                "the trigger source."
+            )
+        else:
+            txt = (
+                "<b>This scope has no EXT trigger input.</b> Set "
+                "<b>Trigger</b> on the channel wired to your sync "
+                f"source (or leave unset to fall back to {rich.I_MON})."
+            )
+        self._scope_trigger_hint.setText(txt)
+
     def _set_visible_scope_channels(self, n_channels: int) -> None:
         """Show/hide CH-role rows so only n_channels of them remain.
 
@@ -794,12 +826,18 @@ class SetupTab(QtWidgets.QWidget):
         # else default to all 4 visible (the user might be running
         # offline / simulated, where we don't constrain).
         n_channels = 4
+        has_ext = True
         if scope is not None:
             try:
                 n_channels = int(getattr(scope.info, "n_channels", 4) or 4)
             except (TypeError, ValueError, AttributeError):
                 n_channels = 4
+            try:
+                has_ext = bool(getattr(scope.info, "has_ext_trigger", True))
+            except AttributeError:
+                has_ext = True
         self._set_visible_scope_channels(n_channels)
+        self._refresh_scope_trigger_hint(has_ext=has_ext)
 
         modes = (scope.acquisition_modes() if scope is not None
                  else ["SAMPLE", "AVERAGE"])
@@ -862,10 +900,12 @@ class SetupTab(QtWidgets.QWidget):
         """Reset every channel role to ``None`` — used when the
         oscilloscope is disconnected so the GUI doesn't claim a
         mapping it can't honour. Also restores all 4 rows to visible
-        since 'no scope' means we don't know the channel count yet."""
+        and resets the trigger hint to its 'EXT available' wording
+        since 'no scope' means we don't know either yet."""
         for cb in self._role_combos.values():
             cb.setCurrentText(ROLE_NONE)
         self._set_visible_scope_channels(4)
+        self._refresh_scope_trigger_hint(has_ext=True)
 
     def _on_role_changed(self, *_):
         """A role dropdown changed — re-emit aliases. Role uniqueness is
