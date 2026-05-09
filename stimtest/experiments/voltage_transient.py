@@ -162,15 +162,24 @@ class VoltageTransientExperiment(ExperimentRunner):
     # the only way to clear a previously-loaded pattern is a full
     # PS_InitAllStim (wrapped by stim.reinit()).
     #
-    # Lab convention: reinit ONCE at the start of every Start-press,
-    # to wipe any stale patterns left over from prior runs in the
-    # same connect session. Within a single Start-press we then
-    # don't reinit again — the user is responsible for choosing
-    # configurations that don't require mid-run unloading. (Multi-
-    # config CG / PCG / PTP sweeps where the previous active becomes
-    # the next return are not safe in a single run; split them into
-    # separate Start-presses so the start-of-run reinit fires
-    # between them.)
+    # Lab convention — TWO reinit triggers within a single Start-press:
+    #
+    # 1. ONCE at the top of run(): clean slate from any prior
+    #    Start-press in the same connect session.
+    # 2. BEFORE every multipolar config in the sweep loop. MP configs
+    #    don't need the per-config reinit because MP's return is
+    #    off-array (no on-array channel has to be in the unloaded
+    #    state for the routing to work). Multipolar configs (BP, CG,
+    #    PCG, PTP, PBP — anything with non-empty config.returns) DO
+    #    need it: their return set spans on-array channels which must
+    #    be in the unloaded state, and the previous config in the
+    #    sweep may have left some of those channels loaded.
+    #
+    # The rule "reinit before every multipolar config" is independent
+    # of which channels were previously loaded — we don't try to be
+    # clever about overlap detection. PS_InitAllStim is cheap
+    # (~200-500 ms), the routing-correctness cost of getting it wrong
+    # is silent bad data, and the simple rule is easy to verify.
 
     def run(self) -> ExperimentResult:
         self.preflight()
@@ -197,6 +206,26 @@ class VoltageTransientExperiment(ExperimentRunner):
             for config in self.configurations:
                 if self.aborted:
                     break
+                # Per-config reinit before multipolar (anything with
+                # non-empty returns). Cheap and unconditional —
+                # accepts a redundant reinit on the very first config
+                # of a multipolar-first sweep (start-of-run already
+                # cleared the device) rather than tracking an extra
+                # "just reinit'd" flag.
+                if config.returns:
+                    try:
+                        self.stim.reinit()
+                        self._emit(ExperimentEvent(
+                            kind="log", session=self.session,
+                            message=(
+                                f"Stimulator reinit before {config.id} "
+                                f"{config.display_name()} (multipolar "
+                                f"config — returns must be unloaded)."
+                            )))
+                    except Exception as e:
+                        self._emit(ExperimentEvent(
+                            kind="log", session=self.session,
+                            message=f"Stimulator reinit failed: {e}"))
                 run = self._run_one_configuration(config)
                 self.session.add_run(run)
                 all_captures.extend(run.captures)
