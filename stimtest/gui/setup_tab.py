@@ -312,6 +312,12 @@ class SetupTab(QtWidgets.QWidget):
         # opts in once a scope is connected, and the panel calls
         # :meth:`apply_default_scope_mapping` on first connect.
         self._role_combos: dict = {}
+        # Row labels are kept around so apply_scope_capabilities can
+        # hide CH3/CH4 rows on a 2-channel scope (TBS1072C, TBS1052C,
+        # etc.) — both the label and the combo are hidden together so
+        # the form doesn't show empty placeholder rows. Set in
+        # ``_assemble_pages`` when the form is laid out.
+        self._role_labels: dict = {}
         for ch in ("CH1", "CH2", "CH3", "CH4"):
             cb = QtWidgets.QComboBox()
             cb.addItems(SCOPE_ROLES)
@@ -482,10 +488,16 @@ class SetupTab(QtWidgets.QWidget):
         QtWidgets.QVBoxLayout(acq_box).addLayout(acq_form)
 
         # Oscilloscope mapping — one row per scope channel, dropdown
-        # picks the waveform role assigned to that channel.
+        # picks the waveform role assigned to that channel. Labels
+        # are kept in self._role_labels so 2-channel scopes can hide
+        # the CH3/CH4 rows without rebuilding the layout.
         sf = rich.make_form()
         for ch in ("CH1", "CH2", "CH3", "CH4"):
-            sf.addRow(f"{ch}:", self._role_combos[ch])
+            lbl = QtWidgets.QLabel(f"{ch}:")
+            self._role_labels[ch] = lbl
+            sf.addRow(lbl, self._role_combos[ch])
+        # Stash the form so the channel-visibility helper can poke it.
+        self._scope_role_form = sf
         scope_box = QtWidgets.QGroupBox("Oscilloscope channel mapping")
         sv = QtWidgets.QVBoxLayout(scope_box)
         sv.addLayout(sf)
@@ -728,8 +740,49 @@ class SetupTab(QtWidgets.QWidget):
                 return int(self.acq_navg_spin.value())
         return int(self.acq_navg_spin.value())
 
+    def _set_visible_scope_channels(self, n_channels: int) -> None:
+        """Show/hide CH-role rows so only n_channels of them remain.
+
+        Used by :meth:`apply_scope_capabilities` to hide CH3/CH4 on a
+        2-channel scope (TBS1052C/1072C/1102C). Hidden channels are
+        also reset to ``ROLE_NONE`` so they don't sneak into
+        :meth:`current_aliases` and confuse the runner with a mapping
+        the user can't actually honour.
+
+        ``n_channels`` is clamped to [2, 4]: scopes outside that range
+        aren't supported by this codebase (every PlexStim experiment
+        wants at minimum V_mon and I_mon, and the catalog tops out at
+        4-channel TBS2204B-class hardware).
+        """
+        n = max(2, min(4, int(n_channels)))
+        for i, ch in enumerate(("CH1", "CH2", "CH3", "CH4"), start=1):
+            visible = (i <= n)
+            lbl = self._role_labels.get(ch)
+            cb = self._role_combos.get(ch)
+            if lbl is not None:
+                lbl.setVisible(visible)
+            if cb is not None:
+                cb.setVisible(visible)
+                # Resetting hidden channels to None means current_aliases
+                # builds the {logical → physical} dict without ever
+                # mapping a role onto a channel that doesn't exist.
+                if not visible and cb.currentText() != ROLE_NONE:
+                    cb.blockSignals(True)
+                    try:
+                        cb.setCurrentText(ROLE_NONE)
+                    finally:
+                        cb.blockSignals(False)
+        # Re-emit so any listeners (the runner aliases path) see the
+        # cleaned-up mapping immediately rather than waiting for the
+        # next user click.
+        self.aliasesChanged.emit(self.current_aliases())
+
     def apply_scope_capabilities(self, scope=None):
         """Rebuild the n_avg widget to match what the connected scope supports.
+
+        Also adapts the channel-mapping form to the scope's channel
+        count: 2-channel scopes hide CH3/CH4 rows so the user can't
+        accidentally map E_act / E_ret onto channels that don't exist.
 
         If the scope returns a fixed list of choices (TBS-series:
         powers of two from 2 to 512), the spinbox is hidden and a
@@ -737,6 +790,17 @@ class SetupTab(QtWidgets.QWidget):
         returns ``None`` (arbitrary), the spinbox stays visible with
         its max set from ``scope.max_average_count()``.
         """
+        # Channel-count visibility: read from scope.info if present,
+        # else default to all 4 visible (the user might be running
+        # offline / simulated, where we don't constrain).
+        n_channels = 4
+        if scope is not None:
+            try:
+                n_channels = int(getattr(scope.info, "n_channels", 4) or 4)
+            except (TypeError, ValueError, AttributeError):
+                n_channels = 4
+        self._set_visible_scope_channels(n_channels)
+
         modes = (scope.acquisition_modes() if scope is not None
                  else ["SAMPLE", "AVERAGE"])
         choices = (scope.average_count_choices() if scope is not None else None)
@@ -797,9 +861,11 @@ class SetupTab(QtWidgets.QWidget):
     def clear_scope_mapping(self):
         """Reset every channel role to ``None`` — used when the
         oscilloscope is disconnected so the GUI doesn't claim a
-        mapping it can't honour."""
+        mapping it can't honour. Also restores all 4 rows to visible
+        since 'no scope' means we don't know the channel count yet."""
         for cb in self._role_combos.values():
             cb.setCurrentText(ROLE_NONE)
+        self._set_visible_scope_channels(4)
 
     def _on_role_changed(self, *_):
         """A role dropdown changed — re-emit aliases. Role uniqueness is
