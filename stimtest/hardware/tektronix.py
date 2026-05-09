@@ -83,14 +83,26 @@ class TekDialect:
     horiz_record: str       # 'HORizontal:RECOrdlength' or 'HORizontal:RECOrdLength'
     use_data_source: bool   # 'DATa:SOUrce <ch>' available
     has_acq_numavg: bool    # supports 'ACQuire:NUMAVg'
+    #: Form used for the trigger horizontal-position SCPI:
+    #:
+    #: * ``"percent"`` — modern TBS2000B/C, TBS1000C, MSO/MDO/DPO:
+    #:   ``HORizontal:POSition <0..100>`` directly sets where the
+    #:   trigger marker sits on screen (0 = far left, 50 = center).
+    #: * ``"seconds"`` — legacy TDS2000/3000, TBS1000/B: position is
+    #:   set as a time delay via ``HORizontal:MAIN:POSition <s>``;
+    #:   the host has to convert percent→seconds based on the
+    #:   current timebase.
+    horiz_position_form: str = "percent"
 
 MODERN = TekDialect(
     preamble="WFMOutpre", horiz_record="HORizontal:RECOrdlength",
     use_data_source=True, has_acq_numavg=True,
+    horiz_position_form="percent",
 )
 LEGACY = TekDialect(
     preamble="WFMPre", horiz_record="HORizontal:RECOrdLength",
     use_data_source=True, has_acq_numavg=True,
+    horiz_position_form="seconds",
 )
 
 #: Patterns that match the *modern* preamble dialect.
@@ -434,11 +446,31 @@ class TektronixOscilloscope(Oscilloscope):
                 pass
             has_acq_numavg = False
 
+        # Probe the trigger horizontal-position form. Modern Tek
+        # firmware accepts ``HORizontal:POSition?`` as a query
+        # returning a percent (0..100); older TDS / TBS1000B firmware
+        # doesn't have that command at all (errors out). Probe by the
+        # query, not by preamble dialect, because *some* legacy-WFMPre
+        # firmware still has HORizontal:POSition, and *some* modern-
+        # WFMOutpre firmware ships without it. The wrong choice
+        # silently mis-positions the trigger marker.
+        try:
+            val = self._inst.query("HORizontal:POSition?").strip()
+            float(val)        # raises on error message / non-numeric
+            horiz_position_form = "percent"
+        except Exception:
+            try:
+                self._inst.write("*CLS")
+            except Exception:
+                pass
+            horiz_position_form = "seconds"
+
         return TekDialect(
             preamble=base.preamble,
             horiz_record=base.horiz_record,
             use_data_source=base.use_data_source,
             has_acq_numavg=has_acq_numavg,
+            horiz_position_form=horiz_position_form,
         )
 
     def probe_external_trigger(self) -> bool:
@@ -551,8 +583,7 @@ class TektronixOscilloscope(Oscilloscope):
     def set_horizontal_position(self, percent: float) -> None:
         """Set the trigger position on the screen as a percentage.
 
-        ``HORizontal:POSition`` on TBS2000B/MSO/MDO/DPO takes a
-        percent value (0..100) where:
+        Always takes a **percent** value (0..100) where:
 
         * **0** → trigger at the far-left edge (no pre-trigger samples,
           full record is post-trigger)
@@ -561,18 +592,42 @@ class TektronixOscilloscope(Oscilloscope):
         * **100** → trigger at the far-right edge (entire record is
           pre-trigger)
 
-        This is **not** the same as the older TDS-series
-        ``HORizontal:MAIN:POSition`` (which takes seconds and stores a
-        separate "main horizontal delay" parameter that doesn't
-        actually move the trigger marker on TBS-firmware). We send
-        the modern percent form unconditionally — the dialect map at
-        the top of this file declares that every supported scope is
-        the modern family.
+        The SCPI command we send is dialect-dependent:
+
+        * **MODERN** dialect (TBS2000B/C, TBS1000C, MSO/MDO/DPO):
+          ``HORizontal:POSition <pct>`` directly accepts the percent.
+        * **LEGACY** dialect (TBS1000 / TBS1000B / TDS2000/3000):
+          ``HORizontal:POSition`` is not recognised; we convert the
+          percent into a seconds offset using the current timebase
+          (read via ``HORizontal:SCAle?``) and send
+          ``HORizontal:MAIN:POSition <s>`` instead.
+
+        On TBS-firmware ``HORizontal:MAIN:POSition`` and
+        ``HORizontal:POSition`` are **two different parameters** —
+        the legacy one sets a "main horizontal delay" that does NOT
+        move the trigger marker on screen. So sending the wrong
+        command on the wrong dialect silently looks like nothing
+        happened. The dialect dispatch here is what keeps the lab
+        bench (TBS2204B, modern) and a TDS3000-class collaborator
+        (legacy) both seeing the same on-screen behaviour.
         """
         # Clamp on the host so a programmer error doesn't put the
         # scope into a state where the trigger is off-screen.
         pct = max(0.0, min(100.0, float(percent)))
-        self._w(f"HORizontal:POSition {pct:g}")
+        if self._dialect.horiz_position_form == "percent":
+            self._w(f"HORizontal:POSition {pct:g}")
+            return
+        # Legacy seconds form — convert percent to a time offset
+        # relative to the left edge of the record. window = 10 *
+        # timebase, position_s = (pct / 100) * window. Best-effort:
+        # if the timebase query fails, skip the write rather than
+        # writing a garbage value.
+        try:
+            timebase_s = float(self._q("HORizontal:SCAle?"))
+        except Exception:
+            return
+        position_s = (pct / 100.0) * timebase_s * 10.0
+        self._w(f"HORizontal:MAIN:POSition {position_s:g}")
 
     def set_channel_position(self, channel: str, divisions: float) -> None:
         """Set the per-channel vertical position (in divisions, +/- ~5)."""
@@ -723,8 +778,19 @@ class TektronixOscilloscope(Oscilloscope):
             scale_s = float(self._q("HORizontal:SCAle?"))
         except Exception:
             pass
+        # Readback path mirrors the dialect dispatch in
+        # set_horizontal_position. Modern: percent comes back directly.
+        # Legacy: query the seconds form and convert back to percent
+        # using the (possibly newly-rounded) timebase.
         try:
-            position_pct = float(self._q("HORizontal:POSition?"))
+            if self._dialect.horiz_position_form == "percent":
+                position_pct = float(self._q("HORizontal:POSition?"))
+            else:
+                position_s = float(self._q("HORizontal:MAIN:POSition?"))
+                window_s = scale_s * 10.0 if scale_s > 0 else 0.0
+                if window_s > 0:
+                    position_pct = max(0.0, min(100.0,
+                                       position_s / window_s * 100.0))
         except Exception:
             pass
         return scale_s, position_pct

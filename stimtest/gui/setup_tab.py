@@ -1303,6 +1303,13 @@ class SetupTab(QtWidgets.QWidget):
                 ch = p.get(key)
                 if ch in self._role_combos:
                     self._role_combos[ch].setCurrentText(role)
+        # All 4 channel rows stay visible until a scope actually
+        # connects (we don't constrain when no hardware is known).
+        # apply_scope_capabilities will hide CH3/CH4 — and reset
+        # their roles to None — when a 2-channel scope shows up,
+        # so the role assignments restored above can never leak
+        # into current_aliases() with the wrong scope.
+        self._set_visible_scope_channels(4)
         # Experiment dropdown
         if "experiment" in p:
             idx = self.experiment_combo.findData(p["experiment"])

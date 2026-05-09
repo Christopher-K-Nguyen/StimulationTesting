@@ -79,7 +79,21 @@ class Stimulator(ABC):
         """Route this channel to the V_mon / I_mon outputs."""
 
     @abstractmethod
-    def start_channel(self, channel: int) -> None: ...
+    def start_channel(self, channel: int) -> None:
+        """Start a SINGLE channel that already has a pattern loaded.
+
+        **Correct usage:** when only one channel needs to fire — e.g.
+        a Voltage Transient sweep where exactly one electrode is
+        active and the rest are unloaded. Single DLL/USB round-trip,
+        no synchronisation concerns.
+
+        **Wrong usage:** ``for ch in channels: stim.start_channel(ch)``
+        when several channels are loaded. Each call is one round-trip
+        of latency, so the channels start staggered by tens to
+        hundreds of microseconds, and the device's digital sync
+        output fires N times per pulse cycle (one edge per channel)
+        instead of once. Use :meth:`start_all` for that case.
+        """
 
     @abstractmethod
     def stop_channel(self, channel: int) -> None: ...
@@ -88,19 +102,24 @@ class Stimulator(ABC):
     def stop_all(self) -> None: ...
 
     def start_all(self) -> None:
-        """Start every loaded channel on the same firmware clock tick.
+        """Start EVERY loaded channel on the same firmware clock tick.
 
-        Default implementation falls back to a per-channel loop, which
-        is the right behaviour for the simulator. The Plexon driver
-        overrides this with ``PS_StartStimAllChannels`` so all enabled
-        channels fire synchronously — important for any workflow that
-        watches the device's digital sync output, which otherwise
-        receives one edge per channel and looks chaotic when 16
-        channels are programmed.
+        **Correct usage:** any workflow where multiple channels are
+        loaded with patterns and need to fire synchronously — uniform
+        whole-array stim, future multipolar configurations that load
+        the active + return channels separately, ANY scenario where
+        the digital sync output has to produce one clean edge per
+        pulse cycle.
+
+        On Plexon hardware this maps to ``PS_StartStimAllChannels``,
+        a single SDK call. Don't simulate this with a per-channel
+        :meth:`start_channel` loop — that defeats the point.
+
+        Default implementation raises :class:`NotImplementedError`
+        so a backend that lacks a synchronous-start primitive surfaces
+        clearly. The simulator overrides this with a synchronous
+        running-state flip across all loaded channels.
         """
-        # Subclasses without a synchronous-start primitive can fall
-        # back to per-channel starts; this is a no-op for the
-        # simulator since loaded patterns auto-fire on demand.
         raise NotImplementedError
 
     # ----- advanced -----
