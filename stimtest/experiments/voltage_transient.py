@@ -160,18 +160,33 @@ class VoltageTransientExperiment(ExperimentRunner):
     # PlexStim firmware: a channel acts as a passive return path only
     # when it has NO pattern loaded. There is no PS_UnloadChannel —
     # the only way to clear a previously-loaded pattern is a full
-    # PS_InitAllStim (wrapped by stim.reinit()). So before starting
-    # any new configuration, we must check whether any of its
-    # designated returns is still in stim.loaded_channels() and
-    # reinit if so. The precise overlap check is the correctness
-    # criterion; the older _NO_REINIT_KINDS hardcoded "MP and CG
-    # don't need reinit" shortcut got the MP→CG and CG→CG cases
-    # wrong (both leave the previous active channel loaded, and CG's
-    # return set spans all-other-on-array — which includes the
-    # previous active).
+    # PS_InitAllStim (wrapped by stim.reinit()).
+    #
+    # Lab convention: reinit ONCE at the start of every Start-press,
+    # to wipe any stale patterns left over from prior runs in the
+    # same connect session. Within a single Start-press we then
+    # don't reinit again — the user is responsible for choosing
+    # configurations that don't require mid-run unloading. (Multi-
+    # config CG / PCG / PTP sweeps where the previous active becomes
+    # the next return are not safe in a single run; split them into
+    # separate Start-presses so the start-of-run reinit fires
+    # between them.)
 
     def run(self) -> ExperimentResult:
         self.preflight()
+        # Reinit at the top of every run so the device starts from a
+        # known empty state — clears any patterns left loaded from
+        # an earlier Start-press in the same connect session, even
+        # if that earlier run aborted before its own cleanup.
+        try:
+            self.stim.reinit()
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message="Stimulator reinit at run start (clean slate)."))
+        except Exception as e:
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message=f"Stimulator reinit at run start failed: {e}"))
         all_captures: List[Capture] = []
         try:
             self.scope.set_record_length(2500)
@@ -182,30 +197,6 @@ class VoltageTransientExperiment(ExperimentRunner):
             for config in self.configurations:
                 if self.aborted:
                     break
-                # Routing-correctness check (see class-level comment):
-                # if any of this config's returns is still loaded
-                # from a previous config, the firmware can't honour
-                # them as returns — they'd carry stale stim instead
-                # of being passive ground paths. Force a reinit to
-                # clear all loaded patterns. MP configs have an empty
-                # returns tuple (return is off-array global) so the
-                # intersection is empty and no reinit is triggered.
-                already_loaded = self.stim.loaded_channels()
-                clashing = set(config.returns) & already_loaded
-                if clashing:
-                    try:
-                        self.stim.reinit()
-                        self._emit(ExperimentEvent(
-                            kind="log", session=self.session,
-                            message=(
-                                f"Stimulator reinit before {config.id} "
-                                f"(prev-loaded ch{sorted(clashing)} would "
-                                f"clash with this config's return set)."
-                            )))
-                    except Exception as e:
-                        self._emit(ExperimentEvent(
-                            kind="log", session=self.session,
-                            message=f"Stimulator reinit failed: {e}"))
                 run = self._run_one_configuration(config)
                 self.session.add_run(run)
                 all_captures.extend(run.captures)

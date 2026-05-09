@@ -52,6 +52,19 @@ class ShortPulsingExperiment(ExperimentRunner):
 
     def run(self) -> ExperimentResult:
         self.preflight()
+        # Lab convention (see voltage_transient.py): reinit at the
+        # top of every Start-press so the device starts from a clean
+        # slate. PlexStim has no PS_UnloadChannel, so any pattern
+        # left loaded from a previous run would carry into this one.
+        try:
+            self.stim.reinit()
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message="Stimulator reinit at run start (clean slate)."))
+        except Exception as e:
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message=f"Stimulator reinit at run start failed: {e}"))
         from datetime import datetime
         config = self.session.test.configuration
         run = ChannelRun(configuration=config,
