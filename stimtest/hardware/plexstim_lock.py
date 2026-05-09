@@ -57,6 +57,13 @@ _KNOWN_PROCESS_NAME_HINTS = (
                           # C:\Program Files (x86)\Plexon Inc\Stim-2\)
     "sim-2", "sim2",      # marketing name (different from binary)
     "stimulator v2",      # window-title fallback
+    "stimulator 2.0",     # Task Manager DISPLAY name from EXE
+                          # manifest ("Stimulator 2.0 Program (32 bit)"),
+                          # distinct from the .exe filename. We match
+                          # against image-name strings, but if a future
+                          # Plexon installer makes the manifest name
+                          # also appear as the process name this catches
+                          # it.
 )
 
 # Filesystem roots where Plexon-shipped binaries legitimately live.

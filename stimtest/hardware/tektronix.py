@@ -76,10 +76,21 @@ LEGACY = TekDialect(
     use_data_source=True, has_acq_numavg=True,
 )
 
-#: Patterns that match the *modern* preamble dialect
+#: Patterns that match the *modern* preamble dialect.
+#:
+#: Includes TBS1000C and TBS2000B/C families — both released after Tek
+#: unified the basic-scope SCPI command set (WFMOutpre, the modern
+#: HORizontal:POSition percent form, CH<x>:PRObe:GAIN). The older
+#: TBS1000 / TBS1000B / TBS1000B-EDU still use WFMPre — leave them on
+#: the LEGACY branch.
 _MODERN_MODELS = re.compile(
-    r"\b(TBS2[0-9]{3}[A-Z]?|MSO|MDO|DPO|MSO[0-9]+|MDO[0-9]+|DPO[0-9]+|"
-    r"TBS2KB|TBS2KBE|TBS2074B|TBS2104B|TBS2204B)\b",
+    r"\b("
+    r"TBS1[0-9]{3}C|"           # TBS1052C / TBS1072C / TBS1102C / etc.
+    r"TBS2[0-9]{3}[A-Z]?|"      # TBS2074B / TBS2104B / TBS2204B / TBS2K-C
+    r"MSO|MDO|DPO|"
+    r"MSO[0-9]+|MDO[0-9]+|DPO[0-9]+|"
+    r"TBS2KB|TBS2KBE|TBS2074B|TBS2104B|TBS2204B"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -88,6 +99,42 @@ def select_dialect(model: str) -> TekDialect:
     if _MODERN_MODELS.search(model or ""):
         return MODERN
     return LEGACY
+
+
+def channel_count_from_model(model: str) -> int:
+    """Infer the number of input channels from a Tek model number.
+
+    Tek's basic-scope naming convention is ``TBS<family><BW><n_ch><suffix>``
+    where the digit just before the optional letter suffix encodes the
+    channel count. Examples:
+
+    * ``TBS1052C`` → 50 MHz, 2-channel
+    * ``TBS1072C`` → 70 MHz, 2-channel
+    * ``TBS1102C`` → 100 MHz, 2-channel
+    * ``TBS2074B`` → 70 MHz, 4-channel
+    * ``TBS2204B`` → 200 MHz, 4-channel
+
+    Returns 4 when the model isn't recognised — the safe default for a
+    DSO and what callers historically assumed before this helper
+    existed. MSO/MDO/DPO models also return 4 (the typical
+    configuration; channel count for those should really be queried
+    via ``CH:LIST?`` or similar but isn't exposed by ``*IDN?``).
+    """
+    m = re.search(r"TBS[12]\d{3}([A-Z])?", model or "", re.IGNORECASE)
+    if m:
+        # The 4-digit numeric part: e.g. "1072" → channel digit is the
+        # last one ('2'). For 4-digit BW like "1102" (representing
+        # 100 MHz / 2-channel), it's still the last digit.
+        digits = re.search(r"TBS[12](\d{3})", model, re.IGNORECASE)
+        if digits:
+            ch_digit = digits.group(1)[-1]
+            try:
+                n = int(ch_digit)
+                if n in (2, 4):
+                    return n
+            except ValueError:
+                pass
+    return 4
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +232,17 @@ class TektronixOscilloscope(Oscilloscope):
         model = parts[1] if len(parts) > 1 else ""
         serial = parts[2] if len(parts) > 2 else ""
         firmware = parts[3] if len(parts) > 3 else ""
+        # Channel count parsed from the model number — TBS1072C and
+        # other 2-channel models report n_channels=2, which the GUI's
+        # Setup tab uses to grey out CH3/CH4 dropdowns. *IDN? doesn't
+        # carry a channel count, and there's no clean SCPI for it
+        # (CH:LIST? is GPIB-era and inconsistent across firmware), so
+        # the safest move is parsing the well-defined model-number
+        # convention (last digit of the 4-digit numeric part).
+        n_ch = channel_count_from_model(model)
         self.info = ScopeInfo(
             make=make, model=model, serial=serial, firmware=firmware,
-            resource=rsrc, n_channels=4, is_simulated=False,
+            resource=rsrc, n_channels=n_ch, is_simulated=False,
         )
         self._dialect = select_dialect(model)
         # Sane defaults — set once so per-capture work is just CURVe? + the
@@ -319,6 +374,310 @@ class TektronixOscilloscope(Oscilloscope):
 
     def set_horizontal_scale(self, seconds_per_div: float) -> None:
         self._w(f"HORizontal:SCAle {seconds_per_div:g}")
+
+    def set_horizontal_position(self, percent: float) -> None:
+        """Set the trigger position on the screen as a percentage.
+
+        ``HORizontal:POSition`` on TBS2000B/MSO/MDO/DPO takes a
+        percent value (0..100) where:
+
+        * **0** → trigger at the far-left edge (no pre-trigger samples,
+          full record is post-trigger)
+        * **50** → trigger at screen centre (default; 50 % pre-, 50 %
+          post-trigger)
+        * **100** → trigger at the far-right edge (entire record is
+          pre-trigger)
+
+        This is **not** the same as the older TDS-series
+        ``HORizontal:MAIN:POSition`` (which takes seconds and stores a
+        separate "main horizontal delay" parameter that doesn't
+        actually move the trigger marker on TBS-firmware). We send
+        the modern percent form unconditionally — the dialect map at
+        the top of this file declares that every supported scope is
+        the modern family.
+        """
+        # Clamp on the host so a programmer error doesn't put the
+        # scope into a state where the trigger is off-screen.
+        pct = max(0.0, min(100.0, float(percent)))
+        self._w(f"HORizontal:POSition {pct:g}")
+
+    def set_channel_position(self, channel: str, divisions: float) -> None:
+        """Set the per-channel vertical position (in divisions, +/- ~5)."""
+        self._w(f"{channel}:POSition {divisions:g}")
+
+    def set_trigger_level(self, level_v: float) -> None:
+        """Direct ``TRIGger:A:LEVel`` setter (older firmware fallback)."""
+        try:
+            self._w(f"TRIGger:A:LEVel {level_v:g}")
+        except Exception:
+            self._w(f"TRIGger:LEVel {level_v:g}")
+
+    # ----- adaptive scaling / layout (ported from MATLAB setDefaultScopeView3
+    #       and adjustScale + improvements) ----------------------------------
+    #: Horizontal-timebase quantisation. The TBS2000B/2204B family uses
+    #: a 1-2-5 sequence per the programmer manual ("1 ns/div to 100
+    #: s/div in a 1-2-5 sequence"); the older TPS / TDS3000 series uses
+    #: 1-2.5-5. We use 1-2-5 here because every supported model
+    #: (TBS-series + MSO/MDO/DPO modern dialects) is 1-2-5; the scope
+    #: would silently round a 1-2.5-5 request anyway, but snapping on
+    #: the host side means our returned (scale, position) tuple is
+    #: what the scope actually applied.
+    _TEK_TIMEBASE_GRID_SECONDS = tuple(
+        m * (10 ** e)
+        for e in range(-9, 2)            # 1 ns/div ... 10 s/div decades
+        for m in (1.0, 2.0, 5.0)
+    ) + (10.0, 20.0, 50.0)               # 10/20/50 s/div hand-completed
+
+    #: Vertical scale grid. Tek scopes use a 1-2-5 sequence in volts/div
+    #: from 1 mV up to 5 V. Mirrors MATLAB ``adjustScale.m`` VERT_SCALE
+    #: but extends the high end to 5 V/div (TBS2204B accepts up to that).
+    _TEK_VERTICAL_GRID_VPD = (
+        1e-3, 2e-3, 5e-3,
+        1e-2, 2e-2, 5e-2,
+        1e-1, 2e-1, 5e-1,
+        1.0, 2.0, 5.0,
+    )
+
+    @staticmethod
+    def _snap_to_grid(value: float, grid: tuple, *,
+                      direction: str = "ceil") -> float:
+        """Round ``value`` to the nearest legal entry in ``grid``.
+
+        ``direction='ceil'`` picks the smallest grid value >= ``value``
+        (use this for vertical scale: never want to clip).
+        ``direction='floor'`` picks the largest grid value <= ``value``
+        (use this for horizontal scale: smaller per-div = more pulse
+        on screen).
+        """
+        if value <= grid[0]:
+            return grid[0]
+        if value >= grid[-1]:
+            return grid[-1]
+        if direction == "ceil":
+            for g in grid:
+                if g >= value:
+                    return g
+            return grid[-1]
+        # floor
+        last = grid[0]
+        for g in grid:
+            if g > value:
+                return last
+            last = g
+        return last
+
+    def auto_layout_for_pulse(self, *,
+                              phase1_us: float,
+                              interphase_us: float = 0.0,
+                              phase2_us: float = 0.0,
+                              discharge_us: float = 0.0,
+                              digital_delay_us: float = 1.5,
+                              ext_trigger: bool = True,
+                              target_fill: float = 0.5,
+                              left_offset_divs: int = 3) -> Tuple[float, float]:
+        """Pick a horizontal scale + position so the pulse fills the screen.
+
+        Mirrors the MATLAB ``setDefaultScopeView3.m`` algorithm:
+
+          1. Total pulse width = phase1 + interphase + phase2 + discharge.
+          2. Choose timebase: smallest 1-2-5 step where the pulse
+             occupies at least ``target_fill`` of the 10-div screen.
+          3. Compute trigger position so the **pulse** starts
+             ``left_offset_divs`` divisions in from the left edge
+             — accounting for the Plexon's digital_delay_us trigger
+             pre-delay when EXT-triggered.
+
+        Improvements over MATLAB:
+
+          * Discharge tail folded into the pulse-width calculation so
+            the C-discharge phase doesn't fall off the right edge.
+          * Uses the documented ``HORizontal:POSition`` (percent) form
+            for TBS2000B-family scopes instead of the legacy
+            ``HORizontal:MAIN:POSition`` (seconds), which on TBS
+            firmware silently sets a "main delay" parameter that
+            doesn't actually move the trigger marker on screen.
+          * Returns ``(scale_s, position_pct)`` from the scope's
+            readback so callers see exactly what landed (timebase is
+            quantised on a 1-2-5/1-2-4 mix and percent is quantised
+            to ~0.01% steps; both are clamped on the device side).
+        """
+        pulse_width_us = (
+            float(phase1_us) + float(interphase_us)
+            + float(phase2_us) + float(discharge_us)
+        )
+        # Target = fraction of the 10-division screen.
+        ideal_scale_us_per_div = pulse_width_us / (10.0 * target_fill)
+        ideal_scale_s = ideal_scale_us_per_div * 1e-6
+        # Floor onto the grid: prefer slightly *more* zoom-in (smaller
+        # s/div) so pulse always meets the fill target; if the floored
+        # value would over-shrink, snap up one rung.
+        scale_s = self._snap_to_grid(
+            ideal_scale_s, self._TEK_TIMEBASE_GRID_SECONDS, direction="ceil")
+        # Verify pulse still fits in 10 divs at this scale; if it
+        # doesn't (rounding edge case), bump to the next grid step.
+        if pulse_width_us / 1e6 > 10.0 * scale_s * 0.9:
+            idx = self._TEK_TIMEBASE_GRID_SECONDS.index(scale_s)
+            if idx + 1 < len(self._TEK_TIMEBASE_GRID_SECONDS):
+                scale_s = self._TEK_TIMEBASE_GRID_SECONDS[idx + 1]
+
+        # Position: pulse starts left_offset_divs from the left edge.
+        # HORizontal:POSition takes a percentage (0=far-left,
+        # 100=far-right) of the trigger marker.
+        #
+        # Pulse-start time relative to left edge   = left_offset_divs * timebase
+        # Trigger marker time relative to left edge = pulse_start - digital_delay
+        #     (the digital sync output fires `digital_delay_us` BEFORE
+        #      the stim phase begins on Plexon EXT-triggered setups)
+        # Position percent                          = trigger_time / window * 100
+        scale_us = scale_s * 1e6
+        window_us = scale_us * 10.0
+        pulse_start_us = float(left_offset_divs) * scale_us
+        trigger_time_us = pulse_start_us
+        if ext_trigger:
+            trigger_time_us = pulse_start_us - float(digital_delay_us)
+        position_pct = max(0.0, min(100.0,
+                            trigger_time_us / window_us * 100.0))
+
+        self.set_horizontal_scale(scale_s)
+        self.set_horizontal_position(position_pct)
+        # Read back what the scope actually stored — TBS-series quantises
+        # to its own 1-2-5 / 1-2-4 mix on the timebase (e.g. requesting
+        # 500 µs/div lands at 400 µs/div on TBS2204B firmware ≥ 1.16),
+        # and HORizontal:POSition rounds to ~0.01% steps. Returning the
+        # readback rather than the request means callers / log lines
+        # reflect what's on the screen.
+        try:
+            scale_s = float(self._q("HORizontal:SCAle?"))
+        except Exception:
+            pass
+        try:
+            position_pct = float(self._q("HORizontal:POSition?"))
+        except Exception:
+            pass
+        return scale_s, position_pct
+
+    def initial_channel_scales(self, *,
+                               amp_ua: float,
+                               imon_v_per_ua: float,
+                               vmon_v_per_v: float,
+                               load_r_ohm: float = 0.0,
+                               load_c_pf: float = 0.0,
+                               phase_us: float = 200.0,
+                               headroom_divs: float = 3.0) -> Dict[str, float]:
+        """Pick first-capture vertical scales from amplitude + load model.
+
+        Returns a dict ``{"CH1": vmon_scale, "CH2": imon_scale}`` (the
+        canonical mapping; callers can rename via configure_channels).
+
+        The I_mon scale is exact (we know the device's mV/µA factor and
+        the requested amplitude). The V_mon scale is best-effort: with
+        ``load_r_ohm`` / ``load_c_pf`` provided (test-board scenario),
+        we predict V_R + V_C at end of phase; for an electrode in
+        saline (unknown impedance), pass zeros and we default to a
+        generous 1 V/div which the runtime adapter will tighten on
+        the next capture.
+
+        Both scales are quantised onto the Tek 1-2-5 grid with at
+        least ``headroom_divs`` divisions of margin so an unexpected
+        peak doesn't clip on the first capture.
+        """
+        # I_mon: peak (V) = amp_ua × imon_v_per_ua
+        imon_peak_v = abs(amp_ua) * float(imon_v_per_ua)
+        imon_scale = self._snap_to_grid(
+            max(imon_peak_v / max(headroom_divs, 1.0), 1e-3),
+            self._TEK_VERTICAL_GRID_VPD, direction="ceil",
+        )
+
+        # V_mon: if a load model is supplied, predict the trace; else
+        # pick a generous default (1 V/div) and let the runtime
+        # adaptor refine after the first capture.
+        if load_r_ohm > 0 or load_c_pf > 0:
+            v_r = abs(amp_ua) * 1e-6 * float(load_r_ohm)
+            v_c = (abs(amp_ua) * 1e-6 * float(phase_us) * 1e-6
+                   / max(float(load_c_pf) * 1e-12, 1e-15)) if load_c_pf > 0 else 0.0
+            vmon_peak_v = (v_r + v_c) * float(vmon_v_per_v)
+            vmon_scale = self._snap_to_grid(
+                max(vmon_peak_v / max(headroom_divs, 1.0), 1e-3),
+                self._TEK_VERTICAL_GRID_VPD, direction="ceil",
+            )
+        else:
+            # Unknown load — start at 1 V/div on V_mon. Adaptive scaling
+            # will tighten this within 1-2 captures.
+            vmon_scale = 1.0
+        return {"CH1": vmon_scale, "CH2": imon_scale}
+
+    def adapt_channel_scale(self, channel: str, *,
+                            v_min: float, v_max: float,
+                            divs: float = 4.0,
+                            shrink_threshold: float = 0.30,
+                            shrink_stable_count: int = 2) -> Optional[float]:
+        """Post-capture autorange: snap CH<n>:SCAle to fit (v_min, v_max).
+
+        Asymmetric hysteresis (improvement on MATLAB ``adjustScale.m``):
+
+          * **Clip detection → instant downscale.** If the signal
+            would clip at the current scale (peak > divs * scale on
+            either side), pick the next legal scale that fits and
+            apply immediately. No waiting period — the next capture
+            would be useless data.
+          * **Slow upscale on shrinking signal.** If the signal is
+            using less than ``shrink_threshold`` of the current
+            scale's range, only upscale (tighten) after seeing the
+            same "should be smaller" verdict ``shrink_stable_count``
+            captures in a row. Avoids flicker between adjacent steps
+            in the 1-2-5 grid.
+
+        Returns the scale that was applied, or ``None`` if no change
+        was made.
+        """
+        # Internal per-channel state for hysteresis. Lazy-init so
+        # callers don't need to pre-populate.
+        if not hasattr(self, "_adapt_state"):
+            self._adapt_state: Dict[str, Dict[str, float]] = {}
+        st = self._adapt_state.setdefault(
+            channel, {"shrink_count": 0, "last_scale": None})
+
+        # Read current scale from the scope (or use cached). Using the
+        # scope query is one extra round-trip but guarantees we
+        # respect any front-panel changes the user made between
+        # captures.
+        try:
+            current_scale = float(self._q(f"{channel}:SCAle?"))
+        except Exception:
+            current_scale = st["last_scale"] or 1.0
+
+        peak = max(abs(v_min), abs(v_max))
+        # 1. Clip check — needs immediate downscale to coarser.
+        if peak > current_scale * divs:
+            new_scale = self._snap_to_grid(
+                peak / divs, self._TEK_VERTICAL_GRID_VPD, direction="ceil")
+            if new_scale > current_scale:
+                self.set_channel_scale(channel, new_scale)
+                st["shrink_count"] = 0
+                st["last_scale"] = new_scale
+                return new_scale
+            return None
+
+        # 2. Possible upscale — peak < shrink_threshold * (4 divs).
+        # Compute the optimal scale; if that's strictly smaller than
+        # current, increment the stability counter and only apply
+        # after shrink_stable_count consecutive votes.
+        ideal_scale = self._snap_to_grid(
+            max(peak / divs, 1e-3),
+            self._TEK_VERTICAL_GRID_VPD, direction="ceil")
+        if (ideal_scale < current_scale
+                and peak < shrink_threshold * current_scale * divs):
+            st["shrink_count"] += 1
+            if st["shrink_count"] >= shrink_stable_count:
+                self.set_channel_scale(channel, ideal_scale)
+                st["shrink_count"] = 0
+                st["last_scale"] = ideal_scale
+                return ideal_scale
+        else:
+            # Signal is in a healthy range or would upscale by only
+            # one step — reset the counter so flicker is suppressed.
+            st["shrink_count"] = 0
+        return None
 
     def set_record_length(self, n: int) -> None:
         n = int(n)
