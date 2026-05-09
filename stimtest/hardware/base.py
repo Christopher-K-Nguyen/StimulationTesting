@@ -122,16 +122,35 @@ class Stimulator(ABC):
         """
         raise NotImplementedError
 
+    def loaded_channels(self) -> "set[int]":
+        """Channels that currently have a pattern loaded on the device.
+
+        Plexon firmware uses the "loaded vs unloaded" state to decide
+        routing for multipolar configurations: an unloaded channel
+        outputs 0 A and can serve as a passive return path; a loaded
+        channel cannot. There is no ``PS_UnloadChannel`` SDK
+        function — the only way to clear a previously-loaded pattern
+        is ``PS_InitAllStim`` (which :meth:`reinit` wraps).
+
+        Experiment runners use this set to decide whether a
+        configuration change requires a full reinit: if any of the
+        new config's return channels appears in ``loaded_channels()``,
+        the return wiring would be invalid, so reinit before
+        proceeding.
+
+        Default implementation returns an empty set; backends that
+        actually track loaded state override this.
+        """
+        return set()
+
     # ----- advanced -----
     def reinit(self) -> None:
         """Close and re-open the hardware connection.
 
-        Required between certain configuration changes — e.g. on the
-        PlexStim 2.0, switching between bipolar / tripolar / partial
-        return-electrode wiring requires a full reinit (Monopolar and
-        Common Ground share the same internal routing and don't need
-        it). The default implementation is ``close(); open();`` which
-        works for any driver that implements those two cleanly.
+        Required between certain configuration changes — see
+        :meth:`loaded_channels` for the routing-correctness rule that
+        drives this. The default implementation is ``close(); open();``
+        which works for any driver that implements those two cleanly.
         """
         try:
             self.close()

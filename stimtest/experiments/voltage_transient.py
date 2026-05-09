@@ -157,19 +157,22 @@ class VoltageTransientExperiment(ExperimentRunner):
     # ------------------------------------------------------------------
     # Configuration kinds that share the same internal stim routing —
     # any pair of consecutive combos *both* in this set can skip the
-    # hardware reinit. Only MP and CG are confirmed safe; PCG (Partial
-    # Common Ground) routes the return through the off-array global
-    # plus the on-array shorted set, which is NOT documented as
-    # equivalent to CG in the Plexon SDK. Until that's verified
-    # against Plexon's docs we conservatively trigger a reinit at
-    # every PCG boundary — costs ~200–500 ms per transition, but a
-    # silent wrong-routing bug would be much worse.
-    _NO_REINIT_KINDS = {"MP", "CG"}
+    # PlexStim firmware: a channel acts as a passive return path only
+    # when it has NO pattern loaded. There is no PS_UnloadChannel —
+    # the only way to clear a previously-loaded pattern is a full
+    # PS_InitAllStim (wrapped by stim.reinit()). So before starting
+    # any new configuration, we must check whether any of its
+    # designated returns is still in stim.loaded_channels() and
+    # reinit if so. The precise overlap check is the correctness
+    # criterion; the older _NO_REINIT_KINDS hardcoded "MP and CG
+    # don't need reinit" shortcut got the MP→CG and CG→CG cases
+    # wrong (both leave the previous active channel loaded, and CG's
+    # return set spans all-other-on-array — which includes the
+    # previous active).
 
     def run(self) -> ExperimentResult:
         self.preflight()
         all_captures: List[Capture] = []
-        prev_id: Optional[str] = None
         try:
             self.scope.set_record_length(2500)
             # Acquisition mode + count are configured by the GUI's
@@ -179,18 +182,26 @@ class VoltageTransientExperiment(ExperimentRunner):
             for config in self.configurations:
                 if self.aborted:
                     break
-                # PlexStim 2.0 requires a close+reopen between different
-                # multipolar combos; MP/CG share the routing and don't
-                # need it.
-                if (prev_id is not None and
-                        not (prev_id in self._NO_REINIT_KINDS
-                             and config.id in self._NO_REINIT_KINDS)):
+                # Routing-correctness check (see class-level comment):
+                # if any of this config's returns is still loaded
+                # from a previous config, the firmware can't honour
+                # them as returns — they'd carry stale stim instead
+                # of being passive ground paths. Force a reinit to
+                # clear all loaded patterns. MP configs have an empty
+                # returns tuple (return is off-array global) so the
+                # intersection is empty and no reinit is triggered.
+                already_loaded = self.stim.loaded_channels()
+                clashing = set(config.returns) & already_loaded
+                if clashing:
                     try:
                         self.stim.reinit()
                         self._emit(ExperimentEvent(
                             kind="log", session=self.session,
-                            message=f"Stimulator reinit between {prev_id} → "
-                                    f"{config.id} configs."))
+                            message=(
+                                f"Stimulator reinit before {config.id} "
+                                f"(prev-loaded ch{sorted(clashing)} would "
+                                f"clash with this config's return set)."
+                            )))
                     except Exception as e:
                         self._emit(ExperimentEvent(
                             kind="log", session=self.session,
@@ -199,7 +210,6 @@ class VoltageTransientExperiment(ExperimentRunner):
                 self.session.add_run(run)
                 all_captures.extend(run.captures)
                 self._emit(ExperimentEvent(kind="run_end", session=self.session, run=run))
-                prev_id = config.id
         except Exception as e:
             self._emit(ExperimentEvent(
                 kind="aborted", session=self.session,

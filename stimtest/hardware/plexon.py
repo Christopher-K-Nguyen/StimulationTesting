@@ -57,6 +57,13 @@ class PlexonStimulator(Stimulator):
         # reloads the same pattern back-to-back we skip the disk
         # rewrite entirely — the file already has the right bytes.
         self._pat_signature: Optional[tuple] = None
+        # Set of channel numbers currently in the "pattern loaded"
+        # state on the device. Mutated by load_channel; cleared by
+        # open() and close() since both go through PS_InitAllStim /
+        # PS_CloseAllStim which wipe device-side patterns. Used by
+        # the experiment runners to decide whether a configuration
+        # change requires a reinit (see Stimulator.loaded_channels).
+        self._loaded_channels: set = set()
 
     # ----- internal helpers -----
     def _check(self, result: int, what: str) -> None:
@@ -192,12 +199,17 @@ class PlexonStimulator(Stimulator):
             imon_scaling_v_per_ua=IMON_SCALING_NIL if is_nil else IMON_SCALING_DEFAULT,
             is_simulated=False,
         )
+        # PS_InitAllStim wipes any patterns the device had from a
+        # previous session, so the loaded-channel set starts empty.
+        self._loaded_channels = set()
 
     def close(self) -> None:
         try:
             self._lib.ps_close_all_stim()
         except Exception:
             pass
+        # PS_CloseAllStim drops device-side patterns; track that.
+        self._loaded_channels = set()
         # Clean up the pinned .pat file so we don't leak temp files
         # across re-init cycles (and the next session starts fresh).
         if self._pat_path is not None:
@@ -271,6 +283,14 @@ class PlexonStimulator(Stimulator):
             raise RuntimeError(
                 f"PlexStim repetitions mismatch on ch{channel}: requested "
                 f"{pattern.repetitions}, device reports {got_reps}.")
+        # Track the loaded state so the runner can decide whether
+        # the next configuration's return-channel set requires a
+        # reinit. See Stimulator.loaded_channels for the rule.
+        self._loaded_channels.add(int(channel))
+
+    def loaded_channels(self) -> set:
+        """Channels with a pattern currently loaded (PlexStim-side)."""
+        return set(self._loaded_channels)
 
     def _load_arbitrary(self, channel: int, pattern: PulsePattern) -> None:
         """Write the .pat file for ``pattern`` and load it onto ``channel``.

@@ -130,8 +130,25 @@ class SimulatedStimulator(Stimulator):
         self._is_open = False
 
     # -- lifecycle --
-    def open(self) -> None: self._is_open = True
-    def close(self) -> None: self._is_open = False
+    def open(self) -> None:
+        self._is_open = True
+        # Mirrors PlexonStimulator.open: a fresh open clears any
+        # previously-loaded patterns.
+        self._patterns.clear()
+        self._running.clear()
+
+    def close(self) -> None:
+        self._is_open = False
+        self._patterns.clear()
+        self._running.clear()
+
+    def loaded_channels(self) -> set:
+        """Return the set of channels that currently have a pattern.
+
+        Mirrors PlexonStimulator.loaded_channels so experiment
+        runners can query the same set against either backend.
+        """
+        return set(self._patterns.keys())
 
     # -- programming --
     def load_channel(self, channel: int, pattern: PulsePattern) -> None:
