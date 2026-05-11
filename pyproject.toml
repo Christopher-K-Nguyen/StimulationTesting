@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stimtest"
 version = "0.2.0"
-description = "Python translation of PlexStimTek for characterizing stimulation electrodes (Plexon PlexStim + Tektronix scope)."
+description = "PULSAR — Python characterization suite for neural-stimulation electrodes (Plexon PlexStim + Tektronix scope), with the POLARIS companion session viewer."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"

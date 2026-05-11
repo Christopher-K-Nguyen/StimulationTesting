@@ -97,6 +97,20 @@ def save_session_npz(session: Session, path: Path | str) -> Path:
                 "rows": session.test.array.rows,
                 "cols": session.test.array.cols,
                 "sites": [asdict(s) for s in session.test.array.sites],
+                # Audit finding #19: previously dropped, so triangular
+                # / hex arrays came back as ``"rect"`` after reload
+                # and the Channel Map tab rendered them with the
+                # wrong (col, row) packing. ``cable_map`` was also
+                # silently None'd, breaking the NeuroNexus path once
+                # it's re-enabled. JSON serialises dict keys as
+                # strings, so we cast int → str on the way out and
+                # cast back on the way in (see load_session_npz).
+                "layout": session.test.array.layout,
+                "cable_map": (
+                    None if session.test.array.cable_map is None
+                    else {str(k): int(v)
+                          for k, v in session.test.array.cable_map.items()}
+                ),
             },
         },
         "runs": runs_meta,
@@ -149,8 +163,13 @@ def save_session_mat(session: Session, path: Path | str) -> Path:
                 "ChargePhase": c.metrics.charge_per_phase_nc,
                 "ChargeInjection": c.metrics.charge_injection_mc_per_cm2,
                 "DrivingVoltage": c.metrics.driving_voltage_v,
+                "ActiveDrivingVoltage": c.metrics.active_driving_voltage_per_phase_v,
+                "ReturnDrivingVoltage": c.metrics.return_driving_voltage_per_phase_v,
+                "InterpulsePotential": c.metrics.interpulse_potential_v,
                 "AccessVoltage": c.metrics.access_voltage_per_phase_v,
                 "AccessResistance": c.metrics.access_resistance_per_phase_kohm,
+                "ReturnAccessVoltage": c.metrics.return_access_voltage_per_phase_v,
+                "ReturnAccessResistance": c.metrics.return_access_resistance_per_phase_kohm,
                 "PotentialExcursion": c.metrics.polarization_per_phase_v,
                 "ReturnExcursion": c.metrics.return_polarization_per_phase_v,
                 "EffectiveCapacitance": c.metrics.effective_capacitance_nf,
@@ -194,7 +213,7 @@ def load_session_meta(path: Path | str) -> Dict[str, Any]:
     path = Path(path)
     with np.load(path, allow_pickle=False) as z:
         if "meta.json" not in z:
-            raise ValueError(f"{path} is not a stimtest session .npz")
+            raise ValueError(f"{path} is not a PULSAR session .npz (no meta.json blob)")
         raw = z["meta.json"].tobytes().decode("utf-8")
         return json.loads(raw)
 
@@ -216,7 +235,7 @@ def load_session_npz(path: Path | str) -> "Session":
     path = Path(path)
     with np.load(path, allow_pickle=False) as z:
         if "meta.json" not in z:
-            raise ValueError(f"{path} is not a stimtest session .npz")
+            raise ValueError(f"{path} is not a PULSAR session .npz (no meta.json blob)")
         meta = json.loads(z["meta.json"].tobytes().decode("utf-8"))
         arrays = {k: z[k] for k in z.files if k != "meta.json"}
 
@@ -230,9 +249,28 @@ def load_session_npz(path: Path | str) -> "Session":
 
     # ----- array -----
     a = meta["test"]["array"]
+    # ``cable_map`` and ``layout`` were added later (audit #19); legacy
+    # archives won't carry them. ``.get`` with sane defaults makes the
+    # loader robust against pre-fix .npz files. JSON serialises dict
+    # keys as strings, so we cast the cable_map keys back to int here
+    # (the in-memory contract is ``Dict[int, int]``).
+    raw_cable = a.get("cable_map")
+    cable_map: "Optional[dict[int, int]]"
+    if raw_cable is None:
+        cable_map = None
+    else:
+        try:
+            cable_map = {int(k): int(v) for k, v in raw_cable.items()}
+        except (TypeError, ValueError):
+            # Corrupt / non-numeric entries → drop the override and
+            # fall back to identity routing rather than blow up the
+            # load.
+            cable_map = None
     array = ElectrodeArray(
         name=a["name"], rows=a["rows"], cols=a["cols"],
         sites=[ElectrodePosition(**s) for s in a["sites"]],
+        cable_map=cable_map,
+        layout=a.get("layout", "rect"),
     )
 
     # ----- top-level configuration (the session-default) -----
@@ -291,16 +329,59 @@ def load_session_npz(path: Path | str) -> "Session":
             )
 
             metrics_d = cap_meta.get("metrics", {})
+            # Audit finding #6: save_session_npz writes every
+            # CaptureMetrics field via ``asdict(c)`` (see
+            # ``_capture_to_dict``), but the reload previously
+            # restored only 12 of the 20 fields. The missing nine —
+            # Shannon k, damage classification / criteria / band /
+            # level, NeurostimML verdict / probability, and pre /
+            # post return-electrode potentials — silently came back
+            # at their dataclass defaults, so Viewer / damage
+            # screens lost every per-capture verdict on reload.
+            # Every ``.get`` below uses the dataclass default so a
+            # legacy archive that lacks the key still loads.
             metrics = CaptureMetrics(
                 driving_voltage_v=metrics_d.get("driving_voltage_v", float("nan")),
+                active_driving_voltage_per_phase_v=list(
+                    metrics_d.get("active_driving_voltage_per_phase_v", [])),
+                return_driving_voltage_per_phase_v=list(
+                    metrics_d.get("return_driving_voltage_per_phase_v", [])),
                 access_voltage_per_phase_v=list(metrics_d.get("access_voltage_per_phase_v", [])),
                 access_resistance_per_phase_kohm=list(metrics_d.get("access_resistance_per_phase_kohm", [])),
+                return_access_voltage_per_phase_v=list(
+                    metrics_d.get("return_access_voltage_per_phase_v", [])),
+                return_access_resistance_per_phase_kohm=list(
+                    metrics_d.get("return_access_resistance_per_phase_kohm", [])),
                 polarization_per_phase_v=list(metrics_d.get("polarization_per_phase_v", [])),
                 return_polarization_per_phase_v=list(metrics_d.get("return_polarization_per_phase_v", [])),
                 charge_per_phase_nc=metrics_d.get("charge_per_phase_nc", float("nan")),
                 charge_injection_mc_per_cm2=metrics_d.get("charge_injection_mc_per_cm2", float("nan")),
                 effective_capacitance_nf=metrics_d.get("effective_capacitance_nf", float("nan")),
                 driving_capacitance_mf_per_cm2=metrics_d.get("driving_capacitance_mf_per_cm2", float("nan")),
+                # Interpulse potential — added later, so pre-existing
+                # archives won't carry the key. The default float NaN
+                # makes the loader robust to legacy npz files.
+                interpulse_potential_v=metrics_d.get("interpulse_potential_v", float("nan")),
+                # E_ret pre/post-pulse rest potentials — separate from
+                # the combined ``interpulse_potential_v`` so a future
+                # drift-watcher can compare the two halves per-capture.
+                return_pre_pulse_potential_v=metrics_d.get(
+                    "return_pre_pulse_potential_v", float("nan")),
+                return_post_pulse_potential_v=metrics_d.get(
+                    "return_post_pulse_potential_v", float("nan")),
+                # Shannon-based damage screen.
+                shannon_k_value=metrics_d.get(
+                    "shannon_k_value", float("nan")),
+                damage_classification=metrics_d.get(
+                    "damage_classification", "insufficient_data"),
+                damage_criteria=dict(metrics_d.get("damage_criteria", {})),
+                damage_band=metrics_d.get("damage_band", ""),
+                damage_level=int(metrics_d.get("damage_level", -1)),
+                # NeurostimML (Li et al. 2024 RF-Partial-19) verdict.
+                neurostimml_classification=metrics_d.get(
+                    "neurostimml_classification", "model_not_installed"),
+                neurostimml_probability=metrics_d.get(
+                    "neurostimml_probability", float("nan")),
             )
 
             status_d = cap_meta.get("status", {})

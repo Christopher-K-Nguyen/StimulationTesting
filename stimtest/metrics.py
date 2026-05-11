@@ -44,7 +44,61 @@ savgol_filter = _scipy_savgol
 
 from .config import DEPOLARIZATION_TIME_US
 from .session import Capture, CaptureMetrics
-from .waveforms import Phase, PulsePattern
+from .waveforms import (
+    PulsePattern,
+    SHAPE_RECTANGULAR, SHAPE_LINEAR_INCREASING, SHAPE_LINEAR_DECREASING,
+    SHAPE_SINUSOIDAL, SHAPE_SPEEDBUMPS, SHAPE_BOWTIE, SHAPE_HALFPIPE,
+    SHAPE_EXP_DECAY,
+)
+
+
+# ---------------------------------------------------------------------------
+# Pulse-shape edge factors
+# ---------------------------------------------------------------------------
+#: Threshold (fraction of phase peak amplitude) above which a phase
+#: boundary is treated as a "clean step" — i.e. the current jumps fast
+#: enough to produce an unambiguous ohmic V step we can read V_a / R_a
+#: off. 0.5 picks up rectangular / linear / bowtie / halfpipe / exp-
+#: decay cleanly while excluding speedbumps' bi-level half-amplitude
+#: edges and the zero-amplitude endpoints of sinusoidal / linear-
+#: increasing leading edges.
+_STEP_FACTOR_THRESHOLD = 0.5
+
+
+def _phase_step_factors(shape: str) -> Tuple[float, float]:
+    """Return ``(leading_factor, trailing_factor)`` for a phase shape:
+    the fraction of the phase's peak amplitude *at* the leading and
+    trailing edges. Used by the access-voltage / driving-voltage
+    extractors to decide whether a given phase boundary produces a
+    measurable step.
+
+    Reference table (factor = current at edge / peak amplitude):
+
+      ============  ============   =============
+      Shape         Leading edge   Trailing edge
+      ============  ============   =============
+      Rectangular   1.0            1.0
+      Lin-incr      0.0            1.0
+      Lin-decr      1.0            0.0
+      Sinusoidal    0.0            0.0
+      Speedbumps    0.0            0.0   (internal segment edges
+                                          confound peak detection
+                                          even though the boundary
+                                          factor is nominally 0.5)
+      Bowtie        1.0            1.0
+      Halfpipe      1.0            1.0
+      Exp-decay     1.0            ~0.007 (= exp(-N) with N=5)
+      ============  ============   =============
+    """
+    if shape == SHAPE_RECTANGULAR:        return (1.0, 1.0)
+    if shape == SHAPE_LINEAR_INCREASING:  return (0.0, 1.0)
+    if shape == SHAPE_LINEAR_DECREASING:  return (1.0, 0.0)
+    if shape == SHAPE_SINUSOIDAL:         return (0.0, 0.0)
+    if shape == SHAPE_SPEEDBUMPS:         return (0.0, 0.0)
+    if shape == SHAPE_BOWTIE:             return (1.0, 1.0)
+    if shape == SHAPE_HALFPIPE:           return (1.0, 1.0)
+    if shape == SHAPE_EXP_DECAY:          return (1.0, 0.0067)
+    return (1.0, 1.0)   # unknown shapes default to rectangular-like
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +143,121 @@ def driving_voltage_from_potentials(e_act: np.ndarray, e_ret: np.ndarray) -> flo
     if e_act.size == 0 or e_ret.size == 0:
         return float("nan")
     return float(np.max(np.abs(e_act - e_ret)))
+
+
+def _driving_voltage_per_phase(time_us: np.ndarray, trace_v: np.ndarray,
+                                pattern: PulsePattern,
+                                *, sample_offset_us: float = 1.0,
+                                ) -> List[float]:
+    """Per-phase driving voltage: |reference - value at driving point|.
+
+    Faithful port of MATLAB ``getVoltageMetrics.m`` lines 554-590.
+
+    For each phase ``k``:
+
+      * The DRIVING point is sampled ``sample_offset_us`` before the
+        phase ends (default 1 µs), so the trace is at its peak
+        excursion but we're not on the trailing-edge access drop.
+      * The REFERENCE is the rest baseline that immediately precedes
+        the phase: pre-pulse mean for phase 1; the END of the prior
+        interphase delay for phases 2+ (when the trace has settled
+        back toward zero); falls back to the pre-pulse mean if the
+        prior interphase delay is zero (no recovery time).
+
+    Returns a list of length ``pattern.num_phases`` with NaN entries
+    where the phase is too short / the trace is empty.
+    """
+    n_samples = time_us.size
+    phases = pattern.phases
+    n_phases = len(phases)
+    if n_samples == 0 or trace_v.size != n_samples or n_phases == 0:
+        return [float("nan")] * n_phases
+
+    pre_mask = time_us < 0
+    pre_voltage = (float(np.mean(trace_v[pre_mask])) if pre_mask.any()
+                   else float(trace_v[0]))
+
+    out: List[float] = []
+    cursor = 0.0
+    prior_delay_us = 0.0     # delay BEFORE the current phase
+    for k, ph in enumerate(phases):
+        end_t = cursor + ph.width_us
+        # Sample the driving point a hair before the phase ends.
+        drive_t = end_t - max(0.0, sample_offset_us)
+        drive_idx = int(np.searchsorted(time_us, drive_t, side="right") - 1)
+        drive_idx = max(0, min(n_samples - 1, drive_idx))
+        drive_val = float(trace_v[drive_idx])
+
+        if k == 0 or prior_delay_us <= 0:
+            # Phase 1, OR a phase with no recovery time before it —
+            # fall back to the pre-pulse baseline.
+            ref = pre_voltage
+        else:
+            # Sample the END of the prior interphase delay (~0 µs
+            # before the current phase starts): the trace has
+            # discharged back toward rest by then.
+            prior_end_t = cursor - max(0.0, sample_offset_us)
+            ref_idx = int(np.searchsorted(time_us, prior_end_t,
+                                          side="right") - 1)
+            ref_idx = max(0, min(n_samples - 1, ref_idx))
+            ref = float(trace_v[ref_idx])
+
+        out.append(abs(ref - drive_val))
+        cursor = end_t + ph.delay_after_us
+        prior_delay_us = ph.delay_after_us
+    return out
+
+
+def _interpulse_potential(time_us: np.ndarray, trace_v: np.ndarray,
+                          pattern: PulsePattern) -> float:
+    """Average ``trace_v`` over the rest periods around the active pulse.
+
+    Two rest windows are sampled:
+
+      * ``time < 0`` — the pre-pulse baseline (matches MATLAB's
+        ``prePulse_tf = time < 0; prePulsePotenial = mean(...)``).
+      * ``time >= total_pulse_us`` — the post-discharge tail, where
+        the electrode has settled back to its open-circuit / inter-
+        pulse rest potential.
+
+    Both windows are averaged together (not separately) so a single
+    scalar reflects the true settled rest potential. If only one
+    window has samples, that one is used. Returns NaN when neither
+    rest window is populated (i.e., the captured frame is entirely
+    inside the active pulse).
+    """
+    if time_us.size == 0 or trace_v.size != time_us.size:
+        return float("nan")
+    pre_mask  = time_us < 0
+    post_mask = time_us >= float(pattern.total_pulse_us)
+    rest_mask = pre_mask | post_mask
+    if not rest_mask.any():
+        return float("nan")
+    return float(np.mean(trace_v[rest_mask]))
+
+
+def _interpulse_potential_split(
+    time_us: np.ndarray, trace_v: np.ndarray, pattern: PulsePattern,
+) -> Tuple[float, float]:
+    """Return ``(pre_pulse_mean, post_pulse_mean)`` from ``trace_v``.
+
+    Same windowing as :func:`_interpulse_potential` but reports the
+    two rest periods separately, so the runner can feed them into
+    :mod:`stimtest.electrode_potential_history` with the right
+    ``phase`` tag and so a downstream drift-detector can watch for
+    pre→post offset growing across captures (a tell-tale sign of
+    accumulating DC bias / failed auto-discharge).
+
+    Each half returns ``float("nan")`` when its window is empty —
+    the caller is expected to guard against NaN before recording.
+    """
+    if time_us.size == 0 or trace_v.size != time_us.size:
+        return float("nan"), float("nan")
+    pre_mask = time_us < 0
+    post_mask = time_us >= float(pattern.total_pulse_us)
+    pre_v = float(np.mean(trace_v[pre_mask])) if pre_mask.any() else float("nan")
+    post_v = float(np.mean(trace_v[post_mask])) if post_mask.any() else float("nan")
+    return pre_v, post_v
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +394,50 @@ def access_voltage_and_resistance(
     if v_trace.size < 20:
         return [], [], []
 
-    # --- 1. Pulse anatomy ---------------------------------------------------
-    has_iph = any(p.delay_after_us > 0 for p in pattern.phases[:-1])
-    has_dd = pattern.phases[-1].delay_after_us > 0
+    # --- 1. Shape-aware boundary list --------------------------------------
+    # Build the expected (phase, role) labels using per-shape leading /
+    # trailing edge factors; this gives one entry per boundary that has
+    # a clean current-step (rect / linear / bowtie / halfpipe / exp-
+    # decay leading) and OMITS boundaries where the current ramps from
+    # or to zero (sinusoidal both edges, linear-increasing leading,
+    # linear-decreasing trailing, exp-decay trailing). The output
+    # arrays have the same length as this label list, so the caller
+    # can ``zip`` to dispatch by role.
+    labels = access_index_labels(pattern)
+    n_access_expected = len(labels)
+    if n_access_expected == 0:
+        return [], [], []
+
     polarity = pattern.polarity
+
+    # Whether the pattern includes an interphase delay (a quiet gap
+    # between phases 1 and 2 where the current returns to zero) and a
+    # discharge delay (a quiet gap AFTER the last phase, where the
+    # electrode passively recovers). These flags gate steps 6b and 6c
+    # below, which look for the trailing-edge / leading-edge access
+    # points that only exist when the current actually steps to / from
+    # zero at those boundaries.
+    #
+    #   * has_iph — phase 1 has a non-zero ``delay_after_us``, AND there
+    #     is at least one subsequent phase to lead. Monophasic patterns
+    #     have no interphase delay by definition (only one phase). For
+    #     biphasic and triphasic this collapses to "is there a gap
+    #     between phase 1 and phase 2?" — the only interphase boundary
+    #     the current code path measures (the second interphase delay
+    #     in a true triphasic is captured by the shape-aware label
+    #     list in step 1, which already drops boundaries that don't
+    #     produce a clean step).
+    #   * has_dd — the LAST phase has a non-zero ``delay_after_us``.
+    #     This is the recovery / passive-discharge window every
+    #     experiment-grade pattern includes; we use the gap to compute
+    #     the trailing-phase access point (the V_a4 entry below).
+    #
+    # Both flags default to ``False`` for monophasic-no-recovery
+    # patterns; the caller still gets the leading-edge V_a out of
+    # step 6a so a bare monophasic pulse isn't a special case.
+    has_iph = (pattern.num_phases >= 2
+               and pattern.phases[0].delay_after_us > 0)
+    has_dd = pattern.phases[-1].delay_after_us > 0
 
     # Pre-pulse baseline (samples where time < 0)
     pre_mask = time_us < 0
@@ -240,15 +449,11 @@ def access_voltage_and_resistance(
     if peak_max <= 0:
         return [], [], []
 
-    # --- 3. Expected peak count (matches getAccess.m logic) ----------------
-    # 3 base peaks for a biphasic pulse + 1 per delay
-    n_phases = pattern.num_phases
-    n_peaks_expected = (n_phases + 1) + (1 if has_iph else 0) + (1 if has_dd else 0)
-    n_access_expected = 1
-    if has_iph:
-        n_access_expected += 2 * (n_phases - 1)
-    if has_dd:
-        n_access_expected += 1
+    # --- 3. Expected peak count -------------------------------------------
+    # One |dV/dt| peak per boundary in the label list. The previous
+    # logic counted purely from delays / phase count; the new label
+    # list already encodes shape-aware filtering.
+    n_peaks_expected = n_access_expected
 
     peaks = _find_n_peaks(deriv_abs, n_peaks_expected, peak_max * 0.9)
     if peaks.size == 0:
@@ -321,15 +526,6 @@ def access_voltage_and_resistance(
     return [abs(x) for x in va], ra, access_idx
 
 
-def access_indices_for_phase(*args, **kwargs):
-    """Backward-compat shim for older callers. The canonical algorithm now
-    operates on the whole pulse via :func:`access_voltage_and_resistance`."""
-    raise NotImplementedError(
-        "Use access_voltage_and_resistance() — the canonical getAccess.m port "
-        "operates on the entire pulse, not one phase at a time."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Polarization (E_pol)
 # ---------------------------------------------------------------------------
@@ -337,31 +533,69 @@ def access_index_labels(pattern: PulsePattern) -> List[Tuple[int, str]]:
     """Per-entry ``(phase_idx, role)`` labels for the ``access_idx`` array
     returned by :func:`access_voltage_and_resistance`.
 
-    The ordering is fixed by the analysis algorithm:
+    The list is built shape-aware: every potential phase boundary is
+    considered, and an entry is emitted only when the current step at
+    that boundary is large enough to produce an unambiguous V_a /
+    R_a measurement. Concretely:
 
-      * entry 0 is always the leading edge of phase 1;
-      * for each interphase delay between phase k and k+1 we get
-        ``(k, 'trail')`` immediately followed by ``(k+1, 'lead')``;
-      * for a discharge delay after the last phase we get ``(last, 'trail')``.
+      * Pre-pulse → phase 1 leading edge: included if phase 1's
+        leading factor (current at t=0 / peak) ≥ threshold.
+      * For each phase k with ``delay_after_us > 0`` we emit
+        ``(k, 'trail')`` if phase k's trailing factor ≥ threshold,
+        and ``(k+1, 'lead')`` if phase k+1's leading factor ≥
+        threshold.
+      * For a delay-less boundary between phase k and k+1, the trail
+        of k and the lead of k+1 fuse into one combined event; we
+        emit a single ``(k+1, 'lead')`` if the combined |Δ I| / peak
+        ≥ threshold.
 
-    The result is a parallel list of the same length as ``access_idx`` so the
-    caller can ``zip(access_idx, labels)`` and dispatch by role.
+    Threshold is :data:`_STEP_FACTOR_THRESHOLD` (0.5 of peak), so
+    e.g. ``linear_decreasing`` contributes a leading entry but no
+    trailing one, ``linear_increasing`` contributes a trailing entry
+    but no leading one, and sinusoidal contributes none at all.
     """
     n = pattern.num_phases
-    has_iph_after = [ph.delay_after_us > 0 for ph in pattern.phases[:-1]]
-    has_dd = pattern.phases[-1].delay_after_us > 0
+    if n == 0:
+        return []
+    peak_amp = max((abs(p.amplitude_ua) for p in pattern.phases), default=1.0)
+    if peak_amp <= 0:
+        peak_amp = 1.0
+    cutoff = _STEP_FACTOR_THRESHOLD * peak_amp
 
-    labels: List[Tuple[int, str]] = [(0, "lead")]
-    if n == 1:
-        if has_dd:
-            labels.append((0, "trail"))
-        return labels
-    for k in range(n - 1):
-        if has_iph_after[k]:
-            labels.append((k, "trail"))
-            labels.append((k + 1, "lead"))
-    if has_dd:
-        labels.append((n - 1, "trail"))
+    labels: List[Tuple[int, str]] = []
+    # Phase 1 leading edge — pre-pulse (0) → phase1 leading-factor × peak.
+    f_lead0, _ = _phase_step_factors(pattern.phases[0].shape)
+    if abs(pattern.phases[0].amplitude_ua) * f_lead0 >= cutoff:
+        labels.append((0, "lead"))
+
+    for k in range(n):
+        ph = pattern.phases[k]
+        _, f_trail_k = _phase_step_factors(ph.shape)
+        is_last = (k == n - 1)
+        delay = ph.delay_after_us
+
+        if delay > 0:
+            # Trailing of phase k: amp drops to 0 over the delay.
+            if abs(ph.amplitude_ua) * f_trail_k >= cutoff:
+                labels.append((k, "trail"))
+            # Leading of phase k+1 (if any): amp rises from 0.
+            if not is_last:
+                next_ph = pattern.phases[k + 1]
+                f_lead_next, _ = _phase_step_factors(next_ph.shape)
+                if abs(next_ph.amplitude_ua) * f_lead_next >= cutoff:
+                    labels.append((k + 1, "lead"))
+        elif not is_last:
+            # No delay: the current jumps directly from phase k's
+            # trailing value to phase k+1's leading value. Net step
+            # magnitude is the absolute difference of the signed
+            # values (phases usually flip polarity, so the magnitudes
+            # add). Reported as (k+1, 'lead') by convention.
+            next_ph = pattern.phases[k + 1]
+            f_lead_next, _ = _phase_step_factors(next_ph.shape)
+            net_step = abs(ph.amplitude_ua * f_trail_k
+                           - next_ph.amplitude_ua * f_lead_next)
+            if net_step >= cutoff:
+                labels.append((k + 1, "lead"))
     return labels
 
 
@@ -553,6 +787,70 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     m.charge_per_phase_nc = q_ph
     m.charge_injection_mc_per_cm2 = q_inj
 
+    # ----- 1b. Tissue-damage screen (Shannon + modified Shannon) ---------
+    # Run the Shannon equation + the macro/micro caps from
+    # ``damage_models`` against the just-computed Q_ph / Q_inj /
+    # surface area. The result populates four new CaptureMetrics
+    # fields (``shannon_k_value``, ``damage_classification``,
+    # ``damage_criteria``, ``damage_band``) so the Viewer can render
+    # the verdict alongside Q_inj. Per Li et al. 2024 the Shannon
+    # model alone has ~64% accuracy and misclassifies ~36% of
+    # damaging stimulation as safe — the GUI surfaces the result
+    # as guidance, never as a hard interlock. See
+    # ``stimtest/damage_models.py`` for the full reference list.
+    try:
+        from .damage_models import (
+            assess_from_capture_metrics,
+            damage_level_from_classification,
+        )
+        assessment = assess_from_capture_metrics(
+            charge_per_phase_nc=q_ph,
+            charge_injection_mc_per_cm2=q_inj,
+            surface_area_um2=surface_area_um2,
+        )
+        m.shannon_k_value = float(assessment.k_value)
+        m.damage_classification = assessment.classification
+        m.damage_criteria = {
+            "shannon": bool(assessment.above_shannon),
+            "macro_cap": bool(assessment.above_macro_cap),
+            "micro_cap": bool(assessment.above_micro_cap),
+        }
+        m.damage_band = assessment.band
+        # Coarse 0-4 damage level from the binary Shannon verdict.
+        # Returns ``None`` for ``insufficient_data`` so a downstream
+        # UI can render "—"; we store -1 in the dataclass to keep
+        # the field a plain int that round-trips through JSON /
+        # numpy without special-casing.
+        level = damage_level_from_classification(assessment.classification)
+        m.damage_level = -1 if level is None else int(level)
+    except Exception:
+        # Damage screen failure must never block the rest of the
+        # metric pipeline — leave the dataclass defaults in place
+        # (``shannon_k_value = NaN``, classification =
+        # ``"insufficient_data"``, ``damage_level = -1``).
+        pass
+
+    # ----- 1c. NeurostimML local-inference screen (optional) ------------
+    # If the user has installed the local RF-Partial-19 model via
+    # Help → Install NeurostimML model…, run the higher-accuracy
+    # ML prediction alongside Shannon. This is opportunistic —
+    # silently no-ops when the model file isn't on disk, the
+    # feature vector can't be assembled (e.g. no pulse rate /
+    # duty cycle reachable from the bare Capture), or scikit-learn
+    # isn't installed. The Shannon screen above always runs and
+    # remains the reliable baseline; the ML prediction is a
+    # second opinion the GUI can render side-by-side.
+    try:
+        from .neurostimml import predict_from_capture
+        result = predict_from_capture(capture, surface_area_um2)
+        if result is not None:
+            m.neurostimml_classification = result.classification
+            m.neurostimml_probability = float(result.probability)
+    except Exception:
+        # Same defensive posture as Shannon — never let the
+        # optional ML hop break per-capture metric population.
+        pass
+
     if capture.time_us.size == 0 or capture.v_mon_v.size == 0:
         # Empty capture (scope timeout / acquisition error) — return what we
         # already have and let the caller decide what to do.
@@ -599,6 +897,42 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     m.access_voltage_per_phase_v = list(va_list)
     m.access_resistance_per_phase_kohm = list(ra_list)
 
+    # Return-side access V_a / R_a — same algorithm but reads off the
+    # E_ret trace so the user gets a separate measurement for the
+    # counter / return path. Skipped if E_ret isn't recorded; if it is,
+    # the return access list is parallel (same length, same access_idx
+    # ordering) to the active-side ``access_voltage_per_phase_v``.
+    if e_ret is not None and e_ret.size == capture.time_us.size:
+        va_ret, ra_ret, _ = access_voltage_and_resistance(
+            capture.time_us, e_ret, pat,
+        )
+        m.return_access_voltage_per_phase_v = list(va_ret)
+        m.return_access_resistance_per_phase_kohm = list(ra_ret)
+    else:
+        m.return_access_voltage_per_phase_v = []
+        m.return_access_resistance_per_phase_kohm = []
+
+    # Driving voltage per phase — for both the ACTIVE and RETURN
+    # electrodes when the instrumentation amp is wired up. Mirrors
+    # getVoltageMetrics.m's ``drivingVoltage_arr`` calc: for each
+    # phase k, take |reference_voltage − value at the driving point|,
+    # where the reference is the pre-pulse rest level for phase 1 and
+    # the end of the prior interphase delay for later phases.
+    if has_potentials:
+        m.active_driving_voltage_per_phase_v = _driving_voltage_per_phase(
+            capture.time_us, e_act, pat,
+        )
+        m.return_driving_voltage_per_phase_v = _driving_voltage_per_phase(
+            capture.time_us, e_ret, pat,
+        )
+    else:
+        # Fallback to V_mon for the active side; return side stays
+        # empty since we don't have a separate E_ret trace.
+        m.active_driving_voltage_per_phase_v = _driving_voltage_per_phase(
+            capture.time_us, capture.v_mon_v, pat,
+        )
+        m.return_driving_voltage_per_phase_v = []
+
     # ----- 4. Electrode polarization (E_pol) ----------------------------
     # E_pol per phase = ``driving_potential − trailing_access_voltage``,
     # which equals the value of the trace at the trailing-access plateau
@@ -627,7 +961,45 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
         )
         m.return_polarization_per_phase_v = []
 
-    # ----- 5. Capacitance metrics ---------------------------------------
+    # ----- 5. Interpulse potential (V vs Ag|AgCl) -----------------------
+    # Mean of E_ret across the time-segments OUTSIDE the active pulse
+    # — i.e. ``time < 0`` (pre-pulse baseline) plus ``time >=
+    # total_pulse_us`` (post-discharge tail). Mirrors
+    # ``getVoltageMetrics.m``'s ``prePulsePotenial`` calc but averages
+    # both rest segments so the result reflects the genuinely-settled
+    # interpulse rest potential rather than just the leading edge.
+    #
+    # Falls back to V_mon if E_ret isn't available — the absolute
+    # value is then biased by the stimulator's offset, but the metric
+    # still tracks drift across captures, which is what the user
+    # cares about.
+    #
+    # We also record the pre- and post-pulse means SEPARATELY so the
+    # runner can feed them into the electrode-potential learning
+    # store (one as ``phase="pre"``, the other as ``phase="post"``)
+    # without having to recompute the windows. Only the E_ret-derived
+    # half is published in those split fields — the V_mon fallback is
+    # NOT a measurement of any single electrode's OCP, so feeding
+    # those numbers into the learning bin would corrupt it.
+    e_ret_for_potentials = (e_ret
+                            if e_ret is not None and e_ret.size == capture.time_us.size
+                            else None)
+    m.interpulse_potential_v = _interpulse_potential(
+        capture.time_us,
+        e_ret_for_potentials if e_ret_for_potentials is not None
+        else capture.v_mon_v,
+        pat,
+    )
+    if e_ret_for_potentials is not None:
+        pre_v, post_v = _interpulse_potential_split(
+            capture.time_us, e_ret_for_potentials, pat,
+        )
+        m.return_pre_pulse_potential_v = pre_v
+        m.return_post_pulse_potential_v = post_v
+    # Else leave both at the dataclass default (NaN); the runner
+    # interprets NaN as "no usable measurement, don't record".
+
+    # ----- 6. Capacitance metrics ---------------------------------------
     # Effective per-phase capacitance: linear fit of V over the *plateau*
     # of the first phase (skipping the leading/trailing 15% to avoid
     # the access drops), then C = I / |dV/dt|. Tells us how much

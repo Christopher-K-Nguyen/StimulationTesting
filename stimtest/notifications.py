@@ -215,8 +215,10 @@ def send_completion_email(*,
     runner shouldn't fail because mail couldn't go out.
 
     ``subject_name`` and ``test_name`` are folded into the email
-    subject the same way ``sendEmail.m`` did:
-    ``"Stimulation: <subject> <test>"``.
+    subject as ``"PULSAR: <subject> <test>"`` (the MATLAB
+    ``sendEmail.m`` used "Stimulation:" — keeping the
+    ``<subject> <test>`` payload format so existing inbox filters
+    keyed off the test/subject tokens continue to match).
     """
     if not to_email:
         return False
@@ -228,7 +230,7 @@ def send_completion_email(*,
                    if elapsed_seconds is not None else "")
     greeting_name = _greeting_name(to_email, recipient_name)
 
-    subject = f"Stimulation: {subject_name} {test_name}".strip()
+    subject = f"PULSAR: {subject_name} {test_name}".strip()
     body_lines = [f"Hello {greeting_name},", ""]
     if elapsed_str:
         body_lines.append(f"Experiment completed in {elapsed_str}.")
@@ -274,7 +276,7 @@ def send_error_email(*,
         return False
 
     greeting_name = _greeting_name(to_email, recipient_name)
-    subject = f"Stimulation FAILED: {subject_name} {test_name}".strip()
+    subject = f"PULSAR FAILED: {subject_name} {test_name}".strip()
     body_lines = [f"Hello {greeting_name},", ""]
     if elapsed_seconds is not None:
         body_lines.append(
@@ -306,13 +308,49 @@ def send_error_email(*,
         return False
 
 
+# Bug-report email — fired by the Help → Report a bug menu item. Uses
+# the same SMTP config as the experiment-completion / error mails so
+# credentials live in one place.
+def send_bug_report(*, title: str, body: str,
+                    to_email: Optional[str] = None,
+                    config: Optional[EmailConfig] = None) -> bool:
+    """Email a bug report to the maintainer.
+
+    ``to_email`` defaults to the project's bug-tracker address (via
+    :data:`BUG_REPORT_TO`); the user's reply-to is the from-address
+    from the SMTP config. Returns True on success, False when no
+    SMTP config is loaded or the send call raises. Raises
+    ``RuntimeError`` on hard failures so the caller can surface the
+    error in a modal.
+    """
+    cfg = config or load_config()
+    if not cfg.configured:
+        raise RuntimeError(
+            "Email notifications aren't configured. Set the SMTP "
+            "credentials on the Setup tab (or via the prefs file) "
+            "first.")
+    recipient = to_email or BUG_REPORT_TO
+    msg = EmailMessage()
+    msg["Subject"] = f"[PULSAR bug] {title.strip() or 'no title'}"
+    msg["From"] = cfg.smtp_user
+    msg["To"] = recipient
+    msg.set_content(body or "(no body)")
+    _send(msg, cfg)
+    return True
+
+
+#: Default bug-report recipient. Override at deployment time by editing
+#: this constant or by passing ``to_email`` to :func:`send_bug_report`.
+BUG_REPORT_TO = "pulsar-bugs@example.com"
+
+
 # Convenience: SMS via email-to-SMS gateway. The MATLAB code stores the
 # user's phone + carrier in ``File.User``; the Python equivalent
 # accepts them as kwargs. Optional — most labs have moved away from
 # this since SMS gateways are unreliable, but keep the door open
 # because the MATLAB version exposed it.
 def send_sms_via_gateway(*, phone: str, carrier: str, body: str,
-                         subject: str = "Stimulation",
+                         subject: str = "PULSAR",
                          config: Optional[EmailConfig] = None) -> bool:
     """Send a text via the email-to-SMS gateway for the given carrier.
 

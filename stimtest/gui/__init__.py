@@ -1,4 +1,4 @@
-"""PyQt6 GUI for StimulationTesting."""
+"""PyQt6 GUI for PULSAR (main app) and POLARIS (viewer)."""
 
 from .main_window import MainWindow, launch
 

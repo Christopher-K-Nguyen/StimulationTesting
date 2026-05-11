@@ -38,6 +38,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from ..config import DeviceDef
 from . import rich
 from .repeating_spinbox import RepeatingSpinBox
+from .widgets import enable_spreadsheet_paste
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +125,19 @@ class _GeometryView(QtWidgets.QWidget):
         font = p.font()
         font.setPointSize(max(7, cell // 5))
         p.setFont(font)
+        # Float math so triangular spacing is exactly equidistant —
+        # the previous ``cell // 2`` integer truncation drifted the
+        # next-row diagonals to ~47.5 px when same-row was 48 px.
+        cell_f = float(cell)
         for r in range(rows):
-            row_offset = (cell // 2) if (triangular and r % 2 == 1) else 0
-            row_y_pitch = (cell * self.TRI_Y_FACTOR) if triangular else cell
+            row_offset = (cell_f / 2.0) if (triangular and r % 2 == 1) else 0.0
+            row_y_pitch = (cell_f * self.TRI_Y_FACTOR) if triangular else cell_f
             for c in range(cols):
                 ch = int(self._grid[r, c])
                 if ch <= 0:
                     continue
-                cx = x0 + c * cell + cell // 2 + row_offset
-                cy = y0 + int(r * row_y_pitch) + cell // 2
+                cx = int(round(x0 + c * cell_f + cell_f / 2.0 + row_offset))
+                cy = int(round(y0 + r * row_y_pitch + cell_f / 2.0))
                 # disk
                 p.setBrush(QtGui.QColor("#1976d2"))
                 p.setPen(QtGui.QPen(QtGui.QColor("#0d47a1"), 1))
@@ -184,6 +189,10 @@ class DeviceView(QtWidgets.QGroupBox):
             QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
         )
         self.table.itemChanged.connect(self._on_table_item_changed)
+        # Spreadsheet copy / cut / paste — users routinely build a
+        # channel-map in Excel / Google Sheets and want to paste a
+        # whole block in one shot rather than retype every cell.
+        enable_spreadsheet_paste(self.table)
 
         # Resize controls
         self.rows_spin = RepeatingSpinBox(); self.rows_spin.setRange(1, 32); self.rows_spin.setValue(4)
@@ -214,6 +223,10 @@ class DeviceView(QtWidgets.QGroupBox):
         )
         self.perchan.itemChanged.connect(lambda _: self.perChannelChanged.emit())
         self.perchan.setVisible(False)
+        # Same spreadsheet copy / cut / paste support as the
+        # channel-map table — users with a long override list can
+        # batch-paste from a spreadsheet column.
+        enable_spreadsheet_paste(self.perchan)
 
         # ----- assemble -----
         v = QtWidgets.QVBoxLayout(self)
@@ -268,6 +281,21 @@ class DeviceView(QtWidgets.QGroupBox):
         self.cols_spin.blockSignals(True); self.cols_spin.setValue(cols); self.cols_spin.blockSignals(False)
         self.set_mapping(grid)
 
+    def set_title(self, name: str, description: str = "") -> None:
+        """Override the device-view header — used for user-named
+        custom devices that share the ``Other (custom grid)``
+        template but want their own display name. The triangular
+        suffix follows the live ``_layout`` (toggled via
+        :meth:`set_layout`). Doesn't touch the mapping or spinners
+        — callers that need to reset those should do it explicitly
+        via :meth:`set_mapping` / :meth:`set_layout`.
+        """
+        suffix = (" <i>(triangular layout)</i>"
+                  if self._layout == "triangular" else "")
+        self.title_label.setText(f"<b>{name}</b>{suffix}")
+        if description:
+            self.desc_label.setText(description)
+
     def set_mapping(self, grid: np.ndarray):
         """Programmatic mapping update — populates table, repaints geometry."""
         grid = np.asarray(grid, dtype=int)
@@ -308,6 +336,36 @@ class DeviceView(QtWidgets.QGroupBox):
                     except ValueError:
                         out[r, c] = 0
         return out
+
+    def current_layout(self) -> str:
+        """Currently active geometry hint — ``"rect"`` or ``"triangular"``.
+
+        Set automatically by :meth:`set_device` from the catalog's
+        :attr:`DeviceDef.layout`, and overridable through
+        :meth:`set_layout` (used by the Custom-grid chooser on the
+        Setup tab).
+        """
+        return self._layout
+
+    def set_layout(self, layout: str):
+        """Override the geometry hint and re-render the geometry view.
+
+        Used by the "Grid type" chooser for the *Other (custom grid)*
+        device, where the user gets to pick between square and
+        hexagonal packing for their hand-built mapping. A no-op if the
+        value is already current — saves an unnecessary repaint.
+        """
+        layout = layout if layout in ("rect", "triangular") else "rect"
+        if layout == self._layout:
+            return
+        self._layout = layout
+        # Refresh the title-bar suffix (only triangular gets the tag).
+        if self._device is not None:
+            suffix = " <i>(triangular layout)</i>" if layout == "triangular" else ""
+            self.title_label.setText(f"<b>{self._device.name}</b>{suffix}")
+        # Redraw the geometry view with the new packing.
+        grid = self.current_mapping()
+        self.geom.set_grid(grid, layout=self._layout)
 
     def set_per_channel_visible(self, visible: bool):
         """Show/hide the per-channel area/coating override table."""
@@ -424,13 +482,19 @@ class DeviceView(QtWidgets.QGroupBox):
         table columns, and the per-channel override table columns.
         Each is captured here so a re-launch lands on the same layout.
         """
-        return {
-            "geom_table_split": list(self._geom_table_split.sizes()),
+        out: dict = {
             "table_col_widths":   [self.table.columnWidth(c)
                                    for c in range(self.table.columnCount())],
             "perchan_col_widths": [self.perchan.columnWidth(c)
                                    for c in range(self.perchan.columnCount())],
         }
+        # Skip persisting splitter sizes if either pane has been
+        # collapsed to zero — restoring the broken layout next
+        # session would leave one side hidden.
+        sp_sizes = list(self._geom_table_split.sizes())
+        if all(int(s) > 0 for s in sp_sizes):
+            out["geom_table_split"] = sp_sizes
+        return out
 
     def restore_view_state(self, view: dict):
         if not view:
@@ -438,9 +502,11 @@ class DeviceView(QtWidgets.QGroupBox):
         sizes = view.get("geom_table_split")
         if isinstance(sizes, (list, tuple)) and len(sizes) >= 2:
             try:
-                self._geom_table_split.setSizes([int(s) for s in sizes])
+                int_sizes = [int(s) for s in sizes]
             except (TypeError, ValueError):
-                pass
+                int_sizes = None
+            if int_sizes is not None and all(s > 0 for s in int_sizes):
+                self._geom_table_split.setSizes(int_sizes)
         # Column widths — re-apply only if the count still matches the
         # current table; otherwise the stored layout is from a different
         # device geometry and shouldn't be force-fit onto this one.

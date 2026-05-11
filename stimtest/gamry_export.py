@@ -74,6 +74,26 @@ def _fmt(v, digits: int = 5) -> str:
     return f"{f:.{digits}E}"
 
 
+def _fmt_int(v) -> str:
+    """Plain integer string for count-style fields, e.g. ``"16"``.
+
+    ``_fmt(16, 0)`` rounds the mantissa and emits ``"2E+01"`` (= 20),
+    which is wrong for integer counts. Use this helper instead for any
+    field that's intrinsically an integer (channel counts, row/col
+    counts, repetition counts). NaN / None / non-numeric inputs return
+    an empty string so blank cells stay blank.
+    """
+    if v is None:
+        return ""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if np.isnan(f) or not np.isfinite(f):
+        return ""
+    return str(int(round(f)))
+
+
 def _experiment_tag(expt: str) -> str:
     return {
         "VT": "VTRANSIENT", "TV": "VTRANSIENT_TRI",
@@ -155,7 +175,7 @@ def _write_instrumentation_sheet(wb: Workbook, session: Session) -> None:
     row = _meta_row(ws, row, "FIRMWARE", "LABEL",
                     stim.get("firmware", ""), "Stimulator firmware")
     row = _meta_row(ws, row, "NCHAN", "QUANT",
-                    _fmt(stim.get("n_channels"), 0),
+                    _fmt_int(stim.get("n_channels")),
                     "Number of stimulator channels")
     row = _meta_row(ws, row, "VMONSCL", "QUANT",
                     _fmt(stim.get("vmon_scaling_v_per_v")),
@@ -180,7 +200,7 @@ def _write_instrumentation_sheet(wb: Workbook, session: Session) -> None:
                     "Oscilloscope firmware")
     row = _meta_row(ws, row, "RESOURCE", "LABEL", scope.get("resource", ""),
                     "VISA resource string")
-    row = _meta_row(ws, row, "NCHAN", "QUANT", _fmt(scope.get("n_channels"), 0),
+    row = _meta_row(ws, row, "NCHAN", "QUANT", _fmt_int(scope.get("n_channels")),
                     "Number of scope channels")
     row = _meta_row(ws, row, "SIMULATED", "LABEL",
                     "yes" if scope.get("is_simulated") else "no",
@@ -218,7 +238,7 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
                     _fmt(session.test.duration_s),
                     "Pulsing duration (s) - SP/LP only")
     row = _meta_row(ws, row, "NPULSES", "QUANT",
-                    _fmt(session.test.number_of_pulses, 0),
+                    _fmt_int(session.test.number_of_pulses),
                     "Number of pulses - SP/LP only")
     row = _meta_row(ws, row, "TARGETQPH", "QUANT",
                     _fmt(session.test.target_charge_phase_nc),
@@ -235,7 +255,7 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
                     "Sign of excitation phase")
     row = _meta_row(ws, row, "RATE", "QUANT", _fmt(p.rate_hz),
                     "Pulse repetition rate (Hz)")
-    row = _meta_row(ws, row, "REPS", "QUANT", _fmt(p.repetitions, 0),
+    row = _meta_row(ws, row, "REPS", "QUANT", _fmt_int(p.repetitions),
                     "Repetitions per train (0 = infinite)")
     for i, ph in enumerate(p.phases, start=1):
         row = _meta_row(ws, row, f"AMP{i}", "QUANT",
@@ -254,7 +274,7 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
     row = _section_header(ws, row, "CONFIGURATION")
     row = _meta_row(ws, row, "CONFIG", "LABEL", cfg.id,
                     "MP / BP / TP / PBP / PTP / CG")
-    row = _meta_row(ws, row, "ACTIVE", "QUANT", _fmt(cfg.active, 0),
+    row = _meta_row(ws, row, "ACTIVE", "QUANT", _fmt_int(cfg.active),
                     "Active electrode (1-based)")
     row = _meta_row(ws, row, "RETURNS", "LABEL",
                     ", ".join(str(r) for r in cfg.returns) if cfg.returns else "",
@@ -268,9 +288,9 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
 
     row = _section_header(ws, row, "ELECTRODE ARRAY")
     row = _meta_row(ws, row, "NAME", "LABEL", array.name, "Array geometry")
-    row = _meta_row(ws, row, "ROWS", "QUANT", _fmt(array.rows, 0), "Grid rows")
-    row = _meta_row(ws, row, "COLS", "QUANT", _fmt(array.cols, 0), "Grid columns")
-    row = _meta_row(ws, row, "NSITES", "QUANT", _fmt(len(array.sites), 0),
+    row = _meta_row(ws, row, "ROWS", "QUANT", _fmt_int(array.rows), "Grid rows")
+    row = _meta_row(ws, row, "COLS", "QUANT", _fmt_int(array.cols), "Grid columns")
+    row = _meta_row(ws, row, "NSITES", "QUANT", _fmt_int(len(array.sites)),
                     "Number of electrode sites")
     if array.sites:
         first = array.sites[0]
@@ -296,6 +316,189 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
         row = _meta_row(ws, row, "DEPOL", "QUANT",
                         _fmt(extras.get("depolarization_us", 12.0) * 1e-6),
                         "Depolarization sample time after phase end (s)")
+
+
+# ---------------------------------------------------------------------------
+# Sheet 3: Setup — every Setup-tab field the GUI snapshotted at start time
+# ---------------------------------------------------------------------------
+def _write_setup_sheet(wb: Workbook, session: Session) -> None:
+    """Write a "Setup" sheet listing every Setup-tab field captured by
+    :meth:`stimtest.gui.setup_tab.SetupTab.setup_snapshot`.
+
+    The sheet is structured as Gamry .DTA preamble rows
+    (``TAG | KIND | VALUE | COMMENT``) so it visually matches the
+    Instrumentation and Parameters sheets above it. The preamble keys
+    cover device + connector + grid type, acquisition mode, surface
+    area + active-electrode coating, return / reference electrodes,
+    water-window limits, the channel-mapping table, and per-channel
+    role assignment (V_mon / I_mon / E_act / E_ret / Trigger).
+
+    No-op when ``extras['setup_snapshot']`` is missing — sessions that
+    weren't built through the GUI (unit tests, headless replays) just
+    won't get the sheet.
+    """
+    extras = session.test.extras or {}
+    snap = extras.get("setup_snapshot")
+    if not snap:
+        return
+    ws = wb.create_sheet("Setup")
+    _set_dta_column_widths(ws)
+
+    row = _section_header(ws, 1, "TEST DEVICE")
+    row = _meta_row(ws, row, "DEVICE", "LABEL",
+                    str(snap.get("device", "")), "Catalog model")
+    grid = str(snap.get("grid_type", "rect"))
+    row = _meta_row(ws, row, "GRIDTYPE", "LABEL",
+                    "Hexagonal (triangular)" if grid == "triangular"
+                    else "Square (rectangular)",
+                    "Physical packing of the array")
+    row = _meta_row(ws, row, "CONNECTOR", "LABEL",
+                    str(snap.get("connector", "")),
+                    "Headstage connector / pinout")
+    row += 1
+
+    row = _section_header(ws, row, "ACQUISITION")
+    row = _meta_row(ws, row, "MODE", "LABEL",
+                    str(snap.get("acq_mode", "")),
+                    "Single capture vs scope-side averaging")
+    row = _meta_row(ws, row, "NAVG", "QUANT",
+                    _fmt_int(snap.get("acq_n_avg")),
+                    "Number of waveforms averaged on the scope")
+    row += 1
+
+    row = _section_header(ws, row, "SURFACE AREA")
+    row = _meta_row(ws, row, "MODE", "LABEL",
+                    str(snap.get("surface_area_mode", "")),
+                    "Same / Different per electrode")
+    row = _meta_row(ws, row, "VALUE", "QUANT",
+                    _fmt(snap.get("surface_area_value")),
+                    "Geometric area in display unit")
+    row = _meta_row(ws, row, "UNIT", "LABEL",
+                    str(snap.get("surface_area_unit", "")),
+                    "Display unit (μm² / mm² / cm²)")
+    row += 1
+
+    row = _section_header(ws, row, "ACTIVE ELECTRODE COATING")
+    row = _meta_row(ws, row, "MODE", "LABEL",
+                    str(snap.get("coating_mode", "")),
+                    "Same / Different per electrode")
+    row = _meta_row(ws, row, "COATING", "LABEL",
+                    str(snap.get("coating_short", "")), "Short tag")
+    row = _meta_row(ws, row, "COATINGNAME", "LABEL",
+                    str(snap.get("coating_label", "")),
+                    "Spelled-out coating name")
+    row += 1
+
+    row = _section_header(ws, row, "RETURN / COUNTER ELECTRODE")
+    row = _meta_row(ws, row, "ENABLED", "LABEL",
+                    "yes" if snap.get("return_enable") else "no",
+                    "Return-electrode metadata captured?")
+    row = _meta_row(ws, row, "COATING", "LABEL",
+                    str(snap.get("return_coating_short", "")), "Short tag")
+    row = _meta_row(ws, row, "COATINGNAME", "LABEL",
+                    str(snap.get("return_coating_label", "")),
+                    "Spelled-out coating name")
+    row += 1
+
+    row = _section_header(ws, row, "REFERENCE ELECTRODE")
+    row = _meta_row(ws, row, "ENABLED", "LABEL",
+                    "yes" if snap.get("reference_enable") else "no",
+                    "Reference-electrode metadata captured?")
+    row = _meta_row(ws, row, "ELECTRODE", "LABEL",
+                    str(snap.get("reference_electrode_short", "")), "Short tag")
+    row = _meta_row(ws, row, "ELECTRODENAME", "LABEL",
+                    str(snap.get("reference_electrode_label", "")),
+                    "Spelled-out reference name")
+    row += 1
+
+    row = _section_header(ws, row, "POTENTIAL LIMITS")
+    row = _meta_row(ws, row, "ELC", "QUANT",
+                    _fmt(snap.get("cathodic_limit_v")),
+                    "Cathodic limit (V vs reference)")
+    row = _meta_row(ws, row, "ELA", "QUANT",
+                    _fmt(snap.get("anodic_limit_v")),
+                    "Anodic limit (V vs reference)")
+    row = _meta_row(ws, row, "TOLERANCE", "QUANT",
+                    _fmt(snap.get("polarization_tolerance_v")),
+                    "Polarization grace band (V)")
+    row += 1
+
+    # Channel-role assignment — one row per role the user actually
+    # assigned. The role-keyed view (V_mon / I_mon / etc. → channel)
+    # reads naturally as "which channel was each instrument signal?".
+    role_to_ch = snap.get("channel_roles_by_role") or {}
+    if role_to_ch:
+        row = _section_header(ws, row, "CHANNEL ROLES")
+        for role, ch in role_to_ch.items():
+            value = ch if isinstance(ch, str) else ", ".join(str(c) for c in ch)
+            row = _meta_row(ws, row, str(role).upper(), "LABEL",
+                            str(value), f"Scope channel(s) carrying {role}")
+        row += 1
+
+    # Channel mapping — render the table inline (rows × cols of
+    # channel numbers, 0 = empty cell) below the preamble. Header row
+    # uses bold; "0" cells are blanked so the array shape is visible.
+    mapping = snap.get("channel_mapping")
+    if mapping:
+        row = _section_header(ws, row, "CHANNEL MAPPING")
+        row = _meta_row(ws, row, "ROWS", "QUANT",
+                        _fmt_int(len(mapping)), "Grid rows")
+        row = _meta_row(ws, row, "COLS", "QUANT",
+                        _fmt_int(len(mapping[0]) if mapping else 0),
+                        "Grid columns")
+        # Column header — col indices.
+        for c in range(len(mapping[0]) if mapping else 0):
+            cell = ws.cell(row=row, column=2 + c, value=f"col {c}")
+            cell.font = BOLD
+        ws.cell(row=row, column=1, value="ROW").font = BOLD
+        row += 1
+        for r, line in enumerate(mapping):
+            ws.cell(row=row, column=1, value=f"row {r}").font = BOLD
+            for c, ch in enumerate(line):
+                # Render 0 (empty cell) as blank so the array shape
+                # reads naturally. Non-zero cells get the channel
+                # number as an int.
+                if int(ch) > 0:
+                    ws.cell(row=row, column=2 + c, value=int(ch))
+            row += 1
+        row += 1
+
+    # Per-channel area / coating overrides — only present when the
+    # user picked "Different per electrode" mode.
+    overrides = snap.get("per_channel_overrides") or {}
+    if overrides:
+        row = _section_header(ws, row, "PER-CHANNEL OVERRIDES")
+        ws.cell(row=row, column=1, value="CHANNEL").font = BOLD
+        ws.cell(row=row, column=2, value="AREA (μm²)").font = BOLD
+        ws.cell(row=row, column=3, value="COATING").font = BOLD
+        row += 1
+        # Sort by channel number for stable output.
+        for ch in sorted(overrides.keys(), key=lambda x: int(x)):
+            o = overrides[ch] or {}
+            ws.cell(row=row, column=1, value=int(ch))
+            if "area_um2" in o:
+                ws.cell(row=row, column=2, value=_fmt(o["area_um2"]))
+            if "coating" in o:
+                ws.cell(row=row, column=3, value=str(o["coating"]))
+            row += 1
+        row += 1
+
+    # Per-experiment params snapshot — pulled from the test-parameters
+    # tab via :meth:`ExperimentTab.params_snapshot`. Each subclass
+    # decides what extra fields to record (ramp policy, mode flags,
+    # strategy choice, etc.). We render every key/value pair as a
+    # generic preamble row so subclasses don't have to round-trip
+    # through the exporter when adding a new field.
+    params = extras.get("params_snapshot") or {}
+    if params:
+        row = _section_header(ws, row, "TEST-PARAMETERS TAB")
+        for key, value in params.items():
+            tag = str(key).upper().replace(" ", "_")[:24]
+            kind = "QUANT" if isinstance(value, (int, float)) and not isinstance(value, bool) else "LABEL"
+            row = _meta_row(
+                ws, row, tag, kind,
+                _fmt(value) if kind == "QUANT" else str(value),
+                str(key))
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +984,7 @@ def save_session_xlsx(session: Session, path: Path | str,
 
     _write_instrumentation_sheet(wb, session)
     _write_parameters_sheet(wb, session)
+    _write_setup_sheet(wb, session)
 
     # Pre-compute metric sets so the Values sheet and the per-channel sheets
     # share exactly the same data and channel labels.
@@ -871,10 +1075,30 @@ def _dta_write(f, session: Session, run: ChannelRun, channel_id: str,
 
     f.write("\nSUMMARY\tTABLE\t" + str(len(run.captures)) +
             "\tPer-capture metrics\n")
-    f.write("\t".join(["Capture", "Amplitude", "Q_ph", "Q_inj", "V_d",
-                       "V_a", "R_a", "C_eff", "C_d", "Status"]) + "\n")
-    f.write("\t".join(["#", "uA", "nC", "mC/cm^2", "V", "V", "kOhm",
-                       "nF", "mF/cm^2", ""]) + "\n")
+    # Use Unicode subscripts / superscripts in the column headers so
+    # Excel renders pretty labels straight from the tsv. Plain-text
+    # ``Vd``/``Ceff`` fallback whenever a subscript letter (d, f, c)
+    # has no Unicode codepoint — see ``rich.plain_label``.
+    from .gui.rich import plain_label as _L
+    f.write("\t".join([
+        "Capture", "Amplitude",
+        _L("Q", "ph"), _L("Q", "inj"),
+        f"{_L('V','d')} act", f"{_L('V','d')} ret",
+        _L("E", "ip"),
+        f"{_L('V','a')} act", f"{_L('R','a')} act",
+        f"{_L('V','a')} ret", f"{_L('R','a')} ret",
+        _L("C", "eff"), _L("C", "d"),
+        "Status",
+    ]) + "\n")
+    f.write("\t".join([
+        "#", "µA",
+        "nC", _L("mC/cm", sup="2"),
+        "V", "V",
+        "V",
+        "V", "kΩ", "V", "kΩ",
+        "nF", _L("mF/cm", sup="2"),
+        "",
+    ]) + "\n")
     for cap in run.captures:
         m = cap.metrics
         if cap.status.reached_potential_limit:
@@ -885,16 +1109,24 @@ def _dta_write(f, session: Session, run: ChannelRun, channel_id: str,
             status = "bad"
         else:
             status = "ok"
-        va = m.access_voltage_per_phase_v
-        ra = m.access_resistance_per_phase_kohm
+        va  = m.access_voltage_per_phase_v
+        ra  = m.access_resistance_per_phase_kohm
+        var = m.return_access_voltage_per_phase_v
+        rar = m.return_access_resistance_per_phase_kohm
+        vd_act = m.active_driving_voltage_per_phase_v
+        vd_ret = m.return_driving_voltage_per_phase_v
         f.write("\t".join([
             str(cap.index),
             _fmt(cap.pattern.excitation_phase.amplitude_ua),
             _fmt(m.charge_per_phase_nc),
             _fmt(m.charge_injection_mc_per_cm2),
-            _fmt(m.driving_voltage_v),
+            _fmt(vd_act[0] if vd_act else m.driving_voltage_v),
+            _fmt(vd_ret[0] if vd_ret else None),
+            _fmt(m.interpulse_potential_v),
             _fmt(va[0] if va else None),
             _fmt(ra[0] if ra else None),
+            _fmt(var[0] if var else None),
+            _fmt(rar[0] if rar else None),
             _fmt(m.effective_capacitance_nf),
             _fmt(m.driving_capacitance_mf_per_cm2),
             status,

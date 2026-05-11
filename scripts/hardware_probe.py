@@ -221,7 +221,7 @@ def step_open_scope() -> bool:
 # Driver
 # ---------------------------------------------------------------------------
 def main() -> int:
-    print("StimulationTesting — hardware probe")
+    print("PULSAR — hardware probe")
     print(f"Python: {sys.version.splitlines()[0]}")
 
     # SDK detection and VISA enumeration are informational — they tell

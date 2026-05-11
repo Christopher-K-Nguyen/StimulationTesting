@@ -22,7 +22,6 @@ metadata page.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -51,6 +50,7 @@ from ..plotting import (
     SCREEN_DPI, WAVE_TYPES, _figsize_in,
 )
 from ..session import Capture, ChannelRun, Session
+from . import rich
 
 
 # ---------------------------------------------------------------------------
@@ -67,21 +67,39 @@ KIND_CAPTURE = "capture"
 
 
 class ChannelTraceToggleBar(QtWidgets.QWidget):
-    """Two rows of checkboxes: channels on top, waveform types below.
+    """Two rows of toggles: channels on top, per-trace axis dropdowns
+    below, mirroring the experiment-tab's MultiChannelScope.
 
-    Used by :class:`ViewerPanel` to drive the multi-channel overlay
-    plot. Emits :pyattr:`selectionChanged` whenever any checkbox flips
-    so the panel can re-render. ``set_available_channels`` rebuilds
-    the channel-row checkboxes when a new session loads, preserving
-    the selection state of channels that still exist.
+    The wave-type row is one ``QComboBox`` per trace with three
+    options: ``N/A`` (hide), ``Left y-axis``, ``Right y-axis``.
+    Default routing matches MultiChannelScope: I_mon → right axis,
+    V_mon / E_act / E_ret → left. The Viewer's overlay plot
+    (``plot_overlay``) consumes :meth:`axis_map` to place each
+    trace, replacing the legacy hardcoded "I_mon goes right".
+
+    Inset toggle + multi-select dropdown sit in a third row, again
+    matching the experiment scope so users see the same controls in
+    both places. Emits :pyattr:`selectionChanged` whenever any
+    control flips so the panel can re-render.
     """
 
     selectionChanged = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Lazy-import to avoid a circular dep with widgets.py.
+        from .widgets import AXIS_LEFT, AXIS_NA, AXIS_RIGHT
+        from .multichannel_scope import (
+            DEFAULT_TRACE_AXIS, TRACE_COLOURS,
+        )
+        self._AXIS_LEFT = AXIS_LEFT
+        self._AXIS_RIGHT = AXIS_RIGHT
+        self._AXIS_NA = AXIS_NA
         self._channel_checks: Dict[int, QtWidgets.QCheckBox] = {}
-        self._wave_checks: Dict[str, QtWidgets.QCheckBox] = {}
+        self.axis_combos: Dict[str, QtWidgets.QComboBox] = {}
+        self.axis_labels: Dict[str, QtWidgets.QLabel] = {}
+        self._axis_map: Dict[str, str] = dict(DEFAULT_TRACE_AXIS)
+        self._available_traces: set = set(WAVE_TYPES)
 
         # Channel row — populated dynamically by ``set_available_channels``.
         self.channel_row = QtWidgets.QHBoxLayout()
@@ -96,23 +114,66 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
         self._channel_none.clicked.connect(lambda: self._set_all_channels(False))
         self.channel_row.addWidget(self._channel_all)
         self.channel_row.addWidget(self._channel_none)
-        # Empty stretch in the channel row — checkbox widgets are
-        # inserted between the All/None buttons and this stretch by
-        # ``set_available_channels``.
         self._channel_row_stretch_index = self.channel_row.count()
         self.channel_row.addStretch(1)
 
-        # Waveform-type row — fixed set, always visible.
+        # Waveform-type row — per-trace axis dropdown (replaces the old
+        # checkbox grid). Order matches WAVE_TYPES so layout is stable.
         self.wave_row = QtWidgets.QHBoxLayout()
         self.wave_row.setContentsMargins(0, 0, 0, 0)
         self.wave_row.setSpacing(8)
         self.wave_row.addWidget(QtWidgets.QLabel("Waveforms:"))
         for wname in WAVE_TYPES:
-            cb = QtWidgets.QCheckBox(wname)
-            cb.setChecked(True)
-            cb.toggled.connect(self._emit)
-            self._wave_checks[wname] = cb
-            self.wave_row.addWidget(cb)
+            lbl = QtWidgets.QLabel(wname)
+            lbl.setStyleSheet(
+                f"color: {TRACE_COLOURS.get(wname, '#000')}; "
+                f"font-weight: bold;")
+            self.axis_labels[wname] = lbl
+            self.wave_row.addWidget(lbl)
+            combo = QtWidgets.QComboBox()
+            combo.addItem("N/A",          userData=AXIS_NA)
+            combo.addItem("Left y-axis",  userData=AXIS_LEFT)
+            combo.addItem("Right y-axis", userData=AXIS_RIGHT)
+            default_axis = DEFAULT_TRACE_AXIS.get(wname, AXIS_LEFT)
+            combo.setCurrentIndex(
+                {AXIS_NA: 0, AXIS_LEFT: 1, AXIS_RIGHT: 2}[default_axis])
+            combo.setToolTip(
+                f"{wname} placement on the overlay: <b>N/A</b> hides "
+                f"it, <b>Left y-axis</b> uses the voltage scale, "
+                f"<b>Right y-axis</b> uses the second (current / "
+                f"alternate) scale. Default: "
+                f"<b>{'Right y-axis' if DEFAULT_TRACE_AXIS[wname] == AXIS_RIGHT else 'Left y-axis'}</b>.")
+            combo.currentIndexChanged.connect(
+                lambda _idx, t=wname: self._on_axis_changed(t))
+            self.axis_combos[wname] = combo
+            self.wave_row.addWidget(combo)
+        self.wave_row.addSpacing(12)
+
+        # Inset controls — same QToolButton + QMenu pattern as
+        # MultiChannelScope, so users see identical UX in both places.
+        self.inset_check = QtWidgets.QCheckBox("Inset")
+        self.inset_check.setToolTip(
+            "Show a compact inset plot below the main overlay, "
+            "mirroring the trace(s) you pick from the dropdown next "
+            "to this toggle.")
+        self.inset_check.toggled.connect(self._on_inset_toggled)
+        self.wave_row.addWidget(self.inset_check)
+        self.inset_btn = QtWidgets.QToolButton()
+        self.inset_btn.setText("(pick traces)")
+        self.inset_btn.setPopupMode(
+            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.inset_btn.setToolTip(
+            "Pick which traces appear in the inset (multi-select).")
+        self._inset_menu = QtWidgets.QMenu(self.inset_btn)
+        self.inset_actions: Dict[str, QtGui.QAction] = {}
+        for trace in WAVE_TYPES:
+            act = self._inset_menu.addAction(trace)
+            act.setCheckable(True)
+            act.triggered.connect(self._on_inset_traces_changed)
+            self.inset_actions[trace] = act
+        self.inset_btn.setMenu(self._inset_menu)
+        self.inset_btn.setEnabled(False)
+        self.wave_row.addWidget(self.inset_btn)
         self.wave_row.addStretch(1)
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -187,7 +248,51 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
         return self.enabled_keys()
 
     def enabled_waves(self) -> set:
-        return {w for w, cb in self._wave_checks.items() if cb.isChecked()}
+        """Set of trace names not set to N/A. Each trace is also
+        gated by ``_available_traces`` so disappearing roles drop
+        out cleanly."""
+        return {w for w in WAVE_TYPES
+                if self._axis_map.get(w) != self._AXIS_NA
+                and w in self._available_traces}
+
+    def axis_map(self) -> Dict[str, str]:
+        """Per-trace axis assignment — values are
+        ``"left"`` / ``"right"`` / ``"na"``."""
+        return dict(self._axis_map)
+
+    def inset_enabled(self) -> bool:
+        return bool(self.inset_check.isChecked())
+
+    def inset_traces(self) -> List[str]:
+        return [t for t, act in self.inset_actions.items() if act.isChecked()]
+
+    def set_available_traces(self, available) -> None:
+        """Limit the per-trace controls to traces actually present in
+        the loaded session. Mirrors :meth:`MultiChannelScope.set_available_traces`
+        including the ``E_ret → E_act`` auto-include rule.
+        """
+        from .multichannel_scope import TRACE_EACT, TRACE_ERET
+        if not available:
+            allowed = set(WAVE_TYPES)
+        else:
+            allowed = {str(t) for t in available if t in WAVE_TYPES}
+        if TRACE_ERET in allowed:
+            allowed.add(TRACE_EACT)
+        self._available_traces = allowed
+        for trace in WAVE_TYPES:
+            visible = trace in allowed
+            self.axis_labels[trace].setVisible(visible)
+            self.axis_combos[trace].setVisible(visible)
+        for trace, act in self.inset_actions.items():
+            act.setVisible(trace in allowed)
+            if trace not in allowed and act.isChecked():
+                act.blockSignals(True)
+                try:
+                    act.setChecked(False)
+                finally:
+                    act.blockSignals(False)
+        self._refresh_inset_button_label()
+        self._emit()
 
     # ----------------------------------------------------------- internal
     def _set_all_channels(self, on: bool) -> None:
@@ -197,8 +302,97 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
             cb.blockSignals(False)
         self._emit()
 
+    def _on_axis_changed(self, trace: str) -> None:
+        combo = self.axis_combos.get(trace)
+        if combo is None:
+            return
+        new_axis = combo.currentData() or self._AXIS_LEFT
+        if new_axis not in (self._AXIS_NA, self._AXIS_LEFT, self._AXIS_RIGHT):
+            new_axis = self._AXIS_LEFT
+        self._axis_map[trace] = new_axis
+        self._emit()
+
+    def _on_inset_toggled(self, on: bool) -> None:
+        self.inset_btn.setEnabled(bool(on))
+        self._emit()
+
+    def _on_inset_traces_changed(self, *_) -> None:
+        self._refresh_inset_button_label()
+        self._emit()
+
+    def _refresh_inset_button_label(self) -> None:
+        picked = self.inset_traces()
+        if not picked:
+            self.inset_btn.setText("(pick traces)")
+        else:
+            self.inset_btn.setText(", ".join(picked))
+
     def _emit(self, *_):
         self.selectionChanged.emit()
+
+    # --------------------------------------------------------------- prefs
+    def current_prefs(self) -> dict:
+        """Snapshot the trace-toggle state for persistence.
+
+        Mirrors :meth:`MultiChannelScope.current_prefs` so the
+        round-trip format is identical between the experiment view
+        and the Viewer — a saved Viewer prefs blob can be diffed
+        against a saved experiment-view blob without translation.
+        """
+        return {
+            "axis_map": self.axis_map(),
+            "inset_enabled": self.inset_enabled(),
+            "inset_traces": self.inset_traces(),
+        }
+
+    def restore_prefs(self, p: dict) -> None:
+        """Apply a previously-saved trace-toggle snapshot.
+
+        Defensive on every key — a missing or malformed value is
+        ignored rather than raising, so a stale prefs file never
+        blocks the launch.
+        """
+        if not isinstance(p, dict) or not p:
+            return
+        axes = p.get("axis_map")
+        if isinstance(axes, dict):
+            for trace, axis in axes.items():
+                if trace not in self.axis_combos:
+                    continue
+                if axis not in (self._AXIS_NA, self._AXIS_LEFT, self._AXIS_RIGHT):
+                    continue
+                combo = self.axis_combos[trace]
+                idx_map = {self._AXIS_NA: 0,
+                           self._AXIS_LEFT: 1,
+                           self._AXIS_RIGHT: 2}
+                combo.blockSignals(True)
+                try:
+                    combo.setCurrentIndex(idx_map[axis])
+                finally:
+                    combo.blockSignals(False)
+                self._axis_map[trace] = axis
+        if "inset_enabled" in p:
+            try:
+                self.inset_check.blockSignals(True)
+                self.inset_check.setChecked(bool(p["inset_enabled"]))
+                self.inset_btn.setEnabled(bool(p["inset_enabled"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.inset_check.blockSignals(False)
+        traces = p.get("inset_traces")
+        if isinstance(traces, (list, tuple, set)):
+            wanted = {str(t) for t in traces}
+            for trace, act in self.inset_actions.items():
+                act.blockSignals(True)
+                try:
+                    act.setChecked(trace in wanted)
+                finally:
+                    act.blockSignals(False)
+            self._refresh_inset_button_label()
+        # Single emission at the end so listeners only see one
+        # consistent state, not three intermediate ones.
+        self._emit()
 
 
 class ViewerPanel(QtWidgets.QWidget):
@@ -224,6 +418,21 @@ class ViewerPanel(QtWidgets.QWidget):
                  parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self._sessions: Dict[str, Session] = {}   # path-string -> Session
+        # Cached overlay context for the trace-toggle re-render.
+        # The original ``_overlay_captures_by_channel`` /
+        # ``_overlay_title`` were declared as CLASS attributes on
+        # :class:`ViewerWindow`; the transplant block at the
+        # bottom of this file copies METHODS (callables) onto
+        # ``ViewerPanel`` but not class-level data attributes, so
+        # the panel started life without these defaults — and the
+        # restored-prefs path (added with the persistence feature)
+        # fires ``trace_toggles.selectionChanged`` →
+        # ``_refresh_overlay`` BEFORE any overlay has been built,
+        # tripping ``AttributeError``. Seeding the attributes here
+        # gives the panel the same starting state ViewerWindow
+        # always had.
+        self._overlay_captures_by_channel: Dict[object, "Capture"] = {}
+        self._overlay_title: str = ""
 
         # ---- Central layout: tree | plot+info ------------------------
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
@@ -264,10 +473,35 @@ class ViewerPanel(QtWidgets.QWidget):
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.trace_toggles = ChannelTraceToggleBar(self)
         self.trace_toggles.selectionChanged.connect(self._refresh_overlay)
+        # Viewer-side gridlines toggle. Independent from the
+        # main window's View → Gridlines action — the Viewer
+        # uses matplotlib (different rendering pipeline from the
+        # experiment plots' pyqtgraph) and is a results-review
+        # surface where users often want a grid for read-off of
+        # specific values, while during a live experiment a grid
+        # would obscure subtle trace features. Default OFF (matches
+        # the experiment plots) so the initial view is clean.
+        self._show_grid: bool = False
+        self.grid_toggle = QtWidgets.QCheckBox("Gridlines")
+        self.grid_toggle.setChecked(self._show_grid)
+        self.grid_toggle.setToolTip(
+            "Show gridlines on the plot. Off by default; turn on "
+            "when you want to read off a specific value at the "
+            "expense of trace contrast.")
+        self.grid_toggle.toggled.connect(self._on_grid_toggled)
         plot_panel = QtWidgets.QWidget()
         pl = QtWidgets.QVBoxLayout(plot_panel)
         pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(self.toolbar)
+        # Top row: matplotlib toolbar + gridline toggle. Keeping
+        # them on one line keeps vertical real estate for the plot
+        # itself.
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+        top_row.addWidget(self.toolbar, stretch=1)
+        top_row.addWidget(self.grid_toggle, stretch=0)
+        top_row_w = QtWidgets.QWidget(); top_row_w.setLayout(top_row)
+        pl.addWidget(top_row_w)
         pl.addWidget(self.trace_toggles)
         pl.addWidget(self.canvas)
 
@@ -318,6 +552,18 @@ class ViewerPanel(QtWidgets.QWidget):
         self.open_folder_btn.clicked.connect(self.on_open_folder)
         self.tree.currentItemChanged.connect(self._on_tree_item)
 
+        # Held so :meth:`current_prefs` can serialise the splitter
+        # sizes the user dragged. Two splitters: the outer (tree | plot)
+        # and the inner (plot canvas | info-panel) on the right side.
+        self._outer_split = splitter
+        self._right_split = right_split
+
+        # Last-opened-path memory — populated by ``load_folder`` /
+        # ``load_session_file`` and read by ``current_prefs``. The
+        # restore_prefs path uses this so a re-launch comes back to
+        # whatever the user was looking at last.
+        self._last_open_path: Optional[str] = None
+
         # Initial status — emitted via the signal so the host can
         # surface it (status bar, label, log, …).
         self.status_message.emit(
@@ -330,23 +576,161 @@ class ViewerPanel(QtWidgets.QWidget):
             elif p.exists():
                 self.load_session_file(p)
 
+    # -----------------------------------------------------------------
+    def _on_grid_toggled(self, checked: bool) -> None:
+        """Gridline checkbox flipped — store the new state and
+        re-render whatever the current view is. The next plot
+        call picks up the new ``self._show_grid`` value via the
+        ``show_grid`` kwarg threaded through :func:`plot_capture`,
+        :func:`plot_overlay`, :func:`plot_qinj_vs_amplitude`, and
+        :func:`plot_vd_vs_qinj`.
+
+        Audit findings #14 + #15:
+
+        * **#14** — the previous fallback path emitted
+          ``self.tree.itemClicked`` but the tree only wires
+          ``currentItemChanged`` (see line 553). Toggling
+          gridlines while viewing a single capture or a Q_inj /
+          V_d analysis surface produced zero re-render. Fixed by
+          calling :meth:`_on_tree_item` directly so the same
+          render path the user originally took fires again.
+        * **#15** — the Channel Map tab is its own matplotlib
+          rendering surface (:class:`ChannelMapPanel`). It used to
+          hardcode ``ax.grid(True, ...)``. Now its ``_refresh``
+          consults ``parent._show_grid`` so flipping this toggle
+          updates the Plot tab AND the Channel Map tab in
+          lockstep.
+        """
+        self._show_grid = bool(checked)
+        # Refresh the Channel Map tab whenever the toggle flips —
+        # it might not be the currently-shown tab, but the user
+        # could switch to it next, and the rebuild is cheap.
+        if hasattr(self, "map_panel") and self.map_panel is not None:
+            try:
+                self.map_panel._refresh()
+            except Exception:
+                pass
+        # Re-render whichever view is currently shown on the
+        # Plot tab.
+        if self._overlay_captures_by_channel:
+            # An overlay is up — refresh it in place.
+            try:
+                self._refresh_overlay()
+                return
+            except Exception:
+                pass
+        # Otherwise the user is on a single capture / Q_inj /
+        # V_d view. ``_on_tree_item`` is the same handler the
+        # tree's currentItemChanged signal fires; re-invoke it
+        # with the active item to re-run the appropriate
+        # ``_show_*`` method and pick up the new ``_show_grid``.
+        selected = (self.tree.currentItem()
+                    if hasattr(self, "tree") else None)
+        if selected is not None:
+            try:
+                self._on_tree_item(selected, None)
+            except Exception:
+                pass
+
 
 class ViewerWindow(QtWidgets.QMainWindow):
     """Standalone viewer window. Wraps :class:`ViewerPanel` with menus
     and a status bar so ``run_viewer.py`` (and the bundled
     ``StimulationTestingViewer.exe``) stay one-window apps.
+
+    Persists window geometry + the embedded panel's prefs to the same
+    ``gui_prefs.json`` the main GUI uses (under the ``results`` key)
+    so launching the standalone viewer twice — or launching it
+    alongside the main GUI — gives the user a consistent context.
     """
+
+    # Section name inside ``gui_prefs.json`` that the standalone
+    # viewer reads + writes on its own. Matches the main window's
+    # ``PREF_KEY_RESULTS`` so both apps round-trip through the same
+    # blob of state without a translation layer.
+    _PREFS_KEY = "results"
 
     def __init__(self, initial_path: Optional[Path] = None,
                  parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("StimulationTesting Viewer")
+        self.setWindowTitle("POLARIS")
         self.resize(1400, 900)
         self._panel = ViewerPanel(initial_path=initial_path, parent=self)
         self.setCentralWidget(self._panel)
         # Forward panel status messages to the QStatusBar.
         self._panel.status_message.connect(self.statusBar().showMessage)
         self._build_menus()
+        # Restore geometry + panel state from the shared prefs file.
+        # Only run when the caller didn't force an ``initial_path`` —
+        # that argument signals "open this file specifically", which
+        # would override whatever was last open.
+        self._restore_window_prefs(skip_last_open=initial_path is not None)
+
+    # -----------------------------------------------------------------
+    # Persistence — round-trips the standalone window's geometry
+    # alongside the embedded panel's own state.
+    # -----------------------------------------------------------------
+    def _restore_window_prefs(self, *, skip_last_open: bool = False) -> None:
+        """Load the ``results`` section from ``gui_prefs.json`` and
+        apply it to both the window and the embedded panel.
+
+        Failures are silent — a stale or unreadable prefs file just
+        means the user gets a default-sized window.
+        """
+        try:
+            from .prefs import load_prefs
+            prefs = load_prefs() or {}
+        except Exception:
+            return
+        section = prefs.get(self._PREFS_KEY) or {}
+        if not isinstance(section, dict):
+            return
+        geom_b64 = section.get("window_geometry_b64")
+        if isinstance(geom_b64, str) and geom_b64:
+            try:
+                ba = QtCore.QByteArray.fromBase64(geom_b64.encode("ascii"))
+                self.restoreGeometry(ba)
+            except Exception:
+                pass
+        viewer_section = section.get("viewer")
+        if isinstance(viewer_section, dict):
+            try:
+                # When loading via CLI/argv we already have a tree
+                # populated — don't let the saved last_open clobber
+                # the user's explicit pick.
+                if skip_last_open:
+                    viewer_section = {k: v for k, v in viewer_section.items()
+                                      if k != "last_open"}
+                self._panel.restore_prefs(viewer_section)
+            except Exception:
+                pass
+
+    def _save_window_prefs(self) -> None:
+        """Write the standalone window's geometry + the panel's prefs
+        back to ``gui_prefs.json`` under the ``results`` section.
+
+        Read-modify-write so we don't clobber prefs that belong to
+        the main GUI (Setup tab, experiment tabs, …) — the standalone
+        Viewer only owns one section.
+        """
+        try:
+            from .prefs import load_prefs, save_prefs
+            prefs = load_prefs() or {}
+            section = {"viewer": self._panel.current_prefs()}
+            try:
+                section["window_geometry_b64"] = bytes(
+                    self.saveGeometry().toBase64()).decode("ascii")
+            except Exception:
+                pass
+            prefs[self._PREFS_KEY] = section
+            save_prefs(prefs)
+        except Exception:
+            # Persistence is a nicety — never block close on it.
+            pass
+
+    def closeEvent(self, ev):
+        self._save_window_prefs()
+        super().closeEvent(ev)
 
     # Forward attribute access so existing call sites that do
     # ``window.tree`` / ``window.figure`` / etc. keep working.
@@ -402,13 +786,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def load_folder(self, folder: Path) -> None:
         """Index every ``.npz`` file in ``folder`` (one tree branch each)."""
+        # Stash the resolved folder path for ``current_prefs`` so a
+        # re-launch can restore the same context. Stored even when
+        # the folder turns out to be empty — opening it once still
+        # signals user intent.
+        try:
+            self._last_open_path = str(Path(folder).resolve())
+        except Exception:
+            pass
         self.tree.clear()
         self._sessions.clear()
         npzs = sorted(folder.glob("*.npz"))
         if not npzs:
-            QtWidgets.QMessageBox.information(
-                self, "No sessions",
-                f"No .npz files found in {folder}")
+            # Empty folder: report via the status bar instead of a
+            # modal popup. ``ResultsTab.refresh`` calls ``load_folder``
+            # whenever the save directory is repointed (or just
+            # selected, on a fresh install with no saved sessions),
+            # and a blocking dialog there made the GUI feel broken.
+            self.status_message.emit(f"No .npz sessions in {folder}")
             return
         root = QtWidgets.QTreeWidgetItem(self.tree, [folder.name, ""])
         root.setData(0, ROLE_KIND, KIND_FOLDER)
@@ -423,6 +818,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self, "Unsupported", "Viewer expects a .npz session file.")
             return
+        try:
+            self._last_open_path = str(Path(path).resolve())
+        except Exception:
+            pass
         self._add_session_to_tree(path, parent=self.tree.invisibleRootItem(),
                                   expand=True, eager=True)
         self.status_message.emit(f"Loaded {path.name}")
@@ -521,7 +920,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         run = session.runs[run_idx]
         cap = run.captures[cap_idx]
-        plot_capture(cap, run, session, fig=self.figure)
+        plot_capture(cap, run, session, fig=self.figure,
+                     show_grid=self._show_grid)
         self.canvas.draw_idle()
         self._set_metric_table(_capture_metric_rows(cap, run))
         self._set_param_table(_session_param_rows(session, run, cap))
@@ -541,11 +941,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         run = session.runs[run_idx]
         self._set_overlay_for_run(run, session)
+        # Audit #25 — guard against NaN ``max_q_inj`` (all-aborted runs)
+        # and non-finite ``surface_area_um2`` (legacy archives missing
+        # the field).
         self._set_metric_table([
             ("Channel", run.configuration.display_name()),
-            ("Surface area", f"{run.surface_area_um2:.0f} µm²"),
+            ("Surface area", _fmt_or_dash(
+                run.surface_area_um2, ".0f", "µm²")),
             ("Captures", str(len(run.captures))),
-            ("Max Q_inj", f"{run.max_q_inj:.3f} mC/cm²"),
+            ("Max Q_inj", _fmt_or_dash(
+                run.max_q_inj, ".3f", "mC/cm²")),
         ])
         self._set_param_table(_session_param_rows(session, run, None))
 
@@ -629,7 +1034,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def _refresh_overlay(self) -> None:
-        """Re-render the overlay plot using the current toggle state."""
+        """Re-render the overlay plot using the current toggle state.
+
+        Passes the per-trace axis map AND the inset state through to
+        :func:`plot_overlay` so the Viewer respects the user's
+        N/A / Left / Right pick per trace, plus the optional inset
+        with its multi-select trace subset.
+        """
         if not self._overlay_captures_by_channel:
             return
         try:
@@ -638,6 +1049,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 fig=self.figure,
                 channels_enabled=self.trace_toggles.enabled_keys(),
                 waves_enabled=self.trace_toggles.enabled_waves(),
+                axis_map=self.trace_toggles.axis_map(),
+                inset_enabled=self.trace_toggles.inset_enabled(),
+                inset_traces=set(self.trace_toggles.inset_traces()),
+                show_grid=self._show_grid,
                 title=self._overlay_title or "Channel waveform overlay",
             )
         except Exception as e:
@@ -770,7 +1185,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         s = self._current_session()
         if s is None:
             return
-        plot_qinj_vs_amplitude(s, fig=self.figure)
+        plot_qinj_vs_amplitude(s, fig=self.figure,
+                               show_grid=self._show_grid)
         self.canvas.draw_idle()
 
     @QtCore.pyqtSlot()
@@ -778,8 +1194,98 @@ class ViewerWindow(QtWidgets.QMainWindow):
         s = self._current_session()
         if s is None:
             return
-        plot_vd_vs_qinj(s, fig=self.figure)
+        plot_vd_vs_qinj(s, fig=self.figure,
+                        show_grid=self._show_grid)
         self.canvas.draw_idle()
+
+    # -----------------------------------------------------------------
+    # Persistence
+    # -----------------------------------------------------------------
+    def current_prefs(self) -> dict:
+        """Snapshot every Viewer setting worth remembering across runs.
+
+        Mirrors :meth:`MultiChannelScope.current_prefs` for the trace
+        bar so the two are diff-friendly, and adds Viewer-specific
+        view state (last-opened path + splitter sizes).
+        """
+        out: dict = {
+            "trace_toggles": self.trace_toggles.current_prefs(),
+        }
+        if getattr(self, "_last_open_path", None):
+            out["last_open"] = self._last_open_path
+        try:
+            out["outer_split_sizes"] = list(self._outer_split.sizes())
+        except Exception:
+            pass
+        try:
+            out["right_split_sizes"] = list(self._right_split.sizes())
+        except Exception:
+            pass
+        # Channel-map metric — small, persists which overlay the user
+        # was last viewing. ``map_panel`` is a ChannelMapPanel.
+        try:
+            out["map_metric_index"] = int(self.map_panel.metric_combo.currentIndex())
+            out["map_show_values"] = bool(self.map_panel.show_values_check.isChecked())
+        except Exception:
+            pass
+        return out
+
+    def restore_prefs(self, p: dict) -> None:
+        """Apply a previously-saved Viewer snapshot.
+
+        Defensive: every key is type-checked, and the last-opened
+        path is verified to still exist before re-loading. Failures
+        log via the status_message signal but never raise — a stale
+        prefs file shouldn't block the next launch.
+        """
+        if not isinstance(p, dict) or not p:
+            return
+        # Trace toggles first so a re-render after load lands with
+        # the user's preferred axis assignment.
+        toggles = p.get("trace_toggles")
+        if isinstance(toggles, dict):
+            self.trace_toggles.restore_prefs(toggles)
+        # Splitter sizes — guard against zero-collapse so a stored
+        # "everything in the left pane" state can't render the plot
+        # canvas invisible on next launch.
+        outer = p.get("outer_split_sizes")
+        if isinstance(outer, (list, tuple)) and len(outer) == 2:
+            try:
+                ints = [int(s) for s in outer]
+                if all(s > 0 for s in ints):
+                    self._outer_split.setSizes(ints)
+            except (TypeError, ValueError):
+                pass
+        right = p.get("right_split_sizes")
+        if isinstance(right, (list, tuple)) and len(right) == 2:
+            try:
+                ints = [int(s) for s in right]
+                if all(s > 0 for s in ints):
+                    self._right_split.setSizes(ints)
+            except (TypeError, ValueError):
+                pass
+        # Channel-map controls.
+        idx = p.get("map_metric_index")
+        if isinstance(idx, int) and 0 <= idx < self.map_panel.metric_combo.count():
+            self.map_panel.metric_combo.setCurrentIndex(idx)
+        if "map_show_values" in p:
+            try:
+                self.map_panel.show_values_check.setChecked(bool(p["map_show_values"]))
+            except (TypeError, ValueError):
+                pass
+        # Last-opened path goes last so its load_folder / load_session_file
+        # call sees the restored toggles & splitter geometry already in place.
+        last = p.get("last_open")
+        if isinstance(last, str) and last:
+            lp = Path(last)
+            try:
+                if lp.is_dir():
+                    self.load_folder(lp)
+                elif lp.is_file() and lp.suffix.lower() == ".npz":
+                    self.load_session_file(lp)
+            except Exception as e:
+                self.status_message.emit(
+                    f"Could not re-open last session: {e}")
 
 
 # Transplant the slot methods physically defined under ``ViewerWindow``
@@ -808,7 +1314,11 @@ for _name in ("on_open_file", "on_open_folder",
               # class block.
               "_representative_capture",
               "_set_overlay_for_session", "_set_overlay_for_run",
-              "_refresh_overlay"):
+              "_refresh_overlay",
+              # Persistence — added so the embedded Results-tab
+              # variant and the standalone ViewerWindow share one
+              # snapshot/restore implementation.
+              "current_prefs", "restore_prefs"):
     setattr(ViewerPanel, _name, getattr(ViewerWindow, _name))
 del _name
 
@@ -816,30 +1326,185 @@ del _name
 # ---------------------------------------------------------------------------
 # Side-panel info builders
 # ---------------------------------------------------------------------------
+def _fmt_or_dash(value: float, spec: str, unit: str = "") -> str:
+    """Format ``value`` with ``spec`` or return ``"—"`` for NaN /
+    non-finite. Audit finding #25 — every Viewer metric cell that
+    previously read ``f"{x:.3f} nC"`` produced ``"nan nC"`` for
+    aborted / pre-acquisition captures. Routing through this
+    helper turns those cells into a clean em-dash that reads as
+    "no data" to a human and doesn't trip a paper-figure
+    auto-extraction script reading the table back.
+
+    ``unit`` is appended with a leading space (if any) only on the
+    formatted branch, so the dash stays on its own.
+    """
+    import math
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
+        return "—"
+    suffix = f" {unit}" if unit else ""
+    return format(v, spec) + suffix
+
+
 def _capture_metric_rows(cap: Capture, run: ChannelRun) -> List[tuple]:
     m = cap.metrics
+    L = rich.plain_label
     rows = [
         ("Capture #", cap.index),
         ("Status", _status_text(cap)),
-        ("Amplitude", f"{cap.pattern.excitation_phase.amplitude_ua:+.2f} µA"),
-        ("Q_ph", f"{m.charge_per_phase_nc:.3f} nC"),
-        ("Q_inj", f"{m.charge_injection_mc_per_cm2:.3f} mC/cm²"),
-        ("V_d", f"{m.driving_voltage_v:.3f} V"),
-        ("C_eff", f"{m.effective_capacitance_nf:.3f} nF"),
-        ("C_d", f"{m.driving_capacitance_mf_per_cm2:.3f} mF/cm²"),
+        ("Amplitude", _fmt_or_dash(
+            cap.pattern.excitation_phase.amplitude_ua, "+.2f", "µA")),
+        (L('Q','ph'),  _fmt_or_dash(m.charge_per_phase_nc, ".3f", "nC")),
+        (L('Q','inj'), _fmt_or_dash(m.charge_injection_mc_per_cm2,
+                                    ".3f", "mC/cm²")),
+        (L('E','ip'),  _fmt_or_dash(m.interpulse_potential_v, ".3f", "V")),
+        (L('C','eff'), _fmt_or_dash(m.effective_capacitance_nf,
+                                    ".3f", "nF")),
+        (L('C','d'),   _fmt_or_dash(m.driving_capacitance_mf_per_cm2,
+                                    ".3f", "mF/cm²")),
     ]
+    if m.active_driving_voltage_per_phase_v:
+        rows.append((f"{L('V','d')} active per phase",
+                     ", ".join(f"{v:.3f}" for v in m.active_driving_voltage_per_phase_v)))
+    if m.return_driving_voltage_per_phase_v:
+        rows.append((f"{L('V','d')} return per phase",
+                     ", ".join(f"{v:.3f}" for v in m.return_driving_voltage_per_phase_v)))
     if m.access_voltage_per_phase_v:
-        rows.append(("V_a per phase",
+        rows.append((f"{L('V','a')} active",
                      ", ".join(f"{v:.3f}" for v in m.access_voltage_per_phase_v)))
     if m.access_resistance_per_phase_kohm:
-        rows.append(("R_a per phase (kΩ)",
+        rows.append((f"{L('R','a')} active (kΩ)",
                      ", ".join(f"{r:.2f}" for r in m.access_resistance_per_phase_kohm)))
+    if m.return_access_voltage_per_phase_v:
+        rows.append((f"{L('V','a')} return",
+                     ", ".join(f"{v:.3f}" for v in m.return_access_voltage_per_phase_v)))
+    if m.return_access_resistance_per_phase_kohm:
+        rows.append((f"{L('R','a')} return (kΩ)",
+                     ", ".join(f"{r:.2f}" for r in m.return_access_resistance_per_phase_kohm)))
     if m.polarization_per_phase_v:
-        rows.append(("E_pol active",
+        rows.append((f"{L('E','pol')} active",
                      ", ".join(f"{e:.3f}" for e in m.polarization_per_phase_v)))
     if m.return_polarization_per_phase_v:
-        rows.append(("E_pol return",
+        rows.append((f"{L('E','pol')} return",
                      ", ".join(f"{e:.3f}" for e in m.return_polarization_per_phase_v)))
+    # Tissue-damage screening (Shannon + modified Shannon). Only
+    # surface when the metrics layer actually computed something —
+    # an empty / pre-acquisition capture leaves
+    # ``shannon_k_value`` as NaN and the classification as
+    # ``"insufficient_data"``, in which case rendering the rows
+    # would just clutter the panel with N/A entries. See
+    # :mod:`stimtest.damage_models` for the full reference list and
+    # the rationale for surfacing this as guidance rather than a
+    # hard interlock.
+    import math
+    if math.isfinite(getattr(m, "shannon_k_value", float("nan"))):
+        try:
+            from ..damage_models import (
+                CLASSIFICATION_LABELS, NEUROSTIMML_WEB_URL,
+                DAMAGE_LEVEL_LABELS,
+            )
+        except Exception:
+            CLASSIFICATION_LABELS = {}
+            NEUROSTIMML_WEB_URL = ""
+            DAMAGE_LEVEL_LABELS = {}
+        # Shannon k-value gets its own row so a numeric reader can
+        # see exactly where they sit relative to the 1.85 boundary.
+        # Trailing arrow indicates the direction of safety (lower
+        # is safer per the Shannon model).
+        rows.append((
+            f"{L('Shannon','k')}",
+            f"{m.shannon_k_value:.3f}"))
+        # Damage classification — single most-conservative verdict.
+        # Plain-text label here; the live GUI render lives in
+        # :class:`ChannelMapPanel` / future status badges where the
+        # colour matters more.
+        cls_label = CLASSIFICATION_LABELS.get(
+            m.damage_classification, m.damage_classification)
+        # Annotate with the band so the user understands why a
+        # macro-cap or micro-cap criterion did or didn't apply.
+        band_tag = ""
+        band = getattr(m, "damage_band", "")
+        if band == "macro":
+            band_tag = " (macro band)"
+        elif band == "micro":
+            band_tag = " (micro band)"
+        elif band == "meso":
+            band_tag = " (meso band)"
+        rows.append(("Damage screen", f"{cls_label}{band_tag}"))
+        # 0–4 damage level mapped from the binary verdict, when
+        # available. Stored as -1 to mean "no verdict"; we render
+        # an em-dash in that case so the column doesn't read as a
+        # default-zero "no damage" claim.
+        level = getattr(m, "damage_level", -1)
+        if isinstance(level, int) and level >= 0:
+            level_label = DAMAGE_LEVEL_LABELS.get(level, f"Level {level}")
+            rows.append(("Damage level (0–4)", f"{level} — {level_label}"))
+        # Per-criterion bools — only surface when at least one is
+        # True so the row count stays low for safe captures.
+        crit = getattr(m, "damage_criteria", {}) or {}
+        flags = [k for k, v in crit.items() if v]
+        if flags:
+            pretty = {
+                "shannon": "Shannon k≥threshold",
+                "macro_cap": "Macro charge density cap",
+                "micro_cap": "Micro charge/phase cap",
+            }
+            rows.append((
+                "Damage criteria fired",
+                ", ".join(pretty.get(f, f) for f in flags)))
+        # NeurostimML local-inference verdict (Li et al. 2024 RF-
+        # Partial-19). Rendered alongside Shannon so a reader can
+        # cross-compare the two classifiers. ``model_not_installed``
+        # is rendered explicitly so the user knows the higher-
+        # accuracy screen is available behind a one-time install
+        # via Help → Install NeurostimML model….
+        ml_class = getattr(m, "neurostimml_classification",
+                            "model_not_installed")
+        ml_prob = getattr(m, "neurostimml_probability", float("nan"))
+        if ml_class == "model_not_installed":
+            rows.append((
+                "NeurostimML",
+                "model not installed — see Help → Install NeurostimML model…"))
+        else:
+            ml_pretty = {
+                "likely_safe":     "Likely safe",
+                "likely_damaging": "Likely damaging",
+            }.get(ml_class, ml_class)
+            if math.isfinite(ml_prob):
+                rows.append((
+                    "NeurostimML",
+                    f"{ml_pretty} (P = {ml_prob:.2f})"))
+            else:
+                rows.append(("NeurostimML", ml_pretty))
+            # Optional extrapolation hint — recompute the feature
+            # vector and check it against the per-feature training
+            # ranges from Li et al. 2024 Table 2. We only render
+            # the hint when a meaningful flag is present so safe
+            # captures don't get a noisy "extrapolating: none" row.
+            try:
+                from ..neurostimml import (
+                    build_feature_vector,
+                    features_outside_training_range,
+                )
+                fv = build_feature_vector(
+                    pattern=cap.pattern,
+                    charge_per_phase_nc=m.charge_per_phase_nc,
+                    charge_injection_mc_per_cm2=m.charge_injection_mc_per_cm2,
+                    surface_area_um2=run.surface_area_um2,
+                )
+                if fv is not None:
+                    flagged = features_outside_training_range(fv)
+                    if flagged:
+                        rows.append((
+                            "NeurostimML extrapolation",
+                            ", ".join(flagged)))
+            except Exception:
+                # Extrapolation hint is a nicety; never let it
+                # break the metric-table rendering.
+                pass
     return rows
 
 
@@ -978,10 +1643,20 @@ class ChannelMapPanel(QtWidgets.QWidget):
         for label, _unit, _fn in _METRIC_OVERLAYS:
             self.metric_combo.addItem(label)
         self.metric_combo.currentIndexChanged.connect(self._refresh)
+        self.metric_combo.setToolTip(
+            "Which per-channel scalar to overlay on the channel "
+            "map. \"None\" shows the geometry alone (one disk per "
+            "electrode at its grid position, no colouring); the "
+            "other entries colour each disk by that metric "
+            "aggregated across the channel's run.")
         ctrl.addWidget(self.metric_combo)
         self.show_values_check = QtWidgets.QCheckBox("Show values")
         self.show_values_check.setChecked(True)
         self.show_values_check.toggled.connect(self._refresh)
+        self.show_values_check.setToolTip(
+            "Print the metric value (with unit) inside each "
+            "channel disk. Off = colour-only — useful for "
+            "denser arrays where the numeric labels overlap.")
         ctrl.addWidget(self.show_values_check)
         ctrl.addStretch(1)
 
@@ -1054,7 +1729,20 @@ class ChannelMapPanel(QtWidgets.QWidget):
         ax.set_aspect("equal")
         ax.set_xticks(range(cols))
         ax.set_yticks(range(rows))
-        ax.grid(True, linestyle=":", color="#cccccc", linewidth=0.5)
+        # Audit #15: honour the parent viewer's ``_show_grid`` toggle
+        # rather than hardcoding the gridlines on. The channel-map
+        # grid is mostly structural (one cell per electrode pitch),
+        # but on dense arrays it overlaps the disk labels and the
+        # user may want it off; flipping the View menu's "Gridlines"
+        # checkbox now controls all four plot surfaces in lockstep.
+        # Fall back to ``True`` when we can't reach the toggle (e.g.
+        # the panel was constructed without a viewer parent in a
+        # test harness).
+        show_grid = True
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_show_grid"):
+            show_grid = bool(parent._show_grid)
+        ax.grid(show_grid, linestyle=":", color="#cccccc", linewidth=0.5)
         ax.set_xlabel("column")
         ax.set_ylabel("row")
         title = (f"{array.name} — {label}" if reducer is not None

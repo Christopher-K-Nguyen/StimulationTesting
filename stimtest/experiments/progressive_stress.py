@@ -163,6 +163,33 @@ class ProgressiveStressExperiment(ExperimentRunner):
                             time.sleep(0.05); continue
                         cap = _make_capture(idx, pattern, acq, self.scope, self.stim)
                         compute_metrics(cap, surface_area)
+                        # Feed E_ret pre/post-pulse rest values into
+                        # the electrode-potential learning bin. No-ops
+                        # when E_ret wasn't recorded, when the session
+                        # lacks a setup snapshot, or for non-Ag|AgCl
+                        # references — see record_capture's docstring.
+                        try:
+                            from ..electrode_potential_history import record_capture
+                            record_capture(cap, self.session)
+                        except Exception:
+                            pass
+                        # Per-capture damage warning, posture-aware.
+                        try:
+                            from ..damage_warnings import assess_finished_capture
+                            snap = (self.session.test.extras or {}).get(
+                                "setup_snapshot") or {}
+                            env_short = (snap.get("environment_short")
+                                         if isinstance(snap, dict) else None
+                                         ) or "pbs"
+                            warn = assess_finished_capture(
+                                cap, environment_short=env_short)
+                            if warn is not None:
+                                self._emit(ExperimentEvent(
+                                    kind="log", session=self.session,
+                                    capture=cap,
+                                    message=f"{warn.title}\n{warn.body}"))
+                        except Exception:
+                            pass
                         cap.status.notes = f"step={amp:.0f}uA"
                         # Hardware-level stop condition: V_mon rail
                         cap.status.voltage_compliance = bool(

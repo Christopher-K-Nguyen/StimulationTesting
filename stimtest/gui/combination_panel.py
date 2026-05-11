@@ -3,13 +3,17 @@
 Inputs:
 * actives                 — channel numbers selected in the grid
 * global return           — bool, True when the off-array counter electrode
-                            is in the circuit (toggled via the Global Return
+                            is in the circuit (toggled via the External Return
                             square next to the channel grid). Required for
                             Monopolar and any "Partial …" kind.
-* spacing                 — set of integer cell offsets the user toggled
-                            (+1 / +2 / +3); each offset means "Nth-nearest
-                            neighbour of the active in row/col distance".
-                            Only meaningful for multipolar kinds.
+* spacing                 — single integer picked from the always-live
+                            **Spacing** dropdown: the number of electrodes
+                            that lie *between* the active and the return
+                            (0 = adjacent / immediate neighbour). Only
+                            meaningful for multipolar kinds.
+* include diagonal        — bool, when on diagonals at the same step
+                            (Euclidean ``(spacing + 1) · √2``) qualify
+                            as candidates alongside orthogonal cells.
 * configuration kind      — Monopolar / Bipolar / Tripolar / Partial Bipolar
                             / Partial Tripolar / Partial Quadrupolar.
 
@@ -20,8 +24,9 @@ ones, in the order the experiment runner should iterate them.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -48,16 +53,20 @@ KIND_NEAR_RETS = {
     KIND_BP: 1, KIND_PBP: 1,
     KIND_TP: 2, KIND_PTP: 2,
 }
-# Modes that require the off-array counter electrode (Global Return) to
+# Modes that require the off-array counter electrode (External Return) to
 # be toggled on. Plain bipolar/tripolar use only on-array returns;
 # Common Ground is on-array (all other channels) and works either way.
 KIND_NEEDS_GLOBAL = {KIND_MONO, KIND_PBP, KIND_PTP, KIND_PCG}
 
-# Mode dropdown contents per Global-Return state. Common Ground is in
-# both because it doesn't depend on the off-array counter — the user's
-# rule was "always show common ground". Partial Common Ground adds the
-# off-array counter on top of CG's all-other-channels return set.
-KINDS_GLOBAL_ON  = [KIND_MONO, KIND_PBP, KIND_PTP, KIND_PCG, KIND_CG]
+# Mode dropdown contents per External-Return state. Common Ground is
+# offered ONLY when the external return is OFF — its return path is
+# every other on-array channel; mixing that with an external return
+# is conceptually muddled (which one is the actual return?). The user
+# spec is "exclude Common Ground when the external return is selected".
+# Partial Common Ground stays in the External-on list because it
+# explicitly combines the all-other-channels return with the external
+# counter (that's its whole point).
+KINDS_GLOBAL_ON  = [KIND_MONO, KIND_PBP, KIND_PTP, KIND_PCG]
 KINDS_GLOBAL_OFF = [KIND_BP, KIND_TP, KIND_CG]
 
 
@@ -71,16 +80,33 @@ class _Combo:
 class CombinationPanel(QtWidgets.QGroupBox):
     combinationsChanged = QtCore.pyqtSignal(list)   # List[Configuration] (enabled only)
     # Emitted when the user hovers over a combo row in the list. Carries
-    # the (active, returns) of that combo so the channel grid can paint
-    # highlight rings. ``active = -1`` means "clear highlight" (mouse
-    # left the list / the empty list).
-    combinationHovered = QtCore.pyqtSignal(int, list)
+    # ``(active, returns, spacing_label)`` so the channel grid can
+    # paint highlight rings AND a double-headed spacing arrow stretched
+    # between the active and each return, with ``spacing_label``
+    # rendered in the middle of the line. The label is the integer
+    # gap value the user picked in the always-live **Spacing** dropdown
+    # (e.g. ``"0"`` for adjacent / immediate neighbours), and an empty
+    # string for kinds with no spacing concept (Monopolar / CG / PCG).
+    # ``active = -1`` means "clear highlight" (mouse left the list /
+    # the empty list); pass an empty list / empty string in that case.
+    combinationHovered = QtCore.pyqtSignal(int, list, str)
 
     # Spacing values shown in the dropdown — number of electrodes that
-    # lie *between* the active and the return. 0 = adjacent (no gap),
-    # 1 = one electrode between, 2 = two between, etc. Internally this
-    # is converted to a Chebyshev grid distance of ``spacing + 1`` for
-    # the candidate-filter pipeline.
+    # lie *between* the active and the return. 0 = adjacent (immediate
+    # neighbour), 1 = one electrode between, 2 = two between. The
+    # dropdown is always live; there is no separate enable toggle.
+    # Internally the chosen value becomes a Euclidean grid distance of
+    # ``spacing + 1`` for orthogonal returns; with "Include diagonal"
+    # on, diagonal returns at the same integer step (Euclidean
+    # ``(spacing + 1) * √2``) also qualify, per the MATLAB
+    # ``getNeighbor.m`` convention.
+    #
+    # The trailing ``"All"`` entry (userData ``None``) disables the
+    # distance filter entirely — every non-active on-array channel
+    # becomes a candidate return, equivalent to the MATLAB
+    # ``getNeighbor.m`` 'all' tag. Useful for sweeps where the user
+    # wants every possible (active, return) pair without a
+    # spacing-shape constraint.
     SPACINGS = (0, 1, 2)
 
     def __init__(self, single_mode: bool = False, parent=None):
@@ -96,7 +122,7 @@ class CombinationPanel(QtWidgets.QGroupBox):
         self._single_mode = self._static_single_mode
         self._array: ElectrodeArray | None = None
         self._actives: List[int] = []
-        # The Channel Selector defaults Global Return to *on*, so init
+        # The Channel Selector defaults External Return to *on*, so init
         # this side as on too — that way the first dropdown populate
         # uses the ON list (which starts with Monopolar) instead of the
         # OFF list and being twin-swapped to PBP later.
@@ -112,50 +138,77 @@ class CombinationPanel(QtWidgets.QGroupBox):
         # spacing widgets exist (the on-kind-changed callback needs them).
         self.kind_combo = QtWidgets.QComboBox()
         self.kind_combo.currentTextChanged.connect(self._on_kind_changed)
+        self.kind_combo.setToolTip(
+            "Electrode configuration kind.<br><br>"
+            "<b>Monopolar</b> — single active channel, current "
+            "returns through the system ground.<br>"
+            "<b>Bipolar</b> — active + one return electrode "
+            "(pairs).<br>"
+            "<b>Tripolar</b> — active + two returns (the second-"
+            "return pair flanks the active when 'Flanking only' "
+            "is on).<br>"
+            "<b>Partial Tripolar</b> — fractional current "
+            "splitting between two returns.<br>"
+            "<b>Common Ground</b> — every other channel ties to "
+            "ground; the active drives against all of them.")
 
-        # Spacing — single value chosen from a dropdown, gated by an
-        # "Apply spacing" toggle. Off = no spacing filter (all
-        # non-active channels are eligible, modulo the neighbours-only
-        # filters); on = use the dropdown value as the Chebyshev
-        # distance from the active.
-        self.apply_spacing_check = QtWidgets.QCheckBox("Apply spacing")
-        # Default off — most users don't want a spacing constraint until
-        # they explicitly opt in.
-        self.apply_spacing_check.setChecked(False)
-        self.apply_spacing_check.toggled.connect(self._on_apply_spacing_toggled)
+        # Spacing — always-live dropdown (no enable toggle). 0 means
+        # adjacent (immediate neighbours, Euclidean distance 1); 1 means
+        # one electrode between (distance 2); etc. With "Include
+        # diagonal" on, diagonal returns at the same integer step
+        # (Euclidean (spacing + 1) · √2) also qualify, per the MATLAB
+        # ``getNeighbor.m`` convention.
         self.spacing_combo = QtWidgets.QComboBox()
         for s in self.SPACINGS:
             label = f"{s} (adjacent)" if s == 0 else str(s)
             self.spacing_combo.addItem(label, userData=s)
+        # "All" sentinel — userData None disables the distance filter
+        # so every non-active channel is a candidate. Pairs with the
+        # MATLAB 'all' tag in getNeighbor.m. Listed last so the
+        # numeric spacings are the primary visual entries.
+        self.spacing_combo.addItem("All (every channel)", userData=None)
         self.spacing_combo.setCurrentIndex(0)
         self.spacing_combo.setToolTip(
             "Number of electrodes that lie between the active and the "
-            "return electrode. 0 = adjacent.")
+            "return electrode. 0 = adjacent (immediate neighbours). "
+            "“All” disables the distance filter — every non-active "
+            "channel is a candidate return.")
         self.spacing_combo.currentTextChanged.connect(self._rebuild)
 
         # ----- candidate-filter checkboxes -----
-        # "Neighbors only" restricts return candidates to topological
-        # neighbours of the active electrode (orthogonal + optionally
-        # diagonal). When off, the spacing distance alone gates which
-        # channels are eligible.
-        self.neighbors_only = QtWidgets.QCheckBox("Neighbors only")
-        self.neighbors_only.setChecked(True)
-        self.neighbors_only.toggled.connect(self._on_neighbors_only_toggled)
-        # Active when "Neighbors only" is on — controls whether diagonal
-        # neighbours (Chebyshev distance 1, but Manhattan 2) count as
-        # neighbours. Off = orthogonal-only (4-connected).
+        # "Include diagonal" — when on, diagonal cells at the picked
+        # spacing N (Euclidean distance N·√2) qualify alongside
+        # orthogonal cells (distance N). Off = orthogonal-only.
+        # Hidden on linear arrays (no second dimension) and on
+        # hexagonal layouts (every immediate neighbour is equidistant
+        # so the distinction is meaningless).
         self.include_diagonal = QtWidgets.QCheckBox("Include diagonal")
         self.include_diagonal.setChecked(True)
+        self.include_diagonal.setToolTip(
+            "Treat diagonal returns as one step away. With this on, "
+            "spacing N matches both orthogonal cells (distance N) and "
+            "diagonal cells (distance N·√2).")
         self.include_diagonal.toggled.connect(self._rebuild)
         # Tripolar / Partial Tripolar only — both returns must flank the
         # active electrode (active is the midpoint of the return pair).
         self.flanking_only = QtWidgets.QCheckBox("Flanking only")
         self.flanking_only.setChecked(True)
         self.flanking_only.toggled.connect(self._rebuild)
+        self.flanking_only.setToolTip(
+            "Tripolar / Partial-Tripolar only. When on, the two "
+            "returns must flank the active (active is the midpoint "
+            "of the return pair). When off, any pair of returns at "
+            "the configured spacing qualifies — useful for asymmetric "
+            "configurations where one return is closer than the other.")
 
         self.select_all = QtWidgets.QCheckBox("All")
         self.select_all.setChecked(True)
         self.select_all.toggled.connect(self._on_select_all_toggled)
+        self.select_all.setToolTip(
+            "Tick / untick every combination in the candidate list "
+            "below. Only meaningful when multiple configurations "
+            "can be queued for a single Start (Long-Term Pulsing, "
+            "Progressive Stress — VT runs one combo at a time).")
         # The "All" affordance is meaningless in single-combo mode.
         self.select_all.setVisible(not self._single_mode)
 
@@ -181,33 +234,27 @@ class CombinationPanel(QtWidgets.QGroupBox):
         kind_row.addWidget(self.kind_combo, stretch=1)
         v.addLayout(kind_row)
 
-        # Spacing row — toggle + dropdown.
+        # Spacing row — always-live dropdown labelled "Spacing:".
         spacing_row = QtWidgets.QHBoxLayout()
-        spacing_row.addWidget(self.apply_spacing_check)
-        spacing_row.addWidget(QtWidgets.QLabel("Distance:"))
+        spacing_row.addWidget(QtWidgets.QLabel("Spacing:"))
         spacing_row.addWidget(self.spacing_combo)
         spacing_row.addStretch(1)
         self.spacing_widget = QtWidgets.QWidget()
         self.spacing_widget.setLayout(spacing_row)
         v.addWidget(self.spacing_widget)
-        # Initial coupling: dropdown is enabled iff toggle is on.
-        self.spacing_combo.setEnabled(self.apply_spacing_check.isChecked())
 
-        # Filter row — Neighbors only / Include diagonal / Flanking only.
-        # The whole row is hidden whenever the mode doesn't use spacing
-        # neighbours (Monopolar, Common Ground); within it, individual
-        # checkboxes are gated by mode and by each other.
+        # Filter row — Include diagonal + Flanking only. Hidden as a
+        # whole whenever the mode doesn't use neighbour returns
+        # (Monopolar, Common Ground); within it, each checkbox is
+        # gated by array geometry / kind (see
+        # :meth:`_refresh_widget_visibility`).
         filter_row = QtWidgets.QHBoxLayout()
-        filter_row.addWidget(self.neighbors_only)
         filter_row.addWidget(self.include_diagonal)
         filter_row.addWidget(self.flanking_only)
         filter_row.addStretch(1)
         self.filter_widget = QtWidgets.QWidget()
         self.filter_widget.setLayout(filter_row)
         v.addWidget(self.filter_widget)
-        # Initial enabled-state coupling (Include diagonal only when
-        # Neighbors only is on).
-        self.include_diagonal.setEnabled(self.neighbors_only.isChecked())
 
         v.addWidget(self.summary)
         list_row = QtWidgets.QHBoxLayout()
@@ -238,21 +285,27 @@ class CombinationPanel(QtWidgets.QGroupBox):
     def set_global_return(self, on: bool):
         prev_on = self._global_return
         self._global_return = bool(on)
-        # When the user toggles Global Return, slide the current mode
-        # between its with-/without-counter twins so the experiment
-        # they were configuring keeps its meaning:
-        #   Bipolar  ↔ Partial Bipolar
-        #   Tripolar ↔ Partial Tripolar
-        # (Monopolar / CG don't have twins so they stay put.)
+        # When the user toggles External Return, slide the current
+        # mode between its with-/without-counter twins so the
+        # experiment they were configuring keeps its meaning:
+        #   Bipolar       ↔ Partial Bipolar
+        #   Tripolar      ↔ Partial Tripolar
+        #   Common Ground ↔ Partial Common Ground
+        # (Monopolar has no twin — it's already global-only, so
+        # toggling External off falls back to the dropdown's first
+        # external-off entry, Bipolar.)
         twin = {
-            KIND_BP: KIND_PBP, KIND_PBP: KIND_BP,
-            KIND_TP: KIND_PTP, KIND_PTP: KIND_TP,
+            KIND_BP:  KIND_PBP, KIND_PBP: KIND_BP,
+            KIND_TP:  KIND_PTP, KIND_PTP: KIND_TP,
+            KIND_CG:  KIND_PCG, KIND_PCG: KIND_CG,
         }
         prev_kind = self._kind()
         target_kind = twin.get(prev_kind)
         # The dropdown's available kinds depend on this state — refresh
         # before rebuilding combos so the user always sees a consistent
-        # kind / spacing visibility for the current Global-Return.
+        # kind / spacing visibility for the current External-Return
+        # state. May implicitly change the selected kind if the prior
+        # one isn't in the new list (e.g. CG → MP when External on).
         self._refresh_kind_dropdown()
         # Apply the twin-swap if one exists and is in the new kind list.
         if target_kind is not None:
@@ -263,7 +316,13 @@ class CombinationPanel(QtWidgets.QGroupBox):
                     self.kind_combo.setCurrentIndex(idx)
                 finally:
                     self.kind_combo.blockSignals(False)
-                self._on_kind_changed(self.kind_combo.currentText())
+        # If the kind has changed (twin swap OR dropdown fallback),
+        # rerun the kind-changed handler so spacing / filter widget
+        # visibility is consistent with the new kind. Idempotent when
+        # the kind didn't change.
+        new_kind = self._kind()
+        if new_kind != prev_kind:
+            self._on_kind_changed(new_kind)
         self._rebuild()
 
     def _refresh_kind_dropdown(self):
@@ -288,72 +347,121 @@ class CombinationPanel(QtWidgets.QGroupBox):
     def selected_configurations(self) -> List[Configuration]:
         return [c.config for c in self._combos if c.enabled]
 
+    # --------------------------------------------------------------- prefs
+    def current_prefs(self) -> dict:
+        """Snapshot the user-editable controls so they survive a GUI
+        restart.
+
+        Captures the *mode* (kind dropdown), the spacing dropdown
+        value (integer gap, or ``None`` for the "All" sentinel), and
+        the two filter toggles. Channel selection / actives /
+        external-return state live on the channel grid and are
+        persisted there — those depend on the current array geometry
+        and are restored separately.
+        """
+        return {
+            "kind": self.kind_combo.currentText(),
+            # ``currentData`` returns the userData (int gap or None
+            # for "All"). Stored directly so the round-trip preserves
+            # the All sentinel without ambiguous string parsing.
+            "spacing_gap": self.spacing_combo.currentData(),
+            "include_diagonal": bool(self.include_diagonal.isChecked()),
+            "flanking_only": bool(self.flanking_only.isChecked()),
+        }
+
+    def restore_prefs(self, p: dict) -> None:
+        """Apply a saved prefs dict back into the controls.
+
+        Defensive on every entry: a saved kind that's no longer in
+        the current dropdown (e.g. user toggled External Return so
+        the available kinds changed) is silently ignored — the
+        dropdown stays on whatever default :meth:`_refresh_kind_dropdown`
+        picked. Same for an out-of-range spacing gap.
+        """
+        if not isinstance(p, dict) or not p:
+            return
+        # Mode / kind — only apply if it's still a valid choice.
+        kind = p.get("kind")
+        if isinstance(kind, str) and kind:
+            idx = self.kind_combo.findText(kind)
+            if idx >= 0:
+                self.kind_combo.blockSignals(True)
+                try:
+                    self.kind_combo.setCurrentIndex(idx)
+                finally:
+                    self.kind_combo.blockSignals(False)
+                self._on_kind_changed(kind)
+        # Spacing — match by userData so the All sentinel (None)
+        # round-trips without string-parsing.
+        if "spacing_gap" in p:
+            gap = p["spacing_gap"]
+            idx = self.spacing_combo.findData(gap)
+            if idx >= 0:
+                self.spacing_combo.blockSignals(True)
+                try:
+                    self.spacing_combo.setCurrentIndex(idx)
+                finally:
+                    self.spacing_combo.blockSignals(False)
+        # Filter toggles.
+        if "include_diagonal" in p:
+            try:
+                self.include_diagonal.setChecked(bool(p["include_diagonal"]))
+            except (TypeError, ValueError):
+                pass
+        if "flanking_only" in p:
+            try:
+                self.flanking_only.setChecked(bool(p["flanking_only"]))
+            except (TypeError, ValueError):
+                pass
+        self._rebuild()
+
     # ----------------------------------------------------------- internal
     def _spacings(self) -> Set[int]:
-        """Set of Chebyshev distances to consider, or empty when the
-        Apply-spacing toggle is off (which the candidate-builder treats
-        as "no distance filter").
+        """Set with the single integer Euclidean grid distance (N) the
+        candidate filter is currently looking for.
 
-        The dropdown value is the number of electrodes *between* the
-        active and the return; the candidate filter operates in
-        Chebyshev grid distance, so we convert via ``distance = gap + 1``.
-        Adjacent (gap=0) → distance 1, one-between → distance 2, etc.
-
-        On a linear array with **Neighbors only** on, distance is
-        always exactly 1 — "neighbours" is unambiguous on a 1-D strip
-        (no second dimension to spread out into) — so spacing is
-        forced to {1} regardless of what's typed in the dropdown.
+        With the always-live spacing dropdown, this is just ``{gap + 1}``
+        where *gap* is the user-picked number-of-electrodes-between
+        value: ``0 (adjacent) → {1}``, ``1 → {2}``, ``2 → {3}``.
+        Returns the empty set when the dropdown is on **All** (userData
+        ``None``) — the candidate filter then accepts every non-active
+        channel, equivalent to MATLAB ``getNeighbor.m`` 'all' tag.
         """
-        if self._is_linear_array() and self.neighbors_only.isChecked():
-            return {1}
-        if not self.apply_spacing_check.isChecked():
-            return set()
         gap = self.spacing_combo.currentData()
+        if gap is None:
+            return set()
         try:
-            gap = int(gap)
+            return {int(gap) + 1}
         except (TypeError, ValueError):
             return set()
-        return {gap + 1}
 
-    def _on_apply_spacing_toggled(self, checked: bool):
-        # Distance dropdown is only meaningful when the toggle is on.
-        self.spacing_combo.setEnabled(checked)
-        # Apply-spacing fully owns candidate selection when on, so we
-        # both disable AND uncheck the neighbour-based filters — their
-        # current state shouldn't influence the candidate set while
-        # spacing is in charge. We remember the prior checked state
-        # so toggling spacing back off restores the user's choices
-        # rather than leaving the boxes blank.
-        if checked:
-            self._neighbors_only_saved = self.neighbors_only.isChecked()
-            self._flanking_only_saved = self.flanking_only.isChecked()
-            for cb in (self.neighbors_only, self.flanking_only):
-                cb.blockSignals(True)
-                try:
-                    cb.setChecked(False)
-                finally:
-                    cb.blockSignals(False)
-            self.neighbors_only.setEnabled(False)
-            self.flanking_only.setEnabled(False)
-            # Include-diagonal stays enabled in spacing mode — it
-            # determines whether diagonal cells at the picked distance
-            # qualify as candidates, which is still meaningful here.
-            self.include_diagonal.setEnabled(True)
-        else:
-            # Restore prior checked state, then re-enable the widgets.
-            saved_n = getattr(self, "_neighbors_only_saved", True)
-            saved_f = getattr(self, "_flanking_only_saved", True)
-            for cb, val in ((self.neighbors_only, saved_n),
-                            (self.flanking_only, saved_f)):
-                cb.blockSignals(True)
-                try:
-                    cb.setChecked(bool(val))
-                finally:
-                    cb.blockSignals(False)
-            self.neighbors_only.setEnabled(True)
-            self.flanking_only.setEnabled(True)
-            self.include_diagonal.setEnabled(self.neighbors_only.isChecked())
-        self._rebuild()
+    def _valid_distances(self) -> Optional[List[float]]:
+        """Euclidean grid distances that qualify as candidate neighbours.
+
+        Mirrors the MATLAB ``getNeighbor.m`` convention:
+
+        * 'side' tag → matches ``N`` only (orthogonal)
+        * 'diag' tag → matches ``N · √2`` only (diagonal corners)
+        * 'adj'  tag → matches both ``{N, N · √2}``
+
+        The GUI's "Include diagonal" toggle picks between *side* (off)
+        and *adj* (on), with N derived directly from the spacing
+        dropdown (``gap + 1``).
+
+        On hexagonal/triangular layouts the six immediate neighbours
+        are equidistant — there's no orthogonal-vs-diagonal distinction
+        to express — so the toggle is hidden and treated as
+        effectively on (always 'adj'). On rectangular layouts the
+        widget state is honoured.
+        """
+        spacings = self._spacings()
+        if not spacings:
+            return None
+        N = float(next(iter(spacings)))
+        diag = self.include_diagonal.isChecked() or self._is_hex_array()
+        if diag:
+            return [N, N * math.sqrt(2)]
+        return [N]
 
     def _kind(self) -> str:
         return self.kind_combo.currentText()
@@ -363,27 +471,49 @@ class CombinationPanel(QtWidgets.QGroupBox):
         return self._array is not None and (
             self._array.rows == 1 or self._array.cols == 1)
 
-    def _on_kind_changed(self, kind: str):
-        # Spacing + filter rows only apply when on-array neighbour returns
-        # are needed. Common Ground and Monopolar use neither.
+    def _is_hex_array(self) -> bool:
+        """True when the loaded array is laid out on a hexagonal/triangular
+        lattice (e.g. MicroProbes FMA, or a custom device the user marked
+        as hexagonal). The orthogonal-vs-diagonal distinction is
+        meaningless here — every immediate neighbour is equidistant —
+        so the "Include diagonal" toggle is hidden and treated as
+        effectively on for the candidate filter.
+        """
+        return (self._array is not None
+                and getattr(self._array, "layout", "rect") == "triangular")
+
+    def _refresh_widget_visibility(self):
+        """Refresh visibility of spacing/filter widgets based on the
+        current kind and the array geometry.
+
+        Centralised so the kind-change handler can keep the row
+        visibility consistent across Mode flips. With the always-live
+        spacing dropdown there are no toggle states to track here.
+        """
+        kind = self._kind()
+        # Spacing + filter rows only apply when on-array neighbour
+        # returns are needed. Common Ground and Monopolar use neither.
         needs_neighbours = KIND_NEAR_RETS.get(kind, 0) > 0
         self.spacing_widget.setVisible(needs_neighbours)
         self.filter_widget.setVisible(needs_neighbours)
         # Linear arrays don't have a second dimension, so "Include
-        # diagonal" and "Flanking only" don't apply — hide both.
-        # Spacing is also moot on a linear strip when Neighbors-only
-        # is on (forced to 1), so hide the Apply-spacing widget too.
+        # diagonal" doesn't apply — hide it. Hexagonal layouts have six
+        # equidistant immediate neighbours, so the orthogonal-vs-
+        # diagonal distinction is meaningless there too — hide the
+        # toggle and let :meth:`_valid_distances` treat the layout as
+        # if diagonals were always on.
         is_linear = self._is_linear_array()
-        self.include_diagonal.setVisible(not is_linear)
-        if is_linear and self.neighbors_only.isChecked():
-            self.spacing_widget.setVisible(False)
-        # Flanking-only is meaningful for tripolar variants only AND
-        # only when "Neighbors only" is on. Hidden on linear arrays
-        # regardless (the user explicitly excluded it).
+        is_hex = self._is_hex_array()
+        self.include_diagonal.setVisible(not is_linear and not is_hex)
+        # Flanking-only is meaningful for tripolar variants only.
+        # Hidden on linear arrays since "flanking" through a 1-D strip
+        # collapses to "the two cells on either side" — there's no
+        # geometric choice to make.
         is_tripolar = kind in (KIND_TP, KIND_PTP)
-        self.flanking_only.setVisible(
-            is_tripolar and self.neighbors_only.isChecked()
-            and not is_linear)
+        self.flanking_only.setVisible(is_tripolar and not is_linear)
+
+    def _on_kind_changed(self, kind: str):
+        self._refresh_widget_visibility()
         # Static single-mode (pulsing experiments + Progressive Stress)
         # is relaxed for the *single-active* kinds: Monopolar, Common
         # Ground, and Partial Common Ground. Each combination there
@@ -402,21 +532,6 @@ class CombinationPanel(QtWidgets.QGroupBox):
         # the default check-state of the combo rows.
         if prev_single != self._single_mode:
             pass    # _rebuild below will pick the new defaults
-        self._rebuild()
-
-    def _on_neighbors_only_toggled(self, checked: bool):
-        # Include-diagonal is meaningful when restricting to neighbours
-        # OR when apply-spacing is on (it gates whether diagonal cells
-        # at the picked distance qualify). Disable only when neither
-        # condition holds.
-        spacing_mode = self.apply_spacing_check.isChecked()
-        self.include_diagonal.setEnabled(checked or spacing_mode)
-        # Flanking-only also depends on neighbours-only — refresh its
-        # visibility here in case the user just turned the parent off
-        # while a tripolar mode is selected.
-        kind = self._kind()
-        is_tripolar = kind in (KIND_TP, KIND_PTP)
-        self.flanking_only.setVisible(is_tripolar and checked)
         self._rebuild()
 
     def _rebuild(self):
@@ -445,15 +560,24 @@ class CombinationPanel(QtWidgets.QGroupBox):
         n_total = len(self._combos)
         n_on = sum(1 for c in self._combos if c.enabled)
         kind = self._kind()
-        spacings = sorted(self._spacings())
         bits = [f"<b>{n_on}</b>/{n_total} combinations selected", kind]
         if KIND_NEAR_RETS.get(kind, 0) > 0:
-            if spacings:
-                bits.append("spacing: +" + ", +".join(str(s) for s in spacings))
+            # Show the user-facing gap value (matches the dropdown)
+            # rather than the internal Euclidean distance — "0" reads
+            # as "adjacent" to the user even though the candidate
+            # filter looks for distance 1.
+            gap = self.spacing_combo.currentData()
+            if gap is None:
+                bits.append("spacing: <i>all</i>")
             else:
-                bits.append("spacing: <i>any distance</i>")
+                try:
+                    gap_str = str(int(gap))
+                except (TypeError, ValueError):
+                    gap_str = "?"
+                label = f"{gap_str} (adjacent)" if gap_str == "0" else gap_str
+                bits.append(f"spacing: {label}")
         if kind in KIND_NEEDS_GLOBAL:
-            bits.append("Global Return: " +
+            bits.append("External Return: " +
                         ("<b>on</b>" if self._global_return
                          else "<span style='color:#c62828;'><b>missing</b></span>"))
         self.summary.setText(" &nbsp;·&nbsp; ".join(bits))
@@ -498,12 +622,10 @@ class CombinationPanel(QtWidgets.QGroupBox):
             from itertools import combinations
             candidates = self._neighbours_at_spacing(active)
             is_tripolar = kind in (KIND_TP, KIND_PTP)
-            # Flanking-only is suppressed in spacing mode (matches the
-            # disabled widget state). Otherwise it constrains tripolar
-            # combos so the active sits at the midpoint of the return
-            # pair.
-            flank_only = (self.flanking_only.isChecked() and is_tripolar
-                          and not self.apply_spacing_check.isChecked())
+            # Flanking-only constrains tripolar combos so the active
+            # sits at the midpoint of the return pair (sum of offsets
+            # is zero in both axes).
+            flank_only = self.flanking_only.isChecked() and is_tripolar
             ref = self._array[active]
             for ret_set in combinations(candidates, n_returns):
                 if flank_only:
@@ -531,54 +653,49 @@ class CombinationPanel(QtWidgets.QGroupBox):
         return out
 
     def _neighbours_at_spacing(self, active: int) -> List[int]:
-        """Channels at any of the selected spacing offsets from ``active``.
+        """Channels matching the active candidate-filter rules.
 
-        Spacing N == Chebyshev distance N on the array's row/col grid.
-        Triangular layouts use the same row/col coordinates the user
-        authored in the device-mapping table, so spacing semantics stay
-        consistent across array geometries.
+        Distances are Euclidean on the row/col grid (matching the
+        MATLAB ``getNeighbor.m`` convention: ``norm(stimXY-checkXY)``).
+        The candidate set is the union of cells at the picked Euclidean
+        distance(s):
 
-        The "Neighbors only" / "Include diagonal" filters apply on top:
+        * **Neither toggle on** — no distance filter; every non-active
+          channel is a candidate (equivalent to the MATLAB 'all' tag).
+        * **Neighbors only, no diagonal** — distance ``1`` (orthogonal
+          immediate neighbours; MATLAB 'side' at N=1).
+        * **Neighbors only, with diagonal** — distance ∈ ``{1, √2}``;
+          the four diagonal neighbours are treated as one step away
+          (MATLAB 'adj' at N=1).
+        * **Apply spacing N, no diagonal** — distance ``N`` (orthogonal;
+          MATLAB 'side' at N).
+        * **Apply spacing N, with diagonal** — distance ∈ ``{N, N·√2}``
+          (MATLAB 'adj' at N).
 
-        * **Neighbors only off** — every channel at one of the picked
-          Chebyshev distances is a candidate.
-        * **Neighbors only on, Include diagonal on** — same as above,
-          since 8-connected neighbours coincide with Chebyshev rings.
-        * **Neighbors only on, Include diagonal off** — orthogonal-only:
-          drop pure-diagonal cells (``dr > 0 and dc > 0``). For spacing
-          1 that gives 4-connected neighbours; for spacing 2 it gives
-          the orthogonal cells two steps away.
+        Triangular and other non-rectangular layouts use the same
+        row/col coordinates the user authored in the device-mapping
+        table, so spacing semantics stay consistent across array
+        geometries — nothing here is specific to a 4×4 or any other
+        particular arrangement.
         """
         if self._array is None: return []
         try:
             ref = self._array[active]
         except KeyError:
             return []
-        spacings = self._spacings()       # empty set ⇒ no distance filter
-        # Apply-spacing owns candidate selection when on; the
-        # Neighbors-only filter is bypassed (its widget is disabled
-        # alongside). Include-diagonal still applies in either mode:
-        # it gates whether pure-diagonal cells qualify, so the user
-        # can switch between 4- and 8-connected candidate sets even
-        # in spacing mode.
-        spacing_mode = self.apply_spacing_check.isChecked()
-        only = self.neighbors_only.isChecked() and not spacing_mode
-        diag = self.include_diagonal.isChecked()
-        # Exclude pure-diagonal cells when diagonals aren't allowed AND
-        # the user has opted into a candidate-shape filter (either
-        # neighbours-only in non-spacing mode, or apply-spacing).
-        exclude_diag = (not diag) and (only or spacing_mode)
+        valid = self._valid_distances()       # None ⇒ no distance filter
         out: List[int] = []
+        tol = 1e-6
         for s in self._array.sites:
             if s.number == active: continue
-            dr = abs(s.row - ref.row); dc = abs(s.col - ref.col)
-            d = max(dr, dc)
-            # Only filter by spacing when the toggle is on.
-            if spacings and d not in spacings:
+            if valid is None:
+                out.append(s.number)
                 continue
-            if exclude_diag and dr > 0 and dc > 0:
-                continue
-            out.append(s.number)
+            dr = float(s.row - ref.row)
+            dc = float(s.col - ref.col)
+            d = math.sqrt(dr * dr + dc * dc)
+            if any(abs(d - vd) <= tol for vd in valid):
+                out.append(s.number)
         return out
 
     # --------- list-widget interactions ---------
@@ -597,13 +714,13 @@ class CombinationPanel(QtWidgets.QGroupBox):
         kind_id = cfg.id
 
         if kind_id == "MP":
-            return f"Channel {active} (active) versus Off-array return"
+            return f"Channel {active} (active) versus External return"
         if kind_id == "CG":
             return (f"Channel {active} (active) versus "
                     f"all other on-array channels (return)")
         if kind_id == "PCG":
             return (f"Channel {active} (active) versus "
-                    f"all other on-array channels (return) + Off-array return")
+                    f"all other on-array channels (return) + External return")
         if kind_id == "BP":
             return (f"Channel {active} (active) versus "
                     f"Channel {rets[0]} (return)")
@@ -612,10 +729,10 @@ class CombinationPanel(QtWidgets.QGroupBox):
                     f"Channels {rets[0]} and {rets[1]} (return)")
         if kind_id == "PBP":
             return (f"Channel {active} (active) versus "
-                    f"Channel {rets[0]} (return) + Off-array return")
+                    f"Channel {rets[0]} (return) + External return")
         if kind_id == "PTP":
             return (f"Channel {active} (active) versus "
-                    f"Channels {rets[0]} and {rets[1]} (return) + Off-array return")
+                    f"Channels {rets[0]} and {rets[1]} (return) + External return")
         # Fallback for any future kind
         if not rets:
             return f"Channel {active} (active)"
@@ -646,16 +763,38 @@ class CombinationPanel(QtWidgets.QGroupBox):
         self.combinationsChanged.emit(self.selected_configurations())
 
     def _on_item_entered(self, item: QtWidgets.QListWidgetItem):
-        """Mouse moved over a combo row — emit hover signal."""
+        """Mouse moved over a combo row — emit hover signal.
+
+        Bundles a spacing label alongside the specific (active,
+        returns) so the channel grid can stretch a double-headed
+        arrow between active and each return, with the value drawn
+        in the middle of the line. The label is the integer gap
+        value the user picked in the **Spacing** dropdown ("0" =
+        adjacent / immediate neighbour), or empty for kinds with no
+        spacing concept (Monopolar / Common Ground / Partial CG).
+        """
         idx = self.combos_list.row(item)
-        if 0 <= idx < len(self._combos):
-            cfg = self._combos[idx].config
-            self.combinationHovered.emit(int(cfg.active), list(cfg.returns))
+        if not (0 <= idx < len(self._combos)):
+            return
+        cfg = self._combos[idx].config
+        active = int(cfg.active)
+        returns = list(cfg.returns)
+        spacing_label = ""
+        # Show the arrow whenever the kind actually uses on-array
+        # neighbour returns (BP / TP / PBP / PTP). Monopolar / CG / PCG
+        # have no spacing concept so the label stays empty there.
+        if KIND_NEAR_RETS.get(self._kind(), 0) > 0:
+            gap = self.spacing_combo.currentData()
+            try:
+                spacing_label = str(int(gap))
+            except (TypeError, ValueError):
+                spacing_label = ""
+        self.combinationHovered.emit(active, returns, spacing_label)
 
     def eventFilter(self, obj, ev):
         """Clear highlight when the mouse leaves the combos list viewport."""
         if obj is self.combos_list.viewport() and ev.type() == QtCore.QEvent.Type.Leave:
-            self.combinationHovered.emit(-1, [])
+            self.combinationHovered.emit(-1, [], "")
         return super().eventFilter(obj, ev)
 
     def _on_select_all_toggled(self, checked: bool):

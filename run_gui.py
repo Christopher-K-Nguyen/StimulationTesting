@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-"""GUI entry point for StimulationTesting."""
+"""PULSAR — GUI entry point.
+
+Launches the PULSAR neural-stimulation characterization GUI. The
+companion session viewer is launched separately via ``run_viewer.py``
+(POLARIS).
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +14,7 @@ from stimtest.gui.main_window import launch
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StimulationTesting GUI")
+    parser = argparse.ArgumentParser(description="PULSAR — GUI")
     parser.add_argument(
         "--simulate", action="store_true",
         help="Force simulator backends (no hardware required)",

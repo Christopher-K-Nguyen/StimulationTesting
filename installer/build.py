@@ -15,7 +15,9 @@ Pipeline:
        construction don't blow up at runtime; abort if it crashes.
     3. Invoke Inno Setup's compiler (``ISCC.exe``) on
        ``installer/StimulationTesting.iss`` to package that folder into
-       ``installer/Output/StimulationTesting-Setup-<version>.exe``.
+       ``installer/Output/PULSAR-Setup-<version>.exe``. (The .iss
+       filename retains the legacy "StimulationTesting" name; only
+       the produced installer .exe carries the new PULSAR brand.)
 
 Both PyInstaller and Inno Setup must be available on PATH (or pointed to
 via ``--iscc``). Run from the project root:
@@ -40,6 +42,81 @@ SPEC = ROOT / "installer" / "StimulationTesting.spec"
 ISS = ROOT / "installer" / "StimulationTesting.iss"
 DIST_FOLDER = ROOT / "installer" / "dist" / "StimulationTesting"
 PLEXSTIM_BIN = ROOT / "stimtest" / "hardware" / "pyplexstim" / "bin"
+INIT_PY = ROOT / "stimtest" / "__init__.py"
+PYPROJECT = ROOT / "pyproject.toml"
+
+
+def read_app_version() -> str:
+    """Pull ``__version__`` out of ``stimtest/__init__.py`` without
+    importing the package.
+
+    Importing would drag in PyQt6 + numpy + scipy etc. just to read
+    a string constant; a tiny regex scan is faster and works even on
+    a build machine where the runtime stack isn't fully installed.
+    Falls back to ``"0.0.0"`` if the line can't be parsed (the .iss
+    has its own ``#ifndef AppVersion`` fallback so the build still
+    completes — but the printed warning makes the failure visible).
+    """
+    import re
+    try:
+        text = INIT_PY.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"WARNING: could not read {INIT_PY}: {e}")
+        return "0.0.0"
+    m = re.search(r'^__version__\s*=\s*[\'\"]([^\'\"]+)[\'\"]',
+                  text, re.MULTILINE)
+    if not m:
+        print(f"WARNING: __version__ not found in {INIT_PY}; "
+              f"falling back to 0.0.0")
+        return "0.0.0"
+    return m.group(1)
+
+
+def assert_version_consistency(app_version: str) -> None:
+    """Verify ``pyproject.toml``'s ``version =`` matches ``app_version``.
+
+    Audit finding #32: the project has THREE locations that need to
+    stay in sync — ``stimtest/__init__.py:__version__`` (the
+    canonical), ``pyproject.toml:version``, and the ``.iss``
+    ``#ifndef AppVersion`` fallback. ``build.py`` already overrides
+    the .iss fallback at compile time via ``ISCC /DAppVersion=…``,
+    but ``pyproject.toml`` is hand-synced; a forgotten bump there
+    silently ships a wheel / sdist with the wrong version. This
+    guard catches that on every build: if the two disagree, abort
+    with a clear message naming the file that needs editing.
+
+    The ``.iss`` fallback is intentionally NOT checked here — it's
+    a build-time-only safety net, never the source of truth, and
+    drift there is harmless because the override always wins.
+    """
+    import re
+    try:
+        text = PYPROJECT.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"WARNING: could not read {PYPROJECT}: {e}; "
+              f"skipping version-consistency check.")
+        return
+    # Match the [project] table's ``version = "x.y.z"`` line. The
+    # regex is conservative — it only matches the bare ``version =``
+    # at the start of a line so a stray comment line containing the
+    # word "version" can't false-match.
+    m = re.search(r'^\s*version\s*=\s*[\'\"]([^\'\"]+)[\'\"]',
+                  text, re.MULTILINE)
+    if not m:
+        print(f"WARNING: ``version =`` not found in {PYPROJECT}; "
+              f"skipping version-consistency check.")
+        return
+    pyproject_version = m.group(1)
+    if pyproject_version != app_version:
+        raise SystemExit(
+            f"Version drift detected:\n"
+            f"    stimtest/__init__.py: {app_version!r}\n"
+            f"    pyproject.toml:       {pyproject_version!r}\n"
+            f"Edit pyproject.toml's ``version = …`` to match "
+            f"``__version__`` and re-run the build."
+        )
+    print(f"      OK — pyproject.toml version {pyproject_version!r} "
+          f"matches __version__.")
 
 
 def preflight() -> None:
@@ -180,8 +257,18 @@ def find_iscc(hint: str | None) -> Path:
     )
 
 
-def run_inno(iscc: Path) -> None:
-    cmd = [str(iscc), str(ISS)]
+def run_inno(iscc: Path, app_version: str) -> None:
+    """Compile the Inno Setup script with the version pinned to
+    ``app_version`` (injected via ``/DAppVersion=…``).
+
+    The .iss file guards its hardcoded fallback with ``#ifndef
+    AppVersion``, so the value passed here always wins. This means
+    a single bump of ``stimtest.__version__`` flows through
+    ``[Setup] AppVersion``, ``OutputBaseFilename``, and the
+    Add/Remove Programs version field with no hand-edits to the
+    .iss required.
+    """
+    cmd = [str(iscc), f"/DAppVersion={app_version}", str(ISS)]
     print(f"[3/3] Inno Setup: {' '.join(cmd)}")
     subprocess.check_call(cmd, cwd=ROOT)
 
@@ -200,6 +287,15 @@ def main() -> int:
                    help="Path to ISCC.exe (Inno Setup compiler).")
     args = p.parse_args()
 
+    app_version = read_app_version()
+    print(f"App version (from stimtest/__init__.py): {app_version}")
+    # Audit #32 — assert pyproject.toml's hand-synced ``version =``
+    # matches ``__version__``. Bails out with a clear message if
+    # they drift, so we never ship a wheel / sdist with the wrong
+    # version. Always runs (even with --skip-preflight) because
+    # the check is essentially free and version drift is the kind
+    # of bug that's invisible until someone runs ``pip show``.
+    assert_version_consistency(app_version)
     if not args.skip_preflight:
         preflight()
     run_pyinstaller(clean=args.clean)
@@ -216,7 +312,7 @@ def main() -> int:
         print("Skipping Inno Setup step (--skip-installer).")
         return 0
     iscc = find_iscc(args.iscc)
-    run_inno(iscc)
+    run_inno(iscc, app_version)
     out = ROOT / "installer" / "Output"
     if out.exists():
         for setup in sorted(out.glob("*.exe")):

@@ -1,4 +1,15 @@
-; StimulationTesting -- Inno Setup script
+; PULSAR — Inno Setup script
+;
+; Produces the **PULSAR** GUI and **POLARIS** viewer
+; installer. The codebase, repo URL, on-disk install directory
+; (``%ProgramFiles%\StimulationTesting``), and launcher .exe filenames
+; (``StimulationTesting.exe`` / ``StimulationTestingViewer.exe``) all
+; intentionally retain the legacy ``StimulationTesting`` name for
+; backward compatibility with installed-base prefs / shortcuts /
+; AppId-driven upgrades. The user-facing AppName + Start-Menu group +
+; Add/Remove-Programs entry + setup-EXE filename all show the new
+; "PULSAR" branding. See ``installer/README.md`` for the full
+; rename ledger.
 ;
 ; Builds a single-file .exe installer that drops the PyInstaller-frozen
 ; application under Program Files, adds Start Menu / Desktop shortcuts,
@@ -35,9 +46,29 @@
 ;     ISCC installer/StimulationTesting.iss   (just Inno Setup, after the
 ;                                              PyInstaller build)
 
-#define AppName "StimulationTesting"
-#define AppVersion "0.2.0"
+; The user-facing product is "PULSAR" (GUI) / "POLARIS"
+; (viewer). The codebase / repo / on-disk dir / launcher .exe filenames
+; intentionally stay as "StimulationTesting" for back-compat with
+; installed-base prefs, shortcuts, and the AppId-driven upgrade path.
+; See installer/README.md for the full rename ledger.
+#define AppName "PULSAR"
+#define ViewerDisplayName "POLARIS"
+; AppVersion is normally injected by ``installer/build.py`` via
+; ``ISCC /DAppVersion=…`` so it always tracks ``stimtest.__version__``.
+; The #ifndef fallback below lets a hand-run ``ISCC StimulationTesting.iss``
+; still build (e.g. when re-packaging an existing PyInstaller dist
+; tree without re-running build.py) using whatever version the
+; codebase had at the time this file was last edited.
+#ifndef AppVersion
+  #define AppVersion "0.2.0"
+#endif
 #define AppPublisher "Neural Interfaces Lab"
+; Launcher .exe filenames — intentionally NOT renamed so existing
+; users' Start-Menu / desktop shortcuts (and the file-system layout
+; under {app}) continue to work across the rename. To repath these,
+; update both the [Icons] block below AND the PyInstaller .spec's
+; ``APP_NAME`` constant in lockstep, and ship an installer upgrade
+; that ``InstallDelete``s the old names.
 #define AppExeName "StimulationTesting.exe"
 #define ViewerExeName "StimulationTestingViewer.exe"
 
@@ -50,14 +81,28 @@ AppId={{6E5CDD7E-9D2E-4D38-8B2E-1E2A0BD8C9F1}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-AppPublisherURL=https://github.com/
-AppSupportURL=https://github.com/
-DefaultDirName={autopf}\{#AppName}
+; Audit finding #30 — these used to point at the github.com landing
+; page (no repo path). The Add/Remove Programs "support" link now
+; resolves to the actual project. The codebase intentionally retains
+; the legacy "StimulationTesting" repo name (renaming the GitHub
+; repo is a separate migration with its own redirect concerns).
+AppPublisherURL=https://github.com/Bortz1234/StimulationTesting
+AppSupportURL=https://github.com/Bortz1234/StimulationTesting
+; ``DefaultDirName`` intentionally NOT bound to ``{#AppName}``. We want
+; existing installations to upgrade in place at
+; ``%ProgramFiles%\StimulationTesting`` rather than forking the
+; install path across the rename (the AppId GUID drives the upgrade
+; detection regardless of folder name). The user-visible AppName +
+; Start-Menu group + Add/Remove-Programs entry reflect the new
+; "PULSAR" branding.
+DefaultDirName={autopf}\StimulationTesting
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 LicenseFile=
 OutputDir={#SourcePath}\Output
-OutputBaseFilename=StimulationTesting-Setup-{#AppVersion}
+; Audit finding #29 — the installer .exe filename is the first thing
+; users see at download time. Show the new branding.
+OutputBaseFilename=PULSAR-Setup-{#AppVersion}
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -65,6 +110,23 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#AppExeName}
+; Optional installer-window icon. Drop ``installer/app.ico`` next to
+; this script and the wizard picks it up automatically; without the
+; file Inno Setup falls through to its default icon. ``FileExists``
+; runs in the preprocessor (pre-compile), not at install time.
+;
+; Audit finding #33 — the fallback used to be completely silent, so a
+; release accidentally went out with the default Inno icon. Print a
+; visible warning during compile so the build operator sees what's
+; happening; CI / scripted builds can grep for "MISSING_APP_ICON"
+; to fail-fast on a missing brand asset.
+#if FileExists(SourcePath + "\app.ico")
+  SetupIconFile={#SourcePath}\app.ico
+#else
+  #pragma message "MISSING_APP_ICON — installer/app.ico not found; " + \
+                  "the installer will ship with Inno Setup's default " + \
+                  "icon. Commit a real app.ico before the next release."
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -72,7 +134,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
     GroupDescription: "Additional shortcuts:"
-Name: "viewericon"; Description: "Add a desktop shortcut for the &Viewer too"; \
+Name: "viewericon"; Description: "Add a desktop shortcut for {#ViewerDisplayName} too"; \
     GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Components]
@@ -89,12 +151,17 @@ Source: "dist\StimulationTesting\*"; DestDir: "{app}"; Components: app; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
+; Audit finding #28 — shortcut labels use {#AppName} ("PULSAR") for
+; the main GUI and {#ViewerDisplayName} ("POLARIS") for the
+; viewer, matching what the running windows display via setWindowTitle.
+; The .exe filenames they point at remain "StimulationTesting*.exe"
+; for installed-base compatibility.
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{group}\{#AppName} Viewer"; Filename: "{app}\{#ViewerExeName}"
+Name: "{group}\{#ViewerDisplayName}"; Filename: "{app}\{#ViewerExeName}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
     Tasks: desktopicon
-Name: "{autodesktop}\{#AppName} Viewer"; Filename: "{app}\{#ViewerExeName}"; \
+Name: "{autodesktop}\{#ViewerDisplayName}"; Filename: "{app}\{#ViewerExeName}"; \
     Tasks: viewericon
 
 [Run]

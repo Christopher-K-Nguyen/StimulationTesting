@@ -78,15 +78,30 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self._stim: Optional[Stimulator] = None
         self._scope: Optional[Oscilloscope] = None
         # Per-serial scaling-preset memory, loaded from prefs and
-        # persisted whenever the user changes the dropdown. Keyed by
-        # the device's reported serial number so swapping in a
-        # different physical PlexStim restores its own preset.
+        # persisted whenever the user changes the dropdown or
+        # finishes a calibration sweep. Keyed by the device's
+        # reported serial number so swapping in a different
+        # physical PlexStim restores its own preset. The map is
+        # ALSO consulted on every Initialize: if the connecting
+        # serial isn't present, the user gets a one-time warning
+        # ("uncalibrated stimulator") and is prompted to run the
+        # calibration wizard or manually confirm the preset.
         self._scaling_by_serial: dict = self._load_scaling_memory()
+        # One-shot flag so the uncalibrated-serial warning fires
+        # at most once per stim lifecycle (cleared on
+        # ``_do_close_stim``).
+        self._uncalibrated_warned: bool = False
 
         # ----- shared simulator toggle -----
         self.simulate = QtWidgets.QCheckBox("Use simulator")
         self.simulate.setChecked(simulate_default)
         self.simulate.toggled.connect(self._on_simulate_toggled)
+        self.simulate.setToolTip(
+            "Drive a built-in simulated stimulator + oscilloscope "
+            "instead of real hardware. Useful for offline GUI work "
+            "and protocol design — every experiment runs end-to-end "
+            "but no current is delivered. Toggle disconnects any "
+            "live hardware first.")
 
         # ----- PyPlexStim SDK path -----
         # Loaded from prefs at startup; remembered across sessions so
@@ -94,6 +109,14 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Empty string means "use the vendored copy" — the existing
         # default behaviour.
         self.sdk_path = QtWidgets.QLineEdit()
+        self.sdk_path.setToolTip(
+            "Folder containing PlexStim64.dll. Leave blank to use "
+            "the copy vendored with the GUI. Set this only if you "
+            "have a different SDK version you want to drive the "
+            "stimulator with — and remember the on-disk DLL is "
+            "independent from whether Plexon's Sim-2 GUI is "
+            "installed; the GUI app must be CLOSED during "
+            "automated runs (it holds an exclusive USB lock).")
         self.sdk_path.setPlaceholderText(
             "PyPlexStim SDK folder (containing PlexStim64.dll). "
             "Leave blank to use the vendored copy."
@@ -103,26 +126,30 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.sdk_browse_btn.clicked.connect(self._on_sdk_browse)
         self.sdk_path.setText(self._load_sdk_path())
 
-        # ----- stimulator: indicator + Initialize / Close -----
-        # Two dots: ``stim_dot`` reflects the *connected* state (open
-        # handle, simulator vs real), and ``detect_dot`` reflects
-        # *detection* — whether ``plexstim_detect`` finds a usable SDK
-        # + DLL on this machine independent of whether we've opened
-        # it. The detection dot also drives a hover tooltip with the
-        # detector's notes so the user can debug "why won't it open?"
-        # at a glance.
+        # ----- stimulator: detection + Initialize / Close -----
+        # Two dots in the stimulator section, mirroring the scope
+        # half below:
+        #   * ``stim_detect_dot`` — *hardware presence*. Driven by
+        #     :func:`stimtest.hardware.plexstim_detect.plexstim_device_present`,
+        #     which probes Windows PnP for a Plexon-named USB
+        #     device. Refreshed on every USB hot-plug event by the
+        #     filter in :mod:`stimtest.gui.usb_hotplug`. This is
+        #     SOFTWARE-installed-detection-independent — the
+        #     launch-time SDK warning still covers the "no DLL on
+        #     this machine" case separately.
+        #   * ``stim_dot`` — *connected / initialized state*. Reflects
+        #     whether ``Initialize`` has actually opened a session
+        #     against the device.
+        # The two indicators answer different questions: "is the
+        # cable plugged in?" vs "have we opened a session?". A user
+        # debugging "why doesn't Initialize work?" looks at
+        # detect_dot first; a user wondering "is my run actually
+        # using real hardware?" looks at stim_dot.
+        self.stim_detect_dot = self._make_dot(_DOT_OFF)
+        self.stim_detect_dot.setToolTip(
+            "Stimulator detection: not yet checked.")
+        self.stim_detect_text = _make_label("Stimulator detection pending…")
         self.stim_dot = self._make_dot(_DOT_OFF)
-        self.detect_dot = self._make_dot(_DOT_OFF)
-        self.detect_dot.setToolTip("Stimulator detection: not yet checked.")
-        # Plain-English status text right of the detection dot. Set
-        # by ``_refresh_detection_indicator`` to one of:
-        #   "Stimulator detected"          (SDK + DLL OK)
-        #   "Stimulator DLL failed to load"   (SDK present, DLL won't load)
-        #   "Stimulator not detected"      (no SDK on this machine)
-        # The dot still carries the colour cue and a tooltip with the
-        # detector's full diagnostic notes; this label exists so the
-        # status reads at a glance without hovering.
-        self.detect_text = _make_label("Stimulator detection pending…")
         # Description label — empty until ``_refresh_stim_label`` fills
         # it with S/N + FW + channel count after a successful Initialize.
         # Closing the device clears it again.
@@ -133,6 +160,21 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.scaling_combo.addItem(preset)
         self.scaling_combo.setEnabled(False)   # only after init
         self.scaling_combo.currentTextChanged.connect(self._on_scaling_changed)
+        self.scaling_combo.setToolTip(
+            "PlexStim V_mon / I_mon scaling preset.<br><br>"
+            "<b>Auto-detect</b> — pick from serial-number "
+            "match against the known NIL-class list, falling "
+            "back to Default. Safe initial choice; the "
+            "calibration wizard tightens this into a verified "
+            "entry.<br>"
+            "<b>Default (PlexStim 2.0)</b> — 0.25 V/V V_mon, "
+            "2.5 mV/µA I_mon. Standard production PlexStim "
+            "2.0 devices.<br>"
+            "<b>NIL</b> — 1.0 V/V V_mon, 1.0 mV/µA I_mon. "
+            "Used by specific NIL-class units. Pick this only "
+            "if you've verified the device with calibration or "
+            "are certain of its scaling — the readout will be "
+            "off by 2.5× if you guess wrong.")
         self.scaling_label = _make_label("")
         self.scaling_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.scaling_label.setStyleSheet("color: #555; font-size: 9pt;")
@@ -141,6 +183,28 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.close_btn.setEnabled(False)
         self.init_btn.clicked.connect(self._do_initialize_stim)
         self.close_btn.clicked.connect(self._do_close_stim)
+
+        # ----- auto-discharge mode toggle -----
+        # PlexStim devices ACTIVELY short the electrode to a recovery
+        # rail during the post-pulse interval when "auto-discharge" is
+        # enabled (the safe default). Disabling it is occasionally
+        # useful for measuring open-circuit potential between pulses,
+        # but it also means residual charge from any per-pulse
+        # imbalance accumulates pulse-to-pulse — drifting the
+        # electrode-tissue interface DC offset and risking
+        # irreversible faradaic reactions. The toggle starts CHECKED;
+        # the toggled-off handler raises a confirmation dialog the
+        # FIRST time per session before letting the change take
+        # effect. After Initialize, the current state is pushed down
+        # to the device.
+        # Auto-discharge UI moved to the pattern panel (below the
+        # pulse rate row, per user spec). Connection panel still owns
+        # the persisted preference + device push, exposed as
+        # :meth:`apply_auto_discharge` and :meth:`auto_discharge_pref`
+        # so the main window can wire the pattern panel's toggle here.
+        # Cache the active state so re-Initialize knows what to push
+        # to the freshly-opened device.
+        self._auto_discharge_state: bool = self._load_auto_discharge()
 
         # ----- oscilloscope: detection + connect/disconnect indicators -----
         # Two dots, mirroring the stimulator section: ``scope_detect_dot``
@@ -157,6 +221,14 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # it with make + model + VISA resource. Cleared on Disconnect.
         self.scope_label = _make_label("")
         self.scope_resource = QtWidgets.QLineEdit()
+        self.scope_resource.setToolTip(
+            "Optional VISA resource identifier for the "
+            "oscilloscope. Leave blank to let pyvisa pick the "
+            "first Tek scope it discovers (the usual case). Set "
+            "explicitly when you have multiple scopes on the same "
+            "bus and need to pin which one Connect targets. "
+            "Format: USB0::0x0699::&lt;model&gt;::&lt;serial&gt;::INSTR "
+            "or TCPIP0::&lt;ip&gt;::inst0::INSTR for LAN scopes.")
         self.scope_resource.setPlaceholderText(
             "Optional VISA resource (e.g. USB0::0x0699::0x03B0::C012345::INSTR)"
         )
@@ -179,22 +251,20 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         sdk_row.addWidget(self.sdk_browse_btn)
         v.addLayout(sdk_row)
 
-        # Stimulator section — two rows: the ID line (connected dot +
-        # description + detection dot pinned to the right) and a single
-        # action row that holds Scaling, the live scaling values, and
-        # the Initialize / Close buttons. Init/Close inline with
-        # Scaling drops one row of vertical space and keeps related
-        # controls visually grouped.
-        # Indicators bracket the description. Each dot has plain-text
-        # status next to it so the user can read both prerequisites
-        # ("is the SDK + DLL detected?") and live session state
-        # ("has Initialize opened the device?") without hovering.
-        # The middle stim_label keeps the device description (S/N,
-        # FW, channel count) so detail is one row up from the
-        # Scaling row.
+        # Stimulator section — two rows: the ID / detection line and
+        # a single action row that holds Scaling, the live scaling
+        # values, and the Initialize / Close buttons. Init/Close
+        # inline with Scaling drops one row of vertical space and
+        # keeps related controls visually grouped.
+        # The ID row reads left-to-right as: hardware-detection dot
+        # + status text + (post-Initialize) device description (S/N,
+        # FW, channel count) + ``Initialized:`` tag + connected dot.
+        # That pairs the same convention used by the scope section
+        # below — the "is it on the bus?" indicator on the left, the
+        # "is it open?" indicator on the right.
         stim_row = QtWidgets.QHBoxLayout()
-        stim_row.addWidget(self.detect_dot)
-        stim_row.addWidget(self.detect_text)
+        stim_row.addWidget(self.stim_detect_dot)
+        stim_row.addWidget(self.stim_detect_text)
         stim_row.addWidget(self.stim_label, stretch=1)
         stim_row.addWidget(_make_label("Initialized:"))
         stim_row.addWidget(self.stim_dot)
@@ -206,6 +276,8 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         scale_row.addWidget(self.init_btn)
         scale_row.addWidget(self.close_btn)
         v.addLayout(scale_row)
+
+        # (Auto-discharge UI is now in the pattern panel — no row here.)
 
         # Oscilloscope rows. Same indicator pattern as the stimulator:
         # detection state (dot + plain-text status) on the left, live
@@ -226,13 +298,16 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         scope_ctrls.addWidget(self.disconnect_btn)
         v.addLayout(scope_ctrls)
 
-        # First-time hardware detection probe — runs on the next event
-        # loop tick so the panel finishes laying out before we touch
-        # the registry / DLL loader. Cheap (no actual stim init).
-        # Same pattern for the scope side: enumerate VISA resources to
-        # see if anything that looks like a scope is on the bus.
-        QtCore.QTimer.singleShot(0, self._refresh_detection_indicator)
+        # First-time hardware-presence probes — both run on the next
+        # event-loop tick so the panel finishes laying out before
+        # we touch the VISA backend / shell out to PowerShell.
+        # Cheap on both sides (descriptor enumeration only, no
+        # device open). Stim-2 SOFTWARE detection (the SDK / DLL
+        # warning) is handled at launch by the dialog in
+        # ``_check_plexstim_prereq`` — these in-panel dots are for
+        # live hardware presence only.
         QtCore.QTimer.singleShot(0, self._refresh_scope_detection_indicator)
+        QtCore.QTimer.singleShot(0, self._refresh_stim_detection_indicator)
 
     # ------------------------------------------------------------- helpers
     @staticmethod
@@ -282,7 +357,17 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Apply any remembered scaling preset for this serial. The
         # combo is set FIRST (signals blocked) so we can then call
         # _apply_scaling_preset without re-entering the slot.
-        preset = self._scaling_by_serial.get(info.serial_number, self.SCALE_AUTO)
+        # ``known_serial`` records whether this device has a
+        # validated entry in the shared scaling database — if not,
+        # the user gets a warning popup below telling them to
+        # calibrate (or to confirm the preset manually if they are
+        # certain). Serials are added to the database either by
+        # the calibration wizard (via ``_record_serial_scaling``)
+        # or by the user explicitly picking a preset from the
+        # combo (via ``_on_scaling_changed``).
+        sn = (info.serial_number or "").strip()
+        known_serial = bool(sn) and sn in self._scaling_by_serial
+        preset = self._scaling_by_serial.get(sn, self.SCALE_AUTO)
         if preset not in (self.SCALE_AUTO, self.SCALE_DEFAULT, self.SCALE_NIL):
             preset = self.SCALE_AUTO
         self.scaling_combo.blockSignals(True)
@@ -291,6 +376,14 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         finally:
             self.scaling_combo.blockSignals(False)
         self._apply_scaling_preset(preset)
+        # Push the user's auto-discharge preference down to the device
+        # — the SDK resets this on PS_InitAllStim, so we have to apply
+        # it after every Initialize. Sim backend's set_auto_discharge
+        # is a no-op so this is safe in either mode.
+        try:
+            self._stim.set_auto_discharge(self._auto_discharge_state)
+        except Exception as e:
+            self.log.emit(f"Auto-discharge apply failed: {e}")
         self._set_dot(self.stim_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
         self._refresh_stim_label()
         self.scaling_combo.setEnabled(True)
@@ -302,6 +395,22 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # so subscribers see both halves.
         if self._scope is not None:
             self.connected.emit(self._stim, self._scope)
+        # Warn the user if this device's scaling hasn't been
+        # validated yet. Simulated devices are exempt — their
+        # scaling is whatever the simulator hard-codes and has
+        # nothing to do with real hardware. The warning is
+        # non-blocking (just a message box) so the user can still
+        # use the stimulator if they're confident in the manually-
+        # picked preset.
+        if (not info.is_simulated and not known_serial
+                and not getattr(self, "_uncalibrated_warned",
+                                  False)):
+            self._warn_uncalibrated_serial(sn or "(no serial)")
+            # Stash a per-session flag so we don't re-warn for the
+            # same device every time the user closes and re-opens
+            # the connection in one session. Cleared on
+            # ``_do_close_stim``.
+            self._uncalibrated_warned = True
 
     def _do_close_stim(self):
         """Close the stimulator handle and reset the indicator."""
@@ -329,6 +438,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.init_btn.setEnabled(True)
             self.close_btn.setEnabled(False)
             self.log.emit("Stimulator closed.")
+            # Reset the "uncalibrated serial" one-shot so the
+            # next Initialize re-evaluates the database
+            # membership and re-warns if appropriate.
+            self._uncalibrated_warned = False
 
     def _on_simulate_toggled(self, _checked: bool):
         # Drop the scope first because real-vs-sim isn't compatible
@@ -338,12 +451,50 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self._do_disconnect_scope()
         if self._stim is not None:
             self._do_close_stim()
-        # Detection state itself doesn't change with the simulate
-        # toggle, but the user may have changed SDK path or plugged
-        # / unplugged hardware while the toggle is on; re-probe both
-        # sides so the dots stay fresh.
-        self._refresh_detection_indicator()
+        # Re-probe both detection indicators — the user may have
+        # changed VISA resources or plugged / unplugged hardware
+        # while the toggle was on. (Stim-2 software detection is
+        # launch-time only; it's not affected by the simulate
+        # toggle.)
         self._refresh_scope_detection_indicator()
+        self._refresh_stim_detection_indicator()
+
+    # ------- auto-discharge mode -----------------------------------
+    def auto_discharge_pref(self) -> bool:
+        """Return the persisted auto-discharge preference.
+
+        Used by the main window at startup to seed every pattern
+        panel's checkbox before any UI is shown. Defaults to True
+        (the safe state) on a clean install.
+        """
+        return self._auto_discharge_state
+
+    def apply_auto_discharge(self, checked: bool) -> None:
+        """Apply a new auto-discharge state to the live device and
+        persist it. Called by the main window when the user toggles
+        the checkbox in any pattern panel.
+
+        The user-facing warning dialog lives in the pattern panel
+        (where the UI is now); by the time this slot runs the user
+        has already confirmed the change. We just push to hardware
+        + save the prefs.
+        """
+        self._auto_discharge_state = bool(checked)
+        # Push to the live device. Sim backend's set_auto_discharge is
+        # a no-op so this is safe whether or not real hardware is open.
+        if self._stim is not None:
+            try:
+                self._stim.set_auto_discharge(self._auto_discharge_state)
+            except Exception as e:
+                self.log.emit(f"Auto-discharge apply failed: {e}")
+        # Persist so a restart reopens with the same preference.
+        try:
+            self._save_auto_discharge(self._auto_discharge_state)
+        except Exception:
+            pass
+        self.log.emit(
+            f"Auto-discharge: "
+            f"{'ON' if self._auto_discharge_state else 'OFF (warning acknowledged)'}")
 
     # ------- scaling preset (per-serial memory) ---------------------
     def _refresh_stim_label(self):
@@ -389,6 +540,60 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Auto-detect: leave the values that PlexonStimulator already
         # set during open() — they reflect the serial-number heuristic.
 
+    def _warn_uncalibrated_serial(self, serial_number: str) -> None:
+        """Pop a modal warning when an Initialize completed for a
+        stimulator whose serial isn't in the shared scaling
+        database.
+
+        The shared database (``stim_scaling_by_serial`` in the
+        prefs JSON) is populated by:
+
+          * the calibration wizard's ``_record_serial_scaling``
+            after a successful sweep — the trusted, R²-validated
+            path; and
+          * the user explicitly picking Default / NIL from the
+            combo in this panel (``_on_scaling_changed``) — the
+            "I'm certain" override path.
+
+        Until one of those has happened, the device's I_mon
+        scaling is effectively unknown. Until calibration, the
+        readback values from V_mon / I_mon may be wildly wrong
+        if Auto-detect picks the wrong preset for this serial.
+
+        This is informational, not blocking — the user can still
+        proceed if they're confident.
+        """
+        text = (
+            f"<h3>Uncalibrated stimulator</h3>"
+            f"<p>Serial <b>{serial_number}</b> isn't in the shared "
+            f"scaling database — its I_mon scaling hasn't been "
+            f"validated for this installation.</p>"
+            f"<p>Until the validation has run, V_mon / I_mon "
+            f"readback values may be off by 2.5× if Auto-detect "
+            f"picked the wrong preset for this device.</p>"
+            f"<p><b>Recommended:</b> connect the Plexon test "
+            f"board and run <i>Run → Calibrate…</i>. The "
+            f"calibration wizard verifies the scaling and "
+            f"records this serial in the database so future "
+            f"sessions apply the right preset automatically.</p>"
+            f"<p><b>If you are CERTAIN of the scaling</b> for "
+            f"this device (e.g. you've confirmed it on the bench "
+            f"by other means), pick <b>Default</b> or <b>NIL</b> "
+            f"from the scaling combo on this panel — that also "
+            f"records the choice in the database. <b>Auto-detect</b> "
+            f"alone does NOT count as a calibration.</p>"
+            f"<p>The scaling combo currently reads "
+            f"<b>{self.scaling_combo.currentText()}</b>.</p>"
+        )
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Uncalibrated stimulator")
+        box.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        box.setText(text)
+        box.setStandardButtons(
+            QtWidgets.QMessageBox.StandardButton.Ok)
+        box.exec()
+
     def _on_scaling_changed(self, preset: str):
         """User picked a different scaling preset from the combo."""
         if self._stim is None:
@@ -404,41 +609,94 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.log.emit(f"Stimulator scaling preset → {preset}")
 
     # ------- detection indicator ------------------------------------
-    def _refresh_detection_indicator(self):
-        """Light up the detection dot based on ``plexstim_detect`` output.
+    def refresh_hardware_detection(self):
+        """Re-probe what's on the bus and refresh both detection
+        indicators. Public so the USB hot-plug filter can call it
+        as devices arrive / disappear without poking private
+        methods.
 
-        The detector walks the registry and tries a ``ctypes.CDLL`` load
-        without initialising the device, so we can show "yes, the SDK
-        is here and the DLL is loadable" before the user hits
-        Initialize. Tooltip carries the detector's diagnostic notes.
+        Two probes run on every refresh:
+
+        * **Scope** — :meth:`_refresh_scope_detection_indicator`
+          (pyvisa enumeration; matches scope vendor IDs).
+        * **Stimulator** — :meth:`_refresh_stim_detection_indicator`
+          (PowerShell PnP query for a Plexon-named USB device).
+
+        Stim-2 SOFTWARE detection (registry / DLL loadability) is
+        unrelated and runs once at launch (see
+        ``_check_plexstim_prereq``); re-running it on every hot-
+        plug would just reload the registry for no benefit, since
+        the SDK install state doesn't flip with USB activity.
+        """
+        self._refresh_scope_detection_indicator()
+        self._refresh_stim_detection_indicator()
+
+    def _refresh_stim_detection_indicator(self):
+        """Drive the stimulator detect dot from a Windows-PnP probe.
+
+        :func:`stimtest.hardware.plexstim_detect.plexstim_device_present`
+        returns:
+
+        * ``True``  → green dot, "Stimulator detected".
+        * ``False`` → grey dot, "Stimulator not detected".
+        * ``None``  → amber dot, "Stimulator detection unavailable
+          on this platform" — non-Windows, missing PowerShell, or
+          PnP timeout. The amber state is intentionally distinct
+          from "not detected" so a user on Linux / macOS isn't
+          told their device is absent when really we just can't
+          check.
+
+        Called on every USB hot-plug event (via
+        :meth:`refresh_hardware_detection`) and once lazily on
+        panel construction. The probe runs synchronously on the
+        GUI thread; PnP enumeration is fast (sub-second on a
+        healthy box) so the UI lag is imperceptible.
         """
         try:
-            from ..hardware.plexstim_detect import detect_plexstim
-            status = detect_plexstim()
+            from ..hardware.plexstim_detect import plexstim_device_present
+            present = plexstim_device_present()
         except Exception as e:
-            self._set_dot(self.detect_dot, _DOT_OFF)
-            self.detect_dot.setToolTip(f"Detection probe failed: {e}")
+            self._set_dot(self.stim_detect_dot, _DOT_OFF)
+            text = "Stimulator detection failed"
+            tip = (f"Detection probe raised an exception: {e}\n\n"
+                   "The 'Initialized' indicator below still works "
+                   "— click Initialize to try opening the device "
+                   "directly.")
+            self.stim_detect_text.setText(text)
+            self.stim_detect_dot.setToolTip(tip)
+            self.stim_detect_text.setToolTip(tip)
             return
-        if status.installed and status.dll_loadable:
-            self._set_dot(self.detect_dot, _DOT_OK)
+        if present is True:
+            self._set_dot(self.stim_detect_dot, _DOT_OK)
             text = "Stimulator detected"
-            tip = "Stimulator SDK detected and DLL loadable."
-        elif status.installed:
-            self._set_dot(self.detect_dot, _DOT_WARN)
-            text = "Stimulator DLL failed to load"
-            tip = ("Stimulator SDK present but DLL failed to load — "
-                   "Visual C++ runtime may be missing.")
-        else:
-            self._set_dot(self.detect_dot, _DOT_OFF)
+            tip = ("A Plexon stimulator USB device is currently "
+                   "enumerated by the operating system. Click "
+                   "Initialize to open a session.")
+        elif present is False:
+            self._set_dot(self.stim_detect_dot, _DOT_OFF)
             text = "Stimulator not detected"
-            tip = "Stimulator SDK not detected on this machine."
-        self.detect_text.setText(text)
-        if status.notes:
-            tip = tip + "\n\n" + "\n".join(status.notes)
-        self.detect_dot.setToolTip(tip)
-        # Echo the same tooltip on the text label so a hover anywhere
-        # in the indicator group surfaces the diagnostic notes.
-        self.detect_text.setToolTip(tip)
+            tip = ("No Plexon stimulator USB device is currently "
+                   "plugged in (or the Plexon USB driver isn't "
+                   "installed yet — see the Stim-2 software "
+                   "warning at launch).\n\n"
+                   "If a stimulator IS plugged in but isn't being "
+                   "detected, check Device Manager for an unknown / "
+                   "yellow-flag entry, and confirm the Stim-2 / "
+                   "Stimulator V2 driver installed cleanly.")
+        else:
+            # ``None`` = couldn't run the probe (non-Windows,
+            # PowerShell missing, PnP timeout). Use the amber
+            # "warning" colour so the user reads it as
+            # indeterminate rather than negative.
+            self._set_dot(self.stim_detect_dot, _DOT_WARN)
+            text = "Stimulator detection unavailable"
+            tip = ("Hardware-presence detection isn't available "
+                   "on this platform (Windows-only via PowerShell "
+                   "PnP enumeration). Click Initialize to test the "
+                   "device connection directly.")
+        self.stim_detect_text.setText(text)
+        self.stim_detect_dot.setToolTip(tip)
+        self.stim_detect_text.setToolTip(tip)
 
     def _refresh_scope_detection_indicator(self):
         """Light up the scope detection dot from the VISA resource list.
@@ -514,6 +772,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     def _sdk_prefs_section() -> str:
         return "pyplexstim_sdk"
 
+    @staticmethod
+    def _stim_prefs_section() -> str:
+        return "stim_settings"
+
     def _load_sdk_path(self) -> str:
         prefs = load_prefs() or {}
         section = prefs.get(self._sdk_prefs_section(), {})
@@ -524,6 +786,25 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     def _save_sdk_path(self, path: str):
         prefs = load_prefs() or {}
         prefs[self._sdk_prefs_section()] = {"dll_path": str(path)}
+        save_prefs(prefs)
+
+    def _load_auto_discharge(self) -> bool:
+        """Read the persisted auto-discharge preference. Defaults to
+        True (the safe state) so a fresh install / wiped prefs always
+        starts with the protective shorting enabled."""
+        prefs = load_prefs() or {}
+        section = prefs.get(self._stim_prefs_section(), {})
+        if not isinstance(section, dict):
+            return True
+        return bool(section.get("auto_discharge", True))
+
+    def _save_auto_discharge(self, enabled: bool):
+        prefs = load_prefs() or {}
+        section = prefs.get(self._stim_prefs_section(), {})
+        if not isinstance(section, dict):
+            section = {}
+        section["auto_discharge"] = bool(enabled)
+        prefs[self._stim_prefs_section()] = section
         save_prefs(prefs)
 
     def _effective_dll_path(self) -> Optional[str]:

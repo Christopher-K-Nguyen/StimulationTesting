@@ -162,6 +162,38 @@ class Stimulator(ABC):
         """Number of pulses to deliver (0 = infinite). Optional override."""
         raise NotImplementedError
 
+    def set_auto_discharge(self, enabled: bool) -> None:
+        """Enable / disable the device's automatic discharge mode.
+
+        With auto-discharge ON (the default and the strongly-recommended
+        setting), the stimulator actively shorts the electrode to a
+        recovery rail during the post-pulse discharge interval — the
+        residual charge from any per-pulse imbalance gets safely drained
+        before the next pulse fires. With it OFF the electrode floats
+        during the gap, and any residual charge accumulates pulse-to-
+        pulse. That can drift the electrode-tissue interface DC offset
+        out of the water-window and cause irreversible faradaic
+        reactions, so the GUI surfaces a warning before letting the
+        user disable this.
+
+        Maps to the PlexStim 2.0 SDK's ``PS_SetAutoDischarge`` call.
+        Default implementation is a no-op so backends without this
+        primitive (the simulator) can ignore it without raising.
+        """
+        return None
+
+    def get_auto_discharge(self) -> Optional[bool]:
+        """Return the current auto-discharge state as a tri-bool:
+
+        * ``True`` — enabled (the safe, recommended state).
+        * ``False`` — explicitly disabled (the user has acknowledged
+          the risk; pulses run with a floating electrode during the
+          discharge interval).
+        * ``None`` — backend doesn't expose this setting (simulator,
+          legacy device).
+        """
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Oscilloscope

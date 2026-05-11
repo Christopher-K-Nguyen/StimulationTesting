@@ -52,11 +52,15 @@ class PlexonStimulator(Stimulator):
         # sweep doesn't churn through hundreds of tempfile create /
         # unlink syscalls. Cleaned up by ``close()``.
         self._pat_path: Optional[str] = None
-        # Cache of the most-recent .pat file *content* keyed by the
-        # pattern's phase tuple. When a fixed-amp pulsing loop
-        # reloads the same pattern back-to-back we skip the disk
-        # rewrite entirely — the file already has the right bytes.
-        self._pat_signature: Optional[tuple] = None
+        # Cache of the most-recent .pat file *content signature* —
+        # covers ONLY the phase tuple (what's actually in the .pat
+        # file). Rate and repetitions are programmed via separate
+        # SDK calls (PS_SetPeriod / PS_SetRepetitions) and don't
+        # invalidate the file; previously we conflated all three in
+        # one signature, so every rate change forced a rewrite + fsync
+        # even though the bytes were unchanged. Splitting the
+        # signatures saves ~5-50 ms / sweep step on slow storage.
+        self._pat_content_signature: Optional[tuple] = None
         # Set of channel numbers currently in the "pattern loaded"
         # state on the device. Mutated by load_channel; cleared by
         # open() and close() since both go through PS_InitAllStim /
@@ -64,6 +68,21 @@ class PlexonStimulator(Stimulator):
         # the experiment runners to decide whether a configuration
         # change requires a reinit (see Stimulator.loaded_channels).
         self._loaded_channels: set = set()
+        # Channels that have successfully passed period / repetitions
+        # read-back validation since the most recent open(). The
+        # read-back catches a class of firmware quirks (silent rounding
+        # during an active stim, .pat-load races) — once a channel has
+        # passed once after open(), subsequent sweep steps run with
+        # the SAME firmware path and we can skip the 2 extra USB
+        # round trips per step (~80-120 ms saved on a 50-step sweep).
+        # Set is wiped by open()/close() since reinit changes the
+        # firmware state.
+        self._validated_channels: set = set()
+        # User's auto-discharge preference, applied on every open() so
+        # the setting survives reinit cycles. ``None`` means "leave at
+        # the SDK default (enabled)" — the panel hasn't pushed an
+        # explicit preference yet.
+        self._auto_discharge_pref: Optional[bool] = None
 
     # ----- internal helpers -----
     def _check(self, result: int, what: str) -> None:
@@ -202,6 +221,20 @@ class PlexonStimulator(Stimulator):
         # PS_InitAllStim wipes any patterns the device had from a
         # previous session, so the loaded-channel set starts empty.
         self._loaded_channels = set()
+        # Firmware state was just reset by PS_InitAllStim — every
+        # channel must re-pass read-back validation before we can
+        # trust it to skip the per-step verification round trips.
+        self._validated_channels = set()
+        # Re-apply the user's auto-discharge preference. The SDK
+        # resets this to its default (enabled) on PS_InitAllStim,
+        # so a reinit between configs would silently re-enable it
+        # if we didn't push the user's choice back here.
+        if self._auto_discharge_pref is not None:
+            try:
+                self._lib.ps_set_auto_discharge(
+                    self._stim_n, bool(self._auto_discharge_pref))
+            except Exception:
+                pass
 
     def close(self) -> None:
         try:
@@ -210,6 +243,7 @@ class PlexonStimulator(Stimulator):
             pass
         # PS_CloseAllStim drops device-side patterns; track that.
         self._loaded_channels = set()
+        self._validated_channels = set()
         # Clean up the pinned .pat file so we don't leak temp files
         # across re-init cycles (and the next session starts fresh).
         if self._pat_path is not None:
@@ -218,7 +252,7 @@ class PlexonStimulator(Stimulator):
             except OSError:
                 pass
             self._pat_path = None
-        self._pat_signature = None
+        self._pat_content_signature = None
 
     # ----- programming -----
     def load_channel(self, channel: int, pattern: PulsePattern) -> None:
@@ -262,27 +296,38 @@ class PlexonStimulator(Stimulator):
         # and with set_period during an active stim), we want to know
         # NOW, not after a captured trace looks wrong.
         #
+        # **Hot-loop optimisation**: a sweep programs each channel
+        # dozens of times in quick succession with the same firmware
+        # path. The first programming verifies the path works; every
+        # subsequent step exercising the same channel doesn't add new
+        # failure modes, so we skip the 2 extra USB round trips after
+        # the first success on each channel. ~80-120 ms saved on a
+        # 50-step sweep × N channels. Reset by open()/close() since
+        # PS_InitAllStim resets firmware state.
+        #
         # Some firmware revisions return PS_GetPeriod in µs even though
         # the docs say ms — we accept either reading by checking the
         # ratio rather than the absolute value. Tolerance is 1% of the
         # requested period so high-rate trains where rounding inside
         # the device matters more get a tighter check naturally.
-        got_period, res = self._lib.ps_get_period(self._stim_n, channel)
-        self._check(res, f"get_period(ch={channel}) read-back")
-        got = float(got_period)
-        candidates = (period_ms, period_ms * 1000.0)  # accept ms or µs reading
-        tolerance = max(period_ms * 0.01, 1e-3)
-        if not any(abs(got - c) <= max(tolerance, c * 0.01) for c in candidates):
-            raise RuntimeError(
-                f"PlexStim period mismatch on ch{channel}: requested "
-                f"{period_ms:.3f} ms, device reports {got} (neither "
-                f"{period_ms:.3f} ms nor {period_ms * 1000:.0f} µs).")
-        got_reps, res = self._lib.ps_get_repetitions(self._stim_n, channel)
-        self._check(res, f"get_repetitions(ch={channel}) read-back")
-        if int(got_reps) != int(pattern.repetitions):
-            raise RuntimeError(
-                f"PlexStim repetitions mismatch on ch{channel}: requested "
-                f"{pattern.repetitions}, device reports {got_reps}.")
+        if int(channel) not in self._validated_channels:
+            got_period, res = self._lib.ps_get_period(self._stim_n, channel)
+            self._check(res, f"get_period(ch={channel}) read-back")
+            got = float(got_period)
+            candidates = (period_ms, period_ms * 1000.0)  # accept ms or µs reading
+            tolerance = max(period_ms * 0.01, 1e-3)
+            if not any(abs(got - c) <= max(tolerance, c * 0.01) for c in candidates):
+                raise RuntimeError(
+                    f"PlexStim period mismatch on ch{channel}: requested "
+                    f"{period_ms:.3f} ms, device reports {got} (neither "
+                    f"{period_ms:.3f} ms nor {period_ms * 1000:.0f} µs).")
+            got_reps, res = self._lib.ps_get_repetitions(self._stim_n, channel)
+            self._check(res, f"get_repetitions(ch={channel}) read-back")
+            if int(got_reps) != int(pattern.repetitions):
+                raise RuntimeError(
+                    f"PlexStim repetitions mismatch on ch{channel}: requested "
+                    f"{pattern.repetitions}, device reports {got_reps}.")
+            self._validated_channels.add(int(channel))
         # Track the loaded state so the runner can decide whether
         # the next configuration's return-channel set requires a
         # reinit. See Stimulator.loaded_channels for the rule.
@@ -307,64 +352,48 @@ class PlexonStimulator(Stimulator):
         from .pyplexstim.pyplexstimlib import PS_PATTERN_ARB
         import tempfile
 
-        # PlexStim .pat: list of (time_us, amplitude_µA) breakpoints.
-        # The DLL linearly interpolates between breakpoints, so any
-        # waveform — rectangular, ramp, sine, halfpipe, bowtie,
-        # speedbumps — reduces to a sufficiently-fine breakpoint
-        # sequence. ``waveforms.shape_breakpoints`` does that
-        # rendering; we just compose the per-phase output with the
-        # running cursor and append zero markers across the
-        # interphase / discharge delays.
-        #
-        # Per the PlexStim 2.0 SDK, the pattern caps at 999 fixed
-        # points or 499 paired values. With our default 50 samples
-        # per curved phase × 2 phases = 100 + 4 zero markers, we sit
-        # comfortably within budget for biphasic; rectangular and
-        # linear-ramp shapes use only 2-3 points per phase.
-        from ..waveforms import shape_breakpoints
+        # PlexStim .pat: list of (amp_nA, duration_µs) pairs. The DLL
+        # holds each amp for its duration (sample-and-hold staircase),
+        # so any waveform — rectangular, ramp, sine, halfpipe, bowtie,
+        # speedbumps — reduces to a sufficiently-fine pair sequence.
+        # ``build_pat_pairs`` does the rendering AND validates the
+        # output against the PlexStim 2.0 SDK constraints (≤ 499 pairs,
+        # every duration ≥ 1 µs, every amplitude in the documented
+        # int32 nA range) so a bad pattern raises here rather than
+        # silently truncating on the device.
+        from ..waveforms import build_pat_pairs, format_pat_lines
 
-        # The signature short-circuits identical reloads but MUST cover
-        # every parameter that affects the device's runtime behaviour
-        # — not just the rectangular phase tuple. ``shape`` and
-        # ``bump_count`` change the file content, so they're part of
-        # the signature too.
-        signature = (
-            tuple(
-                (int(round(ph.amplitude_ua)),
-                 round(ph.width_us, 3),
-                 round(ph.delay_after_us, 3),
-                 ph.shape,
-                 int(ph.bump_count))
-                for ph in pattern.phases
-            ),
-            round(float(pattern.rate_hz), 6),
-            int(pattern.repetitions),
+        # Signature covers ONLY the .pat content (phase tuple) — rate
+        # and repetitions are programmed through PS_SetPeriod /
+        # PS_SetRepetitions, NOT embedded in the .pat file, so a rate
+        # change alone shouldn't force a rewrite + fsync. Previously
+        # rate/reps were folded into the signature and every sweep
+        # step that touched the rate burned ~5-50 ms re-flushing
+        # bytes the DLL already had.
+        content_signature = tuple(
+            (int(round(ph.amplitude_ua)),
+             round(ph.width_us, 3),
+             round(ph.delay_after_us, 3),
+             ph.shape,
+             int(ph.bump_count),
+             round(ph.tau_us, 3),
+             round(getattr(ph, "tail_zero_us", 0.0), 3),
+             round(getattr(ph, "offset_ua", 0.0), 3))
+            for ph in pattern.phases
         )
         # Lazy-allocate the pinned path on first use. ``delete=False``
         # because we want it to outlive the with-block; unlinked in
         # ``close()`` instead.
-        if self._pat_path is None or signature != self._pat_signature:
-            lines = ["0,0"]
-            t = 0.0
-            for ph in pattern.phases:
-                # Breakpoints from the shape generator are
-                # phase-relative; offset by the running cursor so the
-                # device sees absolute pulse-start times.
-                bps = shape_breakpoints(
-                    amplitude_ua=ph.amplitude_ua,
-                    width_us=ph.width_us,
-                    shape=ph.shape,
-                    bump_count=ph.bump_count,
-                )
-                for offset_us, amp_ua in bps:
-                    lines.append(f"{t + offset_us:.0f},"
-                                 f"{int(round(amp_ua))}")
-                t += ph.width_us + ph.delay_after_us
-                # Idle the channel during the inter-phase / post-phase
-                # delay so the next phase's first breakpoint sits on
-                # a clean 0 baseline.
-                lines.append(f"{t:.0f},0")
-            content = "\n".join(lines)
+        if (self._pat_path is None
+                or content_signature != self._pat_content_signature):
+            # Documented PlexStim variable format (per the user
+            # guide, §8.5.2): first line "Variable", then alternating
+            # amp (nA) / duration (µs) lines. ``build_pat_pairs``
+            # constructs the pair list; ``format_pat_lines`` flattens
+            # it to the line-oriented form the DLL expects.
+            pairs = build_pat_pairs(pattern)
+            lines = format_pat_lines(pairs)
+            content = "\n".join(lines) + "\n"
             # Flush + fsync after every write so the bytes are
             # guaranteed on disk before ``ps_load_arb_pattern`` runs.
             # Without it, on slow / network-mounted backing stores
@@ -387,7 +416,7 @@ class PlexonStimulator(Stimulator):
                     fh.write(content)
                     fh.flush()
                     os.fsync(fh.fileno())
-            self._pat_signature = signature
+            self._pat_content_signature = content_signature
         # else: file content already matches this pattern — skip the
         # rewrite and go straight to the DLL load.
 
@@ -458,3 +487,26 @@ class PlexonStimulator(Stimulator):
         self._check(
             self._lib.ps_set_repetitions(self._stim_n, channel, int(n)),
             f"set_repetitions(ch={channel}, n={n})")
+
+    # ----- auto-discharge -----
+    def set_auto_discharge(self, enabled: bool) -> None:
+        """Push the user's auto-discharge preference to the device.
+
+        Cached on the instance so a later ``open() / reinit()`` (which
+        wraps PS_InitAllStim and resets the device-side flag) can
+        re-apply it transparently.
+        """
+        self._auto_discharge_pref = bool(enabled)
+        self._check(
+            self._lib.ps_set_auto_discharge(self._stim_n,
+                                            bool(enabled)),
+            f"set_auto_discharge(enabled={enabled})")
+
+    def get_auto_discharge(self) -> Optional[bool]:
+        try:
+            val, res = self._lib.ps_get_auto_discharge(self._stim_n)
+            if res != self._PS_OK:
+                return None
+            return bool(val)
+        except Exception:
+            return None

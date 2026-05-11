@@ -103,6 +103,36 @@ class ShortPulsingExperiment(ExperimentRunner):
                     acq = self.scope.single_capture()
                     cap = _make_capture(idx, pattern, acq, self.scope, self.stim)
                     compute_metrics(cap, run.surface_area_um2)
+                    # Feed the E_ret pre/post-pulse rest values into
+                    # the electrode-potential learning bin keyed by
+                    # the return coating. Silently no-ops when the
+                    # capture has no E_ret trace (NaN rest values)
+                    # or when the session lacks a setup snapshot.
+                    try:
+                        from ..electrode_potential_history import record_capture
+                        record_capture(cap, self.session)
+                    except Exception:
+                        pass
+                    # Per-capture damage warning — environment-posture
+                    # aware. ``info`` (PBS / mISF / etc.) suppresses
+                    # per-capture log spam; ``warn`` / ``alert`` emit
+                    # one log line per flagged capture.
+                    try:
+                        from ..damage_warnings import assess_finished_capture
+                        snap = (self.session.test.extras or {}).get(
+                            "setup_snapshot") or {}
+                        env_short = (snap.get("environment_short")
+                                     if isinstance(snap, dict) else None
+                                     ) or "pbs"
+                        warn = assess_finished_capture(
+                            cap, environment_short=env_short)
+                        if warn is not None:
+                            self._emit(ExperimentEvent(
+                                kind="log", session=self.session,
+                                capture=cap,
+                                message=f"{warn.title}\n{warn.body}"))
+                    except Exception:
+                        pass
                     run.captures.append(cap)
                     self._emit(ExperimentEvent(kind="capture", session=self.session,
                                                run=run, capture=cap))

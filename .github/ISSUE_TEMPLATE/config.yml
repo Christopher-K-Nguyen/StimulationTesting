@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Hardware-probe diagnostic
+    url: https://github.com/Bortz1234/StimulationTesting/blob/main/scripts/hardware_probe.py
+    about: Before filing a real-hardware bug, run `python scripts/hardware_probe.py` and attach its output to the issue.
+  - name: Contributing guide
+    url: https://github.com/Bortz1234/StimulationTesting/blob/main/CONTRIBUTING.md
+    about: Dev environment setup, test workflow, coding style, PR checklist.
