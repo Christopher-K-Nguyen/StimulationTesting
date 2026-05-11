@@ -9,6 +9,7 @@ Layout:
     ●  Oscilloscope: Tektronix TBS2204B  ·  USB::…::INSTR
        VISA resource: [______________]
        [ Connect ] [ Disconnect ]
+       [ Run Calibration ]  Last calibrated: 2026-05-11 14:32
 
 Both halves now have explicit Initialize/Close (or Connect/Disconnect)
 buttons — the stimulator no longer auto-opens at startup so the user
@@ -223,6 +224,15 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.connect_btn.clicked.connect(self._do_connect_scope)
         self.disconnect_btn.clicked.connect(self._do_disconnect_scope)
 
+        # ----- calibration row -----
+        self.calibrate_btn = QtWidgets.QPushButton("Run Calibration…")
+        self.calibrate_btn.setEnabled(False)   # unlocks when stim+scope both connected
+        self.calibrate_btn.setToolTip(
+            "Initialize the stimulator and connect the oscilloscope first.")
+        self.calibrate_btn.clicked.connect(self._do_run_calibration)
+        self.cal_label = _make_label("")
+        self._refresh_cal_label()
+
         # ----- layout -----
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(8, 4, 8, 6)
@@ -274,6 +284,11 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         scope_ctrls.addWidget(self.connect_btn)
         scope_ctrls.addWidget(self.disconnect_btn)
         v.addLayout(scope_ctrls)
+
+        cal_row = QtWidgets.QHBoxLayout()
+        cal_row.addWidget(self.calibrate_btn)
+        cal_row.addWidget(self.cal_label, stretch=1)
+        v.addLayout(cal_row)
 
         # First-time hardware-presence probes — both run on the next
         # event-loop tick so the panel finishes laying out before
@@ -367,6 +382,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.scaling_combo.setEnabled(True)
         self.init_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
+        self._update_calibrate_btn()
         self.log.emit(f"Stimulator initialized: {info.description or 'sim stim'} "
                       f"(S/N {info.serial_number or 'n/a'})")
         # If a scope is already connected, refresh the connected signal
@@ -415,6 +431,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                 self.scaling_combo.blockSignals(False)
             self.init_btn.setEnabled(True)
             self.close_btn.setEnabled(False)
+            self._update_calibrate_btn()
             self.log.emit("Stimulator closed.")
             # Reset the "uncalibrated serial" one-shot so the
             # next Initialize re-evaluates the database
@@ -869,6 +886,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         )
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
+        self._update_calibrate_btn()
         self.connected.emit(self._stim, self._scope)
         self.scopeConnected.emit(True)
         self.log.emit(f"Scope connected: {info.make} {info.model}")
@@ -884,10 +902,54 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.scope_label.setText("")
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
+            self._update_calibrate_btn()
             if had_scope:
                 self.disconnected.emit()
                 self.scopeConnected.emit(False)
                 self.log.emit("Scope disconnected.")
+
+    # ------------------------------------------------- calibration helpers
+    def _update_calibrate_btn(self):
+        """Enable the calibration button only when both stim and scope
+        are live (mirrors the condition the CalibrationDialog requires
+        before it allows a sweep to run)."""
+        ready = self._stim is not None and self._scope is not None
+        self.calibrate_btn.setEnabled(ready)
+        self.calibrate_btn.setToolTip(
+            "Open the PlexStim test-board calibration wizard."
+            if ready else
+            "Initialize the stimulator and connect the oscilloscope first."
+        )
+
+    def _refresh_cal_label(self):
+        """Read the last-calibration timestamp from disk and update the
+        inline label next to the Run Calibration button."""
+        try:
+            from .calibration import last_calibration_datetime
+            ts = last_calibration_datetime()
+        except Exception:
+            ts = None
+        if ts is None:
+            text = "Last calibrated: <i>never</i>"
+        else:
+            text = f"Last calibrated: {ts.strftime('%Y-%m-%d %H:%M')}"
+        self.cal_label.setText(text)
+
+    def _do_run_calibration(self):
+        """Open the calibration wizard. Refreshes the last-calibrated
+        label when the dialog closes so the timestamp updates immediately."""
+        try:
+            from .calibration import CalibrationDialog
+        except ImportError:
+            QtWidgets.QMessageBox.information(
+                self, "Calibration",
+                "Calibration wizard not available in this build.")
+            return
+        dlg = CalibrationDialog(self, stim=self._stim, scope=self._scope)
+        dlg.exec()
+        # Refresh the label whether the user saved or cancelled — a
+        # partial run may still have written updated coefficients.
+        self._refresh_cal_label()
 
     # ------------------------------------------------------------- props
     @property
