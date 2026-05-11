@@ -60,6 +60,14 @@ class ConnectionPanel(QtWidgets.QGroupBox):
 
     connected = QtCore.pyqtSignal(object, object)   # (Stimulator, Oscilloscope)
     disconnected = QtCore.pyqtSignal()
+    # Internal signal used to safely marshal the stim-detection result
+    # from the background probe thread back to the GUI thread.
+    # ``object`` carries bool | None | Exception from the probe.
+    _stimDetectResult = QtCore.pyqtSignal(object)
+    # Internal signal for marshalling scope-connect results from the
+    # background thread back to the GUI thread. Carries the opened
+    # Oscilloscope on success, or an Exception on failure.
+    _scopeConnectResult = QtCore.pyqtSignal(object)
     # Fires whenever scope connection state flips. Setup tab listens
     # so it can blank out the channel-mapping rows when no scope is up.
     scopeConnected = QtCore.pyqtSignal(bool)
@@ -102,29 +110,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             "and protocol design — every experiment runs end-to-end "
             "but no current is delivered. Toggle disconnects any "
             "live hardware first.")
-
-        # ----- PyPlexStim SDK path -----
-        # Loaded from prefs at startup; remembered across sessions so
-        # the user only has to point the GUI at the SDK folder once.
-        # Empty string means "use the vendored copy" — the existing
-        # default behaviour.
-        self.sdk_path = QtWidgets.QLineEdit()
-        self.sdk_path.setToolTip(
-            "Folder containing PlexStim64.dll. Leave blank to use "
-            "the copy vendored with the GUI. Set this only if you "
-            "have a different SDK version you want to drive the "
-            "stimulator with — and remember the on-disk DLL is "
-            "independent from whether Plexon's Sim-2 GUI is "
-            "installed; the GUI app must be CLOSED during "
-            "automated runs (it holds an exclusive USB lock).")
-        self.sdk_path.setPlaceholderText(
-            "PyPlexStim SDK folder (containing PlexStim64.dll). "
-            "Leave blank to use the vendored copy."
-        )
-        self.sdk_path.editingFinished.connect(self._on_sdk_path_changed)
-        self.sdk_browse_btn = QtWidgets.QPushButton("Browse…")
-        self.sdk_browse_btn.clicked.connect(self._on_sdk_browse)
-        self.sdk_path.setText(self._load_sdk_path())
 
         # ----- stimulator: detection + Initialize / Close -----
         # Two dots in the stimulator section, mirroring the scope
@@ -243,14 +228,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         v.setContentsMargins(8, 4, 8, 6)
         v.addWidget(self.simulate)
 
-        # SDK path row — sits above the stimulator section because it
-        # affects what Initialize will load.
-        sdk_row = QtWidgets.QHBoxLayout()
-        sdk_row.addWidget(_make_label("PyPlexStim SDK:"))
-        sdk_row.addWidget(self.sdk_path, stretch=1)
-        sdk_row.addWidget(self.sdk_browse_btn)
-        v.addLayout(sdk_row)
-
         # Stimulator section — two rows: the ID / detection line and
         # a single action row that holds Scaling, the live scaling
         # values, and the Initialize / Close buttons. Init/Close
@@ -338,11 +315,12 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self._do_close_stim()
         sim = self.simulate.isChecked()
         try:
-            # ``dll_path`` is the user-remembered SDK folder, drilled
-            # into the ``bin/`` subfolder if needed. Empty string =
-            # use the vendored copy in ``stimtest.hardware.pyplexstim.bin``.
-            dll_path = self._effective_dll_path() if not sim else None
-            self._stim = open_stimulator(simulate=sim, dll_path=dll_path)
+            # The PlexStim DLL is vendored inside the package
+            # (``stimtest/hardware/pyplexstim/bin/``); the loader
+            # picks it up automatically. There is no user-facing
+            # SDK-path input anymore — if the vendored DLL fails to
+            # load, the exception below surfaces the reason.
+            self._stim = open_stimulator(simulate=sim)
             self._stim.open()
         except Exception as e:
             self._stim = None
@@ -648,52 +626,64 @@ class ConnectionPanel(QtWidgets.QGroupBox):
 
         Called on every USB hot-plug event (via
         :meth:`refresh_hardware_detection`) and once lazily on
-        panel construction. The probe runs synchronously on the
-        GUI thread; PnP enumeration is fast (sub-second on a
-        healthy box) so the UI lag is imperceptible.
+        panel construction. The probe runs in a daemon thread so
+        the GUI doesn't block during the 3–6 s that
+        ``Get-PnpDevice -PresentOnly`` can take on a loaded
+        Windows 11 machine.
         """
+        # Set a "checking…" state immediately while the background
+        # probe runs (Get-PnpDevice can take 3-6 s on a loaded machine).
+        self._set_dot(self.stim_detect_dot, _DOT_WARN)
+        self.stim_detect_text.setText("Stimulator detection…")
+
+        # Wire the result signal once (idempotent: disconnect first to
+        # avoid double-connecting when refresh_hardware_detection is
+        # called repeatedly from the hot-plug filter).
         try:
-            from ..hardware.plexstim_detect import plexstim_device_present
-            present = plexstim_device_present()
-        except Exception as e:
+            self._stimDetectResult.disconnect(self._on_stim_detect_result)
+        except (RuntimeError, TypeError):
+            pass
+        self._stimDetectResult.connect(self._on_stim_detect_result)
+
+        import threading
+        def _thread():
+            try:
+                from ..hardware.plexstim_detect import plexstim_device_present
+                result = plexstim_device_present()
+            except Exception as exc:
+                result = exc
+            # Emit the signal — PyQt6 signals are thread-safe and will
+            # deliver the payload on the GUI thread via the event queue.
+            self._stimDetectResult.emit(result)
+        threading.Thread(target=_thread, daemon=True).start()
+
+    @QtCore.pyqtSlot(object)
+    def _on_stim_detect_result(self, present):
+        """Apply the result from the background PnP probe. Runs on the
+        GUI thread (delivered via the ``_stimDetectResult`` signal)."""
+        if isinstance(present, Exception):
             self._set_dot(self.stim_detect_dot, _DOT_OFF)
             text = "Stimulator detection failed"
-            tip = (f"Detection probe raised an exception: {e}\n\n"
-                   "The 'Initialized' indicator below still works "
-                   "— click Initialize to try opening the device "
-                   "directly.")
-            self.stim_detect_text.setText(text)
-            self.stim_detect_dot.setToolTip(tip)
-            self.stim_detect_text.setToolTip(tip)
-            return
-        if present is True:
+            tip = (f"Detection probe raised: {present}\n\n"
+                   "Click Initialize to test the connection directly.")
+        elif present is True:
             self._set_dot(self.stim_detect_dot, _DOT_OK)
             text = "Stimulator detected"
-            tip = ("A Plexon stimulator USB device is currently "
+            tip = ("A Plexon PlexStim USB device is currently "
                    "enumerated by the operating system. Click "
                    "Initialize to open a session.")
         elif present is False:
             self._set_dot(self.stim_detect_dot, _DOT_OFF)
             text = "Stimulator not detected"
-            tip = ("No Plexon stimulator USB device is currently "
-                   "plugged in (or the Plexon USB driver isn't "
-                   "installed yet — see the Stim-2 software "
-                   "warning at launch).\n\n"
-                   "If a stimulator IS plugged in but isn't being "
-                   "detected, check Device Manager for an unknown / "
-                   "yellow-flag entry, and confirm the Stim-2 / "
-                   "Stimulator V2 driver installed cleanly.")
-        else:
-            # ``None`` = couldn't run the probe (non-Windows,
-            # PowerShell missing, PnP timeout). Use the amber
-            # "warning" colour so the user reads it as
-            # indeterminate rather than negative.
+            tip = ("No Plexon stimulator USB device found.\n\n"
+                   "If one IS plugged in, check Device Manager for an "
+                   "unknown / yellow-flag FTDI entry (VID 0403 PID 6011).")
+        else:  # None
             self._set_dot(self.stim_detect_dot, _DOT_WARN)
             text = "Stimulator detection unavailable"
-            tip = ("Hardware-presence detection isn't available "
-                   "on this platform (Windows-only via PowerShell "
-                   "PnP enumeration). Click Initialize to test the "
-                   "device connection directly.")
+            tip = ("PnP probe timed out or isn't available on this "
+                   "platform. Click Initialize to test the connection "
+                   "directly.")
         self.stim_detect_text.setText(text)
         self.stim_detect_dot.setToolTip(tip)
         self.stim_detect_text.setToolTip(tip)
@@ -746,9 +736,22 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                            if any(vid in r for vid in scope_vendor_ids)]
         if scope_resources:
             self._set_dot(self.scope_detect_dot, _DOT_OK)
-            text = "Oscilloscope detected"
+            # Show the VISA address inline so the user can see it
+            # without hovering the dot. If multiple scope-shaped
+            # resources are on the bus, append "(+N more)" and put
+            # the full list in the tooltip.
+            primary = scope_resources[0]
+            extras = len(scope_resources) - 1
+            text = (f"Oscilloscope detected · {primary}"
+                    + (f"  (+{extras} more)" if extras else ""))
             tip = ("Detected scope-like VISA resource(s):\n  "
                    + "\n  ".join(scope_resources))
+            # Pre-fill the VISA resource field with the first detected
+            # address (only if the user hasn't typed one of their own)
+            # so Connect targets the visible device without manual
+            # entry.
+            if not self.scope_resource.text().strip():
+                self.scope_resource.setText(primary)
         elif resources:
             # VISA backend works but nothing scope-shaped is on the bus.
             self._set_dot(self.scope_detect_dot, _DOT_WARN)
@@ -767,26 +770,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.scope_detect_dot.setToolTip(tip)
         self.scope_detect_text.setToolTip(tip)
 
-    # ------- SDK path memory ----------------------------------------
-    @staticmethod
-    def _sdk_prefs_section() -> str:
-        return "pyplexstim_sdk"
-
+    # ------- stim prefs ---------------------------------------------
     @staticmethod
     def _stim_prefs_section() -> str:
         return "stim_settings"
-
-    def _load_sdk_path(self) -> str:
-        prefs = load_prefs() or {}
-        section = prefs.get(self._sdk_prefs_section(), {})
-        if not isinstance(section, dict):
-            return ""
-        return str(section.get("dll_path", ""))
-
-    def _save_sdk_path(self, path: str):
-        prefs = load_prefs() or {}
-        prefs[self._sdk_prefs_section()] = {"dll_path": str(path)}
-        save_prefs(prefs)
 
     def _load_auto_discharge(self) -> bool:
         """Read the persisted auto-discharge preference. Defaults to
@@ -806,54 +793,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         section["auto_discharge"] = bool(enabled)
         prefs[self._stim_prefs_section()] = section
         save_prefs(prefs)
-
-    def _effective_dll_path(self) -> Optional[str]:
-        """Resolve the user-typed path into a usable DLL folder.
-
-        Empty string → ``None`` (the loader uses the vendored bin dir).
-        Otherwise: if the path is a folder containing ``PlexStim.dll``
-        or ``PlexStim64.dll``, return it as-is. If it's a parent of a
-        ``bin/`` subfolder that does, drill into ``bin``. Anything
-        else is returned verbatim and let the loader surface the
-        error (the user will see it in the status label).
-        """
-        from pathlib import Path
-        text = self.sdk_path.text().strip()
-        if not text:
-            return None
-        p = Path(text)
-        if (p / "PlexStim64.dll").exists() or (p / "PlexStim.dll").exists():
-            return str(p)
-        # Common case: user picked the SDK root, the DLLs live in `bin/`.
-        nested = p / "bin"
-        if (nested / "PlexStim64.dll").exists() or (nested / "PlexStim.dll").exists():
-            return str(nested)
-        # Or one level deeper: PyPlexStim/bin under a "PlexStim SDKs" root.
-        nested2 = p / "PyPlexStim" / "bin"
-        if (nested2 / "PlexStim64.dll").exists() or (nested2 / "PlexStim.dll").exists():
-            return str(nested2)
-        return str(p)
-
-    def _on_sdk_path_changed(self):
-        """User finished editing the path field — persist + log."""
-        path = self.sdk_path.text().strip()
-        self._save_sdk_path(path)
-        if path:
-            self.log.emit(f"PyPlexStim SDK path set: {path}")
-        else:
-            self.log.emit("PyPlexStim SDK path cleared (using vendored copy).")
-
-    def _on_sdk_browse(self):
-        """Open a folder picker, accept any folder containing the DLL
-        (directly or via ``bin/`` / ``PyPlexStim/bin/`` subfolder)."""
-        start = self.sdk_path.text().strip() or ""
-        chosen = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Choose PyPlexStim SDK folder", start)
-        if not chosen:
-            return
-        self.sdk_path.setText(chosen)
-        self._save_sdk_path(chosen)
-        self.log.emit(f"PyPlexStim SDK path set: {chosen}")
 
     @staticmethod
     def _scaling_prefs_section() -> str:
@@ -882,18 +821,49 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                 self, "Stimulator not ready",
                 "The stimulator hasn't opened yet — fix that first.")
             return
+        # Disable the button immediately so the user can't double-click.
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.setText("Connecting…")
+        self.log.emit("Scope connecting…")
         sim = self.simulate.isChecked()
+        res = self.scope_resource.text().strip() or None
+
+        # Wire up the result handler — disconnect first to avoid
+        # double-firing if the user clicks Connect multiple times fast.
         try:
-            res = self.scope_resource.text().strip() or None
-            self._scope = open_oscilloscope(simulate=sim, resource=res)
-            self._scope.open()
-        except Exception as e:
+            self._scopeConnectResult.disconnect(self._on_scope_connect_result)
+        except (RuntimeError, TypeError):
+            pass
+        self._scopeConnectResult.connect(self._on_scope_connect_result)
+
+        def _thread():
+            try:
+                scope = open_oscilloscope(simulate=sim, resource=res)
+                scope.open()
+            except Exception as exc:
+                scope = exc
+            self._scopeConnectResult.emit(scope)
+
+        import threading
+        threading.Thread(target=_thread, daemon=True).start()
+
+    @QtCore.pyqtSlot(object)
+    def _on_scope_connect_result(self, result):
+        """Called on the GUI thread when the background connect finishes."""
+        self.connect_btn.setText("Connect")
+        try:
+            self._scopeConnectResult.disconnect(self._on_scope_connect_result)
+        except (RuntimeError, TypeError):
+            pass
+        if isinstance(result, Exception):
             self._scope = None
-            QtWidgets.QMessageBox.critical(self, "Scope connect failed", str(e))
-            self.log.emit(f"Scope connect failed: {e}")
+            self.connect_btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "Scope connect failed", str(result))
+            self.log.emit(f"Scope connect failed: {result}")
             return
+        self._scope = result
         info = self._scope.info
-        self._set_dot(self.scope_dot, _DOT_WARN if sim else _DOT_OK)
+        self._set_dot(self.scope_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
         self.scope_label.setText(
             f"Oscilloscope: {info.make} {info.model}  ·  {info.resource}"
         )
