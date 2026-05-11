@@ -114,10 +114,16 @@ LEGACY = TekDialect(
 #: the LEGACY branch.
 _MODERN_MODELS = re.compile(
     r"\b("
-    r"TBS1[0-9]{3}C|"           # TBS1052C / TBS1072C / TBS1102C / etc.
-    r"TBS2[0-9]{3}[A-Z]?|"      # TBS2074B / TBS2104B / TBS2204B / TBS2K-C
-    r"MSO|MDO|DPO|"
-    r"MSO[0-9]+|MDO[0-9]+|DPO[0-9]+|"
+    r"TBS1[0-9]{3}C|"             # TBS1052C / TBS1072C / TBS1102C / etc.
+    r"TBS2[0-9]{3}[A-Z]?|"        # TBS2074B / TBS2104B / TBS2204B / TBS2K-C
+    r"MSO[0-9]+[A-Z]?|"           # MSO4054, MSO4054B, MSO5054, MSO6034C…
+    r"MDO[0-9]+[A-Z]?|"           # MDO3014, MDO3014B, MDO4054C…
+    r"DPO[0-9]+[A-Z]?|"           # DPO4054, DPO4054B, DPO73304D…
+    r"MSO|MDO|DPO|"               # bare family names (kept for *IDN? that
+                                  #   omits the model number — rare but
+                                  #   defensive; tried LAST in the
+                                  #   alternation so suffixed variants
+                                  #   match first)
     r"TBS2KB|TBS2KBE|TBS2074B|TBS2104B|TBS2204B"
     r")\b",
     re.IGNORECASE,
@@ -268,14 +274,20 @@ class TektronixOscilloscope(Oscilloscope):
         model = parts[1] if len(parts) > 1 else ""
         serial = parts[2] if len(parts) > 2 else ""
         firmware = parts[3] if len(parts) > 3 else ""
-        # Channel count parsed from the model number — TBS1072C and
-        # other 2-channel models report n_channels=2, which the GUI's
-        # Setup tab uses to grey out CH3/CH4 dropdowns. *IDN? doesn't
-        # carry a channel count, and there's no clean SCPI for it
-        # (CH:LIST? is GPIB-era and inconsistent across firmware), so
-        # the safest move is parsing the well-defined model-number
-        # convention (last digit of the 4-digit numeric part).
+        # Channel count — try a live probe first, fall back to the
+        # model-name regex if probing fails. The regex is correct for
+        # every TBS naming-convention scope but defaults to 4 for
+        # MSO/MDO/DPO (which can be 2, 4, 6, or 8 channels); the live
+        # probe distinguishes those cleanly.
         n_ch = channel_count_from_model(model)
+        try:
+            probed = self.probe_channel_count(max_channels=8)
+            if probed:
+                n_ch = probed
+        except Exception:
+            # Probe failure shouldn't block ``open()`` — regex
+            # inference is a sane fallback for every known model.
+            pass
         self.info = ScopeInfo(
             make=make, model=model, serial=serial, firmware=firmware,
             resource=rsrc, n_channels=n_ch, is_simulated=False,
@@ -472,6 +484,73 @@ class TektronixOscilloscope(Oscilloscope):
             has_acq_numavg=has_acq_numavg,
             horiz_position_form=horiz_position_form,
         )
+
+    def probe_channel_count(self, max_channels: int = 8) -> int:
+        """Detect the number of analog input channels on the live scope.
+
+        *IDN?* doesn't carry a channel count and there's no portable
+        Tek SCPI for it (``CH:LIST?`` is GPIB-era and inconsistent
+        across firmware). The reliable probe is to query a per-channel
+        attribute and count which channels respond without an error:
+
+          * Try ``CH<n>:PRObe:GAIN?`` for n = 1..max_channels.
+          * A scope with N channels answers cleanly for n ≤ N and
+            raises an "Undefined header" / "Invalid argument" error
+            for n > N. The error queue is the signal — we drain it
+            after each probe and stop counting at the first miss.
+
+        Returns 0 on probe failure (no instrument, total SCPI
+        breakdown) so the caller can fall back to the regex.
+
+        Walks 1..8 by default — Tek's catalog tops out at 8-channel
+        scopes (MSO5K/6K series). Increase the cap only if a future
+        model exceeds that.
+        """
+        if self._inst is None:
+            return 0
+        # Drain any pre-existing error before we start counting; an
+        # error queued from earlier setup would otherwise look like
+        # "channel 1 doesn't exist" on the first probe.
+        try:
+            self._inst.write("*CLS")
+        except Exception:
+            return 0
+        count = 0
+        for n in range(1, int(max_channels) + 1):
+            try:
+                # A query that returns a number on success and an
+                # error on a non-existent channel. Probe GAIN rather
+                # than SELect:CH<n>? because SELect is a setting that
+                # some firmware echoes back even for non-existent
+                # channels.
+                resp = self._inst.query(f"CH{n}:PRObe:GAIN?").strip()
+                # Some firmware returns the literal error string
+                # rather than queueing an error. "Undefined header"
+                # / "Invalid" / a leading minus + colon in the
+                # response → channel doesn't exist.
+                if not resp or any(s in resp.lower() for s in
+                                    ("undefined", "invalid", "error",
+                                     "execution")):
+                    break
+                # Should parse as a numeric attenuation (e.g. 0.1,
+                # 1, 10, 100). If it doesn't, treat as miss.
+                float(resp)
+                count += 1
+            except Exception:
+                # Clear the error so the next probe starts clean,
+                # then stop counting at the first miss.
+                try:
+                    self._inst.write("*CLS")
+                except Exception:
+                    pass
+                break
+        # Final *CLS to leave the error queue clean for downstream
+        # setup code (DATa:ENCdg etc.).
+        try:
+            self._inst.write("*CLS")
+        except Exception:
+            pass
+        return count
 
     def probe_external_trigger(self) -> bool:
         """Detect whether the scope has an EXT trigger BNC input.
@@ -1158,12 +1237,19 @@ class TektronixOscilloscope(Oscilloscope):
         # Determine which channels to fetch
         wanted_channels = sorted(set(self.channel_aliases.values()))
         out_channels: Dict[str, np.ndarray] = {}
+        # Reusable time axis across the per-channel loop. The horizontal
+        # scaling (XINCr / XZEro) is identical across all channels in
+        # ONE acquisition — re-running ``xzero + xinc * np.arange(N)``
+        # for every channel just burns ~100-200 µs / channel allocating
+        # a fresh 20k-sample float64 array. Build it on the first
+        # channel and pass it down to subsequent ``_read_channel`` calls.
         time_us = np.empty(0)
         sample_period_us = 0.0
         record_length = 0
 
         for ch in wanted_channels:
-            t_us, y_v, dt_us, n = self._read_channel(ch)
+            t_us, y_v, dt_us, n = self._read_channel(
+                ch, cached_time_us=time_us if time_us.size else None)
             if time_us.size == 0:
                 time_us = t_us
                 sample_period_us = dt_us
@@ -1175,7 +1261,9 @@ class TektronixOscilloscope(Oscilloscope):
             sample_period_us=sample_period_us, record_length=record_length,
         )
 
-    def _read_channel(self, ch: str) -> Tuple[np.ndarray, np.ndarray, float, int]:
+    def _read_channel(self, ch: str,
+                      cached_time_us: Optional[np.ndarray] = None,
+                      ) -> Tuple[np.ndarray, np.ndarray, float, int]:
         """Fetch one channel, return (time_us, voltage_v, sample_period_us, npts).
 
         Uses Tek's standard conversion formula:
@@ -1186,6 +1274,12 @@ class TektronixOscilloscope(Oscilloscope):
         scopes, 0..65535 for 16-bit). ``WFMOutpre:`` tells us all five
         scaling constants in a single semicolon-separated response, so we
         only pay one VISA round-trip for the preamble per channel.
+
+        ``cached_time_us`` lets ``single_capture`` reuse the time axis it
+        already built for the first channel. The horizontal scaling is
+        identical across all channels in one acquisition, so the array
+        can be passed through and the per-channel arange + multiply
+        skipped (~100-200 µs / channel on a 20k-sample record).
         """
         # Pick which channel CURVe? will read from. DATa:STARt / STOP and
         # the binary-encoding settings are already established at open()
@@ -1208,8 +1302,11 @@ class TektronixOscilloscope(Oscilloscope):
             "CURVe?", datatype="h", is_big_endian=True, container=np.ndarray,
         )
         y_v = (raw.astype(np.float64) - yoff) * ymult + yzero
-        t_s = xzero + xinc * np.arange(raw.size)
-        return t_s * 1e6, y_v, xinc * 1e6, raw.size
+        if cached_time_us is not None and cached_time_us.size == raw.size:
+            t_us = cached_time_us
+        else:
+            t_us = (xzero + xinc * np.arange(raw.size)) * 1e6
+        return t_us, y_v, xinc * 1e6, raw.size
 
     def _read_preamble(self, preamble_root: str) -> Tuple[float, float, float, float, float]:
         """Query ``WFMOutpre?`` / ``WFMPre?`` and return the scaling fields.

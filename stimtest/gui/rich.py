@@ -56,6 +56,83 @@ def label_with_units(label_html: str, unit_html: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text Unicode subscript / superscript helpers
+# ---------------------------------------------------------------------------
+# The HTML-based ``var()`` helper only works inside Qt RichText widgets
+# (QLabel, QGroupBox titles). Many of our display surfaces are plain
+# text — QTableWidgetItem cells, log lines, tsv exports that open in
+# Excel — and rendering ``<sub>``/``<sup>`` tags there leaves literal
+# angle brackets in the output. The two helpers below rewrite to
+# Unicode subscript / superscript code-points where every character
+# in the input is representable; if any character isn't (e.g. there
+# is no Unicode subscript ``d``), the helper returns ``None`` so the
+# caller can fall back to the ``_d`` underscore notation.
+_SUBSCRIPT_MAP = {
+    "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ", "k": "ₖ",
+    "l": "ₗ", "m": "ₘ", "n": "ₙ", "o": "ₒ", "p": "ₚ", "r": "ᵣ",
+    "s": "ₛ", "t": "ₜ", "u": "ᵤ", "v": "ᵥ", "x": "ₓ",
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+    "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+}
+_SUPERSCRIPT_MAP = {
+    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+    "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
+    "i": "ⁱ", "n": "ⁿ",
+}
+
+
+def to_subscript(s: str) -> Optional[str]:
+    """Convert ``s`` to a Unicode subscript string. Lower-cases first,
+    and returns ``None`` if any character isn't representable
+    (e.g. ``d``/``f``/``c``/``b``/``g``/``q``/``y``/``z`` / capitals).
+    """
+    out = []
+    for ch in s.lower():
+        glyph = _SUBSCRIPT_MAP.get(ch)
+        if glyph is None:
+            return None
+        out.append(glyph)
+    return "".join(out)
+
+
+def to_superscript(s: str) -> Optional[str]:
+    """Same as :func:`to_subscript` but for Unicode superscripts. Used
+    chiefly for unit exponents (``cm²`` is the only common case in
+    this codebase, but we also produce ``s⁻¹`` etc. cleanly)."""
+    out = []
+    for ch in s:
+        glyph = _SUPERSCRIPT_MAP.get(ch.lower())
+        if glyph is None:
+            return None
+        out.append(glyph)
+    return "".join(out)
+
+
+def plain_label(name: str, sub: Optional[str] = None,
+                sup: Optional[str] = None) -> str:
+    """Plain-text variable label using Unicode subscripts /
+    superscripts where possible. Used by tables and tsv exports that
+    can't render the HTML-tagged ``var()`` output.
+
+      >>> plain_label("Q", "ph")        # 'Qₚₕ'
+      >>> plain_label("V", "d")         # 'V_d'   (no subscript d)
+      >>> plain_label("C", "eff")       # 'C_eff' (no subscript f)
+      >>> plain_label("R", "a")         # 'Rₐ'
+      >>> plain_label("cm", sup="2")    # 'cm²'
+    """
+    out = name
+    if sub:
+        u = to_subscript(sub)
+        out += u if u is not None else f"_{sub}"
+    if sup:
+        u = to_superscript(sup)
+        out += u if u is not None else f"^{sup}"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Frequently-used labels (single source of truth so all tabs match)
 # ---------------------------------------------------------------------------
 # Scalar variables
@@ -77,6 +154,22 @@ T_PH          = var("t", "ph")
 T_IPH         = var("t", "iph")
 T_DD          = var("t", "dd")
 A_GS          = var("A", "gs")
+# Pulse-train timing — kept in sync with the
+# ``pattern_panel`` row labels (the rate/period unit-toggle
+# rewrites the row text via ``field_label`` so both halves
+# of the toggle reference these constants). ``f_stim`` is
+# the canonical neurostim notation for stimulation
+# frequency; ``T_pulse`` is the inter-pulse period
+# (1 / f_stim). Defining them here means a future tab that
+# also surfaces these knobs picks up the same abbreviation.
+F_STIM        = var("f", "stim")
+T_PULSE       = var("T", "pulse")
+# Ramp-starting amplitude. Used by experiment tabs that sweep
+# the stim amplitude from a small floor up to a ceiling
+# (Voltage Transient, Progressive Stress) — both the spinbox
+# label and any saved-session export reference this constant
+# so a reader sees the same ``I_start`` symbol everywhere.
+I_START       = var("I", "start")
 
 # Common unit strings
 UA            = "μA"
@@ -88,6 +181,7 @@ MM2           = "mm²"
 CM2           = "cm²"
 NA            = "nA"
 NC            = "nC"
+PC            = "pC"
 UC_PER_CM2    = "μC/cm²"
 MC_PER_CM2    = "mC/cm²"
 V_PER_DIV     = "V/div"

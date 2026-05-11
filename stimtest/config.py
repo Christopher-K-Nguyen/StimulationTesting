@@ -30,6 +30,16 @@ IMON_SCALING_NIL = 1e-3
 #: Plexon stimulator output current resolution (μA per LSB)
 STIM_CURRENT_RESOLUTION_UA = 0.1
 
+#: Default GUI spinbox single-step for current / amplitude / offset
+#: spinboxes. Distinct from :data:`STIM_CURRENT_RESOLUTION_UA` (the
+#: hardware grid, 0.1 µA) so users can wheel / arrow-key through
+#: 1 µA increments without 10 clicks per integer microamp — the
+#: hardware resolution still applies on math + quantization, but
+#: the UI step is coarser for ergonomic reasons. Users can still
+#: type sub-1-µA values directly; this only affects increment /
+#: decrement buttons + scroll-wheel.
+STIM_CURRENT_UI_STEP_UA = 1.0
+
 #: Plexon stimulator phase-width / interphase / discharge time resolution (μs)
 STIM_TIME_RESOLUTION_US = 1.0
 
@@ -174,6 +184,30 @@ COATINGS: Dict[str, Coating] = {
         typical_csc_mc_per_cm2=0.05,
         notes="Bare tungsten — narrow water window, low CSC",
     ),
+    "Ti": Coating(
+        name="Ti",
+        display_name="Titanium (Ti)",
+        # Bare Ti has a passive TiO2 layer that pins the OCP near 0 V
+        # vs Ag|AgCl. Treat the safe window as the conservative
+        # ±0.6/±0.8 V envelope used for SIROF / Pt; literature values
+        # vary widely with surface preparation.
+        cathodic_limit_v=-0.6,
+        anodic_limit_v=+0.8,
+        typical_csc_mc_per_cm2=0.05,
+        notes="Bare titanium (passive TiO2 surface); narrow CSC, "
+              "commonly used as a counter electrode.",
+    ),
+    "SS": Coating(
+        name="SS",
+        display_name="Stainless steel (SS)",
+        # 316L stainless — passive Cr-rich oxide surface; pinned near
+        # 0 V vs Ag|AgCl in saline. Conservative water window.
+        cathodic_limit_v=-0.6,
+        anodic_limit_v=+0.8,
+        typical_csc_mc_per_cm2=0.05,
+        notes="Bare stainless steel (e.g. 316L); commonly used as a "
+              "counter / return electrode.",
+    ),
 }
 
 
@@ -219,6 +253,103 @@ CONNECTORS: Dict[str, Connector] = {
 
 
 # ---------------------------------------------------------------------------
+# Electrode geometry catalog
+# ---------------------------------------------------------------------------
+#: Electrode pad/tip geometries supported by the GUI. These are
+#: short-code strings for the persistence side; the user-visible
+#: labels live in :data:`ELECTRODE_GEOMETRIES` below.
+#:
+#: ``rounded`` is a separate flag that only applies to ``square`` /
+#: ``rectangle`` geometries and means "filleted corners" — used to
+#: distinguish the Blackrock/MicroProbes "rounded square" tip from a
+#: literal sharp-cornered square pad.
+ELECTRODE_GEOMETRY_CIRCLE    = "circle"
+ELECTRODE_GEOMETRY_SQUARE    = "square"
+ELECTRODE_GEOMETRY_RECTANGLE = "rectangle"
+ELECTRODE_GEOMETRY_CONE      = "cone"
+ELECTRODE_GEOMETRY_RING      = "ring"
+ELECTRODE_GEOMETRY_BAND      = "band"
+
+
+@dataclass(frozen=True)
+class ElectrodeGeometry:
+    """Display + storage metadata for one electrode geometry option.
+
+    The ``code`` is what gets persisted in prefs / per-channel
+    overrides (a short string so JSON round-trips cleanly).
+    ``label`` is the human-readable dropdown text. ``supports_rounded``
+    flags whether the "Rounded" toggle is meaningful — currently
+    just square + rectangle, where rounded = filleted corners /
+    pill shape; for circle/cone/ring/band the toggle is hidden.
+    ``is_planar`` distinguishes pad-style geometries (circle / square
+    / rectangle / ring / band — the 2-D footprint sets the GSA) from
+    3-D tip geometries (cone — the GSA is the lateral surface area
+    of the truncated cone, not its footprint).
+    """
+    code: str
+    label: str
+    supports_rounded: bool
+    is_planar: bool
+    notes: str
+
+
+ELECTRODE_GEOMETRIES: Dict[str, ElectrodeGeometry] = {
+    ELECTRODE_GEOMETRY_CIRCLE: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_CIRCLE,
+        label="Circle",
+        supports_rounded=False,
+        is_planar=True,
+        notes="Circular pad. UTD MEA / NeuroNexus default. "
+              "GSA = π · r² where r is the disk radius.",
+    ),
+    ELECTRODE_GEOMETRY_SQUARE: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_SQUARE,
+        label="Square",
+        supports_rounded=True,
+        is_planar=True,
+        notes="Square pad. Toggle Rounded for filleted corners "
+              "(pill-cap variant). GSA = side²; rounded variant "
+              "subtracts ~0.86·r² of corner area for fillet "
+              "radius r ≈ 0.2·side.",
+    ),
+    ELECTRODE_GEOMETRY_RECTANGLE: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_RECTANGLE,
+        label="Rectangle",
+        supports_rounded=True,
+        is_planar=True,
+        notes="Rectangular pad. Toggle Rounded for filleted "
+              "ends (pill / stadium variant). GSA = w · h.",
+    ),
+    ELECTRODE_GEOMETRY_CONE: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_CONE,
+        label="Cone",
+        supports_rounded=False,
+        is_planar=False,
+        notes="Conical tip — Blackrock UEA / MicroProbes FMA "
+              "default. GSA = lateral area of truncated cone "
+              "= π · (r₁ + r₂) · slant_height.",
+    ),
+    ELECTRODE_GEOMETRY_RING: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_RING,
+        label="Ring",
+        supports_rounded=False,
+        is_planar=True,
+        notes="Annular ring (cylindrical-shaft electrodes; "
+              "common in DBS leads). GSA = circumference · height "
+              "= 2π · r · h.",
+    ),
+    ELECTRODE_GEOMETRY_BAND: ElectrodeGeometry(
+        code=ELECTRODE_GEOMETRY_BAND,
+        label="Band",
+        supports_rounded=False,
+        is_planar=True,
+        notes="Band (partial ring) — paddle-lead style. GSA = "
+              "arc-length × height = (2π · r · arc_fraction) · h.",
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Test-device catalog (mirrors MATLAB getDeviceType.m)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -249,6 +380,16 @@ class DeviceDef:
     default_surface_area_um2: float = 5000.0   # SIROF UEA, IEEE NER paper
     default_coating: str = "SIROF"
     layout: str = "rect"        #: "rect" | "triangular"
+    #: Per-device default electrode geometry. ``circle`` is a
+    #: sensible fallback for planar / disk-pad arrays (UTD MEA,
+    #: NeuroNexus, generic test boards); ``cone`` matches the
+    #: pyramidal etched tips of the Utah / FMA microelectrode
+    #: families. The user can override per-device in the Setup tab.
+    default_geometry: str = ELECTRODE_GEOMETRY_CIRCLE
+    #: Whether the corners / ends of square / rectangle pads are
+    #: rounded. Has no effect for non-square / non-rectangle
+    #: geometries; the GUI hides the toggle in those cases.
+    default_rounded: bool = False
 
 
 DEVICES: Dict[str, DeviceDef] = {
@@ -280,6 +421,10 @@ DEVICES: Dict[str, DeviceDef] = {
         default_connector="Omnetics UTD",
         default_surface_area_um2=5000.0,
         default_coating="SIROF",
+        # Utah Electrode Array tips are etched to a pyramidal /
+        # truncated-cone profile; the active SIROF site sits at the
+        # exposed tip. ``cone`` captures that 3-D geometry.
+        default_geometry=ELECTRODE_GEOMETRY_CONE,
     ),
     "Blackrock PCB (4×4)": DeviceDef(
         name="Blackrock PCB (4×4)",
@@ -294,24 +439,37 @@ DEVICES: Dict[str, DeviceDef] = {
         default_connector="Omnetics UTD",
         default_surface_area_um2=5000.0,
         default_coating="SIROF",
+        default_geometry=ELECTRODE_GEOMETRY_CONE,
     ),
     "MicroProbes 16-channel FMA": DeviceDef(
         name="MicroProbes 16-channel FMA",
-        description="16-channel MicroProbes FMA. The physical electrode "
-                    "spacing is an equilateral triangular grid; the table "
-                    "below is the closest rectangular approximation, and "
-                    "the geometry view renders it with the correct "
-                    "row-offset packing. Zeros mark empty cells.",
+        description="16-channel MicroProbes FMA. The 16 stimulation "
+                    "channels sit on an equilateral triangular grid "
+                    "with 0.4 mm pitch; row 1 is the widest (5 "
+                    "channels: 13–9), row 0 has 3 channels centered "
+                    "above 12–10, row 2 has 4 channels offset under "
+                    "12–9, and row 3 has 4 channels shifted further "
+                    "right under 11–9. Even rows (0 / 2) align and "
+                    "odd rows (1 / 3) are offset by half a cell. The "
+                    "manufacturer's reference electrode (R) and "
+                    "external counter / ground (G) are NOT part of "
+                    "this mapping — they're treated as the external "
+                    "return / reference electrodes elsewhere in the "
+                    "GUI. Zeros mark empty cells.",
         mapping=(
-            (16, 15, 14,  0,  0,  0),
-            (13, 12, 11, 10,  9,  0),
-            ( 0,  8,  7,  6,  5,  0),
-            ( 0,  0,  4,  3,  2,  1),
+            ( 0, 16, 15, 14,  0),
+            (13, 12, 11, 10,  9),
+            ( 0,  8,  7,  6,  5),
+            ( 0,  4,  3,  2,  1),
         ),
         default_connector="Omnetics UTD",
         default_surface_area_um2=2000.0,
         default_coating="AIROF",
         layout="triangular",
+        # FMA shafts are tapered glass-coated tungsten with a
+        # spherical / conical exposed tip — geometry "cone" is the
+        # closest match in our catalog.
+        default_geometry=ELECTRODE_GEOMETRY_CONE,
     ),
     "NeuroNexus A4×4": DeviceDef(
         name="NeuroNexus A4×4",

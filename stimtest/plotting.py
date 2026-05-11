@@ -31,7 +31,7 @@ Public entry points:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -129,7 +129,8 @@ def _channel_label(name: str) -> str:
 def plot_capture(capture: Capture, run: ChannelRun, session: Session,
                  *, fig: Optional[Figure] = None,
                  show_cursors: bool = True,
-                 show_minmax: bool = True) -> Figure:
+                 show_minmax: bool = True,
+                 show_grid: bool = True) -> Figure:
     """Render one capture on a matplotlib Figure.
 
     Layout matches ``getPlot_Tek.m``:
@@ -207,7 +208,7 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
         ax_v.set_xlim(float(time_us[0]), float(time_us[-1]))
     _symmetric_ylim(ax_v)
     _symmetric_ylim(ax_i)
-    ax_v.grid(True, axis="both", alpha=0.25, linestyle=":")
+    ax_v.grid(show_grid, axis="both", alpha=0.25, linestyle=":")
     ax_v.axhline(0, color="0.4", linewidth=0.6, zorder=0)
     ax_v.axvline(0, color="0.4", linewidth=0.6, zorder=0)
 
@@ -248,12 +249,15 @@ def plot_overlay(captures_by_channel: Dict,
                  *, fig: Optional[Figure] = None,
                  channels_enabled: Optional[Set] = None,
                  waves_enabled: Optional[Set[str]] = None,
+                 axis_map: Optional[Dict[str, str]] = None,
+                 inset_enabled: bool = False,
+                 inset_traces: Optional[Set[str]] = None,
+                 show_grid: bool = True,
                  title: str = "Channel waveform overlay") -> Figure:
     """Overlay one capture per entry onto a shared time axis.
 
     ``captures_by_channel`` maps an arbitrary hashable key to the
-    Capture that key should contribute to the overlay (typically the
-    final / representative capture of one ``ChannelRun``). The key
+    Capture that key should contribute to the overlay. The key
     doubles as the legend label, so callers should use a
     user-meaningful string — e.g. ``"CH05"`` for monopolar,
     ``"CH05 v 06"`` for bipolar, ``"CH05 v 06,09"`` for tripolar
@@ -261,24 +265,43 @@ def plot_overlay(captures_by_channel: Dict,
     ``Dict[int, Capture]`` form is still accepted; integer keys
     render as ``"CHnn"``.
 
-    Entries not in ``channels_enabled`` are skipped; waveforms not in
-    ``waves_enabled`` are skipped per entry. Left voltage axis carries
-    V_mon / E_act / E_ret (all sharing volts); right axis carries
-    I_mon. Color encodes the entry; line style encodes waveform type.
+    Entries not in ``channels_enabled`` are skipped; waveforms not
+    in ``waves_enabled`` are skipped per entry.
 
-    The user toggles entries and waveform types via the UI bar in
-    :class:`stimtest.gui.viewer.ViewerPanel`; this function is the
-    pure-matplotlib renderer that consumes those choices.
+    ``axis_map`` (optional) routes each waveform to a specific Y
+    axis: ``"left"`` (the V scale), ``"right"`` (the second / current
+    scale), or ``"na"`` (skip — same effect as omitting from
+    ``waves_enabled``). When ``axis_map`` is omitted, the legacy
+    routing applies: V_mon / E_act / E_ret → left, I_mon → right.
+
+    ``inset_enabled`` + ``inset_traces`` add a small below-plot inset
+    mirroring the selected traces (matches the experiment-tab
+    MultiChannelScope inset). The inset shares the X range of the
+    main view via ``sharex``.
+
+    Color encodes the entry; line style encodes waveform type.
     """
     if fig is None:
         fig = plt.figure(figsize=_figsize_in(), dpi=SCREEN_DPI)
     fig.clear()
-    ax_v = fig.add_subplot(111)
+    if inset_enabled and inset_traces:
+        # Stack: main plot on top (3/4 height), inset on bottom
+        # (1/4 height), with shared X.
+        ax_v  = fig.add_subplot(4, 1, (1, 3))
+        ax_in = fig.add_subplot(4, 1, 4, sharex=ax_v)
+    else:
+        ax_v  = fig.add_subplot(111)
+        ax_in = None
     ax_i = ax_v.twinx()
     if channels_enabled is None:
         channels_enabled = set(captures_by_channel.keys())
     if waves_enabled is None:
         waves_enabled = set(WAVE_TYPES)
+    if axis_map is None:
+        # Legacy routing — V_mon / E_act / E_ret → left, I_mon → right.
+        axis_map = {"V_mon": "left", "E_act": "left",
+                    "E_ret": "left", "I_mon": "right"}
+    inset_traces = set(inset_traces) if inset_traces else set()
     plotted_any = False
     # Stable order: sort by string repr so int keys order numerically
     # ("CH01", "CH02", ...) and string keys order lexicographically
@@ -287,6 +310,9 @@ def plot_overlay(captures_by_channel: Dict,
     cmap = plt.get_cmap("tab20")
     keys = sorted((k for k in captures_by_channel if k in channels_enabled),
                   key=lambda x: (str(x)))
+    # Per-wave line styles so same colour = same entry and same dash
+    # = same waveform. Kept stable across runs.
+    line_style = {"V_mon": "-", "E_act": "--", "E_ret": ":", "I_mon": "-."}
     for idx, key in enumerate(keys):
         cap = captures_by_channel[key]
         time_us = np.asarray(cap.time_us)
@@ -297,25 +323,26 @@ def plot_overlay(captures_by_channel: Dict,
         # as "CHnn" for the legacy int-keyed callers.
         label_prefix = (f"CH{int(key):02d}"
                         if isinstance(key, int) else str(key))
-        # Voltage traces share the left axis; pick a different line
-        # style per wave-type so the same color = same entry and
-        # the same dash = same waveform.
-        v_styles = {"V_mon": "-", "E_act": "--", "E_ret": ":"}
-        for wave in ("V_mon", "E_act", "E_ret"):
+        for wave in WAVE_TYPES:
             if wave not in waves_enabled:
+                continue
+            axis = axis_map.get(wave, "left")
+            if axis == "na":
                 continue
             data = getattr(cap, _WAVE_ATTR[wave], None)
             if data is None or not getattr(data, "size", 0):
                 continue
-            ax_v.plot(time_us, data, color=color,
-                      linestyle=v_styles[wave], linewidth=1.2,
-                      label=f"{label_prefix} {wave}")
+            target_ax = ax_i if axis == "right" else ax_v
+            target_ax.plot(time_us, data, color=color,
+                           linestyle=line_style.get(wave, "-"),
+                           linewidth=1.2 if wave != "I_mon" else 1.0,
+                           label=f"{label_prefix} {wave}")
             plotted_any = True
-        if "I_mon" in waves_enabled and cap.i_mon_ua is not None and cap.i_mon_ua.size:
-            ax_i.plot(time_us, cap.i_mon_ua, color=color,
-                      linestyle="-.", linewidth=1.0,
-                      label=f"{label_prefix} I_mon")
-            plotted_any = True
+            # Inset: mirror the trace if it's in the selection.
+            if ax_in is not None and wave in inset_traces:
+                ax_in.plot(time_us, data, color=color,
+                           linestyle=line_style.get(wave, "-"),
+                           linewidth=1.0)
 
     if not plotted_any:
         ax_v.text(0.5, 0.5,
@@ -327,12 +354,23 @@ def plot_overlay(captures_by_channel: Dict,
         ax_i.axis("off")
         return fig
 
-    ax_v.set_xlabel("Time (µs)", fontsize=12)
+    # Suppress the main plot's X label when an inset is shown — the
+    # inset shares the X axis and gets the Time label instead so the
+    # main plot's tick labels can be hidden cleanly.
+    if ax_in is None:
+        ax_v.set_xlabel("Time (µs)", fontsize=12)
+    else:
+        ax_v.tick_params(axis="x", labelbottom=False)
+        ax_in.set_xlabel("Time (µs)", fontsize=11)
+        ax_in.set_ylabel("Inset", fontsize=10)
+        ax_in.tick_params(axis="both", labelsize=9)
+        ax_in.grid(show_grid, alpha=0.25)
     ax_v.set_ylabel("Voltage (V)", fontsize=12)
     ax_i.set_ylabel("Current monitor (µA)", fontsize=12,
                     rotation=-90, labelpad=18, va="bottom")
     ax_v.tick_params(axis="both", labelsize=10)
     ax_i.tick_params(axis="y", labelsize=10)
+    ax_v.grid(show_grid, alpha=0.25, linestyle=":")
     ax_v.set_title(title)
     # Combined legend; place outside on the right when many channels
     # are visible so the trace area stays readable.
@@ -563,6 +601,7 @@ def _render_plot_payload(payload: dict) -> Path:
 # Sweep / summary plots — Q_inj vs I_stim overlay, V_d vs Q_inj, etc.
 # ---------------------------------------------------------------------------
 def plot_qinj_vs_amplitude(session: Session, *, fig: Optional[Figure] = None,
+                           show_grid: bool = True,
                            ) -> Figure:
     """Overlay ``Q_inj`` vs ``I_stim`` for every ChannelRun in the session.
 
@@ -584,7 +623,7 @@ def plot_qinj_vs_amplitude(session: Session, *, fig: Optional[Figure] = None,
     ax.set_xlabel("|I_stim| (µA)", fontsize=14)
     ax.set_ylabel("Q_inj (mC/cm²)", fontsize=14)
     ax.tick_params(axis="both", labelsize=12)
-    ax.grid(True, alpha=0.25, linestyle=":")
+    ax.grid(show_grid, alpha=0.25, linestyle=":")
     ax.set_title(f"Charge injection sweep — {session.name}", fontsize=13)
     if session.runs:
         ax.legend(loc="best", fontsize=10, framealpha=0.85)
@@ -592,7 +631,8 @@ def plot_qinj_vs_amplitude(session: Session, *, fig: Optional[Figure] = None,
     return fig
 
 
-def plot_vd_vs_qinj(session: Session, *, fig: Optional[Figure] = None) -> Figure:
+def plot_vd_vs_qinj(session: Session, *, fig: Optional[Figure] = None,
+                    show_grid: bool = True) -> Figure:
     """``V_d`` vs ``Q_inj`` scatter — the IEEE NER 2025 paper's Fig 4-style plot."""
     if fig is None:
         fig = plt.figure(figsize=_figsize_in(), dpi=SCREEN_DPI)
@@ -614,7 +654,7 @@ def plot_vd_vs_qinj(session: Session, *, fig: Optional[Figure] = None) -> Figure
     ax.set_xlabel("Q_inj (mC/cm²)", fontsize=14)
     ax.set_ylabel("V_d (V)", fontsize=14)
     ax.tick_params(axis="both", labelsize=12)
-    ax.grid(True, alpha=0.25, linestyle=":")
+    ax.grid(show_grid, alpha=0.25, linestyle=":")
     ax.set_title(f"Driving voltage vs charge injection — {session.name}",
                  fontsize=13)
     if session.runs:

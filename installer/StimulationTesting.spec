@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for StimulationTesting.
+"""PyInstaller spec for PULSAR (GUI) + POLARIS (viewer).
 
 Builds two side-by-side Windows executables that share one set of binary
 dependencies in a single output folder (``onedir`` mode):
 
-* ``StimulationTesting.exe`` — the main GUI (``run_gui.py``)
-* ``StimulationTestingViewer.exe`` — the Echem-Analyst-style viewer
-  (``run_viewer.py``)
+* ``StimulationTesting.exe`` — the main GUI (``run_gui.py``); the
+  running window's title bar reads "PULSAR".
+* ``StimulationTestingViewer.exe`` — the Gamry Echem Analyst-style
+  session viewer (``run_viewer.py``); the running window's title
+  bar reads "POLARIS".
+
+The launcher .exe filenames are intentionally retained under the
+legacy "StimulationTesting" name for back-compat with installed-
+base shortcuts (see ``installer/README.md`` rename ledger).
 
 Both are ``--windowed`` (no console window). Run from the project root:
 
@@ -35,16 +41,49 @@ from PyInstaller.utils.hooks import (
 ROOT = Path(SPECPATH).parent.resolve()
 APP_NAME = "StimulationTesting"
 
+# Optional branded icon files. Drop ``installer/app.ico`` (and
+# optionally ``installer/app_viewer.ico``) and PyInstaller will embed
+# them in the produced EXE resources — the Inno Setup script picks
+# the same files up via ``SetupIconFile`` for the installer's own
+# icon. If the files aren't present we fall through to PyInstaller's
+# default (the Python runtime icon) without erroring.
+_app_icon = ROOT / "installer" / "app.ico"
+_viewer_icon = ROOT / "installer" / "app_viewer.ico"
+APP_ICON = str(_app_icon) if _app_icon.is_file() else None
+VIEWER_ICON = (str(_viewer_icon) if _viewer_icon.is_file()
+               else APP_ICON)  # fall back to the main icon
+
 # ---------------------------------------------------------------------------
 # Shared data files & hidden imports
 # ---------------------------------------------------------------------------
-plexstim_bin_src = ROOT / "stimtest" / "hardware" / "pyplexstim" / "bin"
+plexstim_root_src = ROOT / "stimtest" / "hardware" / "pyplexstim"
+plexstim_bin_src = plexstim_root_src / "bin"
+plexstim_root_dst = "stimtest/hardware/pyplexstim"
 plexstim_bin_dst = "stimtest/hardware/pyplexstim/bin"
 
 datas = []
+# PlexStim DLLs — both 32-bit and 64-bit so the wrapper can pick
+# whichever matches the frozen Python's bitness. PyInstaller can't
+# auto-detect these because they're loaded by string path via ctypes.
 if plexstim_bin_src.exists():
     for dll in plexstim_bin_src.glob("*.dll"):
         datas.append((str(dll), plexstim_bin_dst))
+    # Any non-DLL artifacts the SDK ships in /bin (e.g. a .lib import
+    # library, .dat tables) — bundle them all so the runtime tree
+    # mirrors the source layout exactly.
+    for extra in plexstim_bin_src.glob("*"):
+        if extra.is_file() and extra.suffix.lower() not in (".dll", ".pyc"):
+            datas.append((str(extra), plexstim_bin_dst))
+# PyPlexStim reference PDF — ship the SDK manual alongside the
+# wrapper so users can find the C-API reference without re-installing
+# Plexon's "Sim-2" SDK separately. The Python wrapper module
+# (``pyplexstimlib.py``) and the package ``__init__.py`` are picked
+# up automatically by PyInstaller's import-graph analysis since
+# ``stimtest.hardware.plexon`` imports them at runtime.
+if plexstim_root_src.exists():
+    pdf = plexstim_root_src / "PyPlexStim.pdf"
+    if pdf.is_file():
+        datas.append((str(pdf), plexstim_root_dst))
 
 # Optional ML assets — the QinjPredictor falls back gracefully if these
 # are missing, but bundling them means Predictive mode works out of the
@@ -129,7 +168,7 @@ gui_exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=APP_ICON,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,7 +204,7 @@ viewer_exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=VIEWER_ICON,
 )
 
 # ---------------------------------------------------------------------------

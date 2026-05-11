@@ -53,6 +53,48 @@ from .base import ExperimentEvent, ExperimentResult, ExperimentRunner
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _v_compliance_tripped(v_mon_v: "np.ndarray",
+                          *,
+                          threshold_v: float,
+                          min_consecutive: int = 3) -> bool:
+    """Return True iff ``|v_mon_v|`` exceeds ``threshold_v`` for at
+    least ``min_consecutive`` consecutive samples.
+
+    Audit finding #20 — the original compliance check was simply
+    ``np.max(np.abs(v_mon_v)) > threshold_v``. A single noisy
+    sample (mains pickup on an unshielded probe lead, an EMI
+    transient near the bench) would trip it and abort an
+    otherwise-good ramp step. Real compliance events come from
+    the stimulator failing to drive the programmed current —
+    they persist across the whole compliance window (tens of µs
+    at minimum), so a ``min_consecutive`` of 3 is conservative:
+    well below any meaningful event yet well above any
+    single-sample transient.
+
+    Implementation: build a boolean ``above`` mask and look for
+    a run of ``min_consecutive`` consecutive True values using a
+    cumulative-sum trick — pure-numpy, O(n), no scipy dep.
+    Returns False on an empty trace (a defensive guard against
+    callers that hand in a pre-acquisition placeholder).
+    """
+    if v_mon_v is None or len(v_mon_v) == 0:
+        return False
+    above = np.abs(np.asarray(v_mon_v, dtype=float)) > threshold_v
+    if min_consecutive <= 1:
+        return bool(above.any())
+    # Count consecutive True runs by resetting on every False.
+    # ``cs[i]`` is the length of the True-run ending at i.
+    # Equivalent to ``itertools.groupby`` but vectorised.
+    cs = np.zeros_like(above, dtype=int)
+    cs[0] = int(above[0])
+    for i in range(1, len(above)):
+        cs[i] = cs[i - 1] + 1 if above[i] else 0
+    return bool(cs.max() >= min_consecutive)
+
+
+# ---------------------------------------------------------------------------
 # Sweep policy
 # ---------------------------------------------------------------------------
 @dataclass
@@ -253,7 +295,6 @@ class VoltageTransientExperiment(ExperimentRunner):
         base_pattern = self.session.test.pattern
         amp = self.ramp.starting_ua
         capture_idx = 0
-        last_good_amp = amp
         # Reset the adaptive bookkeeping so each new configuration
         # starts with a clean prediction trail.
         self._prediction_history = []
@@ -293,7 +334,6 @@ class VoltageTransientExperiment(ExperimentRunner):
                 # Walk back to last good amplitude and stop
                 break
 
-            last_good_amp = amp
             amp += self._next_step(cap, amp, run.captures)
 
         # Stop output for safety
@@ -380,11 +420,65 @@ class VoltageTransientExperiment(ExperimentRunner):
         # device couldn't push the programmed current any further.
         # The constant lives in ``stimtest.config`` so a hardware-rev
         # change updates one place rather than every experiment runner.
-        cap.status.voltage_compliance = bool(
-            np.max(np.abs(v_mon_v)) > STIM_VOLTAGE_COMPLIANCE_V
-        )
+        #
+        # Audit finding #20 — the previous form ``np.max(np.abs(v))
+        # > rail`` triggered on a single noisy sample, aborting
+        # otherwise-good ramp steps when the scope picked up a spike
+        # (e.g. mains coupling on a long unshielded probe lead). We
+        # now require at least 3 consecutive samples above the rail
+        # so glitches don't kill a sweep. 3 samples at the scope's
+        # 2 GS/s rate is 1.5 ns — well below any meaningful
+        # compliance event but well above any single-sample
+        # transient. ``rolling_above`` is a tiny inline routine
+        # (no scipy dep) that returns True iff the input has a run
+        # of ``min_consecutive`` consecutive entries strictly above
+        # the threshold.
+        cap.status.voltage_compliance = bool(_v_compliance_tripped(
+            v_mon_v, threshold_v=STIM_VOLTAGE_COMPLIANCE_V,
+            min_consecutive=3,
+        ))
         compute_metrics(cap, surface_area_um2=self.surface_area_um2,
                         polarization_source=self.polarization_source)
+        # Push the E_ret pre/post-pulse rest values into the
+        # electrode-potential learning bin for the return coating.
+        # No-ops when E_ret wasn't recorded (NaN values), when the
+        # session lacks a setup snapshot, or when a non-Ag|AgCl
+        # reference is wired (see record_capture for the full
+        # skip rules). Wrapped in a try so a flaky disk on the
+        # prefs dir never aborts a capture mid-sweep.
+        try:
+            from ..electrode_potential_history import record_capture
+            record_capture(cap, self.session)
+        except Exception:
+            pass
+        # Per-capture damage-warning synthesis. Reads the user's
+        # Environment from the setup snapshot and emits an
+        # ``ExperimentEvent(kind="log", ...)`` when Shannon /
+        # NeurostimML / a Modified-Shannon cap fires above the
+        # environment's threshold. ``info`` postures (PBS, mISF,
+        # etc.) suppress per-capture spam to avoid 50-line log
+        # floods on a long sweep; ``warn`` / ``alert`` emit one
+        # line per flagged capture, prefixed with the title so
+        # the user can grep / filter the log later.
+        try:
+            from ..damage_warnings import assess_finished_capture
+            from .base import ExperimentEvent
+            extras = self.session.test.extras or {}
+            snap = extras.get("setup_snapshot") or {}
+            env_short = (
+                snap.get("environment_short")
+                if isinstance(snap, dict) else None
+            ) or "pbs"
+            warning = assess_finished_capture(cap, environment_short=env_short)
+            if warning is not None:
+                self._emit(ExperimentEvent(
+                    kind="log",
+                    session=self.session,
+                    capture=cap,
+                    message=f"{warning.title}\n{warning.body}",
+                ))
+        except Exception:
+            pass
         return cap
 
     # ------------------------------------------------------------------
@@ -624,13 +718,39 @@ class VoltageTransientExperiment(ExperimentRunner):
         can't produce a usable estimate (no features for this
         electrode, exception during predict, etc.). The caller treats
         ``None`` as a signal to fall back to the regression path.
+
+        The feature row is built directly from the live
+        ``(pattern, configuration, surface_area, coating)`` tuple
+        the runner already has on hand. An earlier revision called
+        ``features_from_run(self.session, cfg)`` passing a
+        ``Configuration`` where the helper expected a ``ChannelRun``;
+        the resulting ``AttributeError`` was swallowed by the
+        surrounding try/except, so the predictive strategy
+        silently degraded to the regression path on every call.
         """
         if self.predictor is None:
             return None
         try:
-            from ..ml import features_from_run
+            from ..ml.qinj_model import QinjFeatures
             cfg = self.session.test.configuration
-            feats = features_from_run(self.session, cfg)
+            # Honour the live coating from the array (falls back
+            # to SIROF only when the catalog lookup itself fails).
+            # The predictor flags unknown coatings via the
+            # ``is_extrapolation`` field rather than raising, so
+            # an out-of-training-set coating still produces a
+            # numeric prediction — just one the caller should
+            # weight less.
+            try:
+                coating = (self.session.test.array.sites[0].coating
+                           or "SIROF")
+            except (AttributeError, IndexError):
+                coating = "SIROF"
+            feats = QinjFeatures.from_pattern(
+                self.session.test.pattern,
+                cfg,
+                coating=coating,
+                surface_area_um2=self.surface_area_um2,
+            )
             result = self.predictor.predict(feats)
         except Exception:
             return None
@@ -638,8 +758,14 @@ class VoltageTransientExperiment(ExperimentRunner):
         # an excitation-phase amplitude using the active electrode's
         # area and the pattern's phase width. Mirrors the logic the
         # GUI's Fixed-Q_inj path uses.
+        #
+        # Note the dataclass attribute name: ``q_inj_predicted_…``
+        # (the metric prefix), NOT ``predicted_q_inj_…``. An earlier
+        # revision used the latter, which AttributeError'd inside
+        # the surrounding try/except — silently turning every
+        # predictive-strategy call into a regression fallback.
         try:
-            q_target = float(result.predicted_q_inj_mc_per_cm2)
+            q_target = float(result.q_inj_predicted_mc_per_cm2)
             area_cm2 = self.surface_area_um2 / 1e8
             phase_us = abs(self.session.test.pattern
                            .excitation_phase.width_us)

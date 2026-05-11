@@ -63,25 +63,31 @@ PLEXSTIM_INSTALLER_URL = (
 
 @dataclass
 class PlexStimStatus:
-    """What we know about the PlexStim SDK on this machine."""
+    """What we know about the PlexStim software stack on this machine."""
     installed: bool = False
     install_path: Optional[Path] = None
     version: Optional[str] = None
     dll_path: Optional[Path] = None
     dll_loadable: bool = False
+    #: Path to the Stim-2 GUI executable, when found. The presence of
+    #: this file is the *primary* signal that the Stimulator V2
+    #: software is installed (rather than just the SDK / DLL alone).
+    stim2_exe: Optional[Path] = None
     detection_source: str = ""        # 'registry' | 'filesystem' | 'dll-only' | 'none'
     notes: List[str] = field(default_factory=list)
 
     def status_line(self) -> str:
         """One-line human-readable summary for status bars / log lines."""
+        if self.stim2_exe is not None:
+            return f"Stim-2 found at {self.stim2_exe}"
         if self.installed and self.install_path:
             v = f" {self.version}" if self.version else ""
             return f"PlexStim SDK{v} found at {self.install_path}"
         if self.dll_loadable and self.dll_path:
-            return (f"PlexStim DLL at {self.dll_path} loads, but the SDK "
-                    f"installer doesn't appear to be registered. The USB "
-                    f"driver may be missing.")
-        return "PlexStim SDK not found"
+            return (f"PlexStim DLL at {self.dll_path} loads, but the "
+                    f"Stim-2 application doesn't appear to be installed. "
+                    f"The USB driver may be missing.")
+        return "Stim-2 application not found"
 
     def as_dict(self) -> dict:
         return {
@@ -90,6 +96,7 @@ class PlexStimStatus:
             "version": self.version,
             "dll_path": str(self.dll_path) if self.dll_path else None,
             "dll_loadable": self.dll_loadable,
+            "stim2_exe": str(self.stim2_exe) if self.stim2_exe else None,
             "detection_source": self.detection_source,
             "notes": list(self.notes),
         }
@@ -98,8 +105,17 @@ class PlexStimStatus:
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
-_REGISTRY_NAME_HINTS = ("plexstim", "stimulator v2", "plexon")
+_REGISTRY_NAME_HINTS = ("plexstim", "stimulator v2", "plexon",
+                         "stim-2", "stim 2")
 _DLL_NAMES = ("PlexStim64.dll", "PlexStim.dll")
+#: Extra "evidence" filenames — the Stim-2 GUI executable. Plexon's
+#: modern installer drops it as ``Stim-2.exe`` under
+#: ``C:\Program Files (x86)\Plexon Inc\Stim-2\`` (rather than the
+#: legacy ``PlexStim 2.0\`` folder). Finding this exe is a strong
+#: signal that the user has the Stimulator V2 software installed,
+#: even if our DLL search misses it because the modern installer
+#: doesn't co-locate the SDK DLL with the application.
+_STIM2_EXE_NAMES = ("Stim-2.exe", "Stim2.exe", "StimulatorV2.exe")
 
 
 def _enumerate_uninstall_keys() -> List[dict]:
@@ -196,8 +212,13 @@ def _common_install_paths() -> List[Path]:
     for root in (program_files_64, program_files_32):
         if not root:
             continue
+        # Modern installer (current default): installs the GUI under
+        # ``Plexon Inc\Stim-2\``.
+        candidates.append(Path(root) / "Plexon Inc" / "Stim-2")
+        # Legacy install folders (older Plexon installers).
         candidates.append(Path(root) / "Plexon Inc" / "PlexStim 2.0")
         candidates.append(Path(root) / "Plexon Inc" / "PlexStim")
+        candidates.append(Path(root) / "Plexon Inc" / "Stimulator V2")
     # Modern Plexon installers default to C:\PlexonSDKs\<sdk-name> rather
     # than under Program Files. The exact subfolder name varies across
     # SDK versions, so accept any direct child whose name mentions
@@ -233,6 +254,30 @@ def _find_dll_in(folder: Path) -> Optional[Path]:
                 p = sub / name
                 if p.is_file():
                     return p
+    return None
+
+
+def _find_stim2_exe_in(folder: Path) -> Optional[Path]:
+    """Look for the Stim-2 GUI executable under ``folder``. The
+    modern Plexon installer drops ``Stim-2.exe`` directly at the
+    install root; older / SDK-style layouts may put it under a
+    subfolder so we also peek one level deep."""
+    if not folder.is_dir():
+        return None
+    for name in _STIM2_EXE_NAMES:
+        p = folder / name
+        if p.is_file():
+            return p
+    try:
+        for sub in folder.iterdir():
+            if not sub.is_dir():
+                continue
+            for name in _STIM2_EXE_NAMES:
+                p = sub / name
+                if p.is_file():
+                    return p
+    except OSError:
+        pass
     return None
 
 
@@ -321,6 +366,33 @@ def detect_plexstim() -> PlexStimStatus:
                 status.detection_source = "dll-only"
             status.notes.append(f"Using vendored DLL: {v}")
 
+    # ---- 3b. Look for the Stim-2 application -------------------------
+    # This is the strong signal the user actually has the Stimulator V2
+    # software (not just an orphan DLL). We check the previously-found
+    # install path first, then sweep every common-install candidate
+    # so we catch installs that the registry / DLL search missed
+    # (which is exactly the case the user reported).
+    search_roots = []
+    if status.install_path is not None:
+        search_roots.append(status.install_path)
+    search_roots.extend(_common_install_paths())
+    seen = set()
+    for root in search_roots:
+        rp = str(root)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        exe = _find_stim2_exe_in(root)
+        if exe is not None:
+            status.stim2_exe = exe
+            # If we'd previously had no install evidence, take the
+            # exe's parent folder as the install path.
+            if status.install_path is None:
+                status.install_path = exe.parent
+                status.detection_source = "filesystem"
+            status.notes.append(f"Stim-2 GUI found: {exe}")
+            break
+
     # ---- 4. Verify loadability ---------------------------------------
     if status.dll_path is not None:
         status.dll_loadable = _try_load_dll(status.dll_path)
@@ -329,13 +401,135 @@ def detect_plexstim() -> PlexStimStatus:
                 f"DLL at {status.dll_path} failed to load via ctypes — "
                 f"the Visual C++ redistributable may be missing.")
 
-    # The SDK is "installed" only if we found a real install (registry or
-    # filesystem). The DLL-only path means we have just the bundled
-    # binary — useful for offline work but missing the USB driver.
-    status.installed = (status.detection_source in ("registry", "filesystem"))
+    # "Installed" reflects the user-visible reality: did we find the
+    # Stim-2 application on disk? That's the file the user has to
+    # close before the SDK can grab the USB lock and the strongest
+    # signal that the Plexon installer ran. Falls back to registry /
+    # SDK-folder evidence so we still mark it installed for older
+    # layouts that don't ship the GUI exe.
+    status.installed = (status.stim2_exe is not None
+                        or status.detection_source in ("registry", "filesystem"))
     if not status.detection_source:
         status.detection_source = "none"
     return status
 
 
-__all__ = ["PlexStimStatus", "detect_plexstim", "PLEXSTIM_INSTALLER_URL"]
+# ---------------------------------------------------------------------------
+# Hardware-presence detection (separate from software-install detection)
+# ---------------------------------------------------------------------------
+#
+# :func:`detect_plexstim` answers "is the SOFTWARE installed?" — registry
+# entries, files on disk, DLL loadability. None of that proves a
+# physical stimulator is plugged in over USB.
+#
+# :func:`plexstim_device_present` answers the complementary question:
+# "is a Plexon stimulator currently enumerated by the operating
+# system?". Used by the Connection panel's stim-detect indicator dot
+# (mirroring the scope-detect dot driven by the VISA enumerator) and
+# refreshed by the USB-hot-plug filter in
+# :mod:`stimtest.gui.usb_hotplug` whenever a USB device arrives or
+# leaves.
+#
+# Returns:
+#   * ``True``  — a Plexon-named device is plugged in.
+#   * ``False`` — the probe ran and saw no matching device.
+#   * ``None``  — the probe couldn't run (non-Windows host, missing
+#                 PowerShell, timeout, etc.); the GUI surfaces this
+#                 as a separate "unknown" state rather than collapsing
+#                 it to "not present".
+#
+# We deliberately keep the probe shell-out-to-PowerShell rather than
+# parsing pyusb / SetupAPI directly. PowerShell's ``Get-PnpDevice`` is
+# always available on every supported Windows version (10+), it
+# handles WOW64 quirks transparently, and the friendly-name match
+# survives Plexon shipping different USB descriptors / VID-PIDs over
+# the years without requiring us to maintain a static VID list.
+
+#: PnP / friendly-name substrings that identify a Plexon stimulator.
+#: Matching is case-insensitive. Order doesn't matter — any single
+#: match flips the probe to "present". Conservative substring set so
+#: a non-Plexon Plexon-Inc. lab device (a recording headstage, e.g.)
+#: doesn't false-positive as a stimulator.
+_PLEX_DEVICE_NAME_HINTS = (
+    "plexstim",
+    "stimulator v2",
+    "stim-2",
+    "stim 2",
+)
+
+
+def plexstim_device_present(timeout_s: float = 2.0) -> Optional[bool]:
+    """Probe Windows PnP for a plugged-in Plexon stimulator.
+
+    Parameters
+    ----------
+    timeout_s : float, optional
+        Seconds to wait for the PowerShell probe to respond before
+        giving up. The default 2 s is plenty on a healthy machine
+        (PowerShell startup + ``Get-PnpDevice`` typically returns
+        in well under a second), and a slow box just degrades to
+        the ``None`` (unknown) state.
+
+    Returns
+    -------
+    bool or None
+        * ``True``  — at least one currently-present USB device's
+          friendly-name matches one of
+          :data:`_PLEX_DEVICE_NAME_HINTS`.
+        * ``False`` — probe ran successfully and matched nothing.
+        * ``None``  — probe couldn't run (non-Windows host,
+          missing PowerShell, timeout, etc.).
+    """
+    if platform.system() != "Windows":
+        return None
+    # Build a single PowerShell one-liner that filters PnP devices to
+    # the present-only set, matches against any of our hints (joined
+    # into one regex alternation), and prints just the matched
+    # friendly-name strings — one per line so the parser is trivial.
+    # Hints are escaped for regex safety even though they're
+    # alphanumeric today; cheap insurance if the list grows later.
+    import re
+    import subprocess
+    pattern = "|".join(re.escape(h) for h in _PLEX_DEVICE_NAME_HINTS)
+    ps_script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-PnpDevice -PresentOnly | "
+        f"Where-Object {{ $_.FriendlyName -match '{pattern}' "
+        f"-or $_.Manufacturer -match 'plexon' }} | "
+        "Select-Object -ExpandProperty FriendlyName"
+    )
+    try:
+        # CREATE_NO_WINDOW (= 0x08000000) suppresses the brief
+        # PowerShell window flash on non-frozen builds; it's a no-op
+        # on non-Windows but we already short-circuited above.
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            ["powershell", "-NoProfile",
+             "-NonInteractive",
+             "-ExecutionPolicy", "Bypass",
+             "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            creationflags=creation_flags,
+        )
+    except (FileNotFoundError, OSError):
+        # PowerShell binary not on PATH; can't tell.
+        return None
+    except subprocess.TimeoutExpired:
+        # PnP enumeration is generally fast — a timeout suggests a
+        # very loaded machine or a hung WMI service. Surface as
+        # "unknown" rather than "absent" so the user isn't told
+        # the device isn't plugged in when actually we don't know.
+        return None
+    if result.returncode != 0:
+        return None
+    matches = [line.strip() for line in (result.stdout or "").splitlines()
+               if line.strip()]
+    return len(matches) > 0
+
+
+__all__ = [
+    "PlexStimStatus", "detect_plexstim", "PLEXSTIM_INSTALLER_URL",
+    "plexstim_device_present",
+]

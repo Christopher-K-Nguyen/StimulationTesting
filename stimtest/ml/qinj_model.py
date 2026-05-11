@@ -33,6 +33,7 @@ import csv
 import json
 import math
 import pickle
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -125,7 +126,48 @@ def features_from_run(session: Session, run: ChannelRun,
 # ---------------------------------------------------------------------------
 # Dataset I/O — a flat CSV with one observation per finished sweep
 # ---------------------------------------------------------------------------
-DEFAULT_DATASET_PATH = Path("data") / "qinj_dataset.csv"
+
+def _resolve_data_dir() -> Path:
+    """Locate the ``data/`` directory in both dev and frozen builds.
+
+    * Dev: the in-repo ``data/`` folder, relative to the repo root.
+      Resolved by walking up from this file (``stimtest/ml/qinj_model.py``)
+      two levels — works regardless of the user's current working
+      directory.
+    * Frozen (PyInstaller --onedir): the installer drops the bundled
+      assets into ``<dist>/data/``. PyInstaller exposes the bundle root
+      via ``sys._MEIPASS``; the spec adds the bundled files at
+      ``data/qinj_*.{csv,pkl}`` relative to it.
+
+    Returns whichever exists; falls back to the dev-relative path if
+    neither resolves so callers can use the result for *writing*
+    new files in a fresh checkout without a pre-existing ``data/``.
+    """
+    # Frozen first — sys._MEIPASS is only set when PyInstaller has
+    # unpacked the bundle, so an attribute check is the canonical way
+    # to detect that case (recommended by the PyInstaller docs).
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        frozen = Path(meipass) / "data"
+        if frozen.is_dir():
+            return frozen
+    # Dev — walk up from stimtest/ml/qinj_model.py → repo root.
+    dev = Path(__file__).resolve().parents[2] / "data"
+    return dev
+
+
+#: Default dataset path used by :func:`record_observation` and
+#: :meth:`QinjPredictor.fit_from_csv`. The path is resolved at module
+#: import to whichever ``data/`` directory exists (frozen bundle vs.
+#: dev checkout); callers who want a different location can pass
+#: ``path=`` explicitly.
+DEFAULT_DATASET_PATH = _resolve_data_dir() / "qinj_dataset.csv"
+
+#: Default model pickle path. Companion to ``DEFAULT_DATASET_PATH``;
+#: produced by ``scripts/train_qinj_model.py`` and consumed by
+#: :meth:`QinjPredictor.load_default`. Bundled by the installer
+#: alongside the dataset.
+DEFAULT_MODEL_PATH = _resolve_data_dir() / "qinj_model.pkl"
 
 
 def record_observation(features: QinjFeatures, q_inj_mc_per_cm2: float,
@@ -286,6 +328,56 @@ class QinjPredictor:
         if not feats:
             raise FileNotFoundError(f"No observations in {path}")
         return self.fit(feats, targets)
+
+    @classmethod
+    def load_default(cls) -> Optional["QinjPredictor"]:
+        """Best-effort loader for the bundled / installed predictor.
+
+        Tries two paths in order, returning the first that succeeds:
+
+        1. **Pre-fit pickle** at :data:`DEFAULT_MODEL_PATH`. This is
+           what the installer bundles (and what
+           ``scripts/train_qinj_model.py`` produces). Loading from a
+           pickle is free at experiment Start time, whereas fitting
+           from CSV pays the GBM-training cost every time.
+        2. **CSV fit** from :data:`DEFAULT_DATASET_PATH` as a fallback,
+           for dev checkouts that have the dataset but no pre-fit
+           pickle. Slower (~100 ms for a 500-row dataset) but
+           re-produces a working predictor without a build step.
+
+        Returns ``None`` (silently) when neither source is available
+        or both fail to load. The runner treats ``None`` as
+        "predictive strategy unavailable" and falls back to adaptive
+        regression — see the dispatch in
+        :class:`stimtest.experiments.voltage_transient.VoltageTransientExperiment`.
+
+        Used instead of the previous ``QinjPredictor().fit_from_csv()``
+        idiom in the GUI; the old call referenced ``Path("data") /
+        "qinj_dataset.csv"`` (a *relative* path resolved against the
+        process CWD) and silently failed in any frozen build whose
+        launcher started from a different directory.
+        """
+        # 1) Try the pre-fit pickle. ``Path.is_file()`` is a fast
+        #    no-throw check; the actual load is wrapped in
+        #    try/except because a corrupt pickle or version-skew
+        #    sklearn version mismatch shouldn't bring down the
+        #    Start path.
+        try:
+            if DEFAULT_MODEL_PATH.is_file():
+                return cls.load(DEFAULT_MODEL_PATH)
+        except Exception:
+            pass
+        # 2) Fall back to CSV. ``is_file()`` again so we can
+        #    distinguish "dataset present but empty / unreadable"
+        #    (raise, caller surfaces a useful message) from "no
+        #    dataset at all" (return None silently — this is the
+        #    normal state on a fresh checkout).
+        try:
+            if DEFAULT_DATASET_PATH.is_file():
+                return cls().fit_from_csv(DEFAULT_DATASET_PATH)
+        except Exception:
+            pass
+        return None
 
     # ----- inference -----------------------------------------------------
     def predict(self, features: QinjFeatures) -> PredictionResult:

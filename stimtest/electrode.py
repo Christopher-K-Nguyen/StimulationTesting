@@ -13,7 +13,10 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .config import COATINGS, Coating
+from .config import (
+    COATINGS, Coating,
+    ELECTRODE_GEOMETRIES, ELECTRODE_GEOMETRY_CIRCLE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -21,16 +24,34 @@ from .config import COATINGS, Coating
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ElectrodePosition:
-    """Physical location and identity of one electrode site."""
+    """Physical location and identity of one electrode site.
+
+    ``geometry`` selects the shape of the electrode active site —
+    one of :data:`stimtest.config.ELECTRODE_GEOMETRIES`. ``rounded``
+    is meaningful only for ``square`` / ``rectangle`` geometries
+    and indicates filleted corners; otherwise it's ignored. Defaults
+    are circle / not-rounded so existing arrays without explicit
+    geometry information keep their historical interpretation.
+    """
     number: int               # 1-based logical channel number
     row: int                  # 0-based grid row
     col: int                  # 0-based grid column
     surface_area_um2: float = 5000.0
     coating: str = "SIROF"
+    geometry: str = ELECTRODE_GEOMETRY_CIRCLE
+    rounded: bool = False
 
     @property
     def coating_props(self) -> Coating:
         return COATINGS.get(self.coating, COATINGS["SIROF"])
+
+    @property
+    def geometry_props(self):
+        """Return the ``ElectrodeGeometry`` metadata for this site,
+        falling back to the circle entry if the stored code isn't
+        recognised (e.g. a typoed value in a stale prefs file)."""
+        return ELECTRODE_GEOMETRIES.get(
+            self.geometry, ELECTRODE_GEOMETRIES[ELECTRODE_GEOMETRY_CIRCLE])
 
 
 @dataclass
@@ -63,6 +84,16 @@ class ElectrodeArray:
     #: through this map. The catalog tables already live in
     #: :data:`stimtest.config.CONNECTORS`.
     cable_map: Optional[dict[int, int]] = None
+    #: Physical packing of the electrodes. ``"rect"`` = aligned square
+    #: grid (every site at integer (row, col) with equal pitch in both
+    #: axes). ``"triangular"`` = equilateral hexagonal packing where odd
+    #: rows are offset by half a cell horizontally and the row pitch is
+    #: ``cell × √3/2`` so every site has six equidistant neighbours.
+    #: Used as a hint by GUI views that draw the array (geometry +
+    #: channel-selector) and by the combinations panel to suppress the
+    #: "Include diagonal" toggle (orthogonal-vs-diagonal is meaningless
+    #: on a hex grid — the six nearest neighbours are equidistant).
+    layout: str = "rect"
 
     # --------------------------------------------------------------
     @classmethod
@@ -85,19 +116,23 @@ class ElectrodeArray:
     @classmethod
     def custom_grid(cls, name: str, rows: int, cols: int,
                     surface_area_um2: float = 5000.0,
-                    coating: str = "SIROF") -> "ElectrodeArray":
+                    coating: str = "SIROF",
+                    layout: str = "rect") -> "ElectrodeArray":
         sites = [
             ElectrodePosition(number=r * cols + c + 1, row=r, col=c,
                               surface_area_um2=surface_area_um2, coating=coating)
             for r in range(rows) for c in range(cols)
         ]
-        return cls(name=name, rows=rows, cols=cols, sites=sites)
+        return cls(name=name, rows=rows, cols=cols, sites=sites, layout=layout)
 
     @classmethod
     def from_mapping(cls, name: str, mapping,
                      surface_area_um2: float = 5000.0,
                      coating: str = "SIROF",
-                     per_channel: Optional[dict] = None) -> "ElectrodeArray":
+                     geometry: str = ELECTRODE_GEOMETRY_CIRCLE,
+                     rounded: bool = False,
+                     per_channel: Optional[dict] = None,
+                     layout: str = "rect") -> "ElectrodeArray":
         """Build from a 2-D channel-number grid (``0`` = empty / inter-shank gap).
 
         ``mapping`` may be any 2-D array-like of ints. Values <= 0 mark
@@ -106,9 +141,12 @@ class ElectrodeArray:
         bounding box is preserved so the GUI can still draw the layout.
 
         ``per_channel``, if given, is ``{channel_number: {'area_um2':
-        float, 'coating': str}}`` and lets each electrode override the
-        device-level defaults (used by the "Different surface area"
-        mode on the Setup tab).
+        float, 'coating': str, 'geometry': str, 'rounded': bool}}`` —
+        any of those keys may be missing, in which case the
+        device-level default applies.
+
+        ``geometry`` and ``rounded`` are device-level defaults applied
+        to every site that doesn't override them in ``per_channel``.
         """
         import numpy as np
         grid = np.asarray(mapping, dtype=int)
@@ -127,10 +165,12 @@ class ElectrodeArray:
                     number=ch, row=r, col=c,
                     surface_area_um2=float(ovr.get("area_um2", surface_area_um2)),
                     coating=str(ovr.get("coating", coating)),
+                    geometry=str(ovr.get("geometry", geometry)),
+                    rounded=bool(ovr.get("rounded", rounded)),
                 ))
         # Sort by channel number for predictable ordering downstream
         sites.sort(key=lambda s: s.number)
-        return cls(name=name, rows=rows, cols=cols, sites=sites)
+        return cls(name=name, rows=rows, cols=cols, sites=sites, layout=layout)
 
     # --------------------------------------------------------------
     def __getitem__(self, n: int) -> ElectrodePosition:

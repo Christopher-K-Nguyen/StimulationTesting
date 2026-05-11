@@ -29,7 +29,20 @@ from PyQt6 import QtCore
 
 
 PREFS_VERSION = 1
-PREFS_FILE = "gui_prefs.json"
+#: Auto-save filename. The ``.setting`` extension distinguishes
+#: stimtest profiles from generic JSON in file managers / pickers,
+#: while the contents stay JSON (so existing inspectors keep
+#: working). See :func:`load_prefs` for the legacy ``.json``
+#: migration path that catches users upgrading from older
+#: versions of the app.
+PREFS_FILE = "gui_prefs.setting"
+PREFS_FILE_LEGACY = "gui_prefs.json"
+#: Extension for user-saved settings profiles (via File → Save
+#: settings…). Same format as the auto-save file — the
+#: extension is a label not a content-type marker.
+PREFS_USER_EXT = ".setting"
+PREFS_USER_EXT_LEGACY = ".json"
+PREFS_USER_FILTER = "Settings (*.setting);;JSON (*.json);;All files (*)"
 
 _log = logging.getLogger(__name__)
 
@@ -53,11 +66,29 @@ def prefs_path() -> Path:
     return prefs_dir() / PREFS_FILE
 
 
+def _legacy_prefs_path() -> Path:
+    """Pre-v1 auto-save filename (``gui_prefs.json``). Read-only
+    fallback so users upgrading from older builds don't lose their
+    saved settings."""
+    return prefs_dir() / PREFS_FILE_LEGACY
+
+
 def load_prefs() -> Dict[str, Dict[str, Any]]:
-    """Read the prefs JSON. Returns an empty dict on any failure (no nag)."""
+    """Read the prefs JSON. Returns an empty dict on any failure (no nag).
+
+    Tries the new ``gui_prefs.setting`` first; falls back to the
+    legacy ``gui_prefs.json`` if the new file doesn't exist yet.
+    The legacy file is left in place so a one-time crash-or-rollback
+    can recover from it; the next successful close-time save creates
+    the new ``.setting`` file alongside.
+    """
     p = prefs_path()
     if not p.is_file():
-        return {}
+        legacy = _legacy_prefs_path()
+        if legacy.is_file():
+            p = legacy
+        else:
+            return {}
     try:
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)

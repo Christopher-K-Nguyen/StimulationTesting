@@ -1,19 +1,46 @@
-# Building the StimulationTesting Windows installer
+# Building the PULSAR Windows installer
 
 This folder packages the Python application as a single `.exe` installer
-that drops the GUI, the viewer, and all their dependencies under
-`Program Files\StimulationTesting`. It also detects whether the **Plexon
-PlexStim 2.0 SDK** is installed and offers to download it during setup.
+that drops the **PULSAR** GUI, the **POLARIS** viewer,
+and all their dependencies under `Program Files\StimulationTesting`. It
+also detects whether the **Plexon PlexStim 2.0 SDK** is installed and
+offers to download it during setup.
+
+## Rename ledger
+
+The user-facing product was renamed **StimulationTesting → PULSAR**
+(GUI) and **StimulationTesting Viewer → POLARIS** (viewer).
+The rename intentionally stops short of touching anything that would
+break existing installations or external links. The table below is the
+authoritative list of what changed vs. what stayed.
+
+| Surface | Value | Why |
+|---|---|---|
+| **AppName** (window titles, Start Menu folder, Add/Remove Programs) | `PULSAR` | Canonical brand. |
+| **Viewer display name** (Start Menu + desktop shortcut labels) | `POLARIS` | Matches the viewer's `setWindowTitle`. |
+| **Installer .exe filename** | `PULSAR-Setup-<version>.exe` | First thing the user sees on download. |
+| **DefaultDirName** | `%ProgramFiles%\StimulationTesting` | **NOT renamed.** Existing installations upgrade in place (the AppId GUID drives upgrade detection, not the directory). |
+| **Launcher .exe filenames** | `StimulationTesting.exe`, `StimulationTestingViewer.exe` | **NOT renamed.** Preserves existing users' Start Menu / desktop / scripted-launch shortcuts. The PyInstaller `.spec` and the `.iss` `AppExeName` / `ViewerExeName` both stay on the old names; if you ever do rename them, ship a matching `[InstallDelete]` step to clean up the obsolete files. |
+| **`%APPDATA%\StimulationTesting\`** prefs / cache dir | unchanged | Renaming would orphan every existing installation's calibration, setup, electrode-potential cache, and NeurostimML model. Separate migration. |
+| **GitHub repo URL** (`github.com/Bortz1234/StimulationTesting`) | unchanged | Update-check, About-dialog hyperlink, contribute-data issue URL all key off this. GitHub redirects from a renamed repo, but the codebase still hardcodes the canonical name. |
+| **Python package** (`import stimtest`) | unchanged | Module path. Renaming would break every internal import. |
+| **AppId GUID** | `6E5CDD7E-9D2E-4D38-8B2E-1E2A0BD8C9F1` (unchanged) | Drives Inno Setup's upgrade detection. Preserving it means existing installations get an in-place upgrade rather than a sibling install. |
+
+If you're contributing a release, what you'll see referencing "PULSAR"
+is the installer's user-visible surface (window titles, Start Menu,
+Add/Remove Programs, downloaded `.exe` filename). What you'll see still
+referencing "StimulationTesting" is the codebase / repo / file-system /
+launcher filenames — left alone deliberately, per the table above.
 
 ## What gets built
 
 | Artifact | Purpose |
 |----------|---------|
-| `dist/StimulationTesting/StimulationTesting.exe` | Main GUI (Setup / VT / SP / LP / PS / Results tabs) |
-| `dist/StimulationTesting/StimulationTestingViewer.exe` | Echem-Analyst-style session viewer |
+| `dist/StimulationTesting/StimulationTesting.exe` | Main GUI (PULSAR — Setup / VT / SP / LP / PS / Results tabs) |
+| `dist/StimulationTesting/StimulationTestingViewer.exe` | POLARIS — Echem-Analyst-style session viewer |
 | `dist/StimulationTesting/*.dll`, `*.pyd`, etc. | Shared Python / Qt / scipy / matplotlib runtime |
 | `dist/StimulationTesting/stimtest/hardware/pyplexstim/bin/PlexStim64.dll` | Vendored PlexStim DLL (used as a fallback) |
-| `Output/StimulationTesting-Setup-<version>.exe` | The signed-able single-file installer that goes to end users |
+| `Output/PULSAR-Setup-<version>.exe` | The signed-able single-file installer that goes to end users |
 
 ## Prerequisites
 
@@ -111,7 +138,13 @@ app, with the same download URL.
 
 ## Customising
 
-* **App version** — change `AppVersion` at the top of `StimulationTesting.iss`.
+* **App version** — bump `__version__` in `stimtest/__init__.py`. That's
+  the single source of truth; `build.py` reads it and passes the value
+  to Inno Setup via `ISCC /DAppVersion=…`, overriding the `.iss` file's
+  `#ifndef AppVersion` fallback. You also need to update
+  `pyproject.toml`'s `version = "…"` to match — `build.py` aborts the
+  build if the two disagree (audit finding #32). The `.iss` fallback
+  value is build-time-only and harmless to leave stale.
   PyInstaller doesn't need a separate version bump unless you want the
   Windows Explorer "Details" tab to show one (set `version_info.txt` in
   the spec).

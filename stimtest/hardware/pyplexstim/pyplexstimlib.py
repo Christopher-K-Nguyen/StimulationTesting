@@ -67,8 +67,15 @@ class PyPlexStim:
         self.dll_init = 0
         try:
             self.plexstim_dll = CDLL(self.plexstim_dll_file)
-        except (WindowsError):
-            print("Error: Can't load the PlexStim .dll at: " + self.plexstim_dll_file)
+        except OSError:
+            # LOCAL FIX: upstream catches ``WindowsError`` which is undefined
+            # on non-Windows platforms (NameError). On Windows in Py3,
+            # ``WindowsError`` is an alias for ``OSError``, so the broader
+            # catch covers both cases. ``dll_init`` stays 0 — the consumer
+            # in plexon.py checks that flag and raises a structured error.
+            import sys
+            print("Error: Can't load the PlexStim .dll at: " + self.plexstim_dll_file,
+                  file=sys.stderr)
         else:
             self.dll_init = 1
             
@@ -85,10 +92,7 @@ class PyPlexStim:
                 1 - error initializing devices
                 2 - no stimulators found
         """
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_InitAllStim@@YAHXZ")()
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_InitAllStim@@YAHXZ")()
+        self.result = getattr(self.plexstim_dll, "?PS_InitAllStim@@YAHXZ")()
         
         return self.result
         
@@ -109,10 +113,7 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_CloseStim@@YAHH@Z")(self.stim_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_CloseStim@@YAHH@Z")(self.stim_n)
+        self.result = getattr(self.plexstim_dll, "?PS_CloseStim@@YAHH@Z")(self.stim_n)
         
         return self.result
         
@@ -128,10 +129,7 @@ class PyPlexStim:
             0 - OK
             1 - device error
         """
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_CloseAllStim@@YAHXZ")()
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_CloseAllStim@@YAHXZ")()
+        self.result = getattr(self.plexstim_dll, "?PS_CloseAllStim@@YAHXZ")()
         
         return self.result
         
@@ -156,10 +154,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.ch_n = c_int(ch_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_LoadChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_LoadChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
+        self.result = getattr(self.plexstim_dll, "?PS_LoadChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
         
         return self.result
         
@@ -183,10 +178,7 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_LoadAllChannels@@YAHH@Z")(self.stim_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_LoadAllChannels@@YAHH@Z")(self.stim_n)
+        self.result = getattr(self.plexstim_dll, "?PS_LoadAllChannels@@YAHH@Z")(self.stim_n)
         
         return self.result
         
@@ -209,10 +201,7 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_StartStimAllChannels@@YAHH@Z")(self.stim_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_StartStimAllChannels@@YAHH@Z")(self.stim_n)
+        self.result = getattr(self.plexstim_dll, "?PS_StartStimAllChannels@@YAHH@Z")(self.stim_n)
         
         return self.result
         
@@ -235,10 +224,7 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_StopStimAllChannels@@YAHH@Z")(self.stim_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_StopStimAllChannels@@YAHH@Z")(self.stim_n)
+        self.result = getattr(self.plexstim_dll, "?PS_StopStimAllChannels@@YAHH@Z")(self.stim_n)
         
         return self.result
         
@@ -263,10 +249,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.ch_n = c_int(ch_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_StartStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_StartStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
+        self.result = getattr(self.plexstim_dll, "?PS_StartStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
         
         return self.result
         
@@ -291,10 +274,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.ch_n = c_int(ch_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_StopStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_StopStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
+        self.result = getattr(self.plexstim_dll, "?PS_StopStimChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
         
         return self.result
         
@@ -315,10 +295,7 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_Abort@@YAHH@Z")(self.stim_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_Abort@@YAHH@Z")(self.stim_n)
+        self.result = getattr(self.plexstim_dll, "?PS_Abort@@YAHH@Z")(self.stim_n)
         
         return self.result
         
@@ -338,10 +315,7 @@ class PyPlexStim:
                 0 - OK
                 1 - device error
         """
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_AbortAll@@YAHXZ")()
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_AbortAll@@YAHXZ")()
+        self.result = getattr(self.plexstim_dll, "?PS_AbortAll@@YAHXZ")()
         
         return self.result
         
@@ -369,10 +343,7 @@ class PyPlexStim:
         self.ch_n = c_int(ch_n)
         self.pattern_type = c_int(pattern_type)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetPatternType@@YAHHHW4PS_PATTERN_TYPE@@@Z")(self.stim_n, self.ch_n, self.pattern_type)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetPatternType@@YAHHHW4PS_PATTERN_TYPE@@@Z")(self.stim_n, self.ch_n, self.pattern_type)
+        self.result = getattr(self.plexstim_dll, "?PS_SetPatternType@@YAHHHW4PS_PATTERN_TYPE@@@Z")(self.stim_n, self.ch_n, self.pattern_type)
         
         return self.result
         
@@ -441,10 +412,7 @@ class PyPlexStim:
         
         self.param = PS_RectPattern(param[0], param[1], param[2], param[3], param[4])
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetRectParam@@YAHHHUPS_RectPattern@@@Z")(self.stim_n, self.ch_n, self.param)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetRectParam@@YAHHHUPS_RectPattern@@@Z")(self.stim_n, self.ch_n, self.param)
+        self.result = getattr(self.plexstim_dll, "?PS_SetRectParam@@YAHHHUPS_RectPattern@@@Z")(self.stim_n, self.ch_n, self.param)
         
         return self.result
         
@@ -478,8 +446,13 @@ class PyPlexStim:
             self.result = getattr(self.plexstim_dll, "?PS_GetRectParam@@YAHHHPAUPS_RectPattern@@@Z")(self.stim_n, self.ch_n, byref(self.param))
         else:
             self.result = getattr(self.plexstim_dll, "?PS_GetRectParam@@YAHHHPEAUPS_RectPattern@@@Z")(self.stim_n, self.ch_n, byref(self.param))
-        
-        return (self.param.Amp1.value, self.param.Amp1.value, self.param.Amp1.value, self.param.Amp1.value, self.param.Amp1.value), self.result
+
+        # LOCAL FIX (deviates from upstream Plexon 1.2.0): the shipped wrapper
+        # returns Amp1 five times AND calls .value on a Structure field — both
+        # bugs. Structure fields of c_int unwrap to Python int on access, so
+        # .value raises AttributeError. Return all five fields in the order
+        # documented in the docstring.
+        return (self.param.Amp1, self.param.Amp2, self.param.W1, self.param.W2, self.param.Delay), self.result
         
     def ps_load_arb_pattern(self, stim_n, ch_n, pattern_path):
         """
@@ -665,10 +638,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.mode = c_int(mode)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetDigitalOutputMode@@YAHHW4PS_DIGITAL_OUTPUT@@@Z")(self.stim_n, self.mode)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetDigitalOutputMode@@YAHHW4PS_DIGITAL_OUTPUT@@@Z")(self.stim_n, self.mode)
+        self.result = getattr(self.plexstim_dll, "?PS_SetDigitalOutputMode@@YAHHW4PS_DIGITAL_OUTPUT@@@Z")(self.stim_n, self.mode)
         
         return self.result
         
@@ -722,10 +692,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.ch_n = c_int(ch_n)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetMonitorChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetMonitorChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
+        self.result = getattr(self.plexstim_dll, "?PS_SetMonitorChannel@@YAHHH@Z")(self.stim_n, self.ch_n)
         
         return self.result
     
@@ -747,12 +714,19 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         self.mon_ch_n = c_int(0)
-        
+
+        # LOCAL FIX (deviates from upstream Plexon 1.2.0): the shipped wrapper
+        # passes byref(self.ch_n) (a leftover from earlier calls — does not
+        # exist on a fresh instance) and then returns self.mon_ch_n.value
+        # which is always the 0 we initialized. Real hardware would crash
+        # plexon.py's read-back equality check on every set_monitor_channel
+        # call. Pass byref(self.mon_ch_n) so the DLL writes into the
+        # variable we actually return.
         if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_GetMonitorChannel@@YAHHPAH@Z")(self.stim_n, byref(self.ch_n))
+            self.result = getattr(self.plexstim_dll, "?PS_GetMonitorChannel@@YAHHPAH@Z")(self.stim_n, byref(self.mon_ch_n))
         else:
-            self.result = getattr(self.plexstim_dll, "?PS_GetMonitorChannel@@YAHHPEAH@Z")(self.stim_n, byref(self.ch_n))
-        
+            self.result = getattr(self.plexstim_dll, "?PS_GetMonitorChannel@@YAHHPEAH@Z")(self.stim_n, byref(self.mon_ch_n))
+
         return self.mon_ch_n.value, self.result
     
     def ps_set_period(self, stim_n, ch_n, period):
@@ -776,10 +750,7 @@ class PyPlexStim:
         self.ch_n = c_int(ch_n)
         self.period = c_double(period)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetPeriod@@YAHHHN@Z")(self.stim_n, self.ch_n, self.period)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetPeriod@@YAHHHN@Z")(self.stim_n, self.ch_n, self.period)
+        self.result = getattr(self.plexstim_dll, "?PS_SetPeriod@@YAHHHN@Z")(self.stim_n, self.ch_n, self.period)
         
         return self.result
         
@@ -832,10 +803,7 @@ class PyPlexStim:
         self.ch_n = c_int(ch_n)
         self.rate = c_double(rate)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetRate@@YAHHHN@Z")(self.stim_n, self.ch_n, self.rate)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetRate@@YAHHHN@Z")(self.stim_n, self.ch_n, self.rate)
+        self.result = getattr(self.plexstim_dll, "?PS_SetRate@@YAHHHN@Z")(self.stim_n, self.ch_n, self.rate)
         
         return self.result
         
@@ -888,10 +856,7 @@ class PyPlexStim:
         self.ch_n = c_int(ch_n)
         self.repetitions = c_int(repetitions)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetRepetitions@@YAHHHH@Z")(self.stim_n, self.ch_n, self.repetitions)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetRepetitions@@YAHHHH@Z")(self.stim_n, self.ch_n, self.repetitions)
+        self.result = getattr(self.plexstim_dll, "?PS_SetRepetitions@@YAHHHH@Z")(self.stim_n, self.ch_n, self.repetitions)
         
         return self.result
         
@@ -946,10 +911,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.mode = c_int(mode)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetTriggerMode@@YAHHW4PS_TRIG_MODE@@@Z")(self.stim_n, self.mode)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetTriggerMode@@YAHHW4PS_TRIG_MODE@@@Z")(self.stim_n, self.mode)
+        self.result = getattr(self.plexstim_dll, "?PS_SetTriggerMode@@YAHHW4PS_TRIG_MODE@@@Z")(self.stim_n, self.mode)
         
         return self.result
         
@@ -1007,10 +969,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.scaling = c_int(scaling)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetVmonScaling@@YAHHW4PS_VMON_SCALING@@@Z")(self.stim_n, self.scaling)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetVmonScaling@@YAHHW4PS_VMON_SCALING@@@Z")(self.stim_n, self.scaling)
+        self.result = getattr(self.plexstim_dll, "?PS_SetVmonScaling@@YAHHW4PS_VMON_SCALING@@@Z")(self.stim_n, self.scaling)
         
         return self.result
         
@@ -1067,10 +1026,7 @@ class PyPlexStim:
         self.stim_n = c_int(stim_n)
         self.enabled = c_bool(enabled)
         
-        if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_SetAutoDischarge@@YAHH_N@Z")(self.stim_n, self.enabled)
-        else:
-            self.result = getattr(self.plexstim_dll, "?PS_SetAutoDischarge@@YAHH_N@Z")(self.stim_n, self.enabled)
+        self.result = getattr(self.plexstim_dll, "?PS_SetAutoDischarge@@YAHH_N@Z")(self.stim_n, self.enabled)
         
         return self.result
         
@@ -1248,12 +1204,17 @@ class PyPlexStim:
         """
         self.stim_n = c_int(stim_n)
         self.fw_version = (c_char * 512)()
-        
+
+        # LOCAL FIX (deviates from upstream Plexon 1.2.0): the shipped wrapper
+        # uses the mangled name suffix "PAH"/"PEAH" (int*) when the out-buffer
+        # is actually char*. Compare to ps_get_description / ps_get_serial_number
+        # which correctly use "PAD"/"PEAD" (char*). With the wrong suffix the
+        # getattr lookup either fails or resolves to the wrong overload.
         if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPAH@Z")(self.stim_n, byref(self.fw_version))
+            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPAD@Z")(self.stim_n, byref(self.fw_version))
         else:
-            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPEAH@Z")(self.stim_n, byref(self.fw_version))
-        
+            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPEAD@Z")(self.stim_n, byref(self.fw_version))
+
         return self.fw_version.value, self.result
     
     def ps_get_serial_number(self, stim_n):
@@ -1335,5 +1296,8 @@ class PyPlexStim:
             self.result = getattr(self.plexstim_dll, "?PS_IsWaveformBalanced@@YAHHHPA_N@Z")(self.stim_n, self.ch_n, byref(self.is_balanced))
         else:
             self.result = getattr(self.plexstim_dll, "?PS_IsWaveformBalanced@@YAHHHPEA_N@Z")(self.stim_n, self.ch_n, byref(self.is_balanced))
-        
-        return int(self.balanced.value), self.result
+
+        # LOCAL FIX (deviates from upstream Plexon 1.2.0): the shipped wrapper
+        # references self.balanced (typo for self.is_balanced) which raises
+        # AttributeError on every call.
+        return int(self.is_balanced.value), self.result

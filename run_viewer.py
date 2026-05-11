@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Standalone viewer for inspecting saved sessions.
+"""POLARIS — session viewer.
 
-Runs the Gamry Echem Analyst-style browser implemented in
-``stimtest.gui.viewer``. Open a single ``.npz`` file or point at a folder of
-sessions and click through the tree to inspect captures, run summaries, and
-session metadata.
+Standalone viewer for inspecting saved PULSAR sessions. Implements a
+Gamry Echem Analyst-style browser (in ``stimtest.gui.viewer``). Open a
+single ``.npz`` file or point at a folder of sessions and click through
+the tree to inspect captures, run summaries, and session metadata.
 
 Examples
 --------
@@ -22,7 +22,7 @@ from stimtest.gui.viewer import launch
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="StimulationTesting session viewer")
+    p = argparse.ArgumentParser(description="POLARIS — session viewer")
     p.add_argument("path", nargs="?", default=None,
                    help="Optional .npz file or folder to open at startup")
     args = p.parse_args()

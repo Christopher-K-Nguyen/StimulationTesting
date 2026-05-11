@@ -114,6 +114,34 @@ class ResultsTab(QtWidgets.QWidget):
         else:
             self.status_label.setText(f"Save path missing: {self.save_dir}")
 
+    # ----------------------------------------------------------- prefs
+    def current_prefs(self) -> dict:
+        """Snapshot the embedded viewer's prefs so MainWindow can
+        persist them alongside the rest of the GUI state.
+
+        ResultsTab itself doesn't carry any user-visible state worth
+        remembering — the toolbar buttons are stateless, and the
+        save_dir is owned by the Setup tab. The interesting bits
+        (axis map, last-opened session, splitter sizes) live inside
+        :class:`ViewerPanel`; we just forward.
+        """
+        try:
+            return {"viewer": self.viewer.current_prefs()}
+        except Exception:
+            return {}
+
+    def restore_prefs(self, p: dict) -> None:
+        """Apply a previously-saved snapshot to the embedded viewer."""
+        if not isinstance(p, dict) or not p:
+            return
+        sub = p.get("viewer")
+        if isinstance(sub, dict):
+            try:
+                self.viewer.restore_prefs(sub)
+            except Exception as e:
+                self.status_label.setText(
+                    f"Viewer prefs ignored: {e}")
+
     # ----- Quick actions on the currently-selected tree item ---------
     def _selected_npz_path(self):
         """Return the .npz file path the user has selected in the tree,
