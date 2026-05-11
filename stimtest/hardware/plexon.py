@@ -208,11 +208,20 @@ class PlexonStimulator(Stimulator):
         fw, _ = self._lib.ps_get_fw_version(self._stim_n)
         desc, _ = self._lib.ps_get_description(self._stim_n)
 
-        is_nil = any(s in str(serial) for s in NIL_SERIAL_NUMBERS)
+        def _to_str(v):
+            if isinstance(v, (bytes, bytearray)):
+                return v.decode(errors="replace").strip("\x00").strip()
+            return str(v)
+
+        serial_str = _to_str(serial)
+        desc_str = _to_str(desc)
+        fw_str = _to_str(fw)
+
+        is_nil = any(s in serial_str for s in NIL_SERIAL_NUMBERS)
         self.info = StimulatorInfo(
-            serial_number=str(serial),
-            firmware=str(fw),
-            description=str(desc),
+            serial_number=serial_str,
+            firmware=fw_str,
+            description=desc_str,
             n_channels=int(n_ch),
             vmon_scaling_v_per_v=VMON_SCALING_NIL if is_nil else VMON_SCALING_DEFAULT,
             imon_scaling_v_per_ua=IMON_SCALING_NIL if is_nil else IMON_SCALING_DEFAULT,
