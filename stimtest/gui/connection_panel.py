@@ -253,7 +253,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         stim_row.addWidget(self.stim_detect_dot)
         stim_row.addWidget(self.stim_detect_text)
         stim_row.addWidget(self.stim_label, stretch=1)
-        stim_row.addWidget(_make_label("Initialized:"))
+        stim_row.addWidget(_make_label("Initialized"))
         stim_row.addWidget(self.stim_dot)
         v.addLayout(stim_row)
         scale_row = QtWidgets.QHBoxLayout()
@@ -268,13 +268,13 @@ class ConnectionPanel(QtWidgets.QGroupBox):
 
         # Oscilloscope rows. Same indicator pattern as the stimulator:
         # detection state (dot + plain-text status) on the left, live
-        # connection state (label + dot + "Connected:" tag) on the
+        # connection state (label + dot + "Initialized" tag) on the
         # right of the same row.
         scope_row = QtWidgets.QHBoxLayout()
         scope_row.addWidget(self.scope_detect_dot)
         scope_row.addWidget(self.scope_detect_text)
         scope_row.addWidget(self.scope_label, stretch=1)
-        scope_row.addWidget(_make_label("Connected:"))
+        scope_row.addWidget(_make_label("Initialized"))
         scope_row.addWidget(self.scope_dot)
         v.addLayout(scope_row)
 
