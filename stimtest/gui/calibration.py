@@ -569,6 +569,44 @@ class CalibrationDialog(QtWidgets.QDialog):
         """
         from ..waveforms import PulsePattern
         import numpy as np
+        import time
+
+        # --- Configure the scope once before the sweep begins -----------
+        # Calibration needs SAMPLE mode (one raw pulse per capture, no
+        # averaging) so the edge-step extraction sees the true I·R jump
+        # and not a blurred average. Set this unconditionally — a
+        # previous experiment may have left the scope in AVERAGE mode.
+        try:
+            self._scope.set_acquisition_mode("SAMPLE", n_avg=1)
+        except Exception as e:
+            self.status_progress.setText(f"Scope acq mode warning: {e}")
+            QtWidgets.QApplication.processEvents()
+
+        # Timebase: show the full biphasic pulse with margin.
+        # phase1 (200 µs) + interphase (20 µs) + phase2 (200 µs) +
+        # discharge (20 µs) = 440 µs total; 1 ms window (100 µs/div)
+        # gives comfortable headroom. Trigger at 10 % so onset is
+        # near the left edge and the post-discharge recovery is visible.
+        try:
+            self._scope.set_horizontal_scale(100e-6)    # 100 µs/div
+            self._scope.set_horizontal_position(10.0)   # 10 % pre-trigger
+        except Exception as e:
+            self.status_progress.setText(f"Scope timebase warning: {e}")
+            QtWidgets.QApplication.processEvents()
+
+        # Trigger on CH1 (V_mon), rising edge, 0.1 V threshold.
+        # NORMAL mode: scope waits for a real pulse — it will NOT
+        # self-trigger on noise while the stimulator is idle between
+        # channels. 0.1 V is well below the V_mon step even at the
+        # lowest amplitude (50 µA × 4990 Ω ≈ 0.25 V) so every cell
+        # in the amplitude grid is reliably caught.
+        try:
+            self._scope.set_trigger("CH1", level_v=0.1,
+                                    slope="RISE", mode="NORMAL")
+        except Exception as e:
+            self.status_progress.setText(f"Scope trigger warning: {e}")
+            QtWidgets.QApplication.processEvents()
+        # ----------------------------------------------------------------
 
         step_idx = 0
         for ch in range(1, n_channels + 1):
@@ -675,6 +713,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         # transient SCPI / DLL hiccup surfaces clearly upstream.
         self._stim.load_channel(channel, pat)
         self._stim.start_channel(channel)
+        # Let the stimulator fire at least one pulse before arming
+        # the scope. At 50 Hz the inter-pulse period is 20 ms; the
+        # SCPI round-trips above (load + start) already consume
+        # ~20–50 ms, so the first pulse may have already passed by
+        # the time we get here. Waiting 25 ms guarantees we land in
+        # the quiet window between pulse 1 and pulse 2, giving the
+        # scope a full 20 ms budget to arm before the next rising edge.
+        import time
+        time.sleep(0.025)
         try:
             acq = self._scope.single_capture()
         finally:
