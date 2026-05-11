@@ -505,9 +505,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         if info.firmware:
             bits.append(f"FW <b>{info.firmware}</b>")
         if info.n_channels:
-            bits.append(f"<b>{info.n_channels}</b> channels")
-        bits.append("(<i>sim</i>)" if info.is_simulated else "(connected)")
-        self.stim_label.setText("Stimulator: " + " · ".join(bits))
+            bits.append(f"<b>{info.n_channels}</b> ch")
+        if info.is_simulated:
+            bits.append("(<i>sim</i>)")
+        self.stim_label.setText(" · ".join(bits))
         # I_mon scaling is stored as V/µA; show V/mA (×1000) since
         # that's the spec-sheet unit and matches the prior label.
         self.scaling_label.setText(
@@ -759,7 +760,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             # the full list in the tooltip.
             primary = scope_resources[0]
             extras = len(scope_resources) - 1
-            text = (f"Oscilloscope detected · {primary}"
+            text = ("Oscilloscope detected"
                     + (f"  (+{extras} more)" if extras else ""))
             tip = ("Detected scope-like VISA resource(s):\n  "
                    + "\n  ".join(scope_resources))
@@ -881,9 +882,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self._scope = result
         info = self._scope.info
         self._set_dot(self.scope_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
-        self.scope_label.setText(
-            f"Oscilloscope: {info.make} {info.model}  ·  {info.resource}"
-        )
+        label = f"{info.make} {info.model}".strip()
+        if info.is_simulated:
+            label += " (<i>sim</i>)"
+        self.scope_label.setText(label)
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
         self._update_calibrate_btn()
