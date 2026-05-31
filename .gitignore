@@ -27,8 +27,16 @@ data/
 *.npz
 *.pkl
 *.xlsx
+*.tif
+*.svg
 *_plots/
 qinj_dataset.csv
+# Canonical local bench-test session directory per CLAUDE.md §9.
+# Holds .npz / .txt / .xlsx / .tif / .svg per-run output AND the
+# project-tree-preferred crash log paths (pulsar_*.log).  None of
+# this is source — it's user data + post-mortem diagnostics that
+# accumulate as the operator runs experiments.
+test/
 
 # --- Installer build outputs ---
 installer/build/
@@ -41,6 +49,26 @@ installer/Output/
 # pulled from the Tek manual. Keep locally for offline lookup.
 tbs_full.txt
 TBS2000B_manual.txt
+
+# --- Scratch / debug artefacts at the repo root ---
+# Local-only test scripts (proper tests go in tests/), debug PNGs
+# from one-off analyses, ad-hoc stdout/stderr captures.  These
+# accumulate during interactive bench debugging; the canonical
+# version of anything useful ends up in tests/ or in a docstring.
+# Patterns deliberately scoped to the ROOT (leading slash) so they
+# don't shadow legitimate files deeper in the tree (e.g.
+# tests/test_*.py).
+/test_*.py
+/*.png
+/*.log
+/out*.txt
+/gui_*.txt
+/gui_*.log
+# Per-launch diagnostic written by PULSAR.vbs (see CLAUDE.md §9,
+# gotcha #14).  Overwritten on every launch; not source.
+/pulsar_launcher.log
+/pulsar_launch_error.log
+/pulsar_faulthandler.log
 
 # --- Email / SMTP secrets ---
 # Belt-and-braces — the config path is in $HOME, but if anyone ever
