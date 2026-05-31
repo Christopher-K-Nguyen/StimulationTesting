@@ -89,24 +89,38 @@ def assert_version_consistency(app_version: str) -> None:
     a build-time-only safety net, never the source of truth, and
     drift there is harmless because the override always wins.
     """
-    import re
+    # Parse pyproject.toml properly instead of regex-scanning — a
+    # comment-prefixed ``version = …`` line, a nested table key, or
+    # an inline-table assignment could all evade the regex.  tomllib
+    # has been stdlib since Python 3.11; build hosts must use 3.11+
+    # (the runtime itself is 3.13+).
     try:
-        text = PYPROJECT.read_text(encoding="utf-8")
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover — pre-3.11 build host
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ImportError:
+            print(f"WARNING: tomllib not available (Python 3.11+ "
+                  f"required, or `pip install tomli`); skipping "
+                  f"version-consistency check.")
+            return
+    try:
+        with PYPROJECT.open("rb") as f:
+            data = tomllib.load(f)
     except OSError as e:
         print(f"WARNING: could not read {PYPROJECT}: {e}; "
               f"skipping version-consistency check.")
         return
-    # Match the [project] table's ``version = "x.y.z"`` line. The
-    # regex is conservative — it only matches the bare ``version =``
-    # at the start of a line so a stray comment line containing the
-    # word "version" can't false-match.
-    m = re.search(r'^\s*version\s*=\s*[\'\"]([^\'\"]+)[\'\"]',
-                  text, re.MULTILINE)
-    if not m:
-        print(f"WARNING: ``version =`` not found in {PYPROJECT}; "
+    except Exception as e:
+        print(f"WARNING: {PYPROJECT} is not valid TOML ({e}); "
               f"skipping version-consistency check.")
         return
-    pyproject_version = m.group(1)
+    pyproject_version = ((data.get("project") or {}).get("version")
+                         or None)
+    if not pyproject_version:
+        print(f"WARNING: [project].version not found in {PYPROJECT}; "
+              f"skipping version-consistency check.")
+        return
     if pyproject_version != app_version:
         raise SystemExit(
             f"Version drift detected:\n"
@@ -140,18 +154,26 @@ def preflight() -> None:
             "    python -m pip install pyinstaller\n"
             f"(Original error: {e})"
         )
-    # 2. Vendored PlexStim DLL present. The installer bundles this as
-    # a fallback so end-users without the SDK still get a working
-    # simulator-mode launch; if it's missing the bundle would still
-    # build but a real-hardware launch would fail with a confusing
-    # path error.
-    have_dll = any(PLEXSTIM_BIN.glob("*.dll")) if PLEXSTIM_BIN.is_dir() else False
-    if not have_dll:
+    # 2. Vendored PlexStim DLLs present.  We bundle both bitnesses;
+    # ``pyplexstimlib.py`` picks PlexStim64.dll for a 64-bit Python
+    # and PlexStim.dll for a 32-bit Python at runtime via
+    # ``platform.architecture()``.  The frozen GUI is currently
+    # 64-bit, so PlexStim64.dll is the one that MUST be present —
+    # if a user only copied PlexStim.dll into bin/ the previous
+    # "any *.dll" check would pass and the runtime would fail with
+    # a confusing path error after install.
+    have_64 = (PLEXSTIM_BIN / "PlexStim64.dll").is_file()
+    have_32 = (PLEXSTIM_BIN / "PlexStim.dll").is_file()
+    target_bits = "64" if sys.maxsize > 2**32 else "32"
+    required = "PlexStim64.dll" if target_bits == "64" else "PlexStim.dll"
+    if not (PLEXSTIM_BIN.is_dir() and (have_64 if target_bits == "64" else have_32)):
         raise SystemExit(
-            f"Vendored PlexStim DLL not found at {PLEXSTIM_BIN}.\n"
-            f"Copy PlexStim.dll and PlexStim64.dll into that folder "
-            f"before building (the SDK ships them under its 'bin' "
-            f"directory)."
+            f"Vendored PlexStim DLL missing for {target_bits}-bit "
+            f"target:  {PLEXSTIM_BIN / required} not found.\n"
+            f"Copy {required} into that folder before building "
+            f"(the SDK ships it under its 'bin' directory).\n"
+            f"Status: PlexStim64.dll present={have_64}, "
+            f"PlexStim.dll present={have_32}."
         )
     # 3. Spot-check core runtime deps so a missing one fails here
     # instead of inside PyInstaller's hookloop.

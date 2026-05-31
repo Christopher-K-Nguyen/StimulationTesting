@@ -9,7 +9,10 @@ tests, CI, and offline GUI development).
 """
 from __future__ import annotations
 
+import functools
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +26,38 @@ from .base import Stimulator, StimulatorInfo
 
 def _vendored_bin_dir() -> str:
     return str(Path(__file__).with_name("pyplexstim") / "bin")
+
+
+from .base import fmt_elapsed as _fmt_elapsed  # noqa: F401
+# Single source of truth for the MATLAB ``getEndTime.m`` port lives
+# in :mod:`stimtest.hardware.base`.  Re-exported under the leading-
+# underscore name so existing in-module call sites keep working.
+
+
+def _dll_locked(method):
+    """Acquire ``self._dll_lock`` for the duration of ``method``.
+
+    Applied to every public method on :class:`PlexonStimulator` that
+    touches the PlexStim DLL, so concurrent calls from the worker
+    thread (experiment runner) and the GUI thread (Connection-panel
+    Close, scaling combo, prefs restore) serialise rather than
+    racing the DLL's heap.
+
+    CLAUDE.md §3 calls out the PlexStim DLL as not thread-safe
+    ("single producer only").  Two threads hitting the DLL at the
+    same instant has been observed corrupting its heap, killing
+    the whole process with Windows status ``0xC0000374`` /
+    exit code ``-1073740940`` and no Python traceback.
+
+    The lock is re-entrant (``threading.RLock``) so a decorated
+    method can call another decorated method on the same instance
+    without deadlocking — e.g. ``reinit`` → ``close`` → ``open``.
+    """
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._dll_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class PlexonStimulator(Stimulator):
@@ -68,6 +103,26 @@ class PlexonStimulator(Stimulator):
         # the experiment runners to decide whether a configuration
         # change requires a reinit (see Stimulator.loaded_channels).
         self._loaded_channels: set = set()
+        # ``_is_open`` — DEVICE-LEVEL open/close state tracking.
+        # Set True after a successful ``ps_init_all_stim``; False after
+        # ``ps_close_all_stim`` or an init failure.  Used by
+        # :meth:`open` to SKIP ``ps_close_all_stim`` when the device is
+        # already known-closed.
+        #
+        # **Why this matters**: calling ``ps_close_all_stim`` multiple
+        # times in quick succession on an already-closed device has
+        # been observed to HEAP_CORRUPT the vendor DLL (Windows
+        # 0xC0000374).  Worst case observed: 4 calls within 1 second
+        # — GUI Stop close + GUI Start open's internal close + runner
+        # reinit close + runner reinit open's internal close.  The
+        # last call crashes.  With this flag, the GUI's open after a
+        # GUI close sees ``_is_open=False`` and skips the redundant
+        # close, dropping the call count to 1 (the init itself).
+        #
+        # The flag is also wiped by :meth:`__init__` so a fresh
+        # ``PlexonStimulator()`` correctly skips the close on first
+        # ``open()`` (nothing to close yet).
+        self._is_open: bool = False
         # Channels that have successfully passed period / repetitions
         # read-back validation since the most recent open(). The
         # read-back catches a class of firmware quirks (silent rounding
@@ -83,9 +138,47 @@ class PlexonStimulator(Stimulator):
         # the SDK default (enabled)" — the panel hasn't pushed an
         # explicit preference yet.
         self._auto_discharge_pref: Optional[bool] = None
+        # Optional command logger.  When set, every SDK call routed
+        # through ``_check`` logs its ``what`` description (which already
+        # includes the SDK function name and arg summary).  The GUI's
+        # LogPane wires this up after a successful Initialize so the
+        # user sees every PlexStim call in their session log.
+        from typing import Callable as _Cb
+        self.cmd_logger: Optional[_Cb[[str], None]] = None
+        # Serialise every DLL call across threads.
+        # CLAUDE.md §3 calls out the PlexStim DLL as not thread-safe
+        # ("single producer only").  In practice the bench has two
+        # producers in flight at the same time:
+        #   * the worker thread driving an experiment runner
+        #   * the GUI thread responding to Close / scaling-combo /
+        #     prefs-restore actions on the Connection panel
+        # Without a lock, those two streams of DLL calls can land at
+        # the same instant — the DLL has been observed corrupting its
+        # heap (Windows status 0xC0000374 / -1073740940) when this
+        # happens, killing the whole process with no Python traceback.
+        # An RLock (re-entrant) lets a public method call another
+        # public method on the same instance without deadlock —
+        # several of them do, e.g. ``reinit`` → ``close`` → ``open``.
+        self._dll_lock = threading.RLock()
+
+    def _log(self, msg: str) -> None:
+        """Forward to ``self.cmd_logger`` if one is set; silent otherwise."""
+        cb = self.cmd_logger
+        if cb is None:
+            return
+        try:
+            cb(msg)
+        except Exception:
+            pass
+
+    @property
+    def is_open(self) -> bool:
+        """True after a successful ``open()``; False before or after ``close()``."""
+        return self.info.n_channels > 0
 
     # ----- internal helpers -----
-    def _check(self, result: int, what: str) -> None:
+    def _check(self, result: int, what: str,
+               since: Optional[float] = None) -> None:
         """Raise ``RuntimeError`` if a PlexStim DLL call returned non-OK.
 
         Mirrors the MATLAB ``checkPlexStimError`` pattern: every set/load
@@ -93,14 +186,36 @@ class PlexonStimulator(Stimulator):
         leave the device in a half-programmed state. The DLL's extended
         error info gives a human-readable reason which we surface in
         the message.
+
+        Pass ``since=time.perf_counter()`` *before* the SDK call to have
+        the log line include the elapsed duration in MATLAB-style
+        auto-unit format (us / ms / s / min / h).
         """
+        ts = (f"   ({_fmt_elapsed(time.perf_counter() - since)})"
+              if since is not None else "")
         if result == self._PS_OK:
+            self._log(f"[stim] {what}   OK{ts}")
             return
         try:
             info, _ = self._lib.ps_get_extended_error_info(result)
         except Exception:
             info = f"code={result}"
+        self._log(f"[stim] {what}   FAILED: {info}{ts}")
         raise RuntimeError(f"PlexStim {what} failed: {info}")
+
+    def _invoke(self, fn_name: str, *args, what: str) -> int:
+        """Call ``self._lib.<fn_name>(*args)``, time it, log + check.
+
+        Convenience wrapper for the common pattern of
+        ``self._check(self._lib.fn(args), 'label', since=time.perf_counter())``.
+        Returns the raw SDK result code (0 on OK) so callers that need
+        the value (e.g. read-back queries) can still see it.
+        """
+        fn = getattr(self._lib, fn_name)
+        t0 = time.perf_counter()
+        result = fn(*args)
+        self._check(result, what, since=t0)
+        return result
 
     @staticmethod
     def _validate_channel(channel: int, n_channels: int) -> None:
@@ -159,16 +274,48 @@ class PlexonStimulator(Stimulator):
         if closed:
             import sys
             names = ", ".join(p.display() for p in closed)
-            print(
-                f"[plexon] SDK reported 'no stimulator detected'; "
-                f"force-closed Plexon GUI process(es) holding the USB "
-                f"lock: {names}. Retrying PS_InitAllStim...",
-                file=sys.stderr, flush=True,
-            )
+            msg = (f"[plexon] SDK reported 'no stimulator detected'; "
+                   f"force-closed Plexon GUI process(es) holding the USB "
+                   f"lock: {names}. Retrying PS_InitAllStim...")
+            # Route to the LogPane (and the .txt mirror) when a logger
+            # is wired; fall back to stderr for CLI / pre-connect use.
+            self._log(msg)
+            if self.cmd_logger is None:
+                print(msg, file=sys.stderr, flush=True)
 
     # ----- lifecycle -----
+    @_dll_locked
     def open(self) -> None:
-        self._lib.ps_close_all_stim()
+        # ---- Skip redundant ps_close_all_stim ---------------------
+        # The vendor DLL has been observed to HEAP_CORRUPT (Windows
+        # 0xC0000374) when ``ps_close_all_stim`` fires multiple times
+        # within ~1 second across thread boundaries.  Worst-case
+        # cascade we hit before adding the ``_is_open`` flag was 4
+        # calls per GUI Stop/Start cycle:
+        #
+        #   1. GUI ``_on_finished`` close() — PS_CloseAllStim (#1)
+        #   2. GUI ``_start_runner_body`` open() — PS_CloseAllStim
+        #      embedded in this method (#2)
+        #   3. Runner ``reinit()`` at top of run() — close() (#3)
+        #   4. Runner ``reinit()`` — open() embedded close (#4)
+        #
+        # The 4th call crashed the DLL.  ``_is_open`` tracks
+        # device-level state so we can skip ``ps_close_all_stim``
+        # when the device is already closed (the prior close already
+        # cleared it; the DLL has nothing to close again).
+        #
+        # The init below ALWAYS runs — it's the actual "open" work,
+        # and it's idempotent on the device side (a fresh init
+        # cleanly re-establishes the USB session even if a previous
+        # init was active).
+        if self._is_open:
+            # Device thinks it's currently open.  This is a true
+            # "reopen" — close first, then init.  Logs as one SDK
+            # call rather than skipped.
+            self._lib.ps_close_all_stim()
+        # else: device is already closed (fresh __init__, or a prior
+        # close() set the flag); skip the redundant close.
+        self._is_open = False  # cleared during the init transition
         res = self._lib.ps_init_all_stim()
         if res != self._PS_OK:
             info_text = self._extended_error_text(res)
@@ -244,13 +391,34 @@ class PlexonStimulator(Stimulator):
                     self._stim_n, bool(self._auto_discharge_pref))
             except Exception:
                 pass
+        # Device-level open state.  Set TRUE only after a successful
+        # ps_init_all_stim + post-init reads succeed (we made it
+        # past every raise above).  The matching FALSE assignments
+        # live in :meth:`close` and at the top of :meth:`open` (the
+        # init transition).  See ``_is_open`` docstring in __init__
+        # for why this tracking matters (avoiding redundant
+        # ps_close_all_stim cascades that HEAP_CORRUPT the DLL).
+        self._is_open = True
 
+    @_dll_locked
     def close(self) -> None:
-        try:
-            self._lib.ps_close_all_stim()
-        except Exception:
-            pass
+        # Skip ps_close_all_stim when the device is already known-
+        # closed.  Repeated close calls on an already-closed device
+        # have been observed to HEAP_CORRUPT the vendor DLL — see
+        # ``_is_open`` docstring in __init__ for the full failure
+        # mode + call-cascade trace.  This guard is the device-level
+        # half of the fix (the open()-side guard is in :meth:`open`).
+        if self._is_open:
+            try:
+                self._lib.ps_close_all_stim()
+            except Exception:
+                pass
+            self._is_open = False
         # PS_CloseAllStim drops device-side patterns; track that.
+        # Done unconditionally (mirrors the always-clear behaviour of
+        # the prior implementation, even when the skip-close branch
+        # ran — defensive against a previous .load_channel that
+        # somehow bypassed the flag).
         self._loaded_channels = set()
         self._validated_channels = set()
         # Clean up the pinned .pat file so we don't leak temp files
@@ -264,6 +432,7 @@ class PlexonStimulator(Stimulator):
         self._pat_content_signature = None
 
     # ----- programming -----
+    @_dll_locked
     def load_channel(self, channel: int, pattern: PulsePattern) -> None:
         # ALL patterns are programmed via the arbitrary-waveform path so
         # the on-device behaviour is identical regardless of phase count
@@ -289,15 +458,13 @@ class PlexonStimulator(Stimulator):
         # for a requested 50 Hz train. Use the float as-is so we keep
         # sub-ms precision for high-rate (>1 kHz) trains.
         period_ms = 1e3 / pattern.rate_hz
-        self._check(
-            self._lib.ps_set_period(self._stim_n, channel, period_ms),
-            f"set_period(ch={channel}, period={period_ms:.3f} ms)")
-        self._check(
-            self._lib.ps_set_repetitions(self._stim_n, channel, int(pattern.repetitions)),
-            f"set_repetitions(ch={channel}, n={pattern.repetitions})")
-        self._check(
-            self._lib.ps_load_channel(self._stim_n, channel),
-            f"load_channel(ch={channel})")
+        self._invoke("ps_set_period", self._stim_n, channel, period_ms,
+                     what=f"set_period(ch={channel}, period={period_ms:.3f} ms)")
+        self._invoke("ps_set_repetitions",
+                     self._stim_n, channel, int(pattern.repetitions),
+                     what=f"set_repetitions(ch={channel}, n={pattern.repetitions})")
+        self._invoke("ps_load_channel", self._stim_n, channel,
+                     what=f"load_channel(ch={channel})")
 
         # Read-back validation: the MATLAB code did this for every
         # critical setting. If the device silently rounds, ignores, or
@@ -429,12 +596,13 @@ class PlexonStimulator(Stimulator):
         # else: file content already matches this pattern — skip the
         # rewrite and go straight to the DLL load.
 
-        self._check(
-            self._lib.ps_set_pattern_type(self._stim_n, channel, PS_PATTERN_ARB),
-            f"set_pattern_type(ch={channel}, ARB)")
-        self._check(
-            self._lib.ps_load_arb_pattern(self._stim_n, channel, self._pat_path),
-            f"load_arb_pattern(ch={channel}, file={self._pat_path})")
+        self._invoke("ps_set_pattern_type",
+                     self._stim_n, channel, PS_PATTERN_ARB,
+                     what=f"set_pattern_type(ch={channel}, ARB)")
+        self._invoke("ps_load_arb_pattern",
+                     self._stim_n, channel, self._pat_path,
+                     what=f"load_arb_pattern(ch={channel}, "
+                          f"file={self._pat_path})")
         # Read-back: confirm the device is actually in arbitrary mode.
         got_type, res = self._lib.ps_get_pattern_type(self._stim_n, channel)
         self._check(res, f"get_pattern_type(ch={channel}) read-back")
@@ -443,11 +611,11 @@ class PlexonStimulator(Stimulator):
                 f"PlexStim ch{channel}: requested ARB pattern but device "
                 f"reports type {got_type}.")
 
+    @_dll_locked
     def set_monitor_channel(self, channel: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
-        self._check(
-            self._lib.ps_set_monitor_channel(self._stim_n, channel),
-            f"set_monitor_channel(ch={channel})")
+        self._invoke("ps_set_monitor_channel", self._stim_n, channel,
+                     what=f"set_monitor_channel(ch={channel})")
         got, res = self._lib.ps_get_monitor_channel(self._stim_n)
         self._check(res, "get_monitor_channel read-back")
         if int(got) != int(channel):
@@ -455,23 +623,37 @@ class PlexonStimulator(Stimulator):
                 f"PlexStim monitor-channel mismatch: requested {channel}, "
                 f"device reports {got}.")
 
+    @_dll_locked
     def start_channel(self, channel: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
-        self._check(
-            self._lib.ps_start_stim_channel(self._stim_n, channel),
-            f"start_stim_channel(ch={channel})")
+        self._invoke("ps_start_stim_channel", self._stim_n, channel,
+                     what=f"start_stim_channel(ch={channel})")
 
+    @_dll_locked
     def stop_channel(self, channel: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
-        self._check(
-            self._lib.ps_stop_stim_channel(self._stim_n, channel),
-            f"stop_stim_channel(ch={channel})")
+        self._invoke("ps_stop_stim_channel", self._stim_n, channel,
+                     what=f"stop_stim_channel(ch={channel})")
 
+    @_dll_locked
     def stop_all(self) -> None:
-        self._check(
-            self._lib.ps_stop_stim_all_channels(self._stim_n),
-            "stop_stim_all_channels")
+        self._invoke("ps_stop_stim_all_channels", self._stim_n,
+                     what="stop_stim_all_channels")
 
+    @_dll_locked
+    def abort_all(self) -> None:
+        """Emergency cease-all-stim — wraps ``PS_AbortAll``.
+
+        Per the PlexStim API manual: "Causes all stimulation to
+        cease immediately even if there is a pulse or arbitrary
+        waveform in progress."  Unlike ``ps_stop_stim_all_channels``
+        this has no trigger-mode requirement (the soft-stop returns
+        error 4 outside ``PS_TRIG_SOFT``), and it interrupts a pulse
+        in flight rather than letting it complete.
+        """
+        self._invoke("ps_abort_all", what="abort_all")
+
+    @_dll_locked
     def start_all(self) -> None:
         """Synchronously start every loaded channel.
 
@@ -485,19 +667,19 @@ class PlexonStimulator(Stimulator):
         downstream consumer (scope trigger, TTL gating) expects one
         edge per cycle.
         """
-        self._check(
-            self._lib.ps_start_stim_all_channels(self._stim_n),
-            "start_stim_all_channels")
+        self._invoke("ps_start_stim_all_channels", self._stim_n,
+                     what="start_stim_all_channels")
 
+    @_dll_locked
     def set_repetitions(self, channel: int, n: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
         if n < 0:
             raise ValueError(f"repetitions must be ≥ 0 (0 = infinite), got {n}.")
-        self._check(
-            self._lib.ps_set_repetitions(self._stim_n, channel, int(n)),
-            f"set_repetitions(ch={channel}, n={n})")
+        self._invoke("ps_set_repetitions", self._stim_n, channel, int(n),
+                     what=f"set_repetitions(ch={channel}, n={n})")
 
     # ----- auto-discharge -----
+    @_dll_locked
     def set_auto_discharge(self, enabled: bool) -> None:
         """Push the user's auto-discharge preference to the device.
 
@@ -506,11 +688,10 @@ class PlexonStimulator(Stimulator):
         re-apply it transparently.
         """
         self._auto_discharge_pref = bool(enabled)
-        self._check(
-            self._lib.ps_set_auto_discharge(self._stim_n,
-                                            bool(enabled)),
-            f"set_auto_discharge(enabled={enabled})")
+        self._invoke("ps_set_auto_discharge", self._stim_n, bool(enabled),
+                     what=f"set_auto_discharge(enabled={enabled})")
 
+    @_dll_locked
     def get_auto_discharge(self) -> Optional[bool]:
         try:
             val, res = self._lib.ps_get_auto_discharge(self._stim_n)

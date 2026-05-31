@@ -47,6 +47,7 @@ from ..electrode import Configuration, ElectrodeArray
 from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
 from ..metrics import compute_metrics
+from ..readback_calibration import make_capture
 from ..session import Capture, ChannelRun, Session
 from ..waveforms import PulsePattern
 from .base import ExperimentEvent, ExperimentResult, ExperimentRunner
@@ -162,6 +163,20 @@ class VoltageTransientExperiment(ExperimentRunner):
         # reset at the top of each ``_run_one_configuration``.
         self._prediction_history: List[float] = []
         self._oscillation_count: int = 0
+        # NOTE: previously held ``self._r_estimate_ohm`` — a running
+        # estimate of access resistance used to pre-compute V_mon
+        # V/div before each capture.  Removed: it fought the
+        # post-capture ``set_channel_scale_and_position_for_range``
+        # observation-based scaler (V/div would jump formula-up then
+        # observation-down on every step).  V_mon V/div now follows
+        # the MATLAB two-stage flow exactly:
+        #   1. COARSE once in ``apply_default_scope_view`` (1 V/div
+        #      for ≥100 µs phases, 0.2 V/div otherwise — MATLAB
+        #      ``setOscillocopeView.m`` defaults).
+        #   2. FINE after each capture in ``_one_capture``'s
+        #      post-capture block — port of MATLAB
+        #      ``setFineScalePos2.m`` (range/(2·divs) for V/div,
+        #      −mean/scale for POSition).
 
         # Surface area defaults to the active electrode's catalog value
         if surface_area_um2 is not None:
@@ -225,29 +240,63 @@ class VoltageTransientExperiment(ExperimentRunner):
 
     def run(self) -> ExperimentResult:
         self.preflight()
-        # Reinit at the top of every run so the device starts from a
-        # known empty state — clears any patterns left loaded from
-        # an earlier Start-press in the same connect session, even
-        # if that earlier run aborted before its own cleanup.
-        try:
-            self.stim.reinit()
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message="Stimulator reinit at run start (clean slate)."))
-        except Exception as e:
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message=f"Stimulator reinit at run start failed: {e}"))
+        # NOTE: the historical ``self.stim.reinit()`` at the top of
+        # run() was REMOVED.  The GUI lifecycle (see CLAUDE.md gotcha
+        # #29b: "Stop tears down the stim; Start re-initializes it")
+        # now guarantees a fresh device state at the top of every
+        # Start press — the user's Stop press closes the stim and the
+        # subsequent Start re-opens it before this run() is invoked.
+        # On a normal Start with no prior Stop, the device state from
+        # the previous run is harmless because each ``_one_capture``'s
+        # ``stop_all`` + ``load_channel`` + ``load_zero_unused_channels``
+        # cycle fully overwrites any stale patterns before stim starts.
+        #
+        # The reinit-at-top was also the SECOND ``ps_close_all_stim``
+        # in a 4-call cascade (GUI close + GUI open's embedded close +
+        # this reinit's close + this reinit's open's embedded close)
+        # that crashed the vendor DLL with HEAP_CORRUPTION (Windows
+        # 0xC0000374).  See plexon.py ``_is_open`` for the device-
+        # level guard that complements this removal; both fixes are
+        # needed to bring the per-Stop/Start cascade down from 4 to 1.
+        #
+        # Per-config reinit BEFORE multipolar configs (below) is KEPT
+        # — multipolar configs require ``returns`` channels to be
+        # unloaded, and reinit is the only way to enforce that
+        # cleanly without per-channel iteration.
         all_captures: List[Capture] = []
+        # ``current_configuration`` exposes the live config to the GUI's
+        # ``_capture_key`` lookup so each (channel, combo) gets its own
+        # plot page + metrics row in the Experiment tab.  Without this,
+        # ``_capture_key`` falls back to ``session.test.configuration``
+        # (a STATIC reference to the FIRST configuration set at runner
+        # construction), and every capture from every subsequent
+        # configuration overwrites the first config's page — the user
+        # sees one plot that gets replaced rather than per-config rows
+        # to toggle between, and metrics for configs 2+ never make it
+        # into the side panel.  Set BEFORE the first config's
+        # ``_run_one_configuration`` to override the stale fallback,
+        # and updated per iteration below.
+        self.current_configuration = None
         try:
-            self.scope.set_record_length(2500)
-            # Acquisition mode + count are configured by the GUI's
-            # Setup tab via _start_runner before this thread fires —
-            # we don't override here so the user's choice (Sample vs
-            # Average, and the picked n_avg) sticks for the whole run.
-            for config in self.configurations:
+            n_configs = len(self.configurations)
+            for cfg_idx, config in enumerate(self.configurations):
                 if self.aborted:
                     break
+                # Update the live-config marker so any ``capture`` event
+                # the runner emits below resolves to THIS config's
+                # display name in the GUI.
+                self.current_configuration = config
+                # Between-channel pause: when the operator wires one channel
+                # at a time, give them a chance to swap before the next
+                # configuration starts.  Skips the very first config (nothing
+                # to rewire from). Skips when ``pause_between_channels`` is
+                # off — ``wait_for_continue`` short-circuits in that case.
+                if cfg_idx > 0:
+                    next_label = config.display_name()
+                    if not self.wait_for_continue(
+                            next_config_label=f"channel {config.active} "
+                                              f"({next_label})"):
+                        break
                 # Per-config reinit before multipolar (anything with
                 # non-empty returns). Cheap and unconditional —
                 # accepts a redundant reinit on the very first config
@@ -293,6 +342,32 @@ class VoltageTransientExperiment(ExperimentRunner):
         ))
 
         base_pattern = self.session.test.pattern
+        # Revert the scope to its default per-channel view (MATLAB
+        # setDefaultScopeView3.m).  Resets adapt history and re-applies
+        # horizontal + vertical defaults so the new monitor channel
+        # starts fresh instead of inheriting the previous channel's
+        # converged scales.
+        #
+        # Pass the configuration-shape flag + environment short-code so
+        # the MATLAB V/div decision tree picks the right default.  MP
+        # configs (no return list) take the tighter 1 V/div (≥100 µs)
+        # / 0.2 V/div (<100 µs) defaults; multipolar uses 2 V/div / 0.5
+        # V/div instead.  Animal environments bump short-phase patterns
+        # to 2 V/div to ride out baseline drift.
+        _is_multipolar = bool(getattr(config, "returns", ()))
+        _env_short = None
+        try:
+            extras = (self.session.test.extras or {})
+            snap = extras.get("setup_snapshot") or {}
+            if isinstance(snap, dict):
+                _env_short = snap.get("environment_short")
+        except Exception:
+            _env_short = None
+        self.apply_default_scope_view(
+            base_pattern, amp_ua=self.ramp.starting_ua,
+            is_multipolar=_is_multipolar,
+            environment_short=_env_short,
+            reason=f"start of channel {config.active}")
         amp = self.ramp.starting_ua
         capture_idx = 0
         # Reset the adaptive bookkeeping so each new configuration
@@ -336,9 +411,13 @@ class VoltageTransientExperiment(ExperimentRunner):
 
             amp += self._next_step(cap, amp, run.captures)
 
-        # Stop output for safety
+        # Stop output for safety.  ``stop_all`` (= PS_StopStimAllChannels,
+        # MATLAB ``stopStimulation``) so the unused zero-amplitude
+        # channels that were brought up alongside the active in
+        # ``_one_capture`` are also quieted on the way out of the
+        # configuration.
         try:
-            self.stim.stop_channel(config.active)
+            self.stim.stop_all()
         except Exception:
             pass
 
@@ -354,67 +433,988 @@ class VoltageTransientExperiment(ExperimentRunner):
         # set_monitor_channel routes V_mon and I_mon outputs to this channel
         # so the scope sees what the active electrode is doing. We use 0
         # repetitions (== "stimulate forever") and stop manually below.
+
+        # Adaptive scope view: update I_mon vertical scale AND trigger
+        # level before each step so the captured waveform tracks the
+        # programmed current.  Without these, the trace at low amps is
+        # invisible (scale set for max amp) and the trigger threshold
+        # may fall below the noise floor.  Mirrors MATLAB
+        # ``setOscilloscopeCurrentScale.m`` + ``setTriggerLevel.m``.
         try:
+            # Use FIRST PHASE (``phases[0]``) — NOT ``excitation_phase``
+            # — for the trigger-level update.  The I_mon scope trigger
+            # fires on whichever phase the stimulator emits first, and
+            # on some patterns ``phases[0]`` differs from
+            # ``excitation_phase`` (anodic-first protocols, certain
+            # triphasic shapes).  Phase-1 amplitude + width is what
+            # ``imon_trigger_level`` needs to compute the correct
+            # threshold for the leading edge the scope actually sees.
+            _ph0 = pattern.phases[0] if pattern.phases else None
+            _amp_signed = (float(_ph0.amplitude_ua)
+                           if _ph0 is not None else 0.0)
+            ph_us = (float(_ph0.width_us)
+                     if _ph0 is not None else 200.0)
+            # I_mon vertical scale + trigger level are amplitude-derived
+            # via analytical formulas — they ARE the proactive setting
+            # for I_mon (no observation needed; the I_mon peak is
+            # exactly ``amp × imon_scaling``).  V_mon and the
+            # potential channels are handled differently: a single
+            # COARSE V/div at run start (``apply_default_scope_view``,
+            # MATLAB rule), then FINE refinement after each capture
+            # (``set_channel_scale_and_position_for_range``, MATLAB
+            # ``setFineScalePos2``).  We no longer pre-set V_mon
+            # V/div per amplitude — the previous formula-based
+            # ``initial_channel_scales(load_r=R_estimate)`` call
+            # competed with the post-capture observation-based
+            # write, producing visible V/div jitter every step.
+            self.update_imon_vertical_scale(abs(_amp_signed))
+            self.update_imon_trigger_level(
+                _amp_signed, phase_width_us=ph_us)
+        except Exception:
+            pass
+
+        try:
+            # ---- Defensive stop BEFORE load_channel ---------------------
+            # Matches MATLAB ``stopStimulation()`` before ``setPattern``
+            # in ``runProgressiveStress.m`` / ``runVoltageTransient.m``.
+            # ``PS_LoadChannel`` for an arbitrary pattern uploads the
+            # full .pat byte stream over USB and takes ~50-200 ms — we
+            # want the device demonstrably quiescent during that window
+            # rather than continuing the previous step's pattern.
+            #
+            # Idempotent on an already-stopped device, so the cost when
+            # the previous iteration's finally already stopped is just
+            # one extra SCPI round-trip.  Critical when the previous
+            # finally was skipped (early-return on a stim-program error,
+            # an aborted re-capture, etc.) — without this explicit stop,
+            # ``load_channel`` would land on a still-running stim.
+            #
+            # Uses ``stop_all`` (= PS_StopStimAllChannels) rather than
+            # ``stop_channel(active)`` because the previous iteration
+            # also fired the unused zero-amplitude channels via
+            # ``start_all``; ``stop_all`` quiets them too so the upcoming
+            # ``load_zero_unused_channels`` reloads on a fully-stopped
+            # device.
+            try:
+                self.stim.stop_all()
+            except Exception:
+                pass
             self.stim.set_monitor_channel(config.active)
             self.stim.load_channel(config.active, pattern)
             self.stim.set_repetitions(config.active, 0)  # infinite for sweep, then stop
-            self.stim.start_channel(config.active)
+            # Load a zero-amplitude, same-duration copy of the pattern
+            # onto every "unused" channel (anything not active and not
+            # in returns).  Port of MATLAB ``setPattern.m`` Zero Current
+            # block — keeps unused channels TICKING in sync with the
+            # active channel's pulse cycle rather than carrying a stale
+            # pattern from a previous step or falling out of cadence.
+            # Returns are intentionally excluded so they stay UNLOADED
+            # (passive sink); CG configs are auto-skipped because their
+            # returns span every other channel (unused set is empty).
+            self.load_zero_unused_channels(pattern, config)
+            # Use start_all (= PS_StartStimAllChannels) instead of
+            # start_channel — single-channel start hits error code 4
+            # ("WRONG TRIGGER MODE") on default-mode PlexStim devices.
+            # Loaded channels (active + unused-with-zero) fire together;
+            # the zero-amp channels deliver no current.
+            self.stim.start_all()
         except Exception as e:
             cap = Capture(index=index, pattern=pattern)
             cap.status.aborted = True
             cap.status.notes = f"Stimulator program error: {e}"
             return cap
 
-        # ----- 2. Let it settle, then grab one averaged capture ---------
-        # The scope is in AVERAGE mode (set in run()); we wait long enough
-        # for ``settle_pulses`` triggers so the average has converged before
-        # we pull the curve. Skip entirely when both backends are simulated
-        # — the sim scope returns a deterministic averaged frame
-        # synchronously, so the wait is pure overhead. Real hardware needs
-        # the wait so the trigger has time to fire and the average converges.
-        if not (self.stim.info.is_simulated and self.scope.info.is_simulated):
-            time.sleep(max(0.05, self.ramp.settle_pulses / pattern.rate_hz))
+        # ----- Stim runs CONTINUOUSLY across every capture below --------
+        # Critical correctness rule (per user spec):
+        #
+        #   "You can stop pulsing after the waveform is acquired, but
+        #    you then need to stimulate again when trying to get a new
+        #    waveform."
+        #
+        # The iterative fit-the-view loop (block 2b) fires additional
+        # ``single_capture()`` calls to verify each rescale converged
+        # on the in-view condition.  Each of those re-captures NEEDS
+        # the stim still pulsing — otherwise the scope triggers on
+        # noise (or doesn't trigger at all in NORMAL mode), the
+        # observed (min, max) collapses to the noise floor, and the
+        # next fine-scaler write picks a V/div sized for noise rather
+        # than the pulse.  Previous revision stopped the channel in a
+        # ``finally`` right after the first capture, so every iterative
+        # re-capture in 2b ran without stim — visible in the GUI as
+        # the V_mon trace clipping to ±25 mV (the noise envelope on
+        # the V_mon BNC) regardless of the programmed amplitude.
+        #
+        # Solution: ONE outer try/finally that wraps EVERY capture in
+        # this method.  ``stop_channel`` runs once on the way out, no
+        # matter how many iterative re-captures happened.  An early
+        # ``return`` from the inner first-capture exception branch
+        # still triggers the outer finally, so the stim never leaks
+        # past ``_one_capture``.
         try:
-            acq = self.scope.single_capture()
-        except Exception as e:
-            cap = Capture(index=index, pattern=pattern)
-            cap.status.aborted = True
-            cap.status.notes = f"Scope capture error: {e}"
-            return cap
-        finally:
+            # ----- 2. Let it settle, then grab one averaged capture ---------
+            # The scope is in AVERAGE mode (set in run()); we wait long enough
+            # for ``settle_pulses`` triggers so the average has converged before
+            # we pull the curve. Skip entirely when both backends are simulated
+            # — the sim scope returns a deterministic averaged frame
+            # synchronously, so the wait is pure overhead. Real hardware needs
+            # the wait so the trigger has time to fire and the average converges.
+            #
+            # Pulse-rate-aware timeout: ``N_avg / rate_hz + 5 s headroom``.
+            # The driver default (``self._timeout_ms / 1000``, typically
+            # 10 s) is too tight for low pulse rates — 64 averages at
+            # 1 Hz needs 64 s.  The scope's soft-timeout path reads the
+            # rolling average regardless, but that average is incomplete
+            # if the budget expires mid-accumulation.  Headroom covers
+            # trigger latency + USB-TMC round-trip jitter.
             try:
-                self.stim.stop_channel(config.active)
+                # Mirror the LP / SP / PS pattern: pull the configured
+                # ``ACQuire:NUMAVg`` count from the scope itself rather
+                # than a runner attribute (only the scope owns the
+                # truth after ``set_acquisition_mode``).
+                _navg = int(getattr(self.scope,
+                                    "_expected_acq_navg", None) or 0)
+                _rate = float(getattr(pattern, "rate_hz", 0.0) or 0.0)
+                if _navg > 0 and _rate > 0:
+                    # Headroom = 6 s (5 s for trigger latency / USB-TMC
+                    # round-trip jitter + 1 s extra requested by the
+                    # operator after observing tight margins on a
+                    # first-frame capture).
+                    _capture_timeout_s = (_navg / _rate) + 6.0
+                else:
+                    _capture_timeout_s = None  # fall back to driver default
+            except Exception:
+                _capture_timeout_s = None
+            try:
+                acq = self.scope.single_capture(timeout_s=_capture_timeout_s)
+            except Exception as e:
+                # Emit a log event so the operator sees WHY this capture
+                # came back empty.  Without this the GUI shows a blank
+                # plot + NaN metrics row with no explanation (most common
+                # cause: scope trigger timeout because the trigger source
+                # / level was misconfigured for the current pulse polarity
+                # or amplitude).
+                self._emit(ExperimentEvent(
+                    kind="log", session=self.session,
+                    message=(f"⚠ Scope capture error at "
+                             f"{_amp_signed:+.1f} µA "
+                             f"(capture #{index + 1}): "
+                             f"{type(e).__name__}: {e}")))
+                cap = Capture(index=index, pattern=pattern)
+                cap.status.aborted = True
+                cap.status.notes = f"Scope capture error: {e}"
+                return cap
+
+            # Sanity check: largest I_mon edge should land at t ≈ 0 µs.
+            # Emits a ⚠ log entry if the time axis is misaligned.
+            try:
+                self.check_trigger_alignment(acq)
             except Exception:
                 pass
 
-        # ----- 3. Demux scope channels into logical signals --------------
-        # The user picked, on the Setup tab, which physical scope channel
-        # carries which signal (V_mon, I_mon, E_ret, E_act). The driver
-        # remembered that mapping in ``channel_aliases``; here we read the
-        # right key out of the captured frame.
-        aliases = self.scope.channel_aliases
-        v_mon = acq.channels.get(aliases.get("vmon", ""), np.zeros(0))
-        i_mon = acq.channels.get(aliases.get("imon", ""), np.zeros(0))
-        e_ret = acq.channels.get(aliases.get("eret", ""), None)
-        e_act = acq.channels.get(aliases.get("eact", ""), None)
+            # ----- 2b. Iterative fit-the-view loop ---------------------------
+            # Port of MATLAB ``getWaveform2.m``: after each capture, check
+            # whether every voltage trace fits inside the scope's visible
+            # window (``±MAX_FACTOR`` divs around the channel's POSition).
+            # If a trace falls outside its window, rescale + re-capture
+            # until it fits, capped at MAX_RECAPTURE extra attempts (MATLAB
+            # caps fine-scale iterations at 3 total via
+            # ``fineScale_count > 2 → isInRange = true``).
+            #
+            # NOTE: every re-capture inside this loop happens with the
+            # stim STILL RUNNING from the start_all() outside the outer
+            # try.  The outer ``try / finally`` (this block's parent)
+            # calls ``stop_channel`` ONCE on the way out — never between
+            # captures — because stopping mid-loop would make the next
+            # ``single_capture()`` acquire the noise floor (no trigger
+            # in NORMAL mode), the fine-scaler would size V/div for
+            # noise, and the V_mon trace would clip to ±25 mV regardless
+            # of the programmed amplitude.  This was the previous bug.
+            #
+            # divs budget per channel:
+            #   * V_mon → 3 divs (leaves ~5 divs of headroom for the next
+            #     amplitude step's growing peak — VT ramps monotonically,
+            #     so the NEXT capture is always larger; tighter V/div
+            #     would clip).
+            #   * E_act / E_ret → 4 divs (DC-biased traces with small AC
+            #     swing — fit comfortably and leave room for polarization
+            #     growth).
+            #
+            # I_mon is NOT included in this loop: it's a current monitor
+            # whose peak is exactly ``amp × imon_scaling`` — known
+            # analytically and already set by ``update_imon_vertical_scale``
+            # before the first capture.  MATLAB skips it via
+            # ``if isCurrentChannel: isInRange = true``.
+            # MAX_FACTOR — "almost full ±N divs" margin, with 0.1 div
+            # of leave-room.  MUST be derived from the SCOPE'S actual
+            # vertical division count, NOT a hardcoded number:
+            #   * TBS1104B / TDS / TPS (8 vert divs): half = 4.0 →
+            #     MAX_FACTOR = 3.9.  This is what MATLAB
+            #     ``getWaveform2.m`` baked in.
+            #   * TBS2204B and the rest of the TBS2000* family (10 vert
+            #     divs): half = 5.0 → MAX_FACTOR = 4.9.  Using the
+            #     hardcoded 3.9 here would treat 25 % of the screen
+            #     as off-limits and trip the "out of view" branch
+            #     prematurely.
+            # The scope's ``_half_vert_divs`` is set at connect time
+            # from the per-series spec in tektronix_models.py (see
+            # ``TektronixOscilloscope.open()`` step 5/6).  Simulators
+            # inherit the conservative 4.0 default from base.
+            _half_divs = float(getattr(self.scope, "_half_vert_divs", 4.0))
+            MAX_FACTOR = max(0.5, _half_divs - 0.1)
+            # Bumped from 2 → 4 to give the calibration-style
+            # ``adapt_channel_scale`` enough headroom to traverse the
+            # 1-2-5 grid on aggressive shrinks.  Worst case: a V_mon
+            # at the apply_default_scope_view default of 500 mV/div
+            # whose true signal is ±5 mV needs to shrink through
+            # 200→100→50→…→5 mV/div on the 1-2-5 grid.  At one shrink
+            # step per attempt that's up to 7 attempts; the cap is
+            # set lower (5 total) because in practice the snap-UP
+            # math jumps multiple grid cells per call (a single adapt
+            # call on observed 32 mV picks 10 mV/div directly), and
+            # ``adapt_channel_scale``'s internal lock detection bails
+            # if it ever oscillates between two adjacent cells.
+            # MATLAB's ``fineScale_count > 2`` was an under-estimate
+            # for the snap-up grid behaviour.
+            MAX_RECAPTURE = 4
+            # I_mon IS included now (was excluded previously on the
+            # assumption that the analytical ``update_imon_vertical_scale``
+            # always sized it right).  Real-world: an under-sized I_mon
+            # scale clips at the scope's ±4-div rail and the analytical
+            # formula has no way to know.  Adding I_mon to the loop lets
+            # the clip detector catch it and expand.  divs_budget for
+            # I_mon is 3 (matches V_mon — both are zero-symmetric signals
+            # so 3 divs each side of zero gives a 1-div headroom for the
+            # next amplitude's growing peak).
+            _voltage_roles = ("vmon", "imon", "eret", "eact")
+            _divs_for = {"vmon": 3.0, "imon": 3.0,
+                         "eret": 4.0, "eact": 4.0}
+            # Coarse-step factor — when clip detection trips, multiply
+            # the CURRENT V/div by this factor and re-capture.  MATLAB's
+            # equivalent ``vertScale_idx + 5`` jumps ~100× (5 stops on
+            # the 1-2-5 grid); we use a tamer 2.5× per step (~2 stops)
+            # so two iterations cover a 6× range — enough to catch the
+            # realistic "scale was 4× too tight" cases without over-
+            # shooting to 100× and squishing the trace.
+            CLIP_COARSE_FACTOR = 2.5
+            try:
+                import numpy as _np
+                aliases_obs = getattr(self.scope, "channel_aliases", {}) or {}
+                # Capability probe — pick the first available voltage role's
+                # physical channel and see whether the scope can introspect
+                # its current V/div + POSition.  If it can't (simulator,
+                # SCPI silently dropping the query), fall back to a single
+                # write per channel without iterating: no point in re-
+                # capturing if we can't tell whether the new scale fit.
+                _probe_ch = None
+                for _r in _voltage_roles:
+                    _probe_ch = aliases_obs.get(_r)
+                    if _probe_ch:
+                        break
+                _introspectable = False
+                if _probe_ch is not None:
+                    _probe = self.scope.channel_in_view(
+                        _probe_ch, 0.0, 1.0, margin_divs=MAX_FACTOR)
+                    _introspectable = _probe is not None
 
-        # ----- 4. Convert raw scope volts to physical units --------------
-        # V_mon line carries (vmon_scaling) volts per volt at the electrode,
-        # and I_mon line carries (imon_scaling) volts per microamp. Divide
-        # to recover real V and µA. NIL devices use different scaling than
-        # standard PlexStim 2.0; the driver knows which it is.
-        info = self.stim.info
-        v_mon_v = v_mon / info.vmon_scaling_v_per_v if info.vmon_scaling_v_per_v else v_mon
-        i_mon_ua = i_mon / info.imon_scaling_v_per_ua if info.imon_scaling_v_per_ua else i_mon
+                # Per-attempt diagnostic log lines so a session .txt log
+                # shows EXACTLY what the in-view loop did each capture.
+                # Without this, "you did not adjust the vertical scaling"
+                # complaints have no traceable evidence — the only way
+                # to verify the loop was running was to attach a debugger.
+                _diag_lines = []
+                _diag_lines.append(
+                    f"  in-view loop start: introspectable={_introspectable}, "
+                    f"available_roles="
+                    f"{[r for r in _voltage_roles if aliases_obs.get(r)]}")
+                for _attempt in range(MAX_RECAPTURE + 1):
+                    _any_rescaled = False
+                    _chan_data = getattr(acq, "channels", {}) or {}
+                    _t_us_arr = _np.asarray(
+                        getattr(acq, "time_us", None) or [],
+                        dtype=float)
+                    for _role in _voltage_roles:
+                        _ch_name = aliases_obs.get(_role)
+                        if not _ch_name:
+                            continue
+                        _arr = _chan_data.get(_ch_name)
+                        if _arr is None:
+                            continue
+                        _a = _np.asarray(_arr, dtype=float)
+                        if _a.size < 2:
+                            continue
+                        _lo = float(_a.min())
+                        _hi = float(_a.max())
+                        if not (_np.isfinite(_lo) and _np.isfinite(_hi)):
+                            continue
+                        _divs = _divs_for[_role]
+                        # ---- Baseline-centered approach for E_ret / E_act
+                        # Real VT data shows E_ret is mostly FLAT at the
+                        # electrode rest potential with TRANSIENT spikes
+                        # during the pulse — the data mean (pulled UP by
+                        # spikes) is a poor position reference.  Instead:
+                        #
+                        #   1. Compute robust baseline from PRE-TRIGGER
+                        #      samples (t < -1 µs) — the interpulse
+                        #      window IS the rest potential by
+                        #      construction; the pulse spikes are
+                        #      excluded.
+                        #   2. Compute ONE-SIDED swing relative to that
+                        #      baseline: max(|max − baseline|,
+                        #      |baseline − min|).  This is what we
+                        #      actually need to fit on one side of
+                        #      screen centre after positioning.
+                        #   3. Synthesize a SYMMETRIC input
+                        #      ``(baseline ± swing)`` and feed it to
+                        #      ``compute_scale_position_targets``.  Its
+                        #      mid-point = baseline (so the resulting
+                        #      POSition centres the BASELINE, not the
+                        #      pulse-pulled mean), and Vpp = 2 × swing
+                        #      (so the V/div is sized for the max
+                        #      excursion on either side).
+                        #
+                        # For V_mon / I_mon (zero-centred AC signals)
+                        # the baseline path is skipped — the existing
+                        # adapt-with-observed-range works fine because
+                        # mean ≈ 0 makes (min+max)/2 ≈ 0 already.
+                        # ``_target_lo`` / ``_target_hi`` carry the
+                        # range we feed to adapt + coord-helper.  They
+                        # start as the raw observed values; for
+                        # E_ret / E_act we replace them with the
+                        # baseline-symmetric synthetic range below.
+                        # We keep the originals (``_lo`` / ``_hi``) for
+                        # the diagnostic log so the operator sees the
+                        # ACTUAL observed range.
+                        _target_lo, _target_hi = _lo, _hi
+                        _baseline = None  # for logging
+                        _swing = None     # for logging
+                        if _role in ("eret", "eact") and _t_us_arr.size == _a.size:
+                            _pre_mask = _t_us_arr < -1.0
+                            if _np.count_nonzero(_pre_mask) >= 8:
+                                _pre = _a[_pre_mask]
+                                # MAD-clipped mean: median ± 3 × MAD ×
+                                # 1.4826 (the MAD→σ correction factor
+                                # for a Gaussian).  Spikes / outliers
+                                # that survive the time-window mask get
+                                # rejected before averaging.
+                                _med = float(_np.median(_pre))
+                                _mad = float(_np.median(
+                                    _np.abs(_pre - _med)))
+                                if _mad > 0:
+                                    _keep = _np.abs(_pre - _med) <= (
+                                        3.0 * _mad * 1.4826)
+                                    _baseline = (float(_pre[_keep].mean())
+                                                 if _keep.any() else _med)
+                                else:
+                                    _baseline = _med
+                                # One-sided swing — the larger of the
+                                # two excursions above/below baseline.
+                                _swing = max(abs(_hi - _baseline),
+                                             abs(_baseline - _lo))
+                                if _swing > 0:
+                                    # Synthesize baseline-symmetric
+                                    # input.  ``compute_scale_position_targets``
+                                    # sees mid = baseline (so position
+                                    # centres it) and Vpp = 2×swing (so
+                                    # V/div sizes for max excursion).
+                                    _target_lo = _baseline - _swing
+                                    _target_hi = _baseline + _swing
+                        # Two-stage decision:
+                        #   1. CLIP CHECK — if the observed (min, max)
+                        #      is sitting at the ±4-div ADC rail, the
+                        #      TRUE peak is higher than the captured
+                        #      data shows.  Sizing the new V/div from
+                        #      the observed range would produce the
+                        #      same V/div as before (since observed ==
+                        #      rail) and never expand.  Coarse-step UP
+                        #      instead: multiply current V/div by
+                        #      CLIP_COARSE_FACTOR (~2.5×) and re-
+                        #      capture.  Next iteration sees the
+                        #      now-non-clipped data and fine-fits.
+                        #   2. FINE FIT — when not clipped, use the
+                        #      observed range to fit the trace into
+                        #      ``_divs`` divisions via the standard
+                        #      range/(2·divs) + mean-offset port of
+                        #      ``setFineScalePos2``.
+                        # ---- CALIBRATION-STYLE rescale --------------
+                        # Per user feedback ("look at how the
+                        # calibration is changing coarse vertical
+                        # scales"), defer to the stateful
+                        # :meth:`adapt_channel_scale` primitive — the
+                        # same one calibration.py uses.  It is the
+                        # robust, MATLAB-mirroring V/div manager:
+                        #
+                        #   * **Both directions**: clip → upscale,
+                        #     small signal → downscale.  Eliminates
+                        #     the "squished waveform" mode where the
+                        #     trace fits with too much headroom and
+                        #     8-bit ADC quantization (~16 mV/step at
+                        #     500 mV/div) becomes visible as
+                        #     stair-stepping.
+                        #   * **Stateful per channel**: keeps a
+                        #     history of every picked scale, detects
+                        #     oscillation between adjacent grid
+                        #     cells, hysteresis on shrink, hard cap
+                        #     on retries — none of which the prior
+                        #     homegrown loop had.
+                        #   * **Calibration-proven**: this exact
+                        #     primitive runs the per-amplitude
+                        #     calibration sweep and converges
+                        #     reliably across the full V_mon /
+                        #     I_mon range.
+                        #
+                        # The ``_clipped`` extrapolation trick from
+                        # calibration: when the trace sits at the
+                        # ADC rail, the TRUE peak is unknown but at
+                        # least 2× the observed value.  Doubling
+                        # vlo/vhi forces ``adapt`` to size for a
+                        # larger range on the next iteration.
+                        def _clipped_arr(arr):
+                            mn, mx = arr.min(), arr.max()
+                            n = len(arr)
+                            return (_np.sum(arr == mn) > 0.05 * n or
+                                    _np.sum(arr == mx) > 0.05 * n)
+                        _is_clipped = _clipped_arr(_a)
+                        _clip_str = "CLIPPED" if _is_clipped else "not-clipped"
+                        # ---- MATLAB-style in-view check ----------
+                        # Verify the observed (v_min, v_max) actually
+                        # fits within the visible window
+                        # (``±MAX_FACTOR`` divs from the scope's
+                        # current ``POSition``).  MAX_FACTOR is the
+                        # MATLAB-faithful margin: 3.9 div on 8-vert-
+                        # div scopes (TBS1000 / TDS / TPS), 4.9 div
+                        # on 10-vert-div TBS2000-series.  Catches
+                        # the subtle case where the trace exceeds
+                        # the visible budget but DOESN'T saturate
+                        # the ADC rail (e.g. an overshoot riding
+                        # just above the 3.9-div line at 4.0-4.2
+                        # div) — ``_clipped_arr`` misses this
+                        # because the samples never settle at the
+                        # rail.  ``channel_in_view`` returns None
+                        # on simulator / SCPI failure (treat as
+                        # "can't check" — don't extrapolate).
+                        _in_view = None
+                        try:
+                            _in_view = self.scope.channel_in_view(
+                                _ch_name, _lo, _hi,
+                                margin_divs=MAX_FACTOR)
+                        except Exception:
+                            pass
+                        # ---- Directional out-of-view detection -----
+                        # ``channel_clip_sides`` returns a 5-tuple
+                        # exposing WHICH SIDE the trace exceeds
+                        # (above, below, or both) plus the
+                        # position-only shift that would recentre it.
+                        # When out-of-view is one-sided AND the
+                        # opposite side has slack, we can fix it with
+                        # a POSITION nudge alone (no V/div change,
+                        # preserves ADC resolution) instead of
+                        # symmetrically growing the V/div.  The
+                        # symmetric-grow path stays as the fallback
+                        # for both-sides-out + ADC-rail-clip.
+                        _clip_sides = None
+                        if _in_view is False:
+                            try:
+                                _clip_sides = self.scope.channel_clip_sides(
+                                    _ch_name, _lo, _hi,
+                                    margin_divs=MAX_FACTOR)
+                            except Exception:
+                                _clip_sides = None
+                        # Build the in-view diagnostic string with
+                        # directional info when available.
+                        if _in_view is True:
+                            _in_view_str = "in-view"
+                        elif _in_view is False:
+                            if _clip_sides is not None:
+                                _below, _above, _shift, _hr_b, _hr_a = _clip_sides
+                                if _below and _above:
+                                    _in_view_str = (
+                                        f"out-BOTH(±{MAX_FACTOR:.1f}div, "
+                                        f"hr_b={_hr_b:+.2f}, "
+                                        f"hr_a={_hr_a:+.2f})")
+                                elif _below:
+                                    _in_view_str = (
+                                        f"out-BELOW(hr_b={_hr_b:+.2f}, "
+                                        f"hr_a={_hr_a:+.2f}, "
+                                        f"shift={_shift:+.2f}div)")
+                                elif _above:
+                                    _in_view_str = (
+                                        f"out-ABOVE(hr_b={_hr_b:+.2f}, "
+                                        f"hr_a={_hr_a:+.2f}, "
+                                        f"shift={_shift:+.2f}div)")
+                                else:
+                                    # channel_in_view said False but
+                                    # channel_clip_sides says no side
+                                    # out — race condition or rounding.
+                                    _in_view_str = (
+                                        f"out-?(±{MAX_FACTOR:.1f}div)")
+                            else:
+                                _in_view_str = (
+                                    f"out-of-view(±{MAX_FACTOR:.1f}div)")
+                        else:
+                            _in_view_str = "in-view?-unknown"
+                        # ``_target_lo`` / ``_target_hi`` is what we
+                        # pass to adapt + coord-helper — already either
+                        # the raw observed range (V_mon / I_mon) or the
+                        # baseline-symmetric synthetic range (E_ret /
+                        # E_act, set above).  ``_adapt_lo`` /
+                        # ``_adapt_hi`` further extends it when the
+                        # observed data is at the rail (clipped) or
+                        # exceeds the in-view budget — both signals
+                        # that the TRUE peak is bigger than the
+                        # captured range shows.
+                        _adapt_lo, _adapt_hi = _target_lo, _target_hi
+                        # ---- Conservative out-of-view handling -----
+                        # User-spec insight (mirrors the MATLAB
+                        # ``getWaveform2.m`` design): the 0.1 div gap
+                        # between MAX_FACTOR (3.9 or 4.9) and the true
+                        # rail (4.0 or 5.0) exists BECAUSE
+                        # out-of-view almost always means the trace
+                        # is at or near the ADC rail.  The captured
+                        # ``(v_min, v_max)`` is then TRUNCATED — the
+                        # true peak exceeds the observed value by an
+                        # unknown amount.  Any decision based on the
+                        # observed midpoint
+                        # ``(v_min + v_max) / 2`` is BIASED toward
+                        # the visible side; a position nudge derived
+                        # from it can land the trace right back at
+                        # the rail.
+                        #
+                        # Therefore: ALL out-of-view conditions (both
+                        # the explicit ``_is_clipped`` rail-sample
+                        # detection AND the more sensitive
+                        # ``_in_view is False`` MAX_FACTOR exceedance)
+                        # are treated as "probably saturated → grow
+                        # V/div via symmetric extrapolation".  No
+                        # position-only nudge path — the safer
+                        # default is to widen the window, capture
+                        # again with the trace fully visible, and
+                        # let the next attempt use a FAITHFUL
+                        # observed range to do any fine recentering.
+                        #
+                        # The directional ``channel_clip_sides`` info
+                        # is still surfaced in the diagnostic log
+                        # (``fit=out-ABOVE`` / ``fit=out-BELOW`` /
+                        # ``fit=out-BOTH``) so post-mortem analysis
+                        # shows which side went off — useful for
+                        # tuning per-electrode V/div defaults — but
+                        # the per-attempt ACTION is always
+                        # "grow V/div".
+                        if _is_clipped or (_in_view is False):
+                            # Observed range is a lower bound on the
+                            # true range.  Doubling forces ``adapt``
+                            # to size for at least 2× the observed
+                            # extent — escapes the rail in one step.
+                            _adapt_lo = _target_lo * 2.0
+                            _adapt_hi = _target_hi * 2.0
+                        # Read current V/div BEFORE adapt so we can
+                        # tell after the call whether adapt SHRUNK
+                        # (signaling small magnitude → fine
+                        # scale+position appropriate) or GREW
+                        # (signaling large/clipped magnitude →
+                        # coarse only; skip fine positioning per
+                        # user-spec "fine scaling and positioning
+                        # is for small magnitude waveforms.
+                        # Otherwise, just coarse scaling.").
+                        _pre_adapt_vpd = None
+                        try:
+                            _pre_adapt_vpd = float(
+                                self.scope._q(f"{_ch_name}:SCAle?"))
+                        except Exception:
+                            pass
+                        _result = None
+                        try:
+                            _new_scale = self.scope.adapt_channel_scale(
+                                _ch_name,
+                                v_min=_adapt_lo, v_max=_adapt_hi,
+                                divs=_divs,
+                                # ``shrink_stable_count=1`` matches
+                                # calibration — single vote shrink
+                                # since each VT amplitude is a
+                                # fresh decision (no per-amp
+                                # captures to noise-flicker on).
+                                shrink_stable_count=1,
+                            )
+                            if _new_scale is not None:
+                                _any_rescaled = True
+                                _result = (f"adapt → "
+                                           f"{_new_scale*1e3:.2f} mV/div")
+                                # ---- bias_ratio-coordinated position ---
+                                # For DC-biased roles (eret/eact at the
+                                # electrode rest potential), the V/div
+                                # adapt picked is sized for the SWING
+                                # alone — it doesn't know about the
+                                # mean.  Compute the coordinated targets
+                                # explicitly via
+                                # ``compute_scale_position_targets``,
+                                # which uses ``bias_ratio = 2|mean|/Vpp``
+                                # to decide whether V/div needs to be
+                                # coarsened so the position offset fits
+                                # within the ±5-div hardware limit.
+                                # When bias_ratio > 1 (DC-dominated),
+                                # adapt's swing-only V/div would leave
+                                # POSition clamped and the trace would
+                                # sit off-screen — override with the
+                                # coordinated V/div.  Skipped for V_mon
+                                # and I_mon (always AC-centered around
+                                # zero; bias_ratio ≈ 0).
+                                _bias_ratio = 0.0
+                                _regime = "AC-centered"
+                                # ---- "Fine = small-magnitude only" gate
+                                # Per user-spec: fine scaling +
+                                # positioning is ONLY for small-magnitude
+                                # waveforms.  Otherwise, just coarse
+                                # scaling (adapt's V/div alone, no
+                                # position helper).
+                                #
+                                # Criterion: adapt SHRUNK V/div this
+                                # iteration (``_new_scale < _pre_adapt_vpd``).
+                                # A shrink means the observed signal is
+                                # smaller than the previous V/div was
+                                # accommodating — exactly the
+                                # "small-magnitude" case the user
+                                # described.  When adapt GREW V/div
+                                # (large or clipped signal) or kept it
+                                # the same (already converged), we skip
+                                # the fine helper and let position stay
+                                # wherever it was (default 0 from
+                                # apply_default_scope_view, or whatever
+                                # the previous fine-fit picked).
+                                _adapt_shrunk = (
+                                    _pre_adapt_vpd is not None
+                                    and _new_scale is not None
+                                    and _new_scale < _pre_adapt_vpd)
+                                # Annotate the per-attempt result so a
+                                # grep for "coarse-only" surfaces every
+                                # capture where the fine-position path
+                                # was deliberately skipped.
+                                if (_role in ("eret", "eact")
+                                        and not _adapt_shrunk):
+                                    _result += " [coarse-only, large magnitude]"
+                                if _role in ("eret", "eact") and _adapt_shrunk:
+                                    # Use baseline-symmetric inputs so
+                                    # mid-point = baseline (puts the
+                                    # rest potential at screen centre)
+                                    # rather than (min+max)/2 (which
+                                    # gets pulled by pulse spikes).
+                                    # ``_target_lo`` / ``_target_hi``
+                                    # already carry the right values
+                                    # — synthesized above for E_ret /
+                                    # E_act when pre-trigger samples
+                                    # were available, otherwise raw
+                                    # observed.
+                                    if _new_scale > 0:
+                                        try:
+                                            _targets = self.scope.compute_scale_position_targets(
+                                                _target_lo, _target_hi,
+                                                divs=_divs,
+                                                grid=self.scope._TEK_VERTICAL_GRID_VPD,
+                                                position_limit_divs=5.0,
+                                            )
+                                        except Exception:
+                                            _targets = None
+                                        if _targets is not None:
+                                            (_coord_vpd, _coord_pos,
+                                             _bias_ratio, _regime) = _targets
+                                            # Override V/div ONLY when
+                                            # the coordinated target is
+                                            # coarser than adapt's pick
+                                            # — i.e. position would
+                                            # otherwise clamp.  This
+                                            # preserves adapt's stateful
+                                            # convergence in the common
+                                            # AC-centered + moderate-bias
+                                            # cases.
+                                            if _coord_vpd > _new_scale:
+                                                try:
+                                                    self.scope.set_channel_scale(
+                                                        _ch_name, _coord_vpd)
+                                                    _new_scale = _coord_vpd
+                                                    _result = (
+                                                        f"adapt+coord → "
+                                                        f"{_coord_vpd*1e3:.2f} mV/div "
+                                                        f"(coarsened for position)")
+                                                except Exception:
+                                                    pass
+                                            # Apply the coordinated
+                                            # position offset whether or
+                                            # not we changed V/div.
+                                            try:
+                                                self.scope.set_channel_position(
+                                                    _ch_name, _coord_pos)
+                                                _result += (
+                                                    f", pos={_coord_pos:+.1f} div, "
+                                                    f"R={_bias_ratio:.2f} "
+                                                    f"({_regime})")
+                                            except Exception:
+                                                pass
+                                        else:
+                                            # Fall back to the simple
+                                            # divide+clamp if the helper
+                                            # is unavailable.  Use the
+                                            # baseline (preferred) or
+                                            # the synthetic mid-point as
+                                            # the position reference.
+                                            try:
+                                                _ref = (_baseline
+                                                        if _baseline is not None
+                                                        else 0.5 * (_target_lo + _target_hi))
+                                                _pos_divs_raw = -_ref / _new_scale
+                                                _pos_divs = max(-5.0, min(
+                                                    5.0, _pos_divs_raw))
+                                                self.scope.set_channel_position(
+                                                    _ch_name, _pos_divs)
+                                                _result += (f", pos="
+                                                            f"{_pos_divs:+.1f} div")
+                                            except Exception:
+                                                pass
+                            else:
+                                # adapt returned None — either:
+                                #   * already-on-grid (no change needed),
+                                #   * hysteresis blocked the shrink, or
+                                #   * adapt is locked.
+                                _result = "no change (already optimal)"
+                        except Exception as _rescale_err:
+                            _result = (f"FAILED "
+                                       f"({type(_rescale_err).__name__}: "
+                                       f"{_rescale_err})")
+                        # Log per-attempt diagnostic — same format
+                        # as before so existing post-mortem tooling
+                        # (grep the .txt log) keeps working.  The
+                        # ``in-view`` field is dropped because
+                        # ``adapt`` doesn't expose it — the new
+                        # primitive's decisions are visible via the
+                        # scope's own log lines (``[scope] adapt
+                        # CH1: ...``) which are already emitted by
+                        # adapt_channel_scale itself.
+                        # Baseline / swing line: only for E_ret / E_act
+                        # and only when the pre-trigger window had enough
+                        # samples to compute a robust baseline.  Surfaces
+                        # the "we centred the BASELINE not the (min+max)/2"
+                        # decision so post-mortem can verify it.
+                        _baseline_str = ""
+                        if _baseline is not None and _swing is not None:
+                            _baseline_str = (
+                                f", baseline={_baseline*1e3:+.2f}mV"
+                                f", swing±{_swing*1e3:.2f}mV (one-sided)")
+                        _diag_lines.append(
+                            f"    attempt {_attempt + 1}/{MAX_RECAPTURE + 1} "
+                            f"{_role:>4s} ({_ch_name}): "
+                            f"observed [{_lo*1e3:+8.2f}, {_hi*1e3:+8.2f}] mV"
+                            f"{_baseline_str}, "
+                            f"clip={_clip_str}, fit={_in_view_str}, "
+                            f"divs_budget={_divs:.0f} → "
+                            f"result={_result}")
+                    # Stop conditions:
+                    #   * Nothing rescaled this pass → converged.
+                    #   * Hit the attempt cap → accept what we have.
+                    #
+                    # The old ``not _introspectable → break`` gate was
+                    # removed.  Rationale: with the calibration-style
+                    # ``adapt_channel_scale`` primitive, simulator-style
+                    # scopes have a base-class no-op that returns None,
+                    # which naturally leaves ``_any_rescaled = False``
+                    # and trips the first stop condition.  The
+                    # ``_introspectable`` flag was a belt-and-suspenders
+                    # check for the OLD homegrown loop where adapt
+                    # could write a new scale even without working
+                    # introspection — that scenario no longer applies.
+                    # Worse, the gate occasionally short-circuited
+                    # legitimate re-captures on Tek scopes where one
+                    # SCPI query failed transiently, leaving the loop
+                    # with a stale ``acq`` from before the rescale
+                    # write.  Dropping the gate fixes that without
+                    # introducing simulator-side loops.
+                    if not _any_rescaled:
+                        # Converged — no writes this iteration, so the
+                        # current ``acq`` already reflects the final
+                        # scope state.  No need to recapture.
+                        break
+                    # Re-capture with the new scale.  The stim is STILL
+                    # RUNNING from the outer ``start_all()`` — the outer
+                    # try/finally below does the single ``stop_channel``
+                    # after the loop converges.  An exception here leaves
+                    # ``acq`` pointing at the LAST good capture, so
+                    # ``make_capture`` below still produces a Capture
+                    # (just at the pre-rescale scale).  Better than
+                    # aborting the step entirely.
+                    #
+                    # **Final iteration also recaptures**.  Even when
+                    # ``_attempt >= MAX_RECAPTURE`` (we're about to
+                    # break out of the loop), if the analyse-and-write
+                    # block above made scope writes, we MUST recapture
+                    # so the saved ``acq`` reflects the final scope
+                    # state — not the pre-write state we just rejected.
+                    # Without this final recapture, ``make_capture``
+                    # below would use data captured at a V/div the
+                    # rescale loop explicitly walked away from.
+                    try:
+                        # Re-use the pulse-rate-aware timeout computed
+                        # for the first capture in this step.  Rescales
+                        # don't change pulse rate, so the budget still
+                        # applies; using the default would re-introduce
+                        # the 10 s timeout at low rates.
+                        acq = self.scope.single_capture(
+                            timeout_s=_capture_timeout_s)
+                    except Exception as e:
+                        self._emit(ExperimentEvent(
+                            kind="log", session=self.session,
+                            message=(f"⚠ Re-capture after rescale failed at "
+                                     f"{_amp_signed:+.1f} µA "
+                                     f"(capture #{index + 1}, attempt "
+                                     f"{_attempt + 2} of "
+                                     f"{MAX_RECAPTURE + 1}): "
+                                     f"{type(e).__name__}: {e}")))
+                        break
+                    # Hard cap on attempts — break AFTER the recapture
+                    # so the final acq reflects the loop's final writes.
+                    if _attempt >= MAX_RECAPTURE:
+                        break
+            except Exception as _loop_err:
+                # Defensive: a malformed scope state shouldn't kill the
+                # whole sweep.  Just log via the print path and continue
+                # with whatever ``acq`` currently holds.
+                try:
+                    _diag_lines.append(
+                        f"  in-view loop ERROR: "
+                        f"{type(_loop_err).__name__}: {_loop_err}")
+                except Exception:
+                    pass
+            # ---- Final V/div summary per role -----------------------
+            # After the rescale loop converges, read back the actual
+            # V/div the scope landed on for each voltage role and add
+            # it to the diagnostic.  This is the line the operator
+            # should look at to verify the scaling is correct — if
+            # V_mon ended at 500 mV/div with a ±5 mV signal, this
+            # surfaces the problem immediately.  Without this, the
+            # only way to verify "did the scaling actually adapt?"
+            # was to count per-attempt log lines and guess at the
+            # convergence state.
+            try:
+                _final_lines = []
+                _final_chan_data = getattr(acq, "channels", {}) or {}
+                _any_out_of_view = False
+                for _role in _voltage_roles:
+                    _ch_name = aliases_obs.get(_role)
+                    if not _ch_name:
+                        continue
+                    # Per-role scope state.
+                    try:
+                        _final_vpd = float(self.scope._q(
+                            f"{_ch_name}:SCAle?"))
+                        _final_pos = float(self.scope._q(
+                            f"{_ch_name}:POSition?"))
+                    except Exception as _q_err:
+                        _final_lines.append(
+                            f"    {_role:>4s} ({_ch_name}): "
+                            f"V/div read failed ({_q_err})")
+                        continue
+                    # ---- FINAL in-view verification ------------
+                    # Re-check the SAVED acq one last time against
+                    # MAX_FACTOR.  This is the contract guarantee
+                    # the operator asked for: "every acquired
+                    # waveform is verified to fit within 3.9 (or
+                    # 4.9) divs".  If any role's observed range
+                    # exceeds the budget on the FINAL capture,
+                    # emit a ⚠ so the post-mortem shows we
+                    # couldn't converge within MAX_RECAPTURE
+                    # attempts.  The data is still saved (better
+                    # than dropping the capture) but the warning
+                    # surfaces the problem.
+                    _final_arr = _final_chan_data.get(_ch_name)
+                    _verify_str = ""
+                    if _final_arr is not None and len(_final_arr) >= 2:
+                        _a = _np.asarray(_final_arr, dtype=float)
+                        _vlo = float(_a.min())
+                        _vhi = float(_a.max())
+                        if (_np.isfinite(_vlo)
+                                and _np.isfinite(_vhi)
+                                and _final_vpd > 0):
+                            _vp_v = -_final_pos * _final_vpd
+                            _win_lo = -MAX_FACTOR * _final_vpd + _vp_v
+                            _win_hi = +MAX_FACTOR * _final_vpd + _vp_v
+                            _fits = (_vlo > _win_lo
+                                     and _vhi < _win_hi)
+                            if _fits:
+                                _verify_str = (
+                                    f"  ✓ fits in ±{MAX_FACTOR:.1f}div")
+                            else:
+                                _any_out_of_view = True
+                                _verify_str = (
+                                    f"  ⚠ STILL OUT-OF-VIEW: "
+                                    f"observed [{_vlo*1e3:+.1f}, "
+                                    f"{_vhi*1e3:+.1f}] mV vs "
+                                    f"window [{_win_lo*1e3:+.1f}, "
+                                    f"{_win_hi*1e3:+.1f}] mV")
+                    # Visible-range total uses the scope's actual
+                    # vertical-div count (8 on TBS1000/TDS/TPS, 10 on
+                    # TBS2000-series).  Hardcoding 8 here would
+                    # under-report on the 2-series.
+                    _total_divs = 2.0 * float(getattr(
+                        self.scope, "_half_vert_divs", 4.0))
+                    _final_lines.append(
+                        f"    {_role:>4s} ({_ch_name}): "
+                        f"V/div = {_final_vpd*1e3:.2f} mV, "
+                        f"pos = {_final_pos:+.1f} div  "
+                        f"(visible range "
+                        f"{_final_vpd*_total_divs*1e3:.0f} mV total)"
+                        f"{_verify_str}")
+                if _final_lines:
+                    _diag_lines.append("  final scope state:")
+                    _diag_lines.extend(_final_lines)
+                # Loud warning at the top of the diagnostic block
+                # so a grep for "STILL OUT-OF-VIEW" in the session
+                # log surfaces every unconverged capture without
+                # the operator having to read the per-role lines.
+                if _any_out_of_view:
+                    _diag_lines.insert(
+                        0, f"  ⚠ At least one role's FINAL capture "
+                        f"is still out-of-view (±{MAX_FACTOR:.1f}div) "
+                        f"after {MAX_RECAPTURE + 1} attempts. "
+                        f"Data is saved but V/div didn't converge.")
+            except Exception:
+                pass
+            # Emit the entire in-view diagnostic as ONE log event so it
+            # stays grouped with the capture in the session .txt log.
+            # Lets the operator (or a future agent investigating "the
+            # vertical scaling wasn't adjusted") see exactly which
+            # attempts ran, what each role's observed range was,
+            # whether the scope said in-view / out-of-view / can't-
+            # check, and what scale + position got written.
+            try:
+                if _diag_lines:
+                    self._emit(ExperimentEvent(
+                        kind="log", session=self.session,
+                        message=("In-view rescale loop at "
+                                 f"{_amp_signed:+.1f} µA "
+                                 f"(capture #{index + 1}):\n"
+                                 + "\n".join(_diag_lines))))
+            except Exception:
+                pass
+        finally:
+            # SINGLE stop_all for the whole capture lifecycle.
+            # Runs after the initial capture AND every iterative re-
+            # capture in 2b — never between them.  Triggered by both
+            # the normal end-of-block fall-through AND any early
+            # ``return cap`` from the inner first-capture exception
+            # branch (Python guarantees the finally fires on every
+            # path leaving the try, including return-from-inner-block).
+            # ``stop_all`` (= PS_StopStimAllChannels) is the MATLAB-
+            # equivalent of ``stopStimulation``; quiets both the active
+            # channel AND the unused channels we started via the
+            # zero-amplitude pattern, so the next ``_one_capture`` lands
+            # on a fully-stopped device when it does its own pre-load
+            # ``stop_all`` (belt-and-suspenders).
+            try:
+                self.stim.stop_all()
+            except Exception:
+                pass
 
-        cap = Capture(
-            index=index, pattern=pattern,
-            time_us=np.asarray(acq.time_us),
-            v_mon_v=np.asarray(v_mon_v),
-            i_mon_ua=np.asarray(i_mon_ua),
-            e_act_v=np.asarray(e_act) if e_act is not None and e_act.size else None,
-            e_ret_v=np.asarray(e_ret) if e_ret is not None and e_ret.size else None,
-        )
+        # ----- 3+4. Demux channels and convert to physical units ---------
+        # make_capture handles channel_aliases lookup, nominal scaling, and
+        # applies readback calibration (gain/offset on I_mon, vmon_v_per_v
+        # correction) when a calibration record exists for this stimulator.
+        cap = make_capture(index, pattern, acq, self.scope, self.stim,
+                           cal=self.cal, channel=config.active)
         # Voltage compliance check. PlexStim 2.0 V_mon saturates at
         # roughly ±STIM_VOLTAGE_COMPLIANCE_V; crossing it means the
         # device couldn't push the programmed current any further.
@@ -434,7 +1434,7 @@ class VoltageTransientExperiment(ExperimentRunner):
         # of ``min_consecutive`` consecutive entries strictly above
         # the threshold.
         cap.status.voltage_compliance = bool(_v_compliance_tripped(
-            v_mon_v, threshold_v=STIM_VOLTAGE_COMPLIANCE_V,
+            cap.v_mon_v, threshold_v=STIM_VOLTAGE_COMPLIANCE_V,
             min_consecutive=3,
         ))
         compute_metrics(cap, surface_area_um2=self.surface_area_um2,
@@ -462,7 +1462,14 @@ class VoltageTransientExperiment(ExperimentRunner):
         # the user can grep / filter the log later.
         try:
             from ..damage_warnings import assess_finished_capture
-            from .base import ExperimentEvent
+            # ``ExperimentEvent`` is already imported at module level
+            # (top of file).  Re-importing here would silently rebind
+            # the name as a function-local — and Python's name-
+            # resolution rules then treat EVERY ``ExperimentEvent``
+            # reference earlier in the same function as the unbound
+            # local, raising ``UnboundLocalError`` ("cannot access
+            # local variable 'ExperimentEvent' where it is not
+            # associated with a value") at the very first capture.
             extras = self.session.test.extras or {}
             snap = extras.get("setup_snapshot") or {}
             env_short = (

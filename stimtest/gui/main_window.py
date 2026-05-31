@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -19,6 +19,12 @@ from .prefs import (
     save_prefs, save_prefs_to,
     PREFS_USER_EXT, PREFS_USER_EXT_LEGACY, PREFS_USER_FILTER,
 )
+from .admin import (
+    AdminCatalogDialog, apply_admin_catalog, _DEFAULT_HASH,
+    prompt_login, CATALOG_KEYS, Profile, is_restricted_unlocked,
+    is_admin,
+)
+from .calibration import CalibrationTab
 from .results_tab import ResultsTab
 from .setup_tab import SetupTab
 from .widgets import LogPane
@@ -42,8 +48,35 @@ PREF_KEY_RESULTS = "results"
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, simulate_default: bool = True, save_dir: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("PULSAR — Plexon PlexStim + Tektronix scope")
+        self.setWindowTitle("PULSAR")
         self.resize(1500, 950)
+
+        # ---- Profile login state ------------------------------------
+        # PULSAR ships with two built-in profiles (see :mod:`.admin`):
+        #   * Profile.NONE  — anonymous (default at startup)
+        #   * Profile.ADMIN — unlocks Manage Custom Catalog
+        #
+        # Extension packages (any installed ``stimtest_*`` package
+        # whose ``__init__.py`` calls ``register_extension_profile``)
+        # can register additional profiles at runtime — they appear
+        # as plain string names in ``_current_profile``, not enum
+        # members.  See ``_load_extensions`` near the end of
+        # ``__init__`` for the auto-discovery.
+        #
+        # ``_current_profile`` is stored as a string so it can hold
+        # either a built-in (``Profile.ADMIN.value`` == ``"admin"``)
+        # or an extension name (e.g., the name a collaborator
+        # package registered).
+        #
+        # Read ``_current_profile`` (string) directly; gate behavior
+        # with ``is_restricted_unlocked`` / ``is_admin`` helpers from
+        # ``stimtest.gui.admin``.  An earlier draft carried a derived
+        # ``_admin_logged_in`` BOOLEAN alias for back-compat, but no
+        # callers ever read it — audit finding #5 removed it to avoid
+        # the desync risk of a write-only piece of state.
+        self._current_profile: str = Profile.NONE.value
+        self._admin_password_hash: str = _DEFAULT_HASH
+        self._admin_catalog: dict = {k: [] for k in CATALOG_KEYS}
 
         self.save_dir = Path(save_dir or DEFAULT_SAVE_DIR)
         array = ElectrodeArray.utah_4x4()
@@ -82,6 +115,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.currentChanged.connect(
             lambda *_: self._refresh_button_row_placement())
         self.tabs.addTab(self.setup_tab, "Setup")
+        # Calibration tab is created lazily — only when the user clicks
+        # "Run Calibration" on the ConnectionPanel (or Run → Calibrate in
+        # the menu).  Keeping it out of the initial tab bar trims the
+        # default chrome and matches the workflow: most sessions don't
+        # need a fresh verification sweep on every launch.  See
+        # :meth:`_open_calibration_tab` for the on-demand wire-up.
+        self.cal_tab: Optional[CalibrationTab] = None
         # "Test parameters" — top-level tab, sits directly to the
         # right of Setup. Hosts whichever experiment-tab's
         # ``params_page`` is currently active (was an inner sub-tab
@@ -121,6 +161,52 @@ class MainWindow(QtWidgets.QMainWindow):
         # fields.
         self.log_pane.set_log_file(
             self.save_dir / self.setup_tab.current_log_filename())
+        # Thorough session banner — captures the environment so a future
+        # post-mortem against a saved .txt log has all the version /
+        # backend info needed to reproduce behaviour or pin a regression.
+        try:
+            import sys as _sys, platform as _plat, datetime as _dt
+            try:
+                import numpy as _np
+                _np_ver = _np.__version__
+            except Exception:
+                _np_ver = "<unavailable>"
+            try:
+                from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+                _qt_str = f"Qt {QT_VERSION_STR} (PyQt {PYQT_VERSION_STR})"
+            except Exception:
+                _qt_str = "<unavailable>"
+            try:
+                import pyqtgraph as _pg
+                _pg_ver = _pg.__version__
+            except Exception:
+                _pg_ver = "<unavailable>"
+            try:
+                import pyvisa as _pv
+                _pv_ver = _pv.__version__
+            except Exception:
+                _pv_ver = "<unavailable>"
+            self.log_pane.log(
+                "================================================================")
+            self.log_pane.log(
+                f"PULSAR session start  {_dt.datetime.now().isoformat(timespec='seconds')}")
+            self.log_pane.log(
+                "================================================================")
+            self.log_pane.log(
+                f"Python {_sys.version.split()[0]}  ·  "
+                f"{_plat.platform()}  ·  "
+                f"NumPy {_np_ver}  ·  "
+                f"{_qt_str}  ·  "
+                f"pyqtgraph {_pg_ver}  ·  "
+                f"pyvisa {_pv_ver}")
+            self.log_pane.log(
+                f"Mode: {'simulator' if simulate_default else 'live hardware'}  ·  "
+                f"Save dir: {self.save_dir}  ·  "
+                f"Log file: {self.setup_tab.current_log_filename()}")
+            self.log_pane.log(
+                "================================================================")
+        except Exception:
+            pass
         log_box = QtWidgets.QGroupBox("Log")
         log_v = QtWidgets.QVBoxLayout(log_box)
         log_v.setContentsMargins(4, 2, 4, 4)
@@ -254,7 +340,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._act_stop, self._act_capture):
             act.setEnabled(False)
         run_menu.addSeparator()
-        self._act_calibrate = run_menu.addAction("Cali&brate…")
+        self._act_calibrate = run_menu.addAction("&Stimulator Verification…")
         self._act_calibrate.triggered.connect(self._on_run_calibrate)
         # Calibrate needs BOTH hardware sides up — the PlexStim has
         # to deliver pulses and the scope has to capture V_mon /
@@ -266,15 +352,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_calibrate.setToolTip(
             "Initialize the PlexStim and connect the oscilloscope "
             "first (Setup tab → Connection panel).")
-        # Hidden in this build — the calibration dialog itself works
-        # (the data-access bug that left it staring at None handles
-        # has been fixed, see :meth:`_on_run_calibrate`), but the
-        # broader sweep-flow / runner-side integration isn't ready
-        # for end users yet. Flip this back to True once the wizard
-        # is GUI-complete; the enable/disable logic in
-        # ``_on_connected`` / ``_on_disconnected`` is preserved
-        # above so the hardware gate Just Works at that point.
-        self._act_calibrate.setVisible(False)
+        # Re-exposed per user request. The dialog itself works (the
+        # data-access bug that left it staring at None handles has
+        # been fixed, see :meth:`_on_run_calibrate`); the broader
+        # sweep-flow / runner-side integration is still maturing,
+        # so users running the wizard on real hardware should treat
+        # it as best-effort until further validation lands. The
+        # enable/disable gate in ``_on_connected`` / ``_on_disconnected``
+        # still requires both stim + scope live before the action
+        # becomes clickable.
+        self._act_calibrate.setVisible(True)
         run_menu.addSeparator()
         self._act_open_viewer = run_menu.addAction("Open &Viewer")
         self._act_open_viewer.triggered.connect(self._on_run_open_viewer)
@@ -343,6 +430,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_grid.setChecked(False)
         self._act_grid.setShortcut("Ctrl+G")
         self._act_grid.toggled.connect(self._on_view_grid_toggled)
+        # Camera Monitor dock — additional floatable preview, useful
+        # when the operator wants the bench camera on a second
+        # monitor or when no experiment tab is active.  The PRIMARY
+        # camera UI lives in the ConnectionPanel (device picker) +
+        # each experiment tab's embedded CameraStreamPane (live
+        # preview beneath the scope plot); this dock is an OPTIONAL
+        # extra view that shares the same singleton
+        # ``camera_service()`` — no additional camera I/O.
+        view_menu.addSeparator()
+        self._act_camera = view_menu.addAction("&Camera Monitor (dock)")
+        self._act_camera.setCheckable(True)
+        self._act_camera.setChecked(False)
+        self._act_camera.setShortcut("Ctrl+Shift+C")
+        self._act_camera.toggled.connect(self._on_view_camera_toggled)
+        # The dock + the StreamPane it wraps are built lazily —
+        # see _ensure_camera_dock().
+        self._camera_dock: Optional[QtWidgets.QDockWidget] = None
+        self._camera_stream_pane = None   # CameraStreamPane; lazy
 
         # Window menu — basic window-state controls. Mirrors the
         # native window-decoration buttons so users with menu-only
@@ -405,23 +510,57 @@ class MainWindow(QtWidgets.QMainWindow):
         # the dialog tells the user how to run one (Run →
         # Calibrate… opens the wizard). Useful as a quick "do I
         # need to re-calibrate?" check without leaving the GUI.
-        act_last_cal = help_menu.addAction("&Last calibration…")
+        act_last_cal = help_menu.addAction("&Last stimulator verification…")
         act_last_cal.triggered.connect(self._on_help_last_calibration)
         help_menu.addSeparator()
         act_about = help_menu.addAction("&About…")
         act_about.triggered.connect(self._on_help_about)
+
+        # Admin menu — login/logout and catalog management.
+        # "Manage Custom Catalog…" is hidden until the admin logs in.
+        admin_menu = self.menuBar().addMenu("Ad&min")
+        self._act_admin_login = admin_menu.addAction("Log &In…")
+        self._act_admin_login.triggered.connect(self._on_admin_login)
+        self._act_admin_logout = admin_menu.addAction("Log &Out")
+        self._act_admin_logout.triggered.connect(self._on_admin_logout)
+        self._act_admin_logout.setVisible(False)
+        admin_menu.addSeparator()
+        self._act_admin_catalog = admin_menu.addAction(
+            "&Manage Custom Catalog…")
+        self._act_admin_catalog.triggered.connect(self._on_admin_catalog)
+        self._act_admin_catalog.setEnabled(False)
 
         # Status bar
         self.statusBar().showMessage(
             "Ready. Use the Connection panel in the Setup tab to attach "
             "the stimulator and oscilloscope (or run in simulator mode).")
 
+        # Per-input change logging — gate every "operator typed / picked
+        # X" message in the Setup-tab and PatternPanel handlers so the
+        # restore-from-prefs signal burst at startup doesn't flood the
+        # log with stale values the operator didn't actually touch.
+        # Flipped to True at the end of __init__ AFTER
+        # ``_load_prefs_into_tabs()`` + its priming calls return, so
+        # every subsequent input event (user types in a spinbox,
+        # picks a combo entry, toggles a checkbox) emits one
+        # "Setup: <field> = <value>" line.  See ``_log_setup_change``.
+        self._log_setup_changes = False
+
         # Wiring
         self.conn.connected.connect(self._on_connected)
         self.conn.disconnected.connect(self._on_disconnected)
+        # Route ConnectionPanel events to BOTH the status bar (transient)
+        # AND the LogPane (persistent + mirrored to the .txt session log).
+        # Without the LogPane wire, all the high-level init / setup /
+        # connect / disconnect messages would disappear after a couple of
+        # seconds when the status bar's next message overwrites them.
         self.conn.log.connect(self.statusBar().showMessage)
+        self.conn.log.connect(self.log_pane.log)
         # Scope up/down → setup tab seeds default mapping or blanks it.
         self.conn.scopeConnected.connect(self._on_scope_connected)
+        # Run-Stimulator-Verification button on the ConnectionPanel: switch
+        # focus to the embedded Calibration tab.
+        self.conn.calibrationRequested.connect(self._on_run_calibrate)
         self.setup_tab.arrayChanged.connect(self._on_array_changed)
         self.setup_tab.potentialLimitsChanged.connect(self._on_limits_changed)
         self.setup_tab.autoExportXlsxChanged.connect(self._on_auto_export_xlsx_changed)
@@ -454,9 +593,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # experiment tab so the runner-side setup applies what the
         # user picked.
         self.setup_tab.acquisitionChanged.connect(self._on_acq_changed)
+        self.setup_tab.triggerSourceChanged.connect(self._on_trigger_source_changed)
+        self.setup_tab.digitalTriggerChanged.connect(self._on_digital_trigger_changed)
+        # The operator-facing trigger-edge selector was removed; the
+        # experiment runner auto-resolves slope from the trigger-source
+        # rules (digital → RISE, I_mon → phase-1 polarity) at run start.
         # VT hides Fixed charge density mode when all electrodes share
         # an area — same-area arrays make that mode redundant.
         self.setup_tab.sameAreaChanged.connect(self.vt_tab.set_same_area)
+        # ---- Log-only setup signals (no other subscriber) -----------
+        # These signals propagate state that doesn't need to be
+        # forwarded to experiment tabs / hardware — they just need to
+        # appear in the operator's session log so a post-mortem can
+        # reconstruct what was changed.  Lambdas so the gate inside
+        # ``_log_setup_change`` keeps the startup signal burst quiet.
+        try:
+            self.setup_tab.spargeGasChanged.connect(
+                lambda gas: self._log_setup_change(f"sparge gas = {gas}"))
+        except Exception:
+            pass
+        try:
+            self.setup_tab.sameAreaChanged.connect(
+                lambda on: self._log_setup_change(
+                    f"electrodes share area = {'YES' if on else 'NO'}"))
+        except Exception:
+            pass
         # Auto-discharge plumbing. UI lives in each pattern panel
         # (below the rate row); persistence + device push lives in
         # the connection panel. Wire every pattern panel's toggle so
@@ -516,11 +677,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_auto_save_plots_changed(
             self.setup_tab.current_auto_save_plots(),
             self.setup_tab.current_auto_save_plots_format())
+        # Discover and load any installed ``stimtest_*`` extension
+        # packages.  Extensions register additional login profiles
+        # (and the restricted shapes those profiles unlock) by
+        # calling ``register_extension_profile`` in their
+        # ``__init__.py``.  Done AFTER prefs restore so any
+        # extension-owned prefs sections (the extension reads them
+        # itself via ``load_prefs`` / its own key) see the same
+        # restored payload the main app sees; done BEFORE the log
+        # gate flip so the discovery messages don't pollute the
+        # operator-facing setup log with one "extension loaded" line
+        # per package on every launch.  Best-effort: an extension
+        # that raises at import time is logged and skipped — PULSAR
+        # continues to launch with the remaining extensions plus
+        # the built-in Admin + None profiles.
+        try:
+            self._load_extensions()
+        except Exception as _e:
+            # Hard failure in the loader itself (not an individual
+            # extension) — keep launching anyway, but record it.
+            self.log_pane.log(
+                f"Extension discovery failed: "
+                f"{type(_e).__name__}: {_e}")
+        # All prefs restored + downstream tabs primed.  From here on,
+        # every Setup-tab / PatternPanel change reflects a user-driven
+        # input event the operator should see in the log.  Flip the
+        # gate so ``_log_setup_change`` starts emitting.
+        self._log_setup_changes = True
+        # Wire pattern-panel changes from every experiment tab through
+        # a single debounced log slot so the operator gets a "Pattern:
+        # …" line whenever they finish editing a parameter.  Debounce
+        # collapses spinbox-tick bursts into one final line.
+        for _tab in self._experiment_tabs():
+            _pp = getattr(_tab, "pattern_panel", None)
+            if _pp is not None:
+                try:
+                    _pp.patternChanged.connect(self._on_pattern_changed_log)
+                except Exception:
+                    pass
+        # Also: now that prefs are restored, log the resolved initial
+        # setup state once so the session log starts with a complete
+        # snapshot the operator can refer back to later.  Without this
+        # the first log entries would be the runner messages, with no
+        # record of what coating / channels / environment were in
+        # effect at run start.
+        try:
+            self._log_initial_setup_snapshot()
+        except Exception:
+            pass
         # Also save prefs whenever the user clicks Start on any experiment
         # tab — that snapshot is what they actually want preserved if the
         # machine crashes mid-run. closeEvent (below) covers normal quit.
         for tab in self._experiment_tabs():
             tab.start_btn.clicked.connect(self._save_prefs_from_tabs)
+        # Auto-switch from Test parameters to the active Experiment tab
+        # when the user clicks Start — they're done configuring and
+        # want to watch the run.  Only switches when the click came
+        # from Test parameters (or any other non-experiment tab); if
+        # they're already on the experiment tab, we don't fight them.
+        # Wired here in main_window rather than inside each
+        # _BaseExperimentTab because only main_window knows the
+        # top-level tab structure.
+        for tab in self._experiment_tabs():
+            tab.start_btn.clicked.connect(
+                lambda *_, _t=tab: self._auto_switch_to_experiment_tab(_t))
         # Run-lock: when an experiment starts, disable the Setup tab so
         # the user can't reconfigure device / hardware mid-run. The tab
         # bar itself stays enabled, so Setup is still selectable for
@@ -575,26 +795,290 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_connected(self, stim, scope):
         for tab in self._experiment_tabs():
             tab.set_hardware(stim, scope)
+        # Embedded Calibration tab tracks the live handles too — only if
+        # it has actually been instantiated (it's created lazily on first
+        # "Run Calibration" press).
+        if self.cal_tab is not None:
+            self.cal_tab.set_hardware(stim=stim, scope=scope)
+        # Route every SCPI command + every PlexStim SDK call through
+        # the shared LogPane (which mirrors to disk).  The
+        # ConnectionPanel wires a thread-safe logger BEFORE open()
+        # so the connect handshake itself is captured; here we
+        # only re-bind if a logger isn't already in place.  Avoids
+        # mid-session identity churn of the cmd_logger reference
+        # (the worker thread's QueuedConnection logger and the
+        # GUI-thread direct logger both land at the same LogPane,
+        # but it's confusing to swap them under our own feet once
+        # connection is established).
+        if getattr(scope, "cmd_logger", None) is None:
+            try:
+                scope.cmd_logger = self.log_pane.log
+            except Exception:
+                pass
+        if getattr(stim, "cmd_logger", None) is None:
+            try:
+                stim.cmd_logger = self.log_pane.log
+            except Exception:
+                pass
+        # Print a concise hardware summary to the log so every session
+        # has its instrumentation captured in the .txt mirror.  Useful
+        # later for matching .npz captures to the exact device + firmware.
+        try:
+            si = getattr(stim, "info", None)
+            sc = getattr(scope, "info", None)
+            if si is not None:
+                self.log_pane.log(
+                    f"[stim] connected: serial={getattr(si,'serial_number','')} "
+                    f"firmware={getattr(si,'firmware','')} "
+                    f"channels={getattr(si,'n_channels','?')} "
+                    f"V_mon={getattr(si,'vmon_scaling_v_per_v','?')} V/V "
+                    f"I_mon={getattr(si,'imon_scaling_v_per_ua','?')} V/uA")
+            if sc is not None:
+                self.log_pane.log(
+                    f"[scope] connected: {getattr(sc,'make','')} "
+                    f"{getattr(sc,'model','')} "
+                    f"serial={getattr(sc,'serial','')} "
+                    f"fw={getattr(sc,'firmware','')} "
+                    f"channels={getattr(sc,'n_channels','?')} "
+                    f"ext_trigger={getattr(sc,'has_ext_trigger','?')} "
+                    f"divs={getattr(scope, '_n_horiz_divs', '?')}")
+        except Exception:
+            pass
         self.statusBar().showMessage(f"Connected to {scope.info.make} {scope.info.model}.")
         # Both hardware halves are up — unlock Run → Calibrate so the
-        # user can launch the wizard.
+        # user can jump to the Calibration tab.
         self._act_calibrate.setEnabled(True)
         self._act_calibrate.setToolTip(
-            "Open the PlexStim test-board calibration wizard.")
+            "Switch to the Calibration tab to run the PlexStim test-board "
+            "stimulator verification sweep.")
 
     def _on_disconnected(self):
+        # Unwire the driver loggers BEFORE clearing handles so a final
+        # close() command on either device still shows up in the log.
+        for hw in (getattr(self.conn, "stim", None),
+                   getattr(self.conn, "scope", None)):
+            if hw is not None:
+                try:
+                    hw.cmd_logger = None
+                except Exception:
+                    pass
         for tab in self._experiment_tabs():
             tab.clear_hardware()
+        # Clear cal-tab handles so the gate goes back to "not connected"
+        # (only if the tab has been created).
+        if self.cal_tab is not None:
+            self.cal_tab.set_hardware(stim=None, scope=None)
         self.statusBar().showMessage("Disconnected.")
         # One (or both) of the hardware halves dropped — re-lock
-        # Run → Calibrate. The wizard needs both stim and scope live
-        # to drive each channel + capture V_mon/I_mon.
+        # Run → Calibrate. The verification sweep needs both stim and scope
+        # live to drive each channel + capture V_mon / I_mon.
         self._act_calibrate.setEnabled(False)
         self._act_calibrate.setToolTip(
             "Initialize the PlexStim and connect the oscilloscope "
             "first (Setup tab → Connection panel).")
 
+    def _on_calibration_done(self):
+        """Calibration tab signalled it's done (user clicked Done, or save
+        finished). Switch focus back to the Setup tab so the user can
+        continue with experiment configuration, and refresh the
+        ConnectionPanel's "last verified" label since a partial run may
+        have written updated coefficients."""
+        try:
+            self.conn._refresh_cal_label()
+        except Exception:
+            pass
+        idx = self.tabs.indexOf(self.setup_tab)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
+
+    # ---- Setup-input change logging --------------------------------
+    def _log_setup_change(self, msg: str) -> None:
+        """Log a Setup-tab / pattern-panel input change to the LogPane.
+
+        No-op while ``self._log_setup_changes`` is False — the flag is
+        flipped to True at the end of ``__init__`` AFTER
+        ``_load_prefs_into_tabs()`` and its priming calls finish, so
+        the startup signal burst (restored values cascading through
+        every connected handler) doesn't flood the log with stale
+        entries the operator didn't actually type.
+
+        Each call emits exactly one line prefixed "Setup: " so the
+        operator can later grep the .txt session log for every input
+        event without false positives from runner / scope messages.
+        """
+        if not getattr(self, "_log_setup_changes", False):
+            return
+        try:
+            self.log_pane.log(f"Setup: {msg}")
+        except Exception:
+            pass
+
+    def _describe_array(self, array) -> str:
+        """One-line summary of an ElectrodeArray for the log pane.
+
+        Captures the fields the operator most commonly tweaks
+        (device label, n_sites, coating, surface area).  Best-effort:
+        unknown / missing attributes fall back to repr().
+        """
+        if array is None:
+            return "(none)"
+        try:
+            parts: List[str] = []
+            label = (getattr(array, "device_label", None)
+                     or getattr(array, "name", None)
+                     or getattr(array, "label", None))
+            if label:
+                parts.append(str(label))
+            sites = getattr(array, "sites", None) or []
+            n = len(sites)
+            if n:
+                parts.append(f"{n} sites")
+                # Coating + area from the first site — usually
+                # identical across the array unless per-site overrides
+                # are in use.  Mention "(per-site varies)" if not.
+                _site0 = sites[0]
+                coat = getattr(_site0, "coating", None)
+                if coat:
+                    coats = {getattr(s, "coating", None) for s in sites}
+                    if len(coats) > 1:
+                        parts.append(f"coating={coat}+others")
+                    else:
+                        parts.append(f"coating={coat}")
+                area = getattr(_site0, "surface_area_um2", None)
+                if area:
+                    areas = {getattr(s, "surface_area_um2", None)
+                             for s in sites}
+                    if len(areas) > 1:
+                        parts.append(f"area={area:.0f} µm² (varies)")
+                    else:
+                        parts.append(f"area={area:.0f} µm²")
+            return ", ".join(parts) if parts else repr(array)
+        except Exception:
+            return repr(array)
+
+    def _on_pattern_changed_log(self, pattern) -> None:
+        """Debounced pattern-changed slot: emits one "Pattern: …" log
+        line after the user stops fiddling with pattern inputs.
+
+        ``patternChanged`` fires on every spinbox tick (`valueChanged`
+        is per-tick, not per-edit), so a single amplitude edit can
+        burst dozens of signals.  Logging each would drown the pane.
+        We capture the latest pattern and arm a 400 ms QTimer; the
+        slot only emits when the timer fires without being re-armed
+        in the meantime.
+        """
+        self._pending_log_pattern = pattern
+        # Lazy-create the debounce timer the first time we're called.
+        t = getattr(self, "_pattern_log_timer", None)
+        if t is None:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(400)
+            t.timeout.connect(self._flush_pattern_change_log)
+            self._pattern_log_timer = t
+        t.start()  # re-arm; previous start is cancelled
+
+    def _flush_pattern_change_log(self) -> None:
+        """Emit the most recently received PulsePattern as a one-line
+        summary.  Called by the debounce timer; harmless if the
+        pending pattern is None (early signal before any wiring)."""
+        if not getattr(self, "_log_setup_changes", False):
+            return
+        pat = getattr(self, "_pending_log_pattern", None)
+        if pat is None:
+            return
+        try:
+            self._log_setup_change(f"pattern = {self._describe_pattern(pat)}")
+        except Exception:
+            pass
+
+    def _describe_pattern(self, pat) -> str:
+        """One-line summary of a PulsePattern for the log pane.
+
+        Lists phase widths + amplitudes + rate.  Best-effort: any
+        attribute lookup error degrades to repr(pat).
+        """
+        if pat is None:
+            return "(none)"
+        try:
+            phases = getattr(pat, "phases", []) or []
+            phase_parts: List[str] = []
+            for p in phases:
+                w = float(getattr(p, "width_us", 0.0) or 0.0)
+                a = float(getattr(p, "amplitude_ua", 0.0) or 0.0)
+                phase_parts.append(f"{a:+.1f} µA × {w:.0f} µs")
+            rate = float(getattr(pat, "rate_hz", 0.0) or 0.0)
+            txt = " → ".join(phase_parts) if phase_parts else "(no phases)"
+            if rate > 0:
+                txt += f" @ {rate:g} Hz"
+            return txt
+        except Exception:
+            return repr(pat)
+
+    def _log_initial_setup_snapshot(self) -> None:
+        """Emit a one-time multi-line snapshot of the resolved setup at
+        startup so the session .txt log starts with a complete record
+        of what the operator was working with.
+
+        Called once at the end of ``__init__`` after prefs restoration
+        and the priming calls.  Operator-visible context for every
+        run that follows.
+        """
+        # Force-enable logging for this snapshot — bypass the gate
+        # because this call IS the first legitimate post-restore
+        # message; the gate is for subsequent edits.
+        original = getattr(self, "_log_setup_changes", False)
+        self._log_setup_changes = True
+        try:
+            self.log_pane.log(
+                "── Setup snapshot (initial / restored from prefs) ──")
+            try:
+                arr = self.setup_tab.current_array()
+                self._log_setup_change(f"array = {self._describe_array(arr)}")
+            except Exception:
+                pass
+            try:
+                env = self.setup_tab.current_environment_short()
+                custom = self.setup_tab.current_environment_custom_text()
+                label = (custom.strip() or env) if env == "custom" else env
+                self._log_setup_change(f"environment = {label}")
+            except Exception:
+                pass
+            try:
+                mode, n_avg = (
+                    self.setup_tab.acq_mode_combo.currentText(),
+                    int(self.setup_tab.acq_navg_spin.value()),
+                )
+                self._log_setup_change(
+                    f"acquisition = {mode}, n_avg = {n_avg}")
+            except Exception:
+                pass
+            try:
+                aliases = self.setup_tab.current_aliases()
+                if aliases:
+                    desc = ", ".join(f"{k}={v}" for k, v in sorted(
+                        aliases.items()))
+                    self._log_setup_change(f"channel aliases: {desc}")
+            except Exception:
+                pass
+            try:
+                name = self.setup_tab.current_user_name()
+                email = self.setup_tab.current_user_email()
+                self._log_setup_change(
+                    f"operator = {name or '(unset)'} "
+                    f"<{email or 'no-email'}>")
+            except Exception:
+                pass
+            try:
+                subj = self.setup_tab.current_session_subject()
+                self._log_setup_change(f"session subject = {subj}")
+            except Exception:
+                pass
+        finally:
+            self._log_setup_changes = original
+
     def _on_array_changed(self, array):
+        self._log_setup_change(f"array = {self._describe_array(array)}")
         for tab in self._experiment_tabs():
             tab.set_array(array)
 
@@ -604,6 +1088,8 @@ class MainWindow(QtWidgets.QMainWindow):
         next RunnerWorker, so a toggle mid-session affects subsequent
         runs without restart.
         """
+        self._log_setup_change(
+            f"auto-export .xlsx = {'ON' if on else 'OFF'}")
         for tab in self._experiment_tabs():
             tab.set_auto_export_xlsx(on)
 
@@ -611,6 +1097,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Setup-tab plots-auto-save toggle (or format combo) changed —
         broadcast to every experiment tab so the next ``RunnerWorker``
         picks up the new (on, fmt) pair."""
+        self._log_setup_change(
+            f"auto-save plots = {'ON' if on else 'OFF'}"
+            + (f" (format = {fmt})" if on else ""))
         for tab in self._experiment_tabs():
             tab.set_auto_save_plots(on, fmt)
 
@@ -618,6 +1107,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Same forwarding shape as auto-export — every experiment tab
         caches the flag and applies it on the next RunnerWorker.
         """
+        self._log_setup_change(
+            f"email notifications = {'ON' if on else 'OFF'}")
         for tab in self._experiment_tabs():
             tab.set_email_notifications(on)
 
@@ -625,12 +1116,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """Forward the recipient name + email from the Setup tab into
         every experiment tab so the next run picks them up for the
         completion / failure email."""
+        self._log_setup_change(
+            f"operator = {name or '(unset)'} <{email or 'no-email'}>")
         for tab in self._experiment_tabs():
             tab.set_user_identity(name, email)
 
     def _on_session_subject_changed(self, subject: str):
         """Forward the raw Session text into every experiment tab so
         the email subject line matches what the user typed."""
+        self._log_setup_change(f"session subject = {subject!r}")
         for tab in self._experiment_tabs():
             tab.set_session_subject(subject)
 
@@ -639,6 +1133,9 @@ class MainWindow(QtWidgets.QMainWindow):
         experiment tab so the pre-run damage-screen modal picks up
         the right posture (info / warn / alert) for the next Start.
         """
+        _label = (custom_text.strip() or short_code
+                  if short_code == "custom" else short_code)
+        self._log_setup_change(f"environment = {_label}")
         for tab in self._experiment_tabs():
             try:
                 tab.set_environment(short_code, custom_text)
@@ -653,10 +1150,20 @@ class MainWindow(QtWidgets.QMainWindow):
         the Setup tab into every experiment tab so they can hand them
         off to the runner at start time.
         """
+        self._log_setup_change(
+            f"water-window limits = "
+            f"[{cathodic_v:+.3f}, {anodic_v:+.3f}] V, "
+            f"tolerance = {tolerance_v:.3f} V")
         for tab in self._experiment_tabs():
             tab.set_potential_limits(cathodic_v, anodic_v, tolerance_v)
 
     def _on_aliases_changed(self, aliases):
+        try:
+            desc = ", ".join(f"{k}={v}" for k, v in sorted(
+                (aliases or {}).items()))
+        except Exception:
+            desc = repr(aliases)
+        self._log_setup_change(f"channel aliases: {desc}")
         for tab in self._experiment_tabs():
             tab.set_aliases(aliases)
 
@@ -680,8 +1187,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_acq_changed(self, mode: str, n_avg: int):
         """Forward the Setup-tab acquisition selection to each experiment
         tab so the next ``_start_runner`` applies it to the scope."""
+        self._log_setup_change(
+            f"acquisition = {mode}, n_avg = {n_avg}")
         for tab in self._experiment_tabs():
             tab.set_acquisition(mode, n_avg)
+
+    def _on_trigger_source_changed(self, source: str):
+        """Forward the trigger-source toggle to each experiment tab."""
+        self._log_setup_change(f"trigger source = {source}")
+        for tab in self._experiment_tabs():
+            tab.set_trigger_source(source)
+
+    def _on_digital_trigger_changed(self, is_digital: bool):
+        """Forward the TTL-vs-I_mon trigger-type flag to each experiment tab.
+
+        Goes out in lockstep with ``_on_trigger_source_changed`` so the
+        tabs always have a coherent (source, type) pair when the next
+        run starts — without this, a stale flag would tell the runner
+        to apply I_mon polarity logic to a TTL sync line (or vice
+        versa).
+        """
+        self._log_setup_change(
+            f"trigger type = {'digital (TTL sync)' if is_digital else 'I_mon (analog edge)'}")
+        for tab in self._experiment_tabs():
+            tab.set_digital_trigger(is_digital)
+
+    # ``_on_trig_slope_changed`` was removed when the operator-facing
+    # trigger-edge selector was deleted.  Each experiment tab now
+    # resolves slope from the trigger-source rules at run start:
+    #   * digital trigger (EXT or channel-Trigger) → RISE always
+    #   * I_mon channel → RISE for anodic-first, FALL for cathodic-first
+    # See ``_BaseExperimentTab._start_runner`` for the resolution.
 
     def _on_run_state_changed(self, running: bool):
         """An experiment tab has started or finished a run.
@@ -757,6 +1293,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_save_path_changed(self, path: str):
         """Forward a save-path change from the Setup tab to every
         experiment tab so freshly-saved sessions land in the new folder."""
+        self._log_setup_change(f"save path = {path}")
         try:
             p = Path(path).expanduser()
             p.mkdir(parents=True, exist_ok=True)
@@ -795,6 +1332,7 @@ class MainWindow(QtWidgets.QMainWindow):
         it changes. Past log content under the OLD filename is left
         in place (we just stop writing to it).
         """
+        self._log_setup_change(f"log filename = {filename}")
         self.log_pane.set_log_file(self.save_dir / filename)
 
     def _on_experiment_requested(self, code: str):
@@ -803,6 +1341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tab and Test-parameters tab content WITHOUT changing the
         currently-focused tab — the user is presumably still mid-
         configuration on Setup."""
+        self._log_setup_change(f"experiment = {code}")
         self._show_experiment(code)
 
     def _on_test_params_requested(self):
@@ -814,6 +1353,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setCurrentWidget(self._test_params_tab)
         # Keep the Start / Pause / Stop button row attached to
         # whichever top-level tab the user just landed on.
+        self._refresh_button_row_placement()
+
+    def _auto_switch_to_experiment_tab(self, tab) -> None:
+        """Switch focus to the running experiment's tab when Start is clicked.
+
+        Wired to every experiment tab's ``start_btn.clicked``.  The
+        intent: the user finishes configuring on Test parameters and
+        clicks Start; the natural next step is to watch the live
+        capture, so we move them to the experiment view without
+        making them click a second tab.
+
+        Guard: only switches when the currently-focused tab is NOT
+        already the experiment tab.  Without that check, a user who
+        clicked Start while already on the experiment tab (e.g. after
+        a Stop / re-Start cycle) would briefly see the tab re-select
+        itself — visually noisy and slightly disorienting.
+
+        Best-effort: if the experiment tab isn't in the tab bar yet
+        for some reason (it should be — _show_experiment inserted it
+        the moment the experiment was picked) we just return.
+        """
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return
+        if self.tabs.currentIndex() == idx:
+            return
+        self.tabs.setCurrentIndex(idx)
+        # Re-anchor the Start / Pause / Stop button row to the new
+        # focused tab so the buttons stay in the same screen position.
         self._refresh_button_row_placement()
 
     def _show_experiment(self, code: str):
@@ -919,6 +1487,40 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_experiment(code)
             self.tabs.setCurrentWidget(self.setup_tab)
             return
+        # Admin catalog — load before setup_tab prefs so the custom
+        # entries are already in the combos when restore_prefs runs.
+        admin_prefs = prefs.get("admin", {})
+        if isinstance(admin_prefs, dict):
+            self._admin_password_hash = admin_prefs.get(
+                "password_hash", self._admin_password_hash)
+            # NOTE: extension-profile password hashes are NOT loaded
+            # here.  Extension packages own their own credential
+            # persistence (file outside the repo, env var, separate
+            # prefs key with their own namespace, etc.) and call
+            # ``register_extension_profile`` with the resolved hash
+            # at import time.  See EXTENSION_PLUGIN_DESIGN.md for the
+            # rationale (main PULSAR stays unaware of any specific
+            # extension's credentials).
+            # One-time migration: if the stored hash is the legacy
+            # default for the old ``"admin"`` password, upgrade it
+            # in place to the new factory default (``"Neuron01"``).
+            # Users who explicitly set their own password still
+            # have their custom hash and aren't touched.
+            _LEGACY_ADMIN_HASH = (
+                "8c6976e5b5410415bde908bd4dee15dfb167a9c8"
+                "73fc4bb8a81f6f2ab448a918")
+            if self._admin_password_hash == _LEGACY_ADMIN_HASH:
+                self._admin_password_hash = _DEFAULT_HASH
+            saved_catalog = admin_prefs.get("catalog", {})
+            if isinstance(saved_catalog, dict):
+                from .admin import CATALOG_KEYS as _CK
+                for k in _CK:
+                    entries = saved_catalog.get(k, [])
+                    if isinstance(entries, list):
+                        self._admin_catalog[k] = [
+                            str(e) for e in entries if str(e).strip()]
+            apply_admin_catalog(self.setup_tab, self._admin_catalog)
+
         try:
             self.setup_tab.restore_prefs(prefs.get(PREF_KEY_SETUP, {}))
         except Exception as e:
@@ -996,6 +1598,35 @@ class MainWindow(QtWidgets.QMainWindow):
         out["scale_factor"] = float(self._scale_factor)
         if hasattr(self, "_act_grid"):
             out["gridlines"] = bool(self._act_grid.isChecked())
+        # ---- Camera Monitor dock state ------------------------------
+        # ``saveState()`` records the dock-area placement (left /
+        # right / floating, plus the floating-window geometry)
+        # separately from ``saveGeometry()``, which only covers the
+        # main window itself.  Without this the dock would always
+        # re-appear at the default right-side position regardless of
+        # where the user dragged it last.
+        try:
+            out["state_b64"] = bytes(self.saveState().toBase64()).decode("ascii")
+        except Exception:
+            pass
+        # Camera dock visibility — restore the open/closed state so a
+        # user who finished a session with the dock open gets it open
+        # next launch.
+        if hasattr(self, "_act_camera"):
+            out["camera_dock_visible"] = bool(self._act_camera.isChecked())
+        # Camera connector state (selected device id).  Lives in the
+        # ConnectionPanel (always constructed at MainWindow init), so
+        # unlike the old lazy CameraPanel we can read it
+        # unconditionally.  The shared camera service's connected
+        # state is intentionally NOT persisted — re-launching
+        # shouldn't auto-open a camera the user didn't explicitly
+        # ask for this session.
+        try:
+            conn = getattr(self.conn, "camera_connector", None)
+            if conn is not None:
+                out["camera_panel"] = conn.current_prefs()
+        except Exception:
+            pass
         return out
 
     def _restore_view_prefs(self, view_prefs: dict):
@@ -1053,8 +1684,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._act_grid.setChecked(bool(view_prefs["gridlines"]))
             except Exception:
                 pass
+        # ---- Camera connector restore ------------------------------
+        # The CameraConnector lives in the ConnectionPanel and is
+        # always constructed at MainWindow __init__ (not lazy), so
+        # we can apply prefs directly without the old "pending
+        # prefs" stash.
+        cam_panel_prefs = view_prefs.get("camera_panel")
+        if isinstance(cam_panel_prefs, dict):
+            try:
+                conn = getattr(self.conn, "camera_connector", None)
+                if conn is not None:
+                    conn.restore_prefs(cam_panel_prefs)
+            except Exception:
+                pass
+        # Visibility — only auto-show the optional dock if last
+        # session left it open.  Lazy-construction is triggered by
+        # ``setChecked`` firing ``_on_view_camera_toggled``.
+        if view_prefs.get("camera_dock_visible") and hasattr(self, "_act_camera"):
+            try:
+                self._act_camera.setChecked(True)
+            except Exception:
+                pass
+        # Dock layout (positions of every QDockWidget that's been
+        # constructed so far).  Applied AFTER setChecked above so
+        # the camera dock exists when restoreState walks its name.
+        if "state_b64" in view_prefs:
+            try:
+                ba = QtCore.QByteArray.fromBase64(
+                    view_prefs["state_b64"].encode("ascii"))
+                self.restoreState(ba)
+            except Exception:
+                pass
 
     def closeEvent(self, ev):
+        # Close hardware connections before the window disappears so
+        # the stimulator and oscilloscope are left in a clean state
+        # (DLL handle released, VISA session closed).
+        for attr in ("_stim", "_scope"):
+            hw = getattr(self.conn, attr, None)
+            if hw is not None:
+                try:
+                    hw.close()
+                except Exception:
+                    pass
+
         # On close, strip user-added "custom" entries (custom
         # coatings, custom return / reference electrodes, custom
         # devices + their state) so they don't survive into the
@@ -1104,6 +1777,13 @@ class MainWindow(QtWidgets.QMainWindow):
             PREF_KEY_PS: self.ps_tab.current_prefs(),
             PREF_KEY_RESULTS: res_prefs,
             PREF_KEY_VIEW: self._collect_view_prefs(),
+            "admin": {
+                "password_hash": self._admin_password_hash,
+                # Extension-profile password hashes are NOT persisted
+                # here — extensions own their own credential storage.
+                # See EXTENSION_PLUGIN_DESIGN.md.
+                "catalog": self._admin_catalog,
+            },
         }
 
     def _apply_prefs_payload(self, payload: dict) -> None:
@@ -1420,35 +2100,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             "Single capture isn't available for this experiment.")
 
-    def _on_run_calibrate(self):
-        """Run → Calibrate — open the PlexStim test-board calibration
-        wizard. The wizard itself lives in
-        :class:`stimtest.gui.calibration.CalibrationDialog` and walks
-        the user through the test-board steps.
+    def _open_calibration_tab(self) -> "CalibrationTab":
+        """Create the Calibration tab on first use, insert it directly to
+        the right of Setup, and wire its ``doneRequested`` signal.
 
-        The live hardware handles live on :attr:`self.conn` (the
-        ConnectionPanel owns them); they're NOT stored on MainWindow.
-        An earlier version of this slot read ``getattr(self, "_stim",
-        None)`` and ``getattr(self, "_scope", None)``, which always
-        returned ``None`` — the dialog opened but its hardware gate
-        kept Run-sweep disabled even with both halves connected.
-        Source the handles from ``self.conn`` directly.
+        Idempotent — repeated presses of "Run Calibration" just switch
+        focus to the existing tab.
         """
-        try:
-            from .calibration import CalibrationDialog
-        except ImportError:
-            QtWidgets.QMessageBox.information(
-                self, "Calibration",
-                "Calibration wizard not yet bundled with this build. "
-                "Connect the PlexStim test board, run a known-current "
-                "sweep on each channel, and compare the I_mon readback "
-                "against the expected values. The wizard will automate "
-                "this in a future release.")
-            return
-        dlg = CalibrationDialog(self,
-                                stim=getattr(self.conn, "stim", None),
-                                scope=getattr(self.conn, "scope", None))
-        dlg.exec()
+        if self.cal_tab is None:
+            self.cal_tab = CalibrationTab(
+                stim=getattr(self.conn, "stim", None),
+                scope=getattr(self.conn, "scope", None))
+            # Insert at index right-after-Setup so the tab order stays
+            # Setup → Calibration → Test parameters → … even if other
+            # tabs were re-ordered earlier.
+            insert_idx = self.tabs.indexOf(self.setup_tab) + 1
+            self.tabs.insertTab(insert_idx, self.cal_tab, "Calibration")
+            self.cal_tab.doneRequested.connect(self._on_calibration_done)
+        else:
+            # Tab already exists — just refresh the handles in case the
+            # connection state changed since last use.
+            self.cal_tab.set_hardware(
+                stim=getattr(self.conn, "stim", None),
+                scope=getattr(self.conn, "scope", None))
+        return self.cal_tab
+
+    def _on_run_calibrate(self):
+        """Run → Calibrate (menu) / "Run Calibration" button (Setup tab).
+
+        Lazily instantiates the embedded :class:`CalibrationTab`, inserts
+        it after Setup, and switches focus to it.  The tab persists after
+        first creation so a subsequent press is just a tab switch.
+        """
+        cal = self._open_calibration_tab()
+        idx = self.tabs.indexOf(cal)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
 
     def _on_run_open_viewer(self):
         """Run → Open Viewer — focuses the embedded Viewer tab."""
@@ -1473,6 +2160,72 @@ class MainWindow(QtWidgets.QMainWindow):
         """Return to 100 % zoom (the user's chosen base font size
         with no scale multiplier)."""
         self._set_scale_factor(1.0)
+
+    def _ensure_camera_dock(self) -> QtWidgets.QDockWidget:
+        """Build the Camera Monitor dock + CameraStreamPane on first
+        request.
+
+        The dock is an OPTIONAL extra view of the same shared
+        :func:`camera_service`.  The PRIMARY camera UI lives in the
+        ConnectionPanel (device picker + connect) + each experiment
+        tab's embedded ``CameraStreamPane`` (preview beneath the
+        scope plot).  This dock is useful when the operator wants
+        the bench camera on a second monitor while running an
+        experiment on the main display.
+
+        Lazy-constructed: the heavy QtMultimedia / QtMultimediaWidgets
+        imports only land via ``camera_service()`` when something
+        first calls it.
+
+        The dock defaults to docked on the right side, floats with
+        Ctrl+Shift+C (set on the menu action), and survives across
+        show/hide toggles via ``QMainWindow.saveState()``.
+        """
+        if self._camera_dock is not None:
+            return self._camera_dock
+        from .camera import CameraStreamPane
+        # The dock's CameraStreamPane forces ``always_visible`` —
+        # the dock IS the always-on monitor, so hiding the preview
+        # when the camera disconnects would defeat the purpose
+        # (the user wants to see "no signal" not an empty pane).
+        pane = CameraStreamPane(parent=self, allow_snapshot_button=True)
+        pane.set_always_visible(True)
+        dock = QtWidgets.QDockWidget("Camera Monitor", self)
+        dock.setObjectName("CameraMonitorDock")  # for saveState/restoreState
+        dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        dock.setAllowedAreas(
+            QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+            | QtCore.Qt.DockWidgetArea.RightDockWidgetArea
+            | QtCore.Qt.DockWidgetArea.TopDockWidgetArea
+            | QtCore.Qt.DockWidgetArea.BottomDockWidgetArea)
+        dock.setWidget(pane)
+        # Keep the menu-action checkbox in sync when the user closes
+        # the dock via its X button (not via the menu).
+        dock.visibilityChanged.connect(
+            lambda visible: self._act_camera.setChecked(bool(visible)))
+        # Initial placement: right side.  Persisted via
+        # MainWindow.saveState() in the view-prefs round-trip.
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._camera_dock = dock
+        self._camera_stream_pane = pane
+        return dock
+
+    def _on_view_camera_toggled(self, checked: bool) -> None:
+        """Show / hide the Camera Monitor dock.  Lazy-constructs on
+        first show; subsequent toggles just flip visibility.  Does
+        NOT disconnect the camera — the shared
+        :func:`camera_service` stays connected for the
+        ConnectionPanel + experiment-tab consumers."""
+        if checked:
+            dock = self._ensure_camera_dock()
+            dock.show()
+            dock.raise_()
+        else:
+            if self._camera_dock is not None:
+                self._camera_dock.hide()
 
     def _on_view_grid_toggled(self, checked: bool) -> None:
         """Broadcast the View → Gridlines toggle to every
@@ -2203,8 +2956,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _on_help_last_calibration(self):
-        """Help → Last calibration — shows when the per-channel
-        PlexStim test-board calibration was last recorded. Reads
+        """Help → Last stimulator verification — shows when the per-channel
+        PlexStim test-board stimulator verification was last recorded. Reads
         the saved-at timestamp embedded in
         ``calibration.json`` (falling back to the file's mtime
         if the timestamp field is missing), or tells the user
@@ -2214,12 +2967,12 @@ class MainWindow(QtWidgets.QMainWindow):
         path = calibration_path()
         if ts is None:
             body = (
-                "<b>No calibration on record.</b><br><br>"
-                "The per-channel PlexStim test-board calibration "
+                "<b>No stimulator verification on record.</b><br><br>"
+                "The per-channel PlexStim test-board stimulator verification "
                 "file does not exist yet at:<br>"
                 f"<code>{path}</code><br><br>"
                 "Plug the channel array into the PlexStim test "
-                "board and open <b>Run → Calibrate…</b> to run the "
+                "board and open <b>Run → Stimulator Verification…</b> to run the "
                 "amplitude sweep that fits the per-channel gain / "
                 "offset, then save it from the wizard."
             )
@@ -2237,17 +2990,299 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 age_phrase = f"{days} days ago"
             body = (
-                f"<b>Last calibration recorded:</b><br>"
+                f"<b>Last stimulator verification recorded:</b><br>"
                 f"<code>{ts.strftime('%Y-%m-%d %H:%M:%S')}</code> "
                 f"({age_phrase})<br><br>"
                 f"File: <code>{path}</code><br><br>"
-                f"Re-run via <b>Run → Calibrate…</b> when the "
+                f"Re-run via <b>Run → Stimulator Verification…</b> when the "
                 f"PlexStim has been opened (firmware reset), the "
                 f"channel array has been swapped, or your lab's "
-                f"calibration interval has elapsed."
+                f"stimulator verification interval has elapsed."
             )
         QtWidgets.QMessageBox.information(
-            self, "Last calibration", body)
+            self, "Last stimulator verification", body)
+
+    # -------------------------------------------------------------- profile
+    def _on_admin_login(self) -> None:
+        """Admin → Log In — prompt for password (and optionally a
+        username, when an extension profile is registered) and apply
+        the resolved profile.
+
+        The dialog adapts automatically: in a default install with
+        no extensions, it's password-only (classic admin login).
+        With any extension installed, a Username field appears so
+        the operator can pick between Admin and the extension
+        profile.  Wrong credentials → "Incorrect password" message
+        (the user-facing string deliberately mentions only the Admin
+        profile — extensions are documented separately to the
+        people who need them).
+        """
+        profile_name, ok = prompt_login(
+            self,
+            admin_hash=self._admin_password_hash,
+        )
+        if not ok:
+            # Cancel and wrong-password both return (NONE, False).
+            # We err on the side of showing feedback — silent failure
+            # on a wrong password is worse UX than the occasional
+            # "Log in failed" popup after a cancel.
+            # Failure-popup wording adapts to the install state so an
+            # admin-only install (no extensions registered → no Username
+            # field shown) doesn't reference a field the operator was
+            # never asked for.  See audit finding #10.
+            from .admin import _any_extension_registered
+            if _any_extension_registered():
+                msg = ("Incorrect username or password.\n\n"
+                       "Leave Username blank (or type 'admin') and "
+                       "enter the admin password.")
+            else:
+                msg = ("Incorrect password.\n\n"
+                       "Enter the admin password to continue.")
+            QtWidgets.QMessageBox.warning(self, "Log in failed", msg)
+            return
+        self._set_profile(profile_name)
+        self.statusBar().showMessage(
+            f"Logged in as {profile_name.upper()}.", 4000)
+
+    def _on_admin_logout(self) -> None:
+        """Admin → Log Out — drop to anonymous (Profile.NONE)."""
+        prev = self._current_profile
+        self._set_profile(Profile.NONE.value)
+        if prev != Profile.NONE.value:
+            self.statusBar().showMessage(
+                f"{str(prev).upper()} logged out.", 4000)
+
+    def _set_profile(self, profile) -> None:
+        """Apply ``profile`` to the live UI.
+
+        ``profile`` may be a :class:`Profile` enum member, its string
+        value (``"admin"`` / ``"none"``), or an extension profile
+        name string (e.g., the name a collaborator package
+        registered).  Internally we always store the lowercase
+        string form so comparisons against either built-in or
+        extension names work uniformly.
+        """
+        # Normalize to lowercase string form.  Profile is a str-enum
+        # so ``Profile.ADMIN.value == "admin"`` — both members and
+        # raw strings collapse to the same shape.
+        try:
+            name = (profile.value
+                    if hasattr(profile, "value")
+                    else str(profile)).strip().lower()
+        except Exception:
+            name = Profile.NONE.value
+        self._current_profile = name
+        # Menu visibility — Log In shows when logged out, Log Out
+        # shows when logged in (any profile, built-in or extension).
+        # Catalog editor is ADMIN-only because it can also change the
+        # admin password.
+        logged_in = (name != Profile.NONE.value)
+        self._act_admin_login.setVisible(not logged_in)
+        self._act_admin_logout.setVisible(logged_in)
+        self._act_admin_catalog.setEnabled(is_admin(name))
+        # Broadcast to every PatternPanel in every experiment tab so
+        # the asymmetric / symmetric shape dropdowns add / remove the
+        # restricted entries.  Best-effort: a stale tab that doesn't
+        # expose ``pattern_panel`` (e.g. a test stub) is silently
+        # skipped.
+        for tab in self._experiment_tabs():
+            pp = getattr(tab, "pattern_panel", None)
+            if pp is None:
+                continue
+            try:
+                pp.set_profile(name)
+            except Exception as _e:
+                self.log_pane.log(
+                    f"Profile broadcast to {type(tab).__name__} failed: "
+                    f"{type(_e).__name__}: {_e}")
+
+    # ---------------------------------------------------- extensions
+    def _load_extensions(self) -> None:
+        """Auto-discover and import installed ``stimtest_*``
+        extension packages.
+
+        VS Code-style plugin model: any top-level package whose
+        ``__name__`` starts with ``stimtest_`` and lives on the
+        active Python path is imported here.  The package's
+        ``__init__.py`` is expected to call
+        :func:`stimtest.gui.admin.register_extension_profile` (and
+        any other future registration hooks PULSAR exposes) at
+        import time, which is when its profile + restricted shape
+        set become live.
+
+        After all discovery completes, every PatternPanel is asked
+        to re-apply the current profile so it sees any newly-
+        registered restricted shapes.  Without this re-broadcast,
+        a CWRU operator launching PULSAR with the extension already
+        installed would still see the public shape list until they
+        logged in (because PatternPanel built its filter set
+        BEFORE the extension registered its shapes).
+
+        Best-effort:
+
+        * No extensions found → silent (this is the public-default
+          install, not an error).
+        * One extension raises at import → the failure is logged
+          with the package name; remaining extensions still load.
+        * The whole loader fails (e.g. ``pkgutil`` raises) → the
+          caller in ``__init__`` logs it; PULSAR still launches
+          with built-in profiles only.
+
+        Extensions discovered via ``importlib.metadata.distributions``
+        which sees BOTH wheel-installed packages AND editable
+        installs (PEP 660 finder-based, where pkgutil.iter_modules
+        misses them).  ``stimtest_cwru`` is the canonical example;
+        ``stimtest_*`` namespacing reserves the prefix for first-
+        party + invited-collaborator extensions.
+        """
+        import importlib
+        import importlib.metadata as _md
+
+        # ``distributions()`` enumerates every installed
+        # distribution Python's metadata API can see — that's the
+        # union of site-packages installs, --user installs, and
+        # editable installs (via the .dist-info / .egg-info
+        # generated by pip).  Filter by Distribution Name (the
+        # ``[project] name`` from pyproject.toml) so an unrelated
+        # package with a ``stimtest_*`` module file but a
+        # different distribution name doesn't trip us.
+        found: list[str] = []
+        failed: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for _dist in _md.distributions():
+            try:
+                name = (_dist.metadata.get("Name") or "").strip()
+            except Exception:
+                continue
+            # Case-insensitive prefix check — PEP 503 says distribution
+            # names are normalized lowercase for indexing, but the
+            # ``Name:`` metadata field PRESERVES the case the package
+            # author wrote in pyproject.toml.  Empirically ``PyQt6``,
+            # ``Markdown``, ``PyVISA-py`` all return mixed case here,
+            # so an extension pyproject with ``name = "Stimtest_Lab"``
+            # would be silently skipped under a case-sensitive match.
+            # Lowercasing the comparison closes that hole.
+            if not name or not name.lower().startswith("stimtest_"):
+                continue
+            # Distribution names use hyphens (``stimtest-cwru``)
+            # while the actual import name uses underscores
+            # (``stimtest_cwru``) — PEP 503 normalization.  We
+            # always import via the underscore form, and use the
+            # lowercased name so a ``Stimtest-Lab`` distribution
+            # imports as ``stimtest_lab`` (matches what
+            # ``register_extension_profile`` will see at registration
+            # — it also lowercases internally).
+            mod_name = name.lower().replace("-", "_")
+            # De-dup defensively (multiple .dist-info dirs for the
+            # same package can happen in messy environments).
+            if mod_name in seen:
+                continue
+            seen.add(mod_name)
+            # Never auto-load ourselves (defensive — main package
+            # is "stimtest", no underscore, won't match the prefix
+            # gate above, but kept for clarity).
+            if mod_name == "stimtest":
+                continue
+            # Capture log records emitted by the extension's import-
+            # time side effects so warnings like "registration failed
+            # with ValueError" (per ``stimtest_cwru.__init__`` line
+            # 71's ``_log.warning(...)``) end up in PULSAR's LogPane
+            # instead of stderr where the operator never looks.  See
+            # audit finding #11.  We attach a temporary
+            # ``logging.Handler`` scoped to JUST this import, drop it
+            # in a ``finally``, then replay every captured record into
+            # the LogPane.
+            import logging
+            log_records: list = []
+            class _CaptureHandler(logging.Handler):
+                def emit(self_h, record):
+                    log_records.append(record)
+            _h = _CaptureHandler(level=logging.WARNING)
+            _ext_logger = logging.getLogger(mod_name)
+            _ext_logger.addHandler(_h)
+            # Make sure WARNING-and-up actually propagate to our
+            # handler — most extensions won't have set a level.
+            _prev_level = _ext_logger.level
+            if _prev_level > logging.WARNING or _prev_level == logging.NOTSET:
+                _ext_logger.setLevel(logging.WARNING)
+            try:
+                importlib.import_module(mod_name)
+                found.append(mod_name)
+            except Exception as _e:
+                failed.append((mod_name, f"{type(_e).__name__}: {_e}"))
+            finally:
+                _ext_logger.removeHandler(_h)
+                _ext_logger.setLevel(_prev_level)
+            # Replay captured warnings into the LogPane.  Format the
+            # level + message but skip the noisy module path / line —
+            # the operator sees ``[ext warn] stimtest_cwru: …`` which
+            # is enough to act on.
+            for rec in log_records:
+                try:
+                    msg = rec.getMessage()
+                except Exception:
+                    msg = str(rec.msg)
+                self.log_pane.log(
+                    f"[ext {rec.levelname.lower()}] {mod_name}: {msg}")
+
+        if found:
+            self.log_pane.log(
+                f"Extensions loaded: {', '.join(sorted(found))}")
+        for fname, ferr in failed:
+            self.log_pane.log(
+                f"Extension '{fname}' failed to load: {ferr}")
+
+        # Re-broadcast the current profile so any pattern panels
+        # built before extensions registered now see the full
+        # restricted-shape set.  This is the bit that makes the
+        # CWRU operator's launch experience seamless: they don't
+        # have to log out + back in to see the extension's shapes
+        # become AVAILABLE — they only need to log in once to
+        # UNLOCK them.
+        if found:
+            self._set_profile(self._current_profile)
+
+    def _on_admin_catalog(self) -> None:
+        """Admin → Manage Custom Catalog — add / remove combo entries.
+        ADMIN profile only (extension profiles do not get catalog
+        access)."""
+        if not is_admin(self._current_profile):
+            return
+        dlg = AdminCatalogDialog(
+            self,
+            catalog=self._admin_catalog,
+            current_hash=self._admin_password_hash,
+        )
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        new_catalog = dlg.catalog()
+        new_hash = dlg.new_password_hash()
+
+        # Sync additions and removals to the live Setup tab.
+        for key in CATALOG_KEYS:
+            old_entries = set(self._admin_catalog.get(key, []))
+            new_entries = set(new_catalog.get(key, []))
+            # Additions — inject into combo.
+            added = new_entries - old_entries
+            if added:
+                apply_admin_catalog(
+                    self.setup_tab,
+                    {key: sorted(added)})
+            # Removals — pull out of combo.
+            removed = old_entries - new_entries
+            from .admin import remove_from_admin_catalog
+            for name in removed:
+                remove_from_admin_catalog(
+                    self.setup_tab, self._admin_catalog, key, name)
+
+        self._admin_catalog = new_catalog
+        self._admin_password_hash = new_hash
+        # Persist immediately so changes survive a crash.
+        try:
+            save_prefs(self._collect_prefs_payload())
+        except Exception:
+            pass
+        self.statusBar().showMessage("Admin catalog saved.", 4000)
 
     def _on_help_about(self):
         """Help → About — small modal with version + credits."""

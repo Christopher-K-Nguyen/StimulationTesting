@@ -39,6 +39,32 @@ from ..config import (
     STIM_MAX_AMPLITUDE_UA,
     STIM_TIME_RESOLUTION_US,
 )
+def _safe_set_spinbox_value(spinbox, value) -> None:
+    """Best-effort ``spinbox.setValue(...)`` that swallows
+    ``TypeError`` / ``ValueError`` from a malformed prefs entry.
+
+    Detects whether the target is an integer spinbox (``QSpinBox``)
+    or a double spinbox (``QDoubleSpinBox``) and casts the input
+    accordingly — ``QSpinBox.setValue`` requires ``int`` and would
+    silently no-op (raise TypeError caught here) if handed a float.
+
+    Previously this pattern was hand-inlined ~13× across this file
+    (and 4× in setup_tab.py) as
+    ``try: sp.setValue(float(v)); except (TypeError, ValueError): pass``.
+    A single helper makes the intent obvious — "restore this prefs
+    value into this widget; if it doesn't parse, leave the widget
+    at its current value" — and centralises any future logging or
+    debug-traceback the team wants to add.
+    """
+    try:
+        if isinstance(spinbox, QtWidgets.QSpinBox):
+            spinbox.setValue(int(float(value)))
+        else:
+            spinbox.setValue(float(value))
+    except (TypeError, ValueError):
+        pass
+
+
 from ..waveforms import (
     Phase, PulsePattern, shape_breakpoints,
     SHAPE_RECTANGULAR, SHAPE_LINEAR_INCREASING, SHAPE_LINEAR_DECREASING,
@@ -142,8 +168,6 @@ SYMMETRIC_BIPHASIC_SHAPES = (
     ("Linear decreasing → increasing", "linear_dec_inc"),
     ("Sinusoidal",        SHAPE_SINUSOIDAL),
     ("Speedbumps",        SHAPE_SPEEDBUMPS),
-    ("Bowtie",            SHAPE_BOWTIE),
-    ("Halfpipe",          SHAPE_HALFPIPE),
     # Sahin & Tie (2007) compared 7 monophasic waveforms for
     # neural stimulation efficiency through practical (TiN /
     # IrOx) electrodes; ExpDec, LinDec, and Gaussian were the
@@ -161,6 +185,13 @@ SYMMETRIC_BIPHASIC_SHAPES = (
     ("Exponential decreasing", SHAPE_EXP_DECAY),
     ("Exponential increasing → decreasing", "exp_inc_dec"),
     ("Exponential decreasing → increasing", "exp_dec_inc"),
+    # Bowtie and Halfpipe are the two "exotic" symmetric shapes
+    # — kept available but moved to the bottom of the dropdown
+    # since they're rarely the right answer for routine neural
+    # stim and clutter the list above where the commonly-used
+    # waveforms live.
+    ("Bowtie",            SHAPE_BOWTIE),
+    ("Halfpipe",          SHAPE_HALFPIPE),
 )
 #: Symmetric-mode shape ids whose two phases use DIFFERENT shapes.
 #: The standard symmetric path uses ``PulsePattern.biphasic`` which
@@ -684,6 +715,17 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Current rate-spinbox unit. Default = pps to match prior
         # behaviour and what the runner / hardware see at the boundary.
         self._rate_unit: str = self.UNIT_PPS
+        # ---- Login profile (gates restricted shapes) ----------------
+        # Starts as ANONYMOUS (Profile.NONE) so the panel populates
+        # its shape dropdowns WITHOUT the gated entries.  MainWindow
+        # calls :meth:`set_profile` after a successful profile login
+        # to unlock the restricted shapes (halfpipe, bowtie,
+        # speedbumps) — see :mod:`stimtest.gui.admin` for the gate
+        # function ``is_restricted_unlocked``.  Stored as the string
+        # value of :class:`stimtest.gui.admin.Profile` so the
+        # comparison works whether callers pass the enum or the raw
+        # string from prefs.
+        self._current_profile: str = "none"
 
         # ------ top row: phase count + symmetry + polarity ------
         # Pulse-style dropdown — same icon + HTML-tooltip treatment
@@ -783,7 +825,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # so we don't re-render every time the user wiggles the mouse
         # over the combobox.
         self._shape_tooltip_html: dict = {}
-        for label, shape_id in SYMMETRIC_BIPHASIC_SHAPES:
+        # Filter out profile-restricted shapes (halfpipe, bowtie,
+        # speedbumps) when the current profile lacks access.  See
+        # :meth:`_filter_restricted_shapes` for the gate logic.
+        for label, shape_id in self._filter_restricted_shapes(
+                SYMMETRIC_BIPHASIC_SHAPES):
             icon_pm = _render_shape_pixmap(shape_id, w_px=80, h_px=28)
             self.shape_combo.addItem(QtGui.QIcon(icon_pm), label,
                                      userData=shape_id)
@@ -1122,7 +1168,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         self.rate_unit_combo.setToolTip(
             "Display unit for the rate spinbox. ``pps`` shows pulses-"
             "per-second; ``ms`` shows the equivalent period in "
-            "milliseconds. The underlying rate (Hz) is preserved "
+            "milliseconds. The underlying rate (pps) is preserved "
             "when you toggle between units.")
         self.rate_unit_combo.currentTextChanged.connect(self._on_rate_unit_changed)
 
@@ -1431,7 +1477,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             # visualise the per-phase choice without flipping
             # through the dropdown blind.
             cb.setIconSize(QtCore.QSize(60, 24))
-            for label, sid in _MIX_MATCH_SHAPES:
+            # Filter out profile-restricted shapes (halfpipe, bowtie,
+            # speedbumps) for the per-phase mix-and-match dropdown
+            # too — same gate as the symmetric combo above.
+            for label, sid in self._filter_restricted_shapes(
+                    _MIX_MATCH_SHAPES):
                 # Render a SINGLE-PHASE preview (not the
                 # cathodic+anodic biphasic that
                 # ``_render_shape_pixmap`` produces) so each
@@ -1629,11 +1679,25 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # panel doesn't accumulate empty-row gaps.
         delays.setVerticalSpacing(0)
 
+        # Toggles are LEFT-anchored: each delay-row checkbox sits
+        # immediately after the row label, before the spinbox.  The
+        # three checkboxes share the same x-coordinate because they
+        # all occupy the first slot of each row's field area.  The
+        # rate row's unit combo (Hz / kHz / period) still follows
+        # the spinbox on the right.
+        rate_row = QtWidgets.QHBoxLayout()
+        rate_row.setContentsMargins(0, 0, 0, 0)
+        rate_row.setSpacing(4)
+        rate_row.addWidget(self.interpulse_check)
+        rate_row.addWidget(self.rate_pps, stretch=1)
+        rate_row.addWidget(self.rate_unit_combo)
+        rate_w = QtWidgets.QWidget(); rate_w.setLayout(rate_row)
+
         iph_row = QtWidgets.QHBoxLayout()
         iph_row.setContentsMargins(0, 0, 0, 0)
         iph_row.setSpacing(4)
-        iph_row.addWidget(self.interphase_us, stretch=1)
         iph_row.addWidget(self.interphase_check)
+        iph_row.addWidget(self.interphase_us, stretch=1)
         iph_w = QtWidgets.QWidget(); iph_w.setLayout(iph_row)
         delays.addRow(rich.field_label("Interphase delay", rich.T_IPH, rich.US),
                       iph_w)
@@ -1641,19 +1705,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         dd_row = QtWidgets.QHBoxLayout()
         dd_row.setContentsMargins(0, 0, 0, 0)
         dd_row.setSpacing(4)
-        dd_row.addWidget(self.discharge_us, stretch=1)
         dd_row.addWidget(self.discharge_check)
+        dd_row.addWidget(self.discharge_us, stretch=1)
         dd_w = QtWidgets.QWidget(); dd_w.setLayout(dd_row)
         delays.addRow(rich.field_label("Discharge delay", rich.T_DD, rich.US),
                       dd_w)
-
-        rate_row = QtWidgets.QHBoxLayout()
-        rate_row.setContentsMargins(0, 0, 0, 0)
-        rate_row.setSpacing(4)
-        rate_row.addWidget(self.rate_pps, stretch=1)
-        rate_row.addWidget(self.rate_unit_combo)
-        rate_row.addWidget(self.interpulse_check)
-        rate_w = QtWidgets.QWidget(); rate_w.setLayout(rate_row)
         # Row label flips between "Pulse rate (f_stim)" and
         # "Pulse period (T_pulse)" when the user toggles the unit
         # combo. We construct the QLabel by hand (rather than
@@ -3989,13 +4045,13 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                     max_period_str = f"{max_period_s:.1f}&nbsp;s"
                 else:
                     max_period_str = f"{max_period_us:.0f}&nbsp;µs"
-                # Format the rate range. Show in Hz / kHz
+                # Format the rate range. Show in kpps / pps
                 # depending on magnitude.
                 if max_rate_hz >= 1000:
-                    max_rate_str = f"{max_rate_hz*1e-3:.2f}&nbsp;kHz"
+                    max_rate_str = f"{max_rate_hz*1e-3:.2f}&nbsp;kpps"
                 else:
-                    max_rate_str = f"{max_rate_hz:.1f}&nbsp;Hz"
-                min_rate_str = f"{min_rate_hz:.3f}&nbsp;Hz"
+                    max_rate_str = f"{max_rate_hz:.1f}&nbsp;pps"
+                min_rate_str = f"{min_rate_hz:.3f}&nbsp;pps"
                 gap_note = (
                     "5&nbsp;µs interpulse gap" if interpulse_on
                     else "no interpulse gap (toggle is OFF)")
@@ -4010,9 +4066,9 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                     f"({total_us:.1f}&nbsp;µs) + {gap_note}; "
                     f"max rate is its reciprocal. "
                     f"Hardware floor = "
-                    f"{self.RATE_HZ_MIN:.3f}&nbsp;Hz; "
+                    f"{self.RATE_HZ_MIN:.3f}&nbsp;pps; "
                     f"ceiling = "
-                    f"{self.RATE_HZ_MAX*1e-3:.0f}&nbsp;kHz."
+                    f"{self.RATE_HZ_MAX*1e-3:.0f}&nbsp;kpps."
                     f"</span>")
         elif shape_id == ASYM_SHAPE_MIX_MATCH:
             # Mix-and-match — bounds depend on each phase's shape
@@ -4203,6 +4259,143 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         finally:
             self.phase_width[1].blockSignals(False)
 
+    # ----------------------------------------------------------- profile gating
+    def _filter_restricted_shapes(self, shapes):
+        """Return ``shapes`` with profile-restricted entries removed
+        when the current profile lacks access.
+
+        ``shapes`` is an iterable of ``(label, shape_id)`` tuples
+        (the same shape the SYMMETRIC_BIPHASIC_SHAPES /
+        _MIX_MATCH_SHAPES constants use).  The restricted set is
+        ``stimtest.gui.admin.RESTRICTED_SHAPES``, which extension
+        packages populate at import time via
+        ``register_extension_profile``.  Built-in admin sees
+        everything; anonymous sees only the non-restricted base set.
+
+        ``self._current_profile`` is a lowercase string ("none",
+        "admin", or an extension-registered name like a
+        collaborator package's tag).  We pass it directly to
+        ``is_restricted_unlocked`` — that helper handles the
+        built-in + extension-registered name lookup uniformly.
+        """
+        try:
+            from .admin import (RESTRICTED_SHAPES,
+                                is_restricted_unlocked)
+            if is_restricted_unlocked(self._current_profile):
+                return tuple(shapes)
+            return tuple(
+                (label, sid) for (label, sid) in shapes
+                if sid not in RESTRICTED_SHAPES)
+        except Exception:
+            # Defensive: if the admin module fails to import (very
+            # early in startup, or a stripped test env), fall back
+            # to showing all shapes so the panel remains functional.
+            return tuple(shapes)
+
+    def set_profile(self, profile) -> None:
+        """Update the panel's login profile and rebuild the shape
+        dropdowns to add / remove the restricted entries.
+
+        ``profile`` may be a :class:`stimtest.gui.admin.Profile` enum
+        member, its string-value equivalent (the str-enum's
+        ``.value``), or any extension-registered profile name string.
+
+        A re-broadcast of the SAME profile name still triggers a
+        rebuild — main_window calls this after auto-loading
+        extensions so any newly-registered restricted shapes
+        appear (or disappear) in the dropdowns.  The rebuild cost
+        is trivial (a few combo box rows) so we don't bother with
+        an early-return optimization.
+
+        When a restricted shape is currently selected and the new
+        profile loses access to it, the combo falls back to
+        Rectangular and emits ``patternChanged`` so downstream
+        widgets pick up the new pattern.
+        """
+        # Normalize input to the lowercase string form we store
+        # internally.  Profile is a str-enum so members and raw
+        # strings collapse to the same shape.
+        try:
+            new_profile = (profile.value
+                           if hasattr(profile, "value")
+                           else str(profile)).strip().lower()
+        except Exception:
+            new_profile = "none"
+        self._current_profile = new_profile
+        # Rebuild the symmetric biphasic shape combo, preserving
+        # the user's current selection if still legal.
+        self._rebuild_shape_combo(self.shape_combo, SYMMETRIC_BIPHASIC_SHAPES,
+                                  preview_renderer=_render_shape_pixmap)
+        # Rebuild each mix-and-match per-phase combo too.  These
+        # exist only in asymmetric mode; the loop guard handles the
+        # symmetric-mode (no list) case.
+        if getattr(self, "mix_phase_shape_combo", None):
+            # Inline copy of the _MIX_MATCH_SHAPES list — kept in
+            # sync with the one in the constructor's asym block.
+            _MIX = (
+                ("Rectangular",       SHAPE_RECTANGULAR),
+                ("Linear increasing", SHAPE_LINEAR_INCREASING),
+                ("Linear decreasing", SHAPE_LINEAR_DECREASING),
+                ("Sinusoidal",        SHAPE_SINUSOIDAL),
+                ("Speedbumps",        SHAPE_SPEEDBUMPS),
+                ("Bowtie",            SHAPE_BOWTIE),
+                ("Halfpipe",          SHAPE_HALFPIPE),
+                ("Gaussian",          SHAPE_GAUSSIAN),
+                ("Exp decreasing",    SHAPE_EXP_DECAY),
+                ("Exp increasing",    SHAPE_EXP_INCREASING),
+            )
+            cath_first = self.polarity.currentText().startswith("Cathodic")
+            phase_signs = (-1, +1) if cath_first else (+1, -1)
+            for i, cb in enumerate(self.mix_phase_shape_combo):
+                self._rebuild_shape_combo(
+                    cb, _MIX,
+                    preview_renderer=lambda sid, w_px, h_px, _p=phase_signs[i]:
+                        _render_single_phase_pixmap(
+                            sid, w_px=w_px, h_px=h_px, polarity=_p))
+
+    def _rebuild_shape_combo(self, combo, shape_tuple,
+                             *, preview_renderer) -> None:
+        """Repopulate ``combo`` with the filtered shape list.
+
+        Preserves the user's currently-selected shape if still
+        legal after the filter.  Otherwise falls back to the first
+        legal entry (always Rectangular by construction).
+        """
+        if combo is None:
+            return
+        prev_sid = combo.currentData()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            filtered = self._filter_restricted_shapes(shape_tuple)
+            for label, sid in filtered:
+                try:
+                    icon_pm = preview_renderer(sid, 80, 28)
+                    combo.addItem(QtGui.QIcon(icon_pm), label, userData=sid)
+                except Exception:
+                    combo.addItem(label, userData=sid)
+            # Restore prior selection if still legal.
+            restored = False
+            for i in range(combo.count()):
+                if combo.itemData(i) == prev_sid:
+                    combo.setCurrentIndex(i)
+                    restored = True
+                    break
+            if not restored:
+                # Previously-selected shape is now hidden — fall
+                # back to Rectangular (index 0 by construction).
+                combo.setCurrentIndex(0)
+        finally:
+            combo.blockSignals(False)
+        # Re-emit patternChanged if the selection actually changed,
+        # so downstream preview / runner state catches up.
+        new_sid = combo.currentData()
+        if new_sid != prev_sid:
+            try:
+                self.patternChanged.emit(self.pattern())
+            except Exception:
+                pass
+
     # ----------------------------------------------------------- prefs
     def current_prefs(self) -> dict:
         return {
@@ -4292,8 +4485,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                         ("interphase_us", self.interphase_us),
                         ("discharge_us", self.discharge_us)):
             if key in p:
-                try: sp.setValue(float(p[key]))
-                except (TypeError, ValueError): pass
+                _safe_set_spinbox_value(sp, p[key])
         # Rate / unit — accept both new (rate_hz + rate_unit) and the
         # legacy ``rate_pps`` key (which was always Hz under the hood).
         if "rate_unit" in p and p["rate_unit"] in self.RATE_UNIT_CHOICES:
@@ -4310,16 +4502,13 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             except (TypeError, ValueError): pass
         if "ratio" in p and isinstance(p["ratio"], (list, tuple)):
             for sp, v in zip(self.ratio_spins, p["ratio"]):
-                try: sp.setValue(float(v))
-                except (TypeError, ValueError): pass
+                _safe_set_spinbox_value(sp, v)
         if "phase_amp" in p and isinstance(p["phase_amp"], (list, tuple)):
             for sp, v in zip(self.phase_amp, p["phase_amp"]):
-                try: sp.setValue(float(v))
-                except (TypeError, ValueError): pass
+                _safe_set_spinbox_value(sp, v)
         if "phase_width" in p and isinstance(p["phase_width"], (list, tuple)):
             for sp, v in zip(self.phase_width, p["phase_width"]):
-                try: sp.setValue(float(v))
-                except (TypeError, ValueError): pass
+                _safe_set_spinbox_value(sp, v)
         if "charge_mode" in p: self.charge_mode.setCurrentText(p["charge_mode"])
         # Delay-shortcut checkboxes. New keys ("interphase_on" /
         # "interpulse_on") are the inverse of the legacy keys
@@ -4340,11 +4529,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # is right when the table is repopulated.
         if "arb_mode" in p: self.arb_mode.setCurrentText(p["arb_mode"])
         if "arb_n_rows" in p:
-            try: self.arb_n_rows.setValue(int(p["arb_n_rows"]))
-            except (TypeError, ValueError): pass
+            # Int spinbox — helper does float() then setValue;
+            # QSpinBox.setValue accepts float and truncates.
+            _safe_set_spinbox_value(self.arb_n_rows, p["arb_n_rows"])
         if "arb_period_us" in p:
-            try: self.arb_period_us.setValue(float(p["arb_period_us"]))
-            except (TypeError, ValueError): pass
+            _safe_set_spinbox_value(self.arb_period_us,
+                                    p["arb_period_us"])
         if isinstance(p.get("arb_table"), list):
             self._load_arb_table(p["arb_table"])
         # Phase shape selectors — match by userData so a label-text
@@ -4421,11 +4611,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # these keys keep the panel's defaults.
         _select_by_data(self.tau_mode_combo, p.get("cap_tau_mode"))
         if "cap_tau_us" in p:
-            try: self.tau_us.setValue(float(p["cap_tau_us"]))
-            except (TypeError, ValueError): pass
+            _safe_set_spinbox_value(self.tau_us, p["cap_tau_us"])
         if "bump_count" in p:
-            try: self.bump_count.setValue(int(p["bump_count"]))
-            except (TypeError, ValueError): pass
+            # bump_count is an int spinbox — wrap via float() in
+            # the helper, the spinbox truncates if needed.
+            _safe_set_spinbox_value(self.bump_count, p["bump_count"])
         # ``charge_per_phase`` / ``charge_lock`` keys from older prefs
         # files are silently ignored — the Q_ph lock UI now lives in
         # the VT tab and persists there. Pre-existing pulse parameters

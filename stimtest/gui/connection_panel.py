@@ -9,7 +9,7 @@ Layout:
     ●  Oscilloscope: Tektronix TBS2204B  ·  USB::…::INSTR
        VISA resource: [______________]
        [ Connect ] [ Disconnect ]
-       [ Run Calibration ]  Last calibrated: 2026-05-11 14:32
+       [ Run Stimulator Verification ]  Last verified: 2026-05-11 14:32
 
 Both halves now have explicit Initialize/Close (or Connect/Disconnect)
 buttons — the stimulator no longer auto-opens at startup so the user
@@ -56,6 +56,133 @@ _DOT_WARN = "#fb8c00"   # amber (sim mode)
 _DOT_OFF  = "#9e9e9e"   # grey
 
 
+def _scan_scope_probes(scope) -> list:
+    """Query every channel's probe info, return the list of channels
+    that report a real probe (not a plain BNC cable).
+
+    Each entry is a ``(channel_name, type_token, gain)`` tuple, e.g.
+    ``("CH4", "10X", 0.1)``.  Empty list when every input looks like
+    direct BNC.  Silent on any per-channel query failure so a
+    partially-responsive scope still returns whatever it can answer.
+    """
+    out = []
+    if scope is None:
+        return out
+    info = getattr(scope, "info", None)
+    n_ch = int(getattr(info, "n_channels", 4) or 4)
+    probe_info_fn = getattr(scope, "probe_info", None)
+    if not callable(probe_info_fn):
+        return out
+    for i in range(1, n_ch + 1):
+        ch = f"CH{i}"
+        try:
+            pinfo = probe_info_fn(ch) or {}
+        except Exception:
+            continue
+        if pinfo.get("is_probe"):
+            out.append((
+                ch,
+                str(pinfo.get("type") or "?"),
+                float(pinfo.get("gain", 1.0)),
+            ))
+    return out
+
+
+class _ProbeVerifyDialog(QtWidgets.QDialog):
+    """Modal that asks the operator to swap probes for plain BNC and
+    re-checks on demand.  Closes automatically when no probes remain.
+
+    Loops until either (a) every channel reports a plain BNC cable —
+    the dialog auto-accepts — or (b) the operator clicks *Skip* to
+    proceed with probes attached (logged as a warning by the caller).
+    """
+
+    def __init__(self, scope, *, parent=None):
+        super().__init__(parent)
+        self._scope = scope
+        self.setWindowTitle("Probe attached on oscilloscope")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self._intro = QtWidgets.QLabel(
+            "<p>The oscilloscope reports a probe attached on one or "
+            "more inputs.  This bench expects <b>plain BNC → BNC "
+            "cables</b> on every channel — an attenuating probe will "
+            "make the displayed volts disagree with the BNC-tip "
+            "voltage once the driver forces <tt>PRObe:GAIN 1</tt>.</p>"
+            "<p>Swap the affected cables to plain BNC, then click "
+            "<b>Re-check</b>.</p>")
+        self._intro.setWordWrap(True)
+        self._intro.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        layout.addWidget(self._intro)
+
+        self._list = QtWidgets.QLabel("")
+        self._list.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._list.setStyleSheet(
+            "QLabel { background: #fff3e0; padding: 8px; "
+            "border: 1px solid #fb8c00; border-radius: 4px; }")
+        layout.addWidget(self._list)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_recheck = QtWidgets.QPushButton("Re-check")
+        self._btn_recheck.setDefault(True)
+        self._btn_recheck.clicked.connect(self._on_recheck)
+        self._btn_skip = QtWidgets.QPushButton("Skip — proceed with probes")
+        self._btn_skip.clicked.connect(self.reject)
+        btn_row.addWidget(self._btn_recheck)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._btn_skip)
+        layout.addLayout(btn_row)
+
+        # Track every re-check outcome so the caller can summarise in
+        # the log: e.g. "verified after 3 re-checks" or "skipped with
+        # CH3 still attached".
+        self.recheck_count: int = 0
+        self.final_attached: list = []
+        self._refresh_list(initial=True)
+
+    def _refresh_list(self, *, initial: bool = False) -> None:
+        attached = _scan_scope_probes(self._scope)
+        self.final_attached = attached
+        if not attached:
+            html = ("<b style='color:#388e3c;'>All inputs now look like "
+                    "plain BNC.</b><br>The dialog will close "
+                    "automatically.")
+            self._list.setText(html)
+            # Defer accept() one event-loop tick so the user sees the
+            # green confirmation before the dialog disappears.
+            QtCore.QTimer.singleShot(400, self.accept)
+            return
+        rows = "".join(
+            f"<li><b>{ch}</b> — type=<tt>{tok}</tt>, "
+            f"gain=<tt>{gain:g}</tt></li>"
+            for ch, tok, gain in attached
+        )
+        prefix = "" if initial else "Still detected:<br>"
+        self._list.setText(prefix + f"<ul style='margin:0;'>{rows}</ul>")
+
+    def _on_recheck(self) -> None:
+        self.recheck_count += 1
+        self._refresh_list()
+
+
+def _serial_has_saved_calibration(serial_number: str) -> bool:
+    """Return True iff the on-disk calibration.json was written for
+    *serial_number*.  Used by :meth:`ConnectionPanel._do_init_stim` to
+    suppress the "Unverified stimulator" warning when a calibration
+    payload exists even though the prefs scaling map doesn't have an
+    entry yet (e.g. saved on a prior install / by a teammate).
+    """
+    if not serial_number:
+        return False
+    try:
+        from ..readback_calibration import load_calibration
+        cal = load_calibration(stim_serial=serial_number)
+        return cal is not None and bool(cal.channels)
+    except Exception:
+        return False
+
+
 class ConnectionPanel(QtWidgets.QGroupBox):
     """Stimulator (auto-attached, indicator-only) + oscilloscope (Connect/Disconnect)."""
 
@@ -73,14 +200,28 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     # so it can blank out the channel-mapping rows when no scope is up.
     scopeConnected = QtCore.pyqtSignal(bool)
     log = QtCore.pyqtSignal(str)
+    # Fires when the user clicks "Run Stimulator Verification". The main
+    # window catches it and switches to the embedded Calibration tab — the
+    # calibration flow no longer opens a modal dialog.
+    calibrationRequested = QtCore.pyqtSignal()
+
+    # ---- bias-module facade signals --------------------------------
+    # ConnectionPanel is the single owner of the bias driver (per the
+    # user's "Single shared driver, but owned by MainWindow" choice).
+    # Per-tab BiasConnector widgets in each experiment's Test Parameters
+    # delegate to ``open_bias_module`` / ``close_bias_module`` below and
+    # subscribe to these signals to mirror state.  ``self.bias`` is the
+    # live driver attribute, ``None`` when not connected.
+    biasConnected = QtCore.pyqtSignal(object)   # payload: BiasModuleInfo
+    biasDisconnected = QtCore.pyqtSignal()
 
     # Scaling presets exposed in the dropdown. The "auto" preset
     # picks Default vs NIL based on the substring match against the
     # device's serial number that PlexonStimulator already uses; the
     # other two override the auto-detection.
     SCALE_AUTO    = "Auto-detect"
-    SCALE_DEFAULT = "Default (PlexStim 2.0)"
-    SCALE_NIL     = "NIL"
+    SCALE_DEFAULT = "Default (PlexStim 2.0) (V_mon 0.25 V/V · I_mon 2.5 mV/µA)"
+    SCALE_NIL     = "NIL (V_mon 1.0 V/V · I_mon 1.0 mV/µA)"
 
     def __init__(self, simulate_default: bool = True, parent=None):
         super().__init__("Hardware", parent)
@@ -151,14 +292,14 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             "<b>Auto-detect</b> — pick from serial-number "
             "match against the known NIL-class list, falling "
             "back to Default. Safe initial choice; the "
-            "calibration wizard tightens this into a verified "
+            "stimulator verification tightens this into a verified "
             "entry.<br>"
             "<b>Default (PlexStim 2.0)</b> — 0.25 V/V V_mon, "
             "2.5 mV/µA I_mon. Standard production PlexStim "
             "2.0 devices.<br>"
             "<b>NIL</b> — 1.0 V/V V_mon, 1.0 mV/µA I_mon. "
             "Used by specific NIL-class units. Pick this only "
-            "if you've verified the device with calibration or "
+            "if you've verified the device with stimulator verification or "
             "are certain of its scaling — the readout will be "
             "off by 2.5× if you guess wrong.")
         self.scaling_label = _make_label("")
@@ -206,7 +347,18 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Description label — empty until Connect succeeds and fills
         # it with make + model + VISA resource. Cleared on Disconnect.
         self.scope_label = _make_label("")
-        self.scope_resource = QtWidgets.QLineEdit()
+        # VISA resource picker — editable combo populated with whichever
+        # scope-shaped resources the detection probe finds.  Kept editable
+        # so users can paste a non-USB resource (e.g. TCPIP) that isn't
+        # auto-discovered.  Width-capped so the field can't sprawl across
+        # the row and visually overrun the "VISA resource:" label on the
+        # left.
+        self.scope_resource = QtWidgets.QComboBox()
+        self.scope_resource.setEditable(True)
+        self.scope_resource.setInsertPolicy(
+            QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.scope_resource.lineEdit().setPlaceholderText(
+            "Auto-pick first detected scope (or type a VISA resource)")
         self.scope_resource.setToolTip(
             "Optional VISA resource identifier for the "
             "oscilloscope. Leave blank to let pyvisa pick the "
@@ -215,21 +367,47 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             "bus and need to pin which one Connect targets. "
             "Format: USB0::0x0699::&lt;model&gt;::&lt;serial&gt;::INSTR "
             "or TCPIP0::&lt;ip&gt;::inst0::INSTR for LAN scopes.")
-        self.scope_resource.setPlaceholderText(
-            "Optional VISA resource (e.g. USB0::0x0699::0x03B0::C012345::INSTR)"
-        )
-        self.connect_btn = QtWidgets.QPushButton("Connect")
-        self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
+        # Pin both VISA-resource and the Scaling combo (on the stim row) to
+        # the SAME fixed width so the two dropdowns line up vertically and
+        # don't sprawl across the row.  Reference string is a long-form
+        # TCPIP VISA resource (the worst-case practical length) plus a wide
+        # padding so the placeholder text isn't truncated by the dropdown
+        # arrow.  Stored on self so the scaling combo can reuse it below.
+        _res_fm = self.scope_resource.fontMetrics()
+        self._combo_w = (
+            _res_fm.horizontalAdvance(
+                "TCPIP0::192.168.100.123::inst0::INSTR  (typical placeholder)")
+            + 60)
+        self.scope_resource.setFixedWidth(self._combo_w)
+        self.scaling_combo.setFixedWidth(self._combo_w)
+        self.connect_btn = QtWidgets.QPushButton("Initialize")
+        self.disconnect_btn = QtWidgets.QPushButton("Close")
         self.disconnect_btn.setEnabled(False)
         self.connect_btn.clicked.connect(self._do_connect_scope)
         self.disconnect_btn.clicked.connect(self._do_disconnect_scope)
 
+        # Fix all four action buttons to the same width so the layout
+        # never shifts when button states change or the connect button's
+        # text temporarily becomes "Initializing…". Measure via
+        # fontMetrics so the width tracks whatever font the platform
+        # applies to QPushButtons.
+        _fm = self.init_btn.fontMetrics()
+        _pad = 24   # QPushButton horizontal content margin (platform typical)
+        _btn_w = max(
+            _fm.horizontalAdvance("Initializing…"),   # widest transient label
+            _fm.horizontalAdvance("Initialize"),
+            _fm.horizontalAdvance("Close"),
+        ) + _pad
+        for _b in (self.init_btn, self.close_btn,
+                   self.connect_btn, self.disconnect_btn):
+            _b.setFixedWidth(_btn_w)
+
         # ----- calibration row -----
-        self.calibrate_btn = QtWidgets.QPushButton("Run Calibration…")
+        self.calibrate_btn = QtWidgets.QPushButton("Run Calibration")
         self.calibrate_btn.setEnabled(False)   # unlocks when stim+scope both connected
         self.calibrate_btn.setToolTip(
             "Initialize the stimulator and connect the oscilloscope first.")
-        self.calibrate_btn.clicked.connect(self._do_run_calibration)
+        self.calibrate_btn.clicked.connect(self.calibrationRequested.emit)
         self.cal_label = _make_label("")
         self._refresh_cal_label()
 
@@ -256,10 +434,27 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         stim_row.addWidget(_make_label("Initialized"))
         stim_row.addWidget(self.stim_dot)
         v.addLayout(stim_row)
+        # Build the two row labels first so we can pin them to the same
+        # width, left-aligning the scaling combo with the VISA resource field.
+        _scaling_lbl = _make_label("Scaling:")
+        _visa_lbl    = _make_label("VISA resource:")
+        _lbl_fm = _scaling_lbl.fontMetrics()
+        _lbl_w = max(_lbl_fm.horizontalAdvance("Scaling:"),
+                     _lbl_fm.horizontalAdvance("VISA resource:")) + 4
+        _scaling_lbl.setFixedWidth(_lbl_w)
+        _visa_lbl.setFixedWidth(_lbl_w)
+
+        # Indent both dropdowns slightly to the right of the labels so the
+        # combos don't sit flush against the label text.  Same gap on both
+        # rows (Scaling and VISA resource) keeps them aligned vertically.
+        _COMBO_INDENT_PX = 24
+
         scale_row = QtWidgets.QHBoxLayout()
-        scale_row.addWidget(_make_label("Scaling:"))
+        scale_row.addWidget(_scaling_lbl)
+        scale_row.addSpacing(_COMBO_INDENT_PX)
         scale_row.addWidget(self.scaling_combo)
-        scale_row.addWidget(self.scaling_label, stretch=1)
+        scale_row.addWidget(self.scaling_label)
+        scale_row.addStretch(1)
         scale_row.addWidget(self.init_btn)
         scale_row.addWidget(self.close_btn)
         v.addLayout(scale_row)
@@ -279,8 +474,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         v.addLayout(scope_row)
 
         scope_ctrls = QtWidgets.QHBoxLayout()
-        scope_ctrls.addWidget(_make_label("VISA resource:"))
-        scope_ctrls.addWidget(self.scope_resource, stretch=1)
+        scope_ctrls.addWidget(_visa_lbl)
+        scope_ctrls.addSpacing(_COMBO_INDENT_PX)
+        scope_ctrls.addWidget(self.scope_resource)
+        scope_ctrls.addStretch(1)
         scope_ctrls.addWidget(self.connect_btn)
         scope_ctrls.addWidget(self.disconnect_btn)
         v.addLayout(scope_ctrls)
@@ -289,6 +486,98 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         cal_row.addWidget(self.calibrate_btn)
         cal_row.addWidget(self.cal_label, stretch=1)
         v.addLayout(cal_row)
+
+        # ----- Bias module (STM32 interpulse-bias) ------------------
+        # Sits between scope and camera per the user's placement
+        # decision — bias is a bench-instrument, used during runs,
+        # synced to PlexStim's TTL via a GPIO on the Nucleo.  Owned
+        # directly by this panel (no service singleton — unlike the
+        # camera, the bias module has a single consumer at a time:
+        # the active experiment runner).  See
+        # ``stm32_bias_protocol.md`` for the wire protocol.
+        from .bias_panel import BiasConnector
+        self.bias_connector = BiasConnector(parent=self)
+        # Mirror log lines into the connection-panel's log signal so
+        # they land in the MainWindow LogPane alongside scope / stim
+        # / camera traffic.
+        self.bias_connector.log.connect(self.log.emit)
+        # ConnectionPanel publishes ``self.bias`` as a convenience
+        # attribute mirror of ``self.bias_connector.bias`` — main_window
+        # and experiment tabs read it without touching the connector
+        # directly.  Updated by the connector's connected/disconnected
+        # signals.
+        self.bias = None
+        self.bias_connector.connected.connect(self._on_bias_connected)
+        self.bias_connector.disconnected.connect(self._on_bias_disconnected)
+        bias_group = QtWidgets.QGroupBox("Interpulse Bias Module (STM32)")
+        bias_group.setToolTip(
+            "Optional external bias module on a NUCLEO-64 STM32G474RE.  "
+            "Applies a DC bias to the electrode during the interpulse "
+            "interval (when PlexStim's EXT-trigger TTL is LOW).  "
+            "Pulse-train timing is taken from a hardware GPIO link to "
+            "PlexStim's trigger output; this panel handles configuration "
+            "+ buffered measurement readback over the Nucleo's USB CDC "
+            "serial port.")
+        _bg = QtWidgets.QVBoxLayout(bias_group)
+        _bg.setContentsMargins(8, 4, 8, 4)
+        _bg.setSpacing(6)
+        _bg.addWidget(self.bias_connector)
+        v.addWidget(bias_group)
+
+        # ----- Camera (bench monitor) -------------------------------
+        # The camera is part of the bench-instrument cluster (alongside
+        # the stim and the scope) per the user's spec — connecting it
+        # here means the operator initialises ALL the data sources
+        # they'll use during a run from one panel.  The actual live-
+        # preview widget is embedded in each experiment tab beneath
+        # the scope plot (see ``CameraStreamPane`` in
+        # :mod:`stimtest.gui.camera`) so the bench view sits next to
+        # the captured waveforms during a run.
+        #
+        # Lazy import — ``camera`` pulls in QtMultimedia indirectly
+        # via ``camera_service()``'s first call, NOT at module-import
+        # time.  Putting the import here means ConnectionPanel.__init__
+        # is the first place to touch QtMultimedia, but only when the
+        # user has opened the Setup tab.  Cold launch is unaffected
+        # for sessions that never open Setup (rare but possible —
+        # e.g. running from a saved-prefs profile via CLI).
+        from .camera import CameraConnector, CameraStreamPane
+        self.camera_connector = CameraConnector(parent=self)
+        # Mirror camera log lines to the connection-panel's log signal
+        # so they land in the MainWindow LogPane alongside scope /
+        # stim traffic.
+        self.camera_connector.log.connect(self.log.emit)
+        # Live preview pane — appears AS SOON AS the camera connects
+        # (not just when the operator navigates to an experiment tab),
+        # so the bench view is visible right next to the connect
+        # controls.  The pane shares the same singleton
+        # ``camera_service()`` as the per-experiment stream panes —
+        # no additional camera I/O.  Carries a LIVE / RECORDING
+        # status badge that flips colour to make recording state
+        # unambiguous: the operator should NEVER mistake the live
+        # preview for an active recording.
+        self.camera_preview = CameraStreamPane(
+            parent=self, allow_snapshot_button=True)
+        # Pin a comfortable preview height so the pane doesn't
+        # collapse to a one-line strip on smaller screens.  Operator
+        # can still resize the parent dock / window; this just sets
+        # the default footprint.
+        self.camera_preview.setMinimumHeight(180)
+        camera_group = QtWidgets.QGroupBox("Camera")
+        camera_group.setToolTip(
+            "Optional bench-monitor camera.  When connected, the live "
+            "preview below shows the streaming feed and a LIVE / "
+            "RECORDING badge tells you whether frames are being "
+            "saved to disk.  Recording is OFF by default — turn it "
+            "on per-experiment via 'Record MP4 video for the entire "
+            "run' in the Test Parameters tab.  Snapshot stays "
+            "available regardless.")
+        _cg = QtWidgets.QVBoxLayout(camera_group)
+        _cg.setContentsMargins(8, 4, 8, 4)
+        _cg.setSpacing(6)
+        _cg.addWidget(self.camera_connector)
+        _cg.addWidget(self.camera_preview, stretch=1)
+        v.addWidget(camera_group)
 
         # First-time hardware-presence probes — both run on the next
         # event-loop tick so the panel finishes laying out before
@@ -329,6 +618,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             # Already open — close first so a re-init refreshes info.
             self._do_close_stim()
         sim = self.simulate.isChecked()
+        import time as _time
+        _t0 = _time.perf_counter()
+        self.log.emit(
+            f"Initializing stimulator ({'simulator' if sim else 'PlexStim hardware'})…")
         try:
             # The PlexStim DLL is vendored inside the package
             # (``stimtest/hardware/pyplexstim/bin/``); the loader
@@ -336,6 +629,15 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             # SDK-path input anymore — if the vendored DLL fails to
             # load, the exception below surfaces the reason.
             self._stim = open_stimulator(simulate=sim)
+            # Wire the SDK-call logger BEFORE open() so every
+            # PS_InitAllStim / PS_GetNStim / probe call during the
+            # handshake reaches the LogPane + .txt mirror.  Was set
+            # up much later (in MainWindow._on_connected) which left
+            # the init traffic invisible.
+            try:
+                self._stim.cmd_logger = self.log.emit
+            except Exception:
+                pass
             self._stim.open()
         except Exception as e:
             self._stim = None
@@ -359,7 +661,16 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # or by the user explicitly picking a preset from the
         # combo (via ``_on_scaling_changed``).
         sn = (info.serial_number or "").strip()
-        known_serial = bool(sn) and sn in self._scaling_by_serial
+        # A serial counts as verified if it has a preset mapping in the
+        # shared prefs map OR a calibration.json payload was saved for
+        # this exact serial.  The latter catches the case where the
+        # user ran + saved a sweep but the preset detection came back
+        # "unknown" (so _record_serial_scaling didn't fire), or where a
+        # calibration file shipped from another install.
+        known_serial = bool(sn) and (
+            sn in self._scaling_by_serial
+            or _serial_has_saved_calibration(sn)
+        )
         preset = self._scaling_by_serial.get(sn, self.SCALE_AUTO)
         if preset not in (self.SCALE_AUTO, self.SCALE_DEFAULT, self.SCALE_NIL):
             preset = self.SCALE_AUTO
@@ -379,12 +690,16 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.log.emit(f"Auto-discharge apply failed: {e}")
         self._set_dot(self.stim_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
         self._refresh_stim_label()
+        self.scaling_label.setVisible(False)
         self.scaling_combo.setEnabled(True)
         self.init_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
         self._update_calibrate_btn()
-        self.log.emit(f"Stimulator initialized: {info.description or 'sim stim'} "
-                      f"(S/N {info.serial_number or 'n/a'})")
+        from ..hardware.tektronix import _fmt_elapsed
+        self.log.emit(
+            f"Stimulator initialized: {info.description or 'sim stim'} "
+            f"(S/N {info.serial_number or 'n/a'})   "
+            f"({_fmt_elapsed(_time.perf_counter() - _t0)})")
         # If a scope is already connected, refresh the connected signal
         # so subscribers see both halves.
         if self._scope is not None:
@@ -423,6 +738,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self._set_dot(self.stim_dot, _DOT_OFF)
             self.stim_label.setText("")
             self.scaling_label.setText("")
+            self.scaling_label.setVisible(True)
             self.scaling_combo.setEnabled(False)
             self.scaling_combo.blockSignals(True)
             try:
@@ -504,8 +820,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             bits.append(f"S/N <b>{info.serial_number}</b>")
         if info.firmware:
             bits.append(f"FW <b>{info.firmware}</b>")
-        if info.n_channels:
-            bits.append(f"<b>{info.n_channels}</b> ch")
         if info.is_simulated:
             bits.append("(<i>sim</i>)")
         self.stim_label.setText(" · ".join(bits))
@@ -521,8 +835,11 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         """Push the chosen scaling onto the live stimulator info.
 
         ``Auto-detect`` keeps whatever ``PlexonStimulator.open()`` chose
-        from the serial-number prefix match. The other two presets
-        force the values regardless of serial.
+        from the serial-number prefix match, then resolves which named
+        preset that corresponds to and switches the combo to that entry
+        so the user sees the actual scaling in use — not just "Auto-detect".
+
+        The other two presets force the values regardless of serial.
         """
         if self._stim is None:
             return
@@ -533,8 +850,21 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         elif preset == self.SCALE_NIL:
             info.vmon_scaling_v_per_v = VMON_SCALING_NIL
             info.imon_scaling_v_per_ua = IMON_SCALING_NIL
-        # Auto-detect: leave the values that PlexonStimulator already
-        # set during open() — they reflect the serial-number heuristic.
+        else:
+            # Auto-detect: the driver already wrote the scaling into info
+            # during open(). Resolve which named preset it matches and
+            # switch the combo to that entry so the user can see what
+            # was detected rather than a generic "Auto-detect" label.
+            if (info.vmon_scaling_v_per_v == VMON_SCALING_NIL
+                    and info.imon_scaling_v_per_ua == IMON_SCALING_NIL):
+                resolved = self.SCALE_NIL
+            else:
+                resolved = self.SCALE_DEFAULT
+            self.scaling_combo.blockSignals(True)
+            try:
+                self.scaling_combo.setCurrentText(resolved)
+            finally:
+                self.scaling_combo.blockSignals(False)
 
     def _warn_uncalibrated_serial(self, serial_number: str) -> None:
         """Pop a modal warning when an Initialize completed for a
@@ -560,7 +890,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         proceed if they're confident.
         """
         text = (
-            f"<h3>Uncalibrated stimulator</h3>"
+            f"<h3>Unverified stimulator</h3>"
             f"<p>Serial <b>{serial_number}</b> isn't in the shared "
             f"scaling database — its I_mon scaling hasn't been "
             f"validated for this installation.</p>"
@@ -568,8 +898,8 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             f"readback values may be off by 2.5× if Auto-detect "
             f"picked the wrong preset for this device.</p>"
             f"<p><b>Recommended:</b> connect the Plexon test "
-            f"board and run <i>Run → Calibrate…</i>. The "
-            f"calibration wizard verifies the scaling and "
+            f"board and run <i>Run → Stimulator Verification…</i>. The "
+            f"stimulator verification verifies the scaling and "
             f"records this serial in the database so future "
             f"sessions apply the right preset automatically.</p>"
             f"<p><b>If you are CERTAIN of the scaling</b> for "
@@ -577,13 +907,13 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             f"by other means), pick <b>Default</b> or <b>NIL</b> "
             f"from the scaling combo on this panel — that also "
             f"records the choice in the database. <b>Auto-detect</b> "
-            f"alone does NOT count as a calibration.</p>"
+            f"alone does NOT count as a stimulator verification.</p>"
             f"<p>The scaling combo currently reads "
             f"<b>{self.scaling_combo.currentText()}</b>.</p>"
         )
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setWindowTitle("Uncalibrated stimulator")
+        box.setWindowTitle("Unverified stimulator")
         box.setTextFormat(QtCore.Qt.TextFormat.RichText)
         box.setText(text)
         box.setStandardButtons(
@@ -627,6 +957,84 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self._refresh_scope_detection_indicator()
         self._refresh_stim_detection_indicator()
 
+    # ---- bias-module facade ------------------------------------------
+    # Per the architecture decision ("Single shared driver, but owned
+    # by MainWindow"), ConnectionPanel owns the bias-module lifecycle
+    # and exposes open/close methods + Connected/Disconnected signals.
+    # Per-tab BiasConnector widgets in each experiment's Test
+    # Parameters call these methods and subscribe to the signals.
+    #
+    # Threading: open/close run synchronously on the GUI thread.  The
+    # STM32 ``*IDN?`` handshake is short (<1 s; the protocol has a
+    # 1-second timeout) so we don't background-thread it.  If that
+    # ever becomes a UX problem, mirror the scope's
+    # ``_scopeConnectResult`` background-thread pattern.
+    def open_bias_module(self, *, simulate: bool,
+                         port: Optional[str] = None) -> None:
+        """Open the bias-module driver and publish it as ``self.bias``.
+
+        Raises on failure (caller catches + shows the error message).
+        Idempotent: if ``self.bias`` is already non-None, this is a
+        silent no-op (caller's intent of "make sure it's open" is
+        satisfied).
+
+        After a successful open, ``biasConnected(info)`` is emitted
+        and every per-tab BiasConnector that subscribed updates its
+        state dot.
+        """
+        if self.bias is not None:
+            self.log.emit("[bias] already connected; open_bias_module ignored")
+            return
+        from ..hardware import open_bias_module as _factory
+        bias = _factory(simulate=simulate, port=port)
+        # Wire per-command log forwarding BEFORE open() so the
+        # connect handshake itself shows in the LogPane.
+        try:
+            bias.cmd_logger = self.log.emit
+        except Exception:
+            pass
+        bias.open()
+        self.bias = bias
+        info = bias.info
+        self.log.emit(
+            f"[bias] connected: {info.manufacturer} {info.model} "
+            f"{info.hardware_id} fw={info.firmware} "
+            f"port={info.port} log_cap={info.log_capacity}"
+            f"{' (SIMULATED)' if info.is_simulated else ''}")
+        self.biasConnected.emit(info)
+
+    def close_bias_module(self) -> None:
+        """Close the bias-module driver.  Idempotent — silent no-op
+        if not currently connected."""
+        if self.bias is None:
+            return
+        try:
+            self.bias.close()
+        except Exception as e:
+            self.log.emit(
+                f"[bias] close raised: {type(e).__name__}: {e}")
+        self.bias = None
+        self.log.emit("[bias] disconnected")
+        self.biasDisconnected.emit()
+
+    # ---- legacy in-panel BiasConnector forwarding --------------------
+    # The original ConnectionPanel embedded a BiasConnector that owned
+    # its own driver.  That widget is being moved to per-experiment
+    # Test Parameters; until that move lands these slots keep the
+    # legacy direct-owned connector and the new facade in sync, so the
+    # interim state is functional.  Remove once the per-tab move is in.
+    def _on_bias_connected(self, info) -> None:
+        """Mirror the legacy in-panel BiasConnector's driver into
+        ``self.bias`` so existing readers keep working."""
+        if self.bias is None:
+            self.bias = self.bias_connector.bias
+            self.biasConnected.emit(info)
+
+    def _on_bias_disconnected(self) -> None:
+        if self.bias is not None and self.bias_connector.bias is None:
+            self.bias = None
+            self.biasDisconnected.emit()
+
     def _refresh_stim_detection_indicator(self):
         """Drive the stimulator detect dot from a Windows-PnP probe.
 
@@ -657,11 +1065,25 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Wire the result signal once (idempotent: disconnect first to
         # avoid double-connecting when refresh_hardware_detection is
         # called repeatedly from the hot-plug filter).
+        # UniqueConnection guarantees the slot is connected exactly
+        # once — even if a previous disconnect failed silently (which
+        # the broad try/except would otherwise hide), we don't end up
+        # with the slot bound multiple times and firing N times per
+        # detect.  The TypeError raised by UniqueConnection-on-already-
+        # connected is the success case we want.
         try:
             self._stimDetectResult.disconnect(self._on_stim_detect_result)
         except (RuntimeError, TypeError):
             pass
-        self._stimDetectResult.connect(self._on_stim_detect_result)
+        try:
+            self._stimDetectResult.connect(
+                self._on_stim_detect_result,
+                QtCore.Qt.ConnectionType.UniqueConnection)
+        except TypeError:
+            # Already connected (UniqueConnection conflict).  That's
+            # what we want — leave the existing single connection
+            # in place rather than stacking another.
+            pass
 
         import threading
         def _thread():
@@ -731,14 +1153,29 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.scope_detect_dot.setToolTip(tip)
             self.scope_detect_text.setToolTip(tip)
             return
-        # Vendor-ID prefixes for VISA USB resources. Each VISA USB
-        # descriptor looks like "USB0::0xVVVV::0xPPPP::SERIAL::INSTR".
-        scope_vendor_ids = ("0x0699",  # Tektronix
-                            "0x0957",  # Keysight / Agilent
-                            "0x0AAD")  # Rohde & Schwarz
+        # Vendor-ID prefixes for VISA USB resources.
+        # NI-VISA returns hex:  "USB0::0x0699::0x03C7::SERIAL::INSTR"
+        # pyvisa-py returns decimal: "USB0::1689::967::SERIAL::0::INSTR"
+        # Include both forms so detection works with either backend.
+        scope_vendor_ids = (
+            "0x0699", "1689",   # Tektronix (hex / decimal)
+            "0x0957", "2391",   # Keysight / Agilent
+            "0x0AAD", "2733",   # Rohde & Schwarz
+        )
         try:
-            rm = pyvisa.ResourceManager()
-            resources = rm.list_resources()
+            import warnings
+            resources = ()
+            for backend in ("@py", ""):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        rm = (pyvisa.ResourceManager(backend) if backend
+                              else pyvisa.ResourceManager())
+                    resources = rm.list_resources()
+                    if resources:
+                        break
+                except Exception:
+                    pass
         except Exception as e:
             self._set_dot(self.scope_detect_dot, _DOT_OFF)
             text = "Oscilloscope not detected"
@@ -764,12 +1201,20 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                     + (f"  (+{extras} more)" if extras else ""))
             tip = ("Detected scope-like VISA resource(s):\n  "
                    + "\n  ".join(scope_resources))
-            # Pre-fill the VISA resource field with the first detected
-            # address (only if the user hasn't typed one of their own)
-            # so Connect targets the visible device without manual
-            # entry.
-            if not self.scope_resource.text().strip():
-                self.scope_resource.setText(primary)
+            # Populate the dropdown with every detected scope-shaped
+            # resource so the user can pick between multiple scopes on
+            # the bus.  Preserve any user-typed entry if they've already
+            # entered something not in the list.
+            _typed = self.scope_resource.currentText().strip()
+            self.scope_resource.blockSignals(True)
+            self.scope_resource.clear()
+            self.scope_resource.addItems(scope_resources)
+            if _typed and _typed not in scope_resources:
+                self.scope_resource.addItem(_typed)
+                self.scope_resource.setCurrentText(_typed)
+            else:
+                self.scope_resource.setCurrentText(primary)
+            self.scope_resource.blockSignals(False)
         elif resources:
             # VISA backend works but nothing scope-shaped is on the bus.
             self._set_dot(self.scope_detect_dot, _DOT_WARN)
@@ -841,22 +1286,58 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             return
         # Disable the button immediately so the user can't double-click.
         self.connect_btn.setEnabled(False)
-        self.connect_btn.setText("Connecting…")
+        self.connect_btn.setText("Initializing…")
+        import time as _time
+        self._scope_connect_t0 = _time.perf_counter()
         self.log.emit("Scope connecting…")
         sim = self.simulate.isChecked()
-        res = self.scope_resource.text().strip() or None
+        res = self.scope_resource.currentText().strip() or None
 
-        # Wire up the result handler — disconnect first to avoid
-        # double-firing if the user clicks Connect multiple times fast.
+        # Wire up the result handler.  UniqueConnection guarantees
+        # we end up with exactly one binding even if a previous
+        # disconnect silently failed — prevents the slot from firing
+        # N times on a rapid re-press of "Connect".  See the
+        # ``_stimDetectResult`` setup above for the rationale.
         try:
             self._scopeConnectResult.disconnect(self._on_scope_connect_result)
         except (RuntimeError, TypeError):
             pass
-        self._scopeConnectResult.connect(self._on_scope_connect_result)
+        try:
+            self._scopeConnectResult.connect(
+                self._on_scope_connect_result,
+                QtCore.Qt.ConnectionType.UniqueConnection)
+        except TypeError:
+            pass
+
+        # Thread-safe log emitter for the worker thread.  Routes
+        # through ``_logFromWorker`` via QMetaObject.invokeMethod with
+        # an explicit QueuedConnection so the log line is guaranteed
+        # to land on the GUI thread's event loop and reach the
+        # LogPane / .txt mirror — emitting ``self.log`` directly from
+        # a Python thread is documented as thread-safe but has been
+        # observed to silently drop in this stack.  Capturing
+        # ``panel`` keeps the closure independent of how
+        # ``self`` resolves inside the worker.
+        panel = self
+
+        def _log_emit(msg: str) -> None:
+            try:
+                QtCore.QMetaObject.invokeMethod(
+                    panel, "_emit_log_from_worker",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, str(msg)))
+            except Exception:
+                pass
 
         def _thread():
             try:
                 scope = open_oscilloscope(simulate=sim, resource=res)
+                # Hook the logger BEFORE open() so the initial
+                # handshake commands appear in the log.
+                try:
+                    scope.cmd_logger = _log_emit
+                except Exception:
+                    pass
                 scope.open()
             except Exception as exc:
                 scope = exc
@@ -865,33 +1346,93 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         import threading
         threading.Thread(target=_thread, daemon=True).start()
 
+    @QtCore.pyqtSlot(str)
+    def _emit_log_from_worker(self, msg: str) -> None:
+        """Slot invoked via QMetaObject.invokeMethod from a worker
+        thread.  Forwards the line to the public ``log`` signal so the
+        MainWindow's existing connection to the LogPane (and the
+        .txt mirror) picks it up.  This is the receiving end of the
+        scope/stim cmd_logger callback set up in
+        :meth:`_initialize_scope`.
+        """
+        self.log.emit(msg)
+
     @QtCore.pyqtSlot(object)
     def _on_scope_connect_result(self, result):
         """Called on the GUI thread when the background connect finishes."""
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText("Initialize")
         try:
             self._scopeConnectResult.disconnect(self._on_scope_connect_result)
         except (RuntimeError, TypeError):
             pass
+        import time as _time
+        from ..hardware.tektronix import _fmt_elapsed
+        _t0 = getattr(self, "_scope_connect_t0", _time.perf_counter())
+        _elapsed = _fmt_elapsed(_time.perf_counter() - _t0)
         if isinstance(result, Exception):
             self._scope = None
             self.connect_btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(self, "Scope connect failed", str(result))
-            self.log.emit(f"Scope connect failed: {result}")
+            self.log.emit(f"Scope connect failed: {result}   ({_elapsed})")
             return
         self._scope = result
         info = self._scope.info
         self._set_dot(self.scope_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
-        label = f"{info.make} {info.model}".strip()
+        parts = [f"{info.make} {info.model}".strip()]
+        if info.serial:
+            parts.append(f"S/N <b>{info.serial}</b>")
+        if info.n_channels:
+            parts.append(f"<b>{info.n_channels}</b> ch")
         if info.is_simulated:
-            label += " (<i>sim</i>)"
-        self.scope_label.setText(label)
+            parts.append("(<i>sim</i>)")
+        self.scope_label.setText(" · ".join(parts))
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
         self._update_calibrate_btn()
         self.connected.emit(self._stim, self._scope)
         self.scopeConnected.emit(True)
-        self.log.emit(f"Scope connected: {info.make} {info.model}")
+        self.log.emit(
+            f"Scope connected: {info.make} {info.model}   ({_elapsed})")
+        # ---- Probe verification ------------------------------------
+        # If the scope reports a real probe on any input, prompt the
+        # operator to swap to plain BNC and loop until clean.  Skipped
+        # on simulated scopes (they have no physical inputs) and on
+        # any scope where the probe_info query isn't supported.
+        if not info.is_simulated:
+            self._verify_no_probes_attached()
+
+    def _verify_no_probes_attached(self) -> None:
+        """Pop a modal asking the operator to swap probes for plain BNC.
+
+        Returns immediately when the initial scan finds no probes (the
+        common case).  Otherwise the dialog stays up until either every
+        input reports BNC (auto-accept) or the operator clicks Skip.
+        """
+        if self._scope is None:
+            return
+        initial = _scan_scope_probes(self._scope)
+        if not initial:
+            return
+        ch_list = ", ".join(f"{ch} ({tok}, {gain:g}x)"
+                             for ch, tok, gain in initial)
+        self.log.emit(
+            f"Probe(s) detected on scope inputs: {ch_list} — "
+            f"prompting operator to swap to plain BNC.")
+        dlg = _ProbeVerifyDialog(self._scope, parent=self)
+        accepted = bool(dlg.exec())
+        if accepted:
+            self.log.emit(
+                f"Probe verification: all inputs now plain BNC "
+                f"(after {dlg.recheck_count} re-check"
+                f"{'s' if dlg.recheck_count != 1 else ''}).")
+        else:
+            still = ", ".join(f"{ch} ({tok}, {gain:g}x)"
+                               for ch, tok, gain in dlg.final_attached)
+            self.log.emit(
+                f"Probe verification skipped by operator — proceeding "
+                f"with: {still or 'no further info'}.  Displayed "
+                f"voltages on the affected channels will be off by the "
+                f"probe gain factor.")
 
     def _do_disconnect_scope(self):
         had_scope = self._scope is not None
@@ -913,45 +1454,35 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     # ------------------------------------------------- calibration helpers
     def _update_calibrate_btn(self):
         """Enable the calibration button only when both stim and scope
-        are live (mirrors the condition the CalibrationDialog requires
+        are live (mirrors the condition the CalibrationTab requires
         before it allows a sweep to run)."""
         ready = self._stim is not None and self._scope is not None
         self.calibrate_btn.setEnabled(ready)
         self.calibrate_btn.setToolTip(
-            "Open the PlexStim test-board calibration wizard."
+            "Open the Calibration tab to run the PlexStim test-board "
+            "stimulator verification sweep."
             if ready else
             "Initialize the stimulator and connect the oscilloscope first."
         )
 
     def _refresh_cal_label(self):
-        """Read the last-calibration timestamp from disk and update the
-        inline label next to the Run Calibration button."""
+        """Read the last stimulator verification timestamp from disk and update the
+        inline label next to the Run Stimulator Verification button."""
         try:
             from .calibration import last_calibration_datetime
             ts = last_calibration_datetime()
         except Exception:
             ts = None
         if ts is None:
-            text = "Last calibrated: <i>never</i>"
+            text = "Last verified: <i>never</i>"
         else:
-            text = f"Last calibrated: {ts.strftime('%Y-%m-%d %H:%M')}"
+            text = f"Last verified: {ts.strftime('%Y-%m-%d %H:%M')}"
         self.cal_label.setText(text)
 
-    def _do_run_calibration(self):
-        """Open the calibration wizard. Refreshes the last-calibrated
-        label when the dialog closes so the timestamp updates immediately."""
-        try:
-            from .calibration import CalibrationDialog
-        except ImportError:
-            QtWidgets.QMessageBox.information(
-                self, "Calibration",
-                "Calibration wizard not available in this build.")
-            return
-        dlg = CalibrationDialog(self, stim=self._stim, scope=self._scope)
-        dlg.exec()
-        # Refresh the label whether the user saved or cancelled — a
-        # partial run may still have written updated coefficients.
-        self._refresh_cal_label()
+    # _do_run_calibration was removed: the verification flow is now an
+    # embedded tab in MainWindow (CalibrationTab), reached by emitting
+    # ``calibrationRequested``.  MainWindow refreshes the "last verified"
+    # label on its own after the user returns from the tab.
 
     # ------------------------------------------------------------- props
     @property

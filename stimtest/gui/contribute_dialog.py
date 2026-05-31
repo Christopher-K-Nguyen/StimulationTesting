@@ -283,17 +283,17 @@ class ContributeDialog(QtWidgets.QDialog):
             "interesting sample.")
         self.lbl_email = QtWidgets.QLabel(self._user_email or "<i>(empty)</i>")
         self.lbl_email.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self.cb_institution = QtWidgets.QCheckBox("Include institution")
+        self.cb_institution = QtWidgets.QCheckBox("Include institution/company")
         self.cb_institution.setToolTip(
             "Adds your lab / company affiliation to the payload. "
-            "Pre-populated from the Institution field on the Setup "
-            "tab; you can edit the value here if you'd like a "
+            "Pre-populated from the Institution/Company field on the "
+            "Setup tab; you can edit the value here if you'd like a "
             "different attribution string just for this submission.")
         self.lbl_institution = QtWidgets.QLineEdit(self._user_institution)
         self.lbl_institution.setToolTip(
             "Attribution string included with the contribution "
-            "when 'Include institution' is ticked. Pre-populated "
-            "from the Institution field on the Setup tab; edit "
+            "when 'Include institution/company' is ticked. Pre-populated "
+            "from the Institution/Company field on the Setup tab; edit "
             "here for a one-off override (e.g. you're submitting "
             "on behalf of a collaborator at a different lab).")
         self.lbl_institution.setPlaceholderText(

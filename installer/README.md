@@ -116,11 +116,35 @@ stays checked is verified after the file copy and, if missing, fetched.
 |---|--------|-----------|------------|
 | 1 | **MS Visual C++ 2015–2022 Redist (x64)** — required by PyQt6 / numpy / scipy DLLs | `HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64\Installed = 1` | Silently downloads `vc_redist.x64.exe` from `aka.ms/vs/17/release` and installs with `/quiet /norestart`. Tolerates exit codes 0 / 1638 (newer present) / 3010 (reboot needed). |
 | 2 | **Plexon PlexStim 2.0 SDK** — needed for a real stimulator | Walks `Uninstall` keys in **both** `HKLM` and `HKLM32` (PlexStim's installer is 32-bit) for a `DisplayName` matching `PlexStim`, `Stimulator V2`, or `Plexon Inc` | Prompts user, then downloads `StimulatorV2Setup.exe` from Plexon's canonical URL and launches it interactively. |
-| 3 | **NI-VISA / any IVI VISA** — recommended for real Tek scopes | Looks for `System32\visa64.dll`, then `HKLM\SOFTWARE\IVI Foundation\VISA\Win64`, then `HKLM\SOFTWARE\National Instruments\NI-VISA` (TekVISA / Keysight / R&S all satisfy this) | Optional. Prompts user; opens NI's download page in the browser (NI gates direct URLs behind login). The app falls back to bundled `pyvisa-py` if no VISA runtime is present. |
+| 3 | **NI-VISA / any IVI VISA** — required for real Tek scopes over USB | Looks for `System32\visa64.dll`, then `HKLM\SOFTWARE\IVI Foundation\VISA\Win64`, then `HKLM\SOFTWARE\National Instruments\NI-VISA` (TekVISA / Keysight / R&S all satisfy this) | Prompts user; opens the NI-VISA download page in the browser. See [NI-VISA installation](#ni-visa-installation) below. |
 
 All downloads use PowerShell `Invoke-WebRequest` so no extra installer
 machinery is needed; failures fall back to a clear message with the
 manual URL.
+
+### NI-VISA installation
+
+NI-VISA is required to communicate with the Tektronix oscilloscope (and any
+other VISA-compatible instrument) over USB. Without it, the scope will fail
+to connect with `VI_ERROR_LIBRARY_NFOUND`.
+
+**Download:** https://www.ni.com/en/support/downloads/drivers/download.ni-visa.html
+
+**Steps:**
+1. Go to the link above — you will need a free NI account to download.
+2. Download the latest **NI-VISA** release (~600 MB).
+3. Run the installer and follow the prompts.
+4. **Restart your computer** after installation.
+5. Reconnect the scope via USB — it should now be detected automatically.
+
+NI-VISA installs the `visa64.dll` system library that pyvisa uses to talk to
+instruments. It also installs the proper USB-TMC driver for Tektronix scopes.
+It is free and does not require a paid NI license.
+
+> **Note for developers:** If you do not want to install NI-VISA, the pure-Python
+> `pyvisa-py` backend is bundled but requires an additional USB driver step on
+> Windows (see the project README for details). NI-VISA is strongly recommended
+> for production lab use.
 
 ### Runtime re-check (PlexStim only)
 

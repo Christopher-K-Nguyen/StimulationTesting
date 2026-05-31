@@ -239,14 +239,15 @@ class TestChannelCountFromModel:
     def test_known_tbs_models(self, model, expected):
         assert channel_count_from_model(model) == expected
 
-    def test_unknown_model_defaults_to_four(self):
-        """MSO / MDO / DPO scopes don't follow the TBS naming
-        convention; the helper conservatively returns 4 (the typical
-        configuration) so callers don't grey out channels that exist."""
-        assert channel_count_from_model("MSO4054") == 4
-        assert channel_count_from_model("UnknownScope123") == 4
+    def test_unknown_model_returns_none(self):
+        """MSO / MDO / DPO scopes don't follow the TBS naming convention;
+        the helper returns None to signal that a live SCPI probe is needed
+        rather than guessing.  Callers fall back to 4 when the probe also
+        fails."""
+        assert channel_count_from_model("MSO4054") is None
+        assert channel_count_from_model("UnknownScope123") is None
 
-    def test_empty_model_returns_four(self):
-        """Empty string → safe default rather than crash."""
-        assert channel_count_from_model("") == 4
-        assert channel_count_from_model(None) == 4
+    def test_empty_model_returns_none(self):
+        """Empty / None model string → None (probe required)."""
+        assert channel_count_from_model("") is None
+        assert channel_count_from_model(None) is None

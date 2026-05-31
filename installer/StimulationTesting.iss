@@ -110,22 +110,26 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#AppExeName}
-; Optional installer-window icon. Drop ``installer/app.ico`` next to
-; this script and the wizard picks it up automatically; without the
-; file Inno Setup falls through to its default icon. ``FileExists``
-; runs in the preprocessor (pre-compile), not at install time.
-;
-; Audit finding #33 — the fallback used to be completely silent, so a
-; release accidentally went out with the default Inno icon. Print a
-; visible warning during compile so the build operator sees what's
-; happening; CI / scripted builds can grep for "MISSING_APP_ICON"
-; to fail-fast on a missing brand asset.
+; Required installer-window icon. Drop ``installer/app.ico`` next to
+; this script and the wizard picks it up automatically.  Missing
+; icon now FAILS the compile rather than emitting a warning that
+; could be missed in CI logs — preventing a release from accidentally
+; shipping with the default Inno icon.  Set the BUILD_ALLOW_NO_ICON
+; preprocessor flag (``ISCC /DBUILD_ALLOW_NO_ICON=1``) to fall back
+; to the default icon on purpose, e.g. for a smoke-test build before
+; the brand asset has been committed.
 #if FileExists(SourcePath + "\app.ico")
   SetupIconFile={#SourcePath}\app.ico
 #else
-  #pragma message "MISSING_APP_ICON — installer/app.ico not found; " + \
-                  "the installer will ship with Inno Setup's default " + \
-                  "icon. Commit a real app.ico before the next release."
+  #ifdef BUILD_ALLOW_NO_ICON
+    #pragma message "MISSING_APP_ICON — installer/app.ico not found; " + \
+                    "BUILD_ALLOW_NO_ICON is set so falling back to " + \
+                    "Inno Setup's default icon."
+  #else
+    #error MISSING_APP_ICON: installer/app.ico not found. \
+        Commit a real app.ico before building the release installer, \
+        or pass /DBUILD_ALLOW_NO_ICON=1 to ISCC to allow a fallback build.
+  #endif
 #endif
 
 [Languages]

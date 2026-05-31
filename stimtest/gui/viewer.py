@@ -1520,7 +1520,7 @@ def _session_param_rows(session: Session, run: Optional[ChannelRun],
                  ("Monophasic" if p.num_phases == 1 else "Biphasic")))
     rows.append(("Polarity",
                  "Cathodic-first" if p.polarity == -1 else "Anodic-first"))
-    rows.append(("Rate", f"{p.rate_hz} Hz"))
+    rows.append(("Rate", f"{p.rate_hz} pps"))
     rows.append(("Reference", session.test.reference_electrode_label))
     rows.append(("Counter", session.test.counter_electrode_label))
     for k, ph in enumerate(p.phases, start=1):

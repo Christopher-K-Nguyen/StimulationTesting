@@ -340,6 +340,22 @@ class PatternPreview(QtWidgets.QWidget):
             ax = self.plot.getAxis(ax_name)
             if ax is not None:
                 ax.setStyle(tickFont=tick_font)
+        # Suppress the y-axis minor ticks.  pyqtgraph's default
+        # AxisItem returns three tick levels (major + minor + sub-
+        # minor) from ``tickValues``; the inner two render as small
+        # tick marks between the labelled major ticks.  Override
+        # ``tickValues`` on the left axis to expose ONLY the major
+        # (first) level so the y-axis shows clean integer-µA ticks
+        # without the busy minor-tick hair between them.  Bottom
+        # axis is left untouched — minor ticks on the time axis
+        # help judge phase widths.
+        _y_axis = self.plot.getAxis("left")
+        if _y_axis is not None:
+            _orig_tick_values = _y_axis.tickValues
+            def _major_only_y(minVal, maxVal, size, _orig=_orig_tick_values):
+                levels = _orig(minVal, maxVal, size)
+                return levels[:1] if levels else levels
+            _y_axis.tickValues = _major_only_y
         # User can pan/zoom both axes — wheel + drag works on either.
         # The auto-fit y-range still gets set in set_pattern() so the
         # initial view covers the amp span; the user can then scroll
@@ -999,45 +1015,85 @@ class PatternPreview(QtWidgets.QWidget):
                                     [dd_marker_y, dd_marker_y], pen=dd_pen)
                 )
             # ONE text annotation only — placed in the central pulse's
-            # discharge zone with a short diagonal leader. Unified
-            # rule (biphasic + triphasic both follow the same
-            # placement, since for triphasic the user wants the
-            # leaders ~45° apart, intersecting / overlapping the
-            # plot, just like biphasic):
+            # discharge zone. Layout side (above / below y=0) follows
+            # the user-spec'd alternation rule:
             #
-            #   * WITH interpulse delay → discharge sits to the LEFT,
-            #     on the OPPOSITE side of y=0 from the LAST PHASE's
-            #     polarity. The interpulse annotation lives upper-
-            #     RIGHT (always), so the two land in opposite
-            #     corners.
-            #         Last phase anodic   → lower-LEFT
-            #         Last phase cathodic → upper-LEFT
+            #   * WITH interpulse delay → discharge sits on the OPPOSITE
+            #     side of y=0 from the LAST PHASE's polarity (the
+            #     interpulse annotation lives upper-RIGHT always, so
+            #     the two land in opposite quadrants).
+            #         Last phase anodic   → lower side
+            #         Last phase cathodic → upper side
             #
-            #   * NO interpulse delay → discharge sits to the RIGHT,
-            #     on the SAME side of y=0 as the last phase
-            #     (room there because no interpulse annotation
-            #     competes for the right side).
-            #         Last phase anodic   → upper-RIGHT
-            #         Last phase cathodic → lower-RIGHT
-            dd_center_x = (dd_lo_local + dd_hi_local) / 2.0
-            dx_mag = max(35.0, last_dd * 1.5)
+            #   * NO interpulse delay → discharge sits on the SAME side
+            #     as the last phase (interpulse area is empty, so that
+            #     quadrant is free).
+            #
+            # Text positioning splits two ways depending on band width:
+            #
+            #   * SHORT discharge (< 1 ms) → diagonal-arrow callout
+            #     pointing AT the band centre.  Leader length capped
+            #     at 80 µs so even a near-1-ms discharge doesn't
+            #     produce a multi-ms arrow that shoots off-screen.
+            #     Without the cap, ``dx_mag = last_dd * 1.5`` grew
+            #     linearly with the discharge delay (e.g. 15 ms
+            #     discharge → 22.5 ms arrow), producing a gigantic
+            #     leader that crossed the entire plot AND a text
+            #     endpoint that landed inside the interphase-delay
+            #     label's x range (``text_x = total_pulse −
+            #     2·last_dd`` overlapped the interphase at ~250 µs
+            #     last_dd).
+            #
+            #   * LARGE discharge (≥ 1 ms) → drop the arrow entirely
+            #     and pin the text near the band START so it stays
+            #     adjacent to the active phases the user is reading.
+            #     Mirrors the interpulse "ip_large" branch directly
+            #     above: at ≥ 1 ms the orange marker is wide enough
+            #     to read as its own band at default zoom, and a
+            #     leader arrow becomes visual clutter rather than
+            #     useful guidance.
             has_interpulse = (interpulse_us >= 1.0)
             last_phase_sign = (+1 if pattern.phases[-1].amplitude_ua >= 0
                                else -1)
             if has_interpulse:
-                # LEFT, OPPOSITE of last-phase polarity.
                 discharge_sign = -last_phase_sign
-                dx_step = -dx_mag
             else:
-                # RIGHT, SAME side as last-phase polarity.
                 discharge_sign = +last_phase_sign
-                dx_step = +dx_mag
+
+            dd_large = last_dd >= 1000.0
+            if dd_large:
+                # Target sits NEAR the band start (capped 25 µs in,
+                # same cap the interpulse uses), so a 15-ms discharge
+                # doesn't push the label into the middle of a long
+                # flat run far from the user-edited phases.
+                dd_target_x = dd_lo_local + min(last_dd / 2.0, 25.0)
+                # Small horizontal nudge with the SAME cap (50 µs) as
+                # the interpulse annotation — keeps the label close
+                # to the band start regardless of how long the
+                # discharge is.
+                dx_step = +max(35.0, min(50.0, last_dd * 0.05))
+                dy_factor = 0.7
+                skip_arrow = True
+            else:
+                dd_target_x = (dd_lo_local + dd_hi_local) / 2.0
+                # Cap leader at 80 µs — slightly more generous than
+                # the interpulse 50 µs cap because the discharge band
+                # is narrower (so we need a visible pointer) but still
+                # tight enough to never overlap the interphase label.
+                dx_mag = max(35.0, min(80.0, last_dd * 1.5))
+                # LEFT when an interpulse exists (right side reserved
+                # for the interpulse annotation); RIGHT otherwise.
+                dx_step = -dx_mag if has_interpulse else +dx_mag
+                dy_factor = 4.0
+                skip_arrow = False
+
             self._draw_dim_diagonal(
-                dd_center_x, dd_marker_y,
+                dd_target_x, dd_marker_y,
                 self._format_time(last_dd),
                 dx_us=dx_step,
-                dy=discharge_sign * offset * 4.0,
+                dy=discharge_sign * offset * dy_factor,
                 color="#fb8c00",
+                skip_arrow=skip_arrow,
             )
 
         if interpulse_us >= 1.0:

@@ -37,7 +37,8 @@ from ..config import (
 from ..electrode import ElectrodeArray
 from . import rich
 from .device_view import DeviceView
-from .repeating_spinbox import RepeatingDoubleSpinBox, RepeatingSpinBox
+from .repeating_spinbox import (RepeatingDoubleSpinBox, RepeatingSpinBox,
+                                ScientificDoubleSpinBox)
 
 
 CUSTOM_COATING_LABEL = "Custom…"
@@ -307,6 +308,18 @@ class SetupTab(QtWidgets.QWidget):
     # (acquisition_mode, n_avg) — runner-side code applies these to the
     # scope before each capture. n_avg is ignored for SAMPLE mode.
     acquisitionChanged = QtCore.pyqtSignal(str, int)
+    # Trigger source selection — "EXT" for digital sync, the physical
+    # channel name of a Trigger-role channel (e.g. "CH4"), or the
+    # I_mon channel name (e.g. "CH2") as the fallback.
+    triggerSourceChanged = QtCore.pyqtSignal(str)
+    # True when the resolved trigger source is a TTL sync line (EXT
+    # checkbox or a channel with Role=Trigger).  Distinguishes the two
+    # different trigger physics: TTL sync = RISE @ 1.4 V regardless of
+    # pulse polarity; I_mon = polarity-derived slope + amplitude-
+    # derived level.  Emitted in lockstep with triggerSourceChanged
+    # so the experiment tabs always have a consistent (source, type)
+    # pair to act on.
+    digitalTriggerChanged = QtCore.pyqtSignal(bool)
     # True when the user has "Same for all electrodes" ticked under
     # Surface area. VT listens so it can hide the Fixed charge density
     # mode (uniform-area arrays make that mode redundant with
@@ -687,6 +700,10 @@ class SetupTab(QtWidgets.QWidget):
             "column is enabled. The value is stored in the unit "
             "shown in the dropdown to its right (also displayed "
             "inline as the spinbox suffix).")
+        # Seed the "last unit" cache so the first unit-change correctly
+        # converts the displayed value (otherwise it would treat the
+        # current unit as both old and new and skip the rescale).
+        self._area_last_unit: str = self.area_unit.currentText()
         self.area_unit.currentTextChanged.connect(self._on_area_unit_changed)
         self.area_value.valueChanged.connect(self._emit_array)
         self.area_mode.toggled.connect(self._on_area_mode_changed)
@@ -852,7 +869,7 @@ class SetupTab(QtWidgets.QWidget):
         # the limit-shift math (when the return acts as the reference
         # baseline) uses the right value. Saved to / restored from
         # prefs so a custom choice survives a restart.
-        self.return_custom_ocp_v = QtWidgets.QDoubleSpinBox()
+        self.return_custom_ocp_v = ScientificDoubleSpinBox()
         self.return_custom_ocp_v.setRange(-2.0, 2.0)
         self.return_custom_ocp_v.setDecimals(3)
         self.return_custom_ocp_v.setSingleStep(0.05)
@@ -968,7 +985,7 @@ class SetupTab(QtWidgets.QWidget):
         # limit-shift math uses the right value rather than the
         # default 0 V (which would mean "no shift, same as Ag|AgCl").
         # Saved to / restored from prefs.
-        self.reference_custom_ocp_v = QtWidgets.QDoubleSpinBox()
+        self.reference_custom_ocp_v = ScientificDoubleSpinBox()
         self.reference_custom_ocp_v.setRange(-2.0, 2.0)
         self.reference_custom_ocp_v.setDecimals(3)
         self.reference_custom_ocp_v.setSingleStep(0.05)
@@ -1091,6 +1108,53 @@ class SetupTab(QtWidgets.QWidget):
         self.acq_navg_spin.valueChanged.connect(self._on_acq_changed)
         self.acq_navg_combo: QtWidgets.QComboBox | None = None
 
+        # Tracks whether the last connected scope had an EXT BNC input.
+        # Default False so the toggle stays hidden at app launch until
+        # a live scope confirms otherwise.  ``apply_scope_capabilities``
+        # is the only writer.  This field is the in-process cache of
+        # the live state; the prefs-restore path no longer reads it
+        # (see :meth:`_restore_prefs` for why — stale prefs from a
+        # previous session's scope would re-show the toggle on a
+        # newly-connected no-EXT scope at startup).
+        self._scope_has_ext: bool = False
+
+        # Trigger-source toggle — checked = use EXT digital sync,
+        # unchecked = use the I_mon channel as the trigger source.
+        # Hidden by default; ``apply_scope_capabilities`` reveals it
+        # only when the connected scope's ``info.has_ext_trigger`` is
+        # True.  Without the initial hide, the toggle flashes on at
+        # app startup (no scope yet) and stays visible until the user
+        # connects a no-EXT scope, which makes it look like the GUI
+        # is offering an option the hardware doesn't support.
+        self.ext_trigger_check = QtWidgets.QCheckBox("Use digital sync trigger (EXT)")
+        self.ext_trigger_check.setChecked(False)
+        self.ext_trigger_check.setVisible(False)
+        self.ext_trigger_check.setToolTip(
+            "Checked: the scope triggers off the Plexon digital-sync "
+            "output wired to the EXT BNC. "
+            "Unchecked: the scope triggers off the Iₘₒₙ "
+            "channel (useful when no EXT input is available or no digital "
+            "sync cable is connected).")
+        self.ext_trigger_check.toggled.connect(self._on_trigger_source_changed)
+
+        # Trigger edge is NOT operator-selectable.  The slope is fully
+        # determined by the trigger-source rule set (see
+        # ``current_trigger_source`` for the three priorities):
+        #
+        #   * EXT BNC               → RISE  (TTL active-high)
+        #   * Channel-Trigger TTL   → RISE  (TTL active-high)
+        #   * I_mon channel         → FALL for cathodic-first patterns,
+        #                             RISE for anodic-first
+        #                             (auto-derived from the
+        #                             excitation-phase polarity at run
+        #                             start in the experiment tab)
+        #
+        # An operator-facing dropdown was previously rendered here,
+        # but every code path in :class:`_BaseExperimentTab` resolves
+        # the slope from the rules above and never read the combo's
+        # value — leaving the control in the GUI only added a UX
+        # trap where flipping it appeared to do something but didn't.
+
         # Experiment picker
         self.experiment_combo = QtWidgets.QComboBox()
         for code, defn in EXPERIMENTS.items():
@@ -1134,7 +1198,7 @@ class SetupTab(QtWidgets.QWidget):
         sess_form.addRow(self._lbl("Session:"), self.subject)
         sess_form.addRow(self._lbl("User name:"), self.user_name)
         sess_form.addRow(self._lbl("User email:"), self.user_email)
-        sess_form.addRow(self._lbl("Institution:"), self.user_institution)
+        sess_form.addRow(self._lbl("Institution/Company:"), self.user_institution)
         # Environment + sparge-gas were originally added to the
         # session form. They were moved BELOW the Potential-limits
         # / Tolerance row in the device-parameters form (see
@@ -1337,7 +1401,9 @@ class SetupTab(QtWidgets.QWidget):
         self._acq_navg_label = QtWidgets.QLabel("Average count:")
         acq_form.addRow(self._acq_navg_label, navg_w)
         acq_box = QtWidgets.QGroupBox("Oscilloscope acquisition")
-        QtWidgets.QVBoxLayout(acq_box).addLayout(acq_form)
+        acq_vbox = QtWidgets.QVBoxLayout(acq_box)
+        acq_vbox.addLayout(acq_form)
+        acq_vbox.addWidget(self.ext_trigger_check)
 
         # Oscilloscope mapping — one row per scope channel, dropdown
         # picks the waveform role assigned to that channel. Labels
@@ -1679,6 +1745,96 @@ class SetupTab(QtWidgets.QWidget):
             self.acq_navg_combo.setEnabled(is_avg)
         self.acq_navg_spin.setEnabled(is_avg)
 
+    def _on_trigger_source_changed(self, *_):
+        """EXT-trigger checkbox toggled → re-emit the trigger source.
+
+        Also emits ``digitalTriggerChanged`` so the experiment tabs
+        learn about the source-type switch (TTL vs I_mon) atomically
+        with the source-name update — otherwise a stale digital-
+        trigger flag would mis-route the trigger setup at the next
+        run start.
+        """
+        self.triggerSourceChanged.emit(self.current_trigger_source())
+        self.digitalTriggerChanged.emit(self.is_digital_trigger())
+
+    def current_trigger_source(self) -> str:
+        """Return the configured trigger source.
+
+        Priority order (matches the operator's three-path mental model):
+
+        1. **EXT** — the digital-sync BNC checkbox is checked (and the
+           checkbox is visible, i.e. the scope actually has an EXT
+           input).  Returned as the literal string ``"EXT"``; the
+           driver knows the firmware owns the trigger level in this
+           mode.
+        2. **Channel with Role = "Trigger"** — the operator assigned
+           the ``Trigger`` role to a scope channel (typically CH3 or
+           CH4 because the Plexon digital sync is wired there).  This
+           is a TTL sync line, NOT a current monitor — slope is always
+           RISE, level is always 1.4 V (TTL midpoint).  Use
+           :meth:`is_digital_trigger` to detect this so the experiment
+           tab applies the TTL settings instead of the I_mon
+           polarity-derived ones.
+        3. **I_mon channel** — fall back to whichever channel carries
+           the ``I_mon`` role.  Slope auto-flips on phase-1 polarity
+           (RISE for anodic-first, FALL for cathodic-first); level
+           comes from :func:`imon_trigger_level` keyed on the stim
+           amplitude.
+
+        Final fallback is ``"CH2"`` only when no role assignment exists
+        at all (defensive default — matches the legacy MATLAB I_mon
+        channel mapping).
+        """
+        if self.ext_trigger_check.isChecked() and self.ext_trigger_check.isVisible():
+            return "EXT"
+        # Path 2: a channel explicitly tagged as the Trigger sync line.
+        # Iterate CH1..CH4 in order so a multi-Trigger assignment (the
+        # GUI permits non-unique roles) picks the lowest-numbered one,
+        # but in practice CH3/CH4 are where the Plexon digital sync is
+        # wired on this bench.
+        for ch, cb in self._role_combos.items():
+            if cb.currentText() == ROLE_TRIG:
+                return ch
+        # Path 3: I_mon fallback.
+        for ch, cb in self._role_combos.items():
+            if cb.currentText() == ROLE_IMON:
+                return ch
+        return "CH2"
+
+    def is_digital_trigger(self) -> bool:
+        """Return True when the trigger source is a digital sync line.
+
+        Digital sync means a TTL edge — either the EXT BNC checkbox
+        is checked, or a channel has been assigned Role=Trigger.  In
+        either case the trigger setup is fixed:
+
+        * **Slope**: RISE (sync lines are always active-high)
+        * **Level**: 1.4 V (TTL midpoint, ignored by the firmware in
+          EXT mode where it auto-sets, applied verbatim in channel-
+          Trigger mode)
+
+        When this returns False, the trigger source is the I_mon
+        channel and the experiment tab must derive slope from phase-1
+        polarity and level from :func:`imon_trigger_level`.
+
+        This separation matters because I_mon and a TTL sync line
+        have completely different waveform shapes — applying the
+        cathodic-polarity slope rule to a sync line would make the
+        scope fire on the falling edge of a TTL pulse (the end of the
+        sync, not the start).
+        """
+        if self.ext_trigger_check.isChecked() and self.ext_trigger_check.isVisible():
+            return True
+        for cb in self._role_combos.values():
+            if cb.currentText() == ROLE_TRIG:
+                return True
+        return False
+
+    # ``current_trigger_slope`` was removed when the operator-facing
+    # edge selector was deleted — the experiment tabs resolve slope
+    # from the trigger-source / phase-1-polarity rule set internally
+    # at run start (see ``_BaseExperimentTab._start_runner``).
+
     def _current_n_avg(self) -> int:
         if self.acq_navg_combo is not None and self.acq_navg_combo.isVisible():
             data = self.acq_navg_combo.currentData()
@@ -1774,18 +1930,28 @@ class SetupTab(QtWidgets.QWidget):
         # else default to all 4 visible (the user might be running
         # offline / simulated, where we don't constrain).
         n_channels = 4
-        has_ext = True
+        has_ext = False   # safe default: hide EXT until scope confirms it
         if scope is not None:
             try:
                 n_channels = int(getattr(scope.info, "n_channels", 4) or 4)
             except (TypeError, ValueError, AttributeError):
                 n_channels = 4
             try:
-                has_ext = bool(getattr(scope.info, "has_ext_trigger", True))
+                has_ext = bool(getattr(scope.info, "has_ext_trigger", False))
             except AttributeError:
-                has_ext = True
+                has_ext = False
         self._set_visible_scope_channels(n_channels)
         self._refresh_scope_trigger_hint(has_ext=has_ext)
+        # EXT trigger checkbox — hide entirely when scope has no EXT BNC input
+        # (e.g. TBS1000C, TBS1000B-EDU). Uncheck first so the trigger source
+        # reverts to I_mon before the widget disappears.
+        if not has_ext and self.ext_trigger_check.isChecked():
+            self.ext_trigger_check.blockSignals(True)
+            self.ext_trigger_check.setChecked(False)
+            self.ext_trigger_check.blockSignals(False)
+        self.ext_trigger_check.setVisible(has_ext)
+        self._scope_has_ext = has_ext
+        self._on_trigger_source_changed()
 
         modes = (scope.acquisition_modes() if scope is not None
                  else ["SAMPLE", "AVERAGE"])
@@ -1856,11 +2022,39 @@ class SetupTab(QtWidgets.QWidget):
         self._refresh_scope_trigger_hint(has_ext=True)
 
     def _on_role_changed(self, *_):
-        """A role dropdown changed — re-emit aliases. Role uniqueness is
-        not enforced (the user might want to inspect the same waveform
-        on two channels), but the runner uses the *first* match for any
-        given role, so duplicates are harmless from the GUI's side."""
+        """A role dropdown changed — re-emit aliases AND re-emit the
+        trigger source when the EXT checkbox is unchecked.
+
+        Role uniqueness is not enforced (the user might want to inspect
+        the same waveform on two channels), but the runner uses the
+        *first* match for any given role, so duplicates are harmless
+        from the GUI's side.
+
+        Trigger-source re-emit is critical when the operator moves the
+        I_mon role between channels: ``current_trigger_source()``
+        returns the channel assigned to I_mon, so moving I_mon from CH2
+        to CH4 changes what the trigger source *should* be — but the
+        experiment-tab cache (``_trigger_source``) only refreshes when
+        ``triggerSourceChanged`` fires.  Without this re-emit, the tab
+        keeps using whatever channel was active the last time the EXT
+        checkbox was toggled (typically the default ``CH2``), so a run
+        triggers on the wrong channel even though the Setup tab's
+        dropdown shows the correct one.
+        """
         self._emit_aliases()
+        # Re-emit trigger source whenever a role change *could* affect
+        # the resolved source.  When EXT is checked, none of the role
+        # combos matter for the trigger — skip the emit to avoid
+        # churn.  When EXT is unchecked, both ``Trigger`` and ``I_mon``
+        # role changes can change which channel becomes the source, so
+        # always re-emit.  digitalTriggerChanged also goes out because
+        # promoting/demoting Role=Trigger flips the TTL-vs-I_mon
+        # physics path even though the source name might stay the same
+        # (e.g. CH2 stays I_mon but loses or gains the Trigger flag).
+        if not (self.ext_trigger_check.isChecked()
+                and self.ext_trigger_check.isVisible()):
+            self.triggerSourceChanged.emit(self.current_trigger_source())
+            self.digitalTriggerChanged.emit(self.is_digital_trigger())
 
     # ---------------------------------------------------------------- slots
     def _on_device_changed(self, name: str):
@@ -2050,17 +2244,57 @@ class SetupTab(QtWidgets.QWidget):
         self._emit_array()
 
     def _on_area_unit_changed(self, new_unit: str):
-        # Don't convert the displayed number — most users expect to retype
-        # in the new unit. Just rebuild the array with the new value
-        # interpreted in the new unit. The spinbox STEP, DECIMAL
-        # PRECISION, and SUFFIX all rescale so the input matches the
-        # natural granularity of the chosen unit (integer µm², two-
-        # decimal mm², one-decimal cm²).
+        # Preserve the PHYSICAL area when the user switches units.  E.g.
+        # 5000 µm² → mm²  becomes 0.005 mm² (same area, different display),
+        # NOT 5000 mm² (a 6-orders-of-magnitude larger area by accident).
+        # The conversion uses the cached "old unit" we stashed last time
+        # the combo settled; first call after construction has no cached
+        # value, so we fall back to the current unit (no-op rescale).
+        old_unit = getattr(self, "_area_last_unit", new_unit)
+        old_factor = UNITS.get(old_unit, 1.0)
+        new_factor = UNITS.get(new_unit, 1.0)
+
+        natural_decimals = AREA_DECIMALS_BY_UNIT.get(
+            new_unit, self.area_value.decimals())
         self.area_value.setSingleStep(
             AREA_STEPS_BY_UNIT.get(new_unit, self.area_value.singleStep()))
-        self.area_value.setDecimals(
-            AREA_DECIMALS_BY_UNIT.get(new_unit, self.area_value.decimals()))
         self.area_value.setSuffix(f" {new_unit}")
+
+        # Convert: value_um2 = old_value × old_factor; new_value = value_um2
+        # / new_factor.  Block the signal so the rescale doesn't fire
+        # ``_emit_array`` twice — we do that once below after the cache
+        # update.
+        if old_factor != new_factor:
+            value_um2 = float(self.area_value.value()) * old_factor
+            self.area_value.blockSignals(True)
+            try:
+                converted = value_um2 / new_factor
+                # Widen decimal precision when the natural precision would
+                # truncate the converted value to zero (e.g. 2000 µm² →
+                # 0.002 mm² needs ≥3 decimals but mm² is natively 2).
+                # Pick enough decimals to keep 3 significant figures while
+                # never going below the unit's natural precision.
+                if converted > 0:
+                    import math
+                    needed = max(0, 3 - int(math.floor(math.log10(converted))) - 1)
+                    decimals_to_use = max(natural_decimals, needed)
+                else:
+                    decimals_to_use = natural_decimals
+                self.area_value.setDecimals(decimals_to_use)
+                # Widen the range when the converted value falls below the
+                # spinbox minimum (e.g. 1 µm² → 1e-8 cm² is below the
+                # default 0.001 lower bound).
+                if converted < self.area_value.minimum():
+                    self.area_value.setMinimum(min(self.area_value.minimum(),
+                                                    converted / 10.0))
+                self.area_value.setValue(
+                    round(converted, max(decimals_to_use, 0)))
+            finally:
+                self.area_value.blockSignals(False)
+        else:
+            self.area_value.setDecimals(natural_decimals)
+
+        self._area_last_unit = new_unit
         self._emit_array()
 
     def _on_area_mode_changed(self, _checked: bool = True):
@@ -2803,6 +3037,12 @@ class SetupTab(QtWidgets.QWidget):
             "connector": self.connector_combo.currentText(),
             "acq_mode": self.acq_mode_combo.currentText(),
             "acq_n_avg": self._current_n_avg(),
+            "ext_trigger": self.ext_trigger_check.isChecked(),
+            # ``trig_slope`` is intentionally not saved — the
+            # operator-facing edge selector was removed in favour of
+            # auto-resolving the slope from the trigger-source rules
+            # at run time (digital → RISE, I_mon → phase-1 polarity).
+            "scope_has_ext": self._scope_has_ext,
             # Surface area
             "surface_area_mode": "Same for all electrodes" if self.area_mode.isChecked()
                                   else "Different per electrode",
@@ -2882,6 +3122,9 @@ class SetupTab(QtWidgets.QWidget):
             "auto_save_plots_fmt": self.current_auto_save_plots_format(),
             "acq_mode": self.acq_mode_combo.currentText(),
             "acq_n_avg": self._current_n_avg(),
+            "ext_trigger": self.ext_trigger_check.isChecked(),
+            # ``trig_slope`` removed — see :meth:`current_prefs` for why.
+            "scope_has_ext": self._scope_has_ext,
             "device": self.device_combo.currentText(),
             # Grid type for the *Other (custom grid)* device. Stored as
             # the canonical "rect" / "triangular" tag; ignored on
@@ -3071,8 +3314,12 @@ class SetupTab(QtWidgets.QWidget):
                 self.area_mode.setChecked(str(am) == SAME_VAL)
         if "area_unit" in p: self.area_unit.setCurrentText(p["area_unit"])
         if "area_value" in p:
-            try: self.area_value.setValue(float(p["area_value"]))
-            except (TypeError, ValueError): pass
+            # Reuse the spinbox-restore helper from pattern_panel —
+            # same try/except shape, same intent.  Imported lazily
+            # so this module doesn't pull pattern_panel at import
+            # time.
+            from .pattern_panel import _safe_set_spinbox_value
+            _safe_set_spinbox_value(self.area_value, p["area_value"])
         if "coating_mode" in p:
             cm = p["coating_mode"]
             # New format: bool (True = Same). Legacy format: string
@@ -3274,6 +3521,31 @@ class SetupTab(QtWidgets.QWidget):
                     self.acq_navg_spin.setValue(n)
             except (TypeError, ValueError):
                 pass
+        # NOTE: ``scope_has_ext`` from prefs is *intentionally not*
+        # restored here.  Doing so would show the EXT toggle before
+        # any scope had a chance to confirm its model — e.g. an
+        # operator who used a TBS2204B (has EXT) yesterday and a
+        # TBS1052C (no EXT) today would briefly see the toggle at
+        # app startup until they connected the new scope.
+        # ``apply_scope_capabilities`` is the *only* place that flips
+        # the toggle's visibility, and it runs on every scope-connect
+        # signal, so we don't need (and shouldn't have) a pre-connect
+        # cached value here.
+        #
+        # ``ext_trigger`` (the checked-state pref) is still restored
+        # below — but only when the toggle is currently visible
+        # (i.e. a live scope has confirmed EXT support), so stale
+        # prefs from a different scope can't re-route the trigger
+        # to a non-existent BNC.
+        if "ext_trigger" in p:
+            try:
+                if self.ext_trigger_check.isVisible():
+                    self.ext_trigger_check.setChecked(bool(p["ext_trigger"]))
+            except Exception:
+                pass
+        # ``trig_slope`` from old prefs files is silently ignored — the
+        # operator-facing edge selector was removed and the slope is
+        # now auto-resolved at run time from the trigger-source rules.
         # Scope mapping
         # New per-channel role format
         if isinstance(p.get("channel_roles"), dict):

@@ -4,7 +4,12 @@ This module defines what a "stimulator" and "oscilloscope" look like to the
 rest of the project. Both real and simulated drivers implement these
 abstract base classes; experiment runners and GUI code never import the
 concrete drivers directly — they go through the factory functions in
-``stimtest.hardware.__init__`` so swapping backends is trivial:
+``stimtest.hardware.__init__`` so swapping backends is trivial.
+
+Also exposes :func:`fmt_elapsed` — a shared MATLAB-``getEndTime.m`` port
+that auto-picks µs / ms / s / min / h based on magnitude.  Used by every
+hardware driver's per-command timing log; lives here so the
+implementations don't fork copies.
 
     >>> from stimtest.hardware import open_stimulator, open_oscilloscope
     >>> stim = open_stimulator(simulate=False)   # real Plexon, fall back to sim
@@ -33,6 +38,34 @@ from typing import Dict, List, Optional, Sequence, Tuple  # noqa: F401
 
 import numpy as np
 
+
+def fmt_elapsed(t_s: float) -> str:
+    """Format an elapsed-seconds value with an auto-selected unit.
+
+    Direct port of MATLAB ``getEndTime.m``:
+
+      * < 0.1 ms → microseconds
+      * < 0.1 s  → milliseconds
+      * < 60 s   → seconds
+      * < 60 min → minutes
+      * else     → hours
+
+    Single source of truth — both :mod:`stimtest.hardware.tektronix`
+    and :mod:`stimtest.hardware.plexon` re-export this as ``_fmt_elapsed``
+    so legacy intra-module callers keep working unchanged.
+    """
+    ms = t_s * 1e3
+    if ms < 0.1:
+        return f"{t_s * 1e6:.2f} us"
+    if t_s < 0.1:
+        return f"{ms:.2f} ms"
+    if t_s < 60:
+        return f"{t_s:.2f} s"
+    mn = t_s / 60.0
+    if mn < 60:
+        return f"{mn:.2f} min"
+    return f"{mn / 60.0:.2f} h"
+
 from ..waveforms import PulsePattern
 
 
@@ -54,6 +87,11 @@ class Stimulator(ABC):
     """Abstract Plexon-style multi-channel current stimulator."""
 
     info: StimulatorInfo
+
+    @property
+    def is_open(self) -> bool:
+        """True after a successful ``open()``; subclasses may override."""
+        return getattr(self, "info", None) is not None and self.info.n_channels > 0
 
     # ----- lifecycle -----
     @abstractmethod
@@ -100,6 +138,31 @@ class Stimulator(ABC):
 
     @abstractmethod
     def stop_all(self) -> None: ...
+
+    def abort_all(self) -> None:
+        """Cease ALL stimulation **immediately**, even mid-pulse.
+
+        Wraps the PlexStim SDK's ``PS_AbortAll`` — the *emergency*
+        cease-all-stim primitive.  Distinct from :meth:`stop_all`
+        (``PS_StopStimAllChannels``) in two ways:
+
+        * **Mid-pulse halt**: takes effect even if a pulse or
+          arbitrary waveform is currently being emitted.
+          ``stop_all`` lets the current waveform finish.
+        * **No trigger-mode requirement**: ``stop_all`` returns SDK
+          error 4 ("wrong trigger mode") when the device isn't in
+          ``PS_TRIG_SOFT``; ``abort_all`` has no such restriction.
+
+        Intended for the GUI's Stop button so the operator can halt
+        a sweep on demand without waiting up to one capture period
+        for the current pulse to complete.
+
+        Default implementation falls back to :meth:`stop_all` so
+        backends without a true abort primitive (e.g. the simulator)
+        still behave sensibly — the API distinction is a no-op there
+        because they have no in-flight hardware pulses to interrupt.
+        """
+        self.stop_all()
 
     def start_all(self) -> None:
         """Start EVERY loaded channel on the same firmware clock tick.
@@ -213,7 +276,14 @@ class ScopeInfo:
     #: CH1, CH2, AC LINE only on those models). Probed at open time and
     #: cached here so the GUI / runners can fall back to an internal
     #: channel trigger when EXT is unavailable.
-    has_ext_trigger: bool = True
+    #:
+    #: Default is **False** — EXT must be affirmatively confirmed by
+    #: either a matching model-spec entry or a successful live probe.
+    #: A True default would silently show the EXT toggle in the Setup
+    #: tab even on scopes that have no rear-BNC input (TBS1000C etc.),
+    #: leaving the operator to pick a trigger source the scope can't
+    #: actually use.
+    has_ext_trigger: bool = False
 
 
 @dataclass
@@ -231,6 +301,22 @@ class Oscilloscope(ABC):
 
     info: ScopeInfo
     channel_aliases: Dict[str, str]  # logical name -> physical channel ('CH1' ...)
+
+    # ----- display geometry -----
+    # Default values are the conservative "classic Tek" layout
+    # (10 horizontal × 8 vertical divs).  Real drivers should
+    # override at connect time:
+    #   * Tek: queries ``HORizontal:DIVisions?`` for horiz, looks up
+    #     ``n_vert_divs`` in the per-series spec for vert (no SCPI
+    #     query exists for vertical divs — it's a fixed family
+    #     property).
+    #   * Simulator: inherits the defaults; tests don't care.
+    # Used by the in-view rescale loop and the clip detector — see
+    # ``hardware/tektronix.py:channel_is_clipped`` and
+    # ``experiments/voltage_transient.py:_one_capture`` block 2b.
+    _n_horiz_divs: float = 10.0
+    _n_vert_divs: float = 8.0
+    _half_vert_divs: float = 4.0
 
     # ----- lifecycle -----
     @abstractmethod
@@ -253,9 +339,75 @@ class Oscilloscope(ABC):
     @abstractmethod
     def set_horizontal_scale(self, seconds_per_div: float) -> None: ...
 
+    def set_horizontal_position(self, percent: float) -> None:
+        """Set the trigger position as a percentage from the left edge
+        (0 = far left, 100 = far right). Default no-op; overridden by
+        drivers that support trigger-marker repositioning."""
+
+    def capture_single_sequence(self, *, n_acq: int = 16,
+                                timeout_s: float = 30.0,
+                                tick_fn=None) -> "ScopeAcquisition":
+        """Acquire one complete N-average sequence (SEQuence mode).
+        Default falls back to single_capture; overridden by real drivers."""
+        return self.single_capture()
+
     def set_trigger(self, source: str = "EXT", level_v: float = 1.0,
                     slope: str = "RISE", mode: str = "NORMAL") -> None:
         """Default no-op; overridden by real driver."""
+
+    def set_trigger_level(self, level_v: float) -> None:
+        """Update only the trigger threshold (V) without changing source/slope.
+        Default no-op; overridden by real driver and simulator."""
+
+    def set_cursors(self, phase1_us: float, interphase_us: float = 0.0,
+                    source_channel: str = "CH1") -> None:
+        """Place vertical-bar cursors at end-of-phase-1 and mid-interphase.
+        Default no-op; overridden by real driver."""
+
+    # ----- gated measurement primitives (closed-loop feedback path) -----
+    # These provide a *fast* read of a per-channel statistic (mean / min /
+    # max) over a user-selected time window WITHOUT pulling the full
+    # waveform off the wire.  Used by the closed-loop interpulse-bias
+    # feedback controller (~10-20 Hz update rate is the design target).
+    #
+    # Implementation pattern on real Tek scopes:
+    #   1. Place vertical (time-axis) cursors at ``t_us_start`` and
+    #      ``t_us_end`` relative to the trigger via
+    #      ``CURSor:VBArs:POSITION1/2``.
+    #   2. Configure the MEASUrement subsystem to gate on cursors
+    #      (``MEASU:IMMed:GATing CURSor``, ``TYPe MEAN``, ``SOURce CHx``).
+    #   3. Query ``MEASU:IMMed:VALue?`` — the scope computes the statistic
+    #      over every sample in the gated window and returns one float.
+    #
+    # Faster than ``CURVe?`` because no waveform transfer; more accurate
+    # than a point-cursor read because the scope averages internally,
+    # beating 8-bit ADC quantization the same way the AVERAGE acquisition
+    # mode does.  See ``experiments/bias_feedback.py`` for the consumer.
+    def gate_measurement_window(self, t_us_start: float,
+                                t_us_end: float) -> None:
+        """Place cursors at ``[t_us_start, t_us_end]`` (µs from trigger)
+        and configure the scope's MEASUrement subsystem to gate on those
+        cursors.  Subsequent :meth:`measure_mean` / similar queries return
+        statistics computed over just this window.
+
+        Default no-op; real drivers override.  Idempotent — repeated calls
+        with the same window are cheap; calls with a new window update
+        cursor positions but don't re-arm anything else.
+        """
+
+    def clear_measurement_gating(self) -> None:
+        """Turn off cursor gating so subsequent MEASUrement queries
+        operate on the full acquisition window.  Default no-op."""
+
+    def measure_mean(self, channel: str) -> float:
+        """Return the MEAN of ``channel`` over the currently-gated window
+        (set by :meth:`gate_measurement_window`).  Volts.
+
+        Returns ``float('nan')`` if the scope can't compute a value
+        (channel off, no acquisition, gating cleared without re-setting).
+        Default no-op returns NaN; real drivers override.
+        """
+        return float("nan")
 
     def set_acquisition_mode(self, mode: str = "AVERAGE", n_avg: int = 16) -> None:
         """SAMPLE | AVERAGE | PEAK; n_avg only used for AVERAGE."""
@@ -296,8 +448,140 @@ class Oscilloscope(ABC):
 
     # ----- acquisition -----
     @abstractmethod
-    def single_capture(self) -> ScopeAcquisition:
-        """Trigger once, wait for completion, return all configured channels."""
+    def single_capture(self, *,
+                       timeout_s: "Optional[float]" = None) -> ScopeAcquisition:
+        """Trigger once, wait for completion, return all configured channels.
+
+        Parameters
+        ----------
+        timeout_s:
+            Override for the driver's default per-capture timeout.
+            Pass when the caller can predict the required wait from
+            ``N_avg / rate_hz``.  ``None`` falls back to the driver's
+            default (typically 10 s via the VISA session timeout).
+        """
+
+    def capture_while_running(self, wait_s: float = 0.0, *,
+                              reset_before_run: bool = False,
+                              tick_fn=None) -> ScopeAcquisition:
+        """Acquire while stim is running (MATLAB-style continuous mode).
+
+        Default implementation falls back to ``single_capture`` so
+        simulators and legacy drivers work without change.
+        """
+        import time
+        remaining = max(float(wait_s), 0.0)
+        while remaining > 0.0:
+            chunk = min(0.05, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+            if tick_fn is not None:
+                tick_fn()
+        return self.single_capture()
+
+    def adapt_channel_scale(self, channel: str, *,
+                            v_min: float, v_max: float,
+                            divs: float = 4.0,
+                            shrink_threshold: float = 0.30,
+                            shrink_stable_count: int = 2):
+        """Post-capture autorange — default no-op; returns None."""
+        return None
+
+    def channel_is_clipped(self, channel: str,
+                           v_min: float, v_max: float,
+                           *, margin_pct: float = 0.05) -> Optional[bool]:
+        """Does the observed ``[v_min, v_max]`` indicate the trace is
+        saturating the scope's vertical rails?
+
+        Different from :meth:`channel_in_view` (which checks "does
+        the data fit comfortably inside the visible window") because
+        clipping is the failure mode where the data appears to fit
+        EXACTLY at the rail — the scope's ADC saturated and the true
+        peak is HIGHER than what was captured.  When this happens,
+        sizing the new V/div from the observed range produces the
+        SAME V/div as before (since the observed range == the visible
+        window) and the rescale fails to expand.  Coarse-step UP is
+        required instead.
+
+        Default implementation returns ``None`` (can't detect);
+        overridden by drivers that can query the channel's actual
+        V/div + POSition and compute the rail position.
+
+        ``margin_pct`` (default 5 %) — how close to the rail counts
+        as clipped.  At 5 %, an observation within `0.95 × half_window`
+        of either rail is flagged as clipped.  Too tight and noisy
+        traces trip false positives; too loose and genuine clips are
+        missed.
+
+        Returns:
+          * ``True``  — clipped at the top, bottom, or both rails.
+          * ``False`` — trace has headroom on both sides.
+          * ``None``  — driver can't introspect (simulator, SCPI
+            error).  Callers treat None like "leave alone" — don't
+            assume one way or the other.
+        """
+        return None
+
+    def channel_in_view(self, channel: str,
+                        v_min: float, v_max: float,
+                        *, margin_divs: float = 3.9) -> Optional[bool]:
+        """Does ``[v_min, v_max]`` fit inside the channel's visible window?
+
+        Port of the in-view check from MATLAB ``getWaveform2.m``::
+
+            vertPos        = -pos_divs * vpd               # volts
+            range_min      = -margin_divs * vpd + vertPos
+            range_max      = +margin_divs * vpd + vertPos
+            in_view        = (v_min > range_min) and (v_max < range_max)
+
+        ``margin_divs`` defaults to **3.9** (MATLAB ``MAX_FACTOR``), one
+        tenth of a division shy of the scope's hard ±4-div edge so
+        traces that just kiss the grid still register as out-of-view —
+        the user typically wants headroom on every rescale.
+
+        Returns:
+          * ``True``  — trace fits comfortably; no rescale needed.
+          * ``False`` — trace would clip; rescale + recapture.
+          * ``None``  — scope can't introspect its own scale / position
+            (no SCPI access, e.g. the simulator). Callers should fall
+            back to a single-pass fit-the-range write without iterating.
+
+        Default implementation returns ``None``; tektronix.py overrides
+        it with an actual SCPI ``SCAle? / POSition?`` query pair.
+        """
+        return None
+
+    def channel_clip_sides(self, channel: str,
+                           v_min: float, v_max: float,
+                           *, margin_divs: float = 3.9):
+        """Directional companion to :meth:`channel_in_view` — returns
+        which side(s) of the screen the trace exceeds.
+
+        See ``TektronixOscilloscope.channel_clip_sides`` for the full
+        contract (5-tuple ``(below_out, above_out, pos_shift_divs,
+        headroom_below_div, headroom_above_div)``).  Default returns
+        ``None`` so simulator-style drivers without introspection
+        don't have to implement it; the caller falls back to the
+        existing symmetric-extrapolate path.
+        """
+        return None
+
+    def set_channel_position(self, channel: str, divisions: float) -> None:
+        """Set the per-channel vertical position in divisions from screen
+        centre.  Default no-op so simulator-style drivers don't have
+        to override; the Tek driver overrides with a SCPI write."""
+
+    def set_channel_scale_and_position_for_range(
+            self, channel: str, *,
+            v_min: float, v_max: float,
+            divs: float = 4.0):
+        """Fine-scale + position for a channel whose observed trace
+        spans ``[v_min, v_max]``.  Default no-op — only overridden by
+        the Tektronix driver where the SCPI writes have real effect.
+        Returns ``None`` so callers don't have to special-case
+        non-introspectable backends (simulator, headless tests).
+        """
+        return None
 
     def auto_scale(self) -> None:
         """Best-effort autoscale; default no-op (simulator)."""

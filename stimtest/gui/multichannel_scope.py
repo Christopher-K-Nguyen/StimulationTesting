@@ -9,8 +9,6 @@ experiment tab. Layout per sub-tab::
     │                                                │
     │           ScopePlot (pyqtgraph)                │   per-channel
     │                                                │
-    ├────────────────────────────────────────────────┤
-    │   per-channel metrics table                    │
     └────────────────────────────────────────────────┘
 
 The wrapping ``QTabWidget`` shows a tab for every channel that has
@@ -18,6 +16,12 @@ either been selected as active, has captures recorded, or has been
 explicitly registered via :meth:`ensure_tab`. Tabs that finish a run
 get a small green ✓ in their title so the user can see at a glance
 which channels are done.
+
+Per-capture metrics are shown in the experiment tab's *right-hand*
+:class:`stimtest.gui.widgets.MetricTable` panel (``metrics_side``);
+the page itself only carries the scope plot — a previous inline
+metric table below the plot was redundant with the side panel and
+has been removed.
 
 Visibility checkboxes are global to the pane — toggling V_mon hides
 the V_mon trace in every sub-tab. State is exposed via :meth:`prefs`
@@ -32,7 +36,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from ..session import Capture
 from . import rich
-from .widgets import AXIS_LEFT, AXIS_NA, AXIS_RIGHT, MetricTable, ScopePlot
+from .widgets import AXIS_LEFT, AXIS_NA, AXIS_RIGHT, ScopePlot
 
 
 # Trace identifiers — keep the strings stable; they're used as plot keys
@@ -42,11 +46,23 @@ TRACE_IMON = "I_mon"
 TRACE_EACT = "E_act"
 TRACE_ERET = "E_ret"
 ALL_TRACES = (TRACE_VMON, TRACE_IMON, TRACE_EACT, TRACE_ERET)
+# Trace colour palette — Wong's colourblind-safe set
+# (https://www.nature.com/articles/nmeth.1618) so red and green stay
+# distinguishable under deuteranopia / protanopia.  Mapping:
+#   * Voltage (V_mon)            → golden yellow
+#   * Current / density (I_mon)  → teal-cyan
+#   * Active Potential (E_act)   → bluish-green
+#   * Return Potential (E_ret)   → vermillion (orange-red)
+# The active / return assignment is "green = active electrode, red =
+# return electrode" — green reads as the "live" colour to most
+# operators, while red marks the path the cathodic current returns
+# along.  Operators learn the mapping once and it carries across
+# every plot (POLARIS viewer, experiment scope, calibration plot).
 TRACE_COLOURS = {
-    TRACE_VMON: "#444444",
-    TRACE_IMON: "#1976d2",
-    TRACE_EACT: "#e57373",
-    TRACE_ERET: "#26a69a",
+    TRACE_VMON: "#E6B800",   # Voltage          — golden yellow
+    TRACE_IMON: "#00B4C8",   # Current/density  — teal-cyan
+    TRACE_EACT: "#009E73",   # Active Potential — bluish-green
+    TRACE_ERET: "#D55E00",   # Return Potential — vermillion (red)
 }
 # Default per-trace Y-axis assignment. I_mon goes to the right axis so
 # its µA range doesn't compress the V/E traces on the left axis;
@@ -60,8 +76,7 @@ DEFAULT_TRACE_AXIS = {
 
 
 class _ChannelPage(QtWidgets.QWidget):
-    """One sub-tab: scope plot + metric table for a single
-    channel-or-combination key.
+    """One sub-tab: scope plot for a single channel-or-combination key.
 
     The ``key`` argument is the stable identifier used by
     :class:`MultiChannelScope` to route captures: ``int`` for legacy
@@ -70,6 +85,12 @@ class _ChannelPage(QtWidgets.QWidget):
     bipolar pair). Two combinations sharing an active channel get
     distinct sub-tabs, which fixes the previous behaviour where they
     collided on a single CHnn tab.
+
+    Per-capture metric numbers are rendered by the experiment tab's
+    right-side :class:`stimtest.gui.widgets.MetricTable`
+    (``metrics_side``) — the page itself carries only the scope plot
+    now. A previous inline ``MetricTable`` below the plot duplicated
+    the side panel and has been removed.
     """
 
     def __init__(self, key, parent=None):
@@ -80,7 +101,6 @@ class _ChannelPage(QtWidgets.QWidget):
         # full combination label.
         self.channel = key
         self.scope = ScopePlot()
-        self.metrics = MetricTable()
         # Full per-key capture history. Previously this stored only
         # ``_latest`` and every new capture overwrote the prior one,
         # leaving the user no way to inspect mid-run captures after
@@ -130,11 +150,124 @@ class _ChannelPage(QtWidgets.QWidget):
         self._nav_row_w.setLayout(nav_row)
         self._nav_row_w.setVisible(False)
 
+        # Plot title — single-line summary of the rendered capture.
+        # Shows: channel / configuration · I_stim · current density
+        # (when area is set) · Q_ph · Q_inj · capture #.  Carried as
+        # its own QLabel rather than pyqtgraph's PlotItem title
+        # because the pyqtgraph title row's visibility behaviour is
+        # flaky across versions (same reason calibration uses a
+        # separate label).  Default-empty; populated by ``set_capture``
+        # / ``set_index`` each time a capture is rendered.
+        self._title_label = QtWidgets.QLabel("")
+        self._title_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setStyleSheet(
+            "QLabel { font-size: 11pt; font-weight: bold; padding: 2px; }")
+        self._title_label.setVisible(False)
+
+        # The inline metric table that used to sit below the scope
+        # plot was redundant with the experiment tab's right-side
+        # ``metrics_side`` panel and has been removed.  The page is
+        # now just nav row + title + scope plot.  No vertical splitter
+        # is needed (there is no second pane to size against), so the
+        # scope simply takes all remaining vertical space via
+        # ``stretch=1``.
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(2, 2, 2, 2)
         v.addWidget(self._nav_row_w)
-        v.addWidget(self.scope, stretch=3)
-        v.addWidget(self.metrics, stretch=2)
+        v.addWidget(self._title_label)
+        v.addWidget(self.scope, stretch=1)
+
+    def _format_title(self, capture: Capture,
+                      surface_area_um2: Optional[float] = None) -> str:
+        """Build the single-line plot-title HTML for ``capture``.
+
+        Combines:
+          * Channel / configuration (from ``self.key`` — e.g. ``"CH05"``
+            for legacy monopolar or ``"CH05 v 06"`` for bipolar)
+          * I_stim (excitation-phase amplitude in µA)
+          * Current density (A/cm²) when ``surface_area_um2 > 0``
+          * Q_ph (charge per phase, nC) from ``capture.metrics``
+          * Q_inj (charge injection capacity, mC/cm²) from ``capture.metrics``
+          * Capture # (``capture.index`` + 1, for 1-based display)
+        """
+        parts = []
+        # Channel / configuration label.
+        if isinstance(self.key, int):
+            parts.append(f"<b>CH{self.key:02d}</b>")
+        else:
+            parts.append(f"<b>{self.key}</b>")
+        # I_stim — pull from the pattern's excitation phase.
+        try:
+            amp_ua = abs(float(capture.pattern.excitation_phase.amplitude_ua))
+        except Exception:
+            amp_ua = None
+        if amp_ua is not None:
+            parts.append(
+                f"<i>I</i><sub>stim</sub> = {amp_ua:.1f} µA")
+            # Current density (A/cm²) requires a positive area.
+            try:
+                area_um2 = float(surface_area_um2) if surface_area_um2 else 0.0
+            except (TypeError, ValueError):
+                area_um2 = 0.0
+            if area_um2 > 0:
+                # J_stim = I_stim / A;  amp_ua × 1e-6 A / (area_um2 ×
+                # 1e-8 cm²) = amp_ua / area_um2 × 100  A/cm²
+                density = amp_ua / area_um2 * 100.0
+                parts.append(
+                    f"<i>J</i><sub>stim</sub> = {density:.2f} A/cm<sup>2</sup>")
+        # Q_ph (nC) and Q_inj (mC/cm²) — from CaptureMetrics.
+        try:
+            m = capture.metrics
+            q_ph = float(m.charge_per_phase_nc)
+            q_inj = float(m.charge_injection_mc_per_cm2)
+        except Exception:
+            q_ph = q_inj = None
+        import math
+        if q_ph is not None and math.isfinite(q_ph):
+            parts.append(
+                f"<i>Q</i><sub>ph</sub> = {q_ph:.2f} nC")
+        if q_inj is not None and math.isfinite(q_inj):
+            parts.append(
+                f"<i>Q</i><sub>inj</sub> = {q_inj:.3f} mC/cm<sup>2</sup>")
+        # Capture # — 1-based for the operator-facing display.
+        try:
+            cap_num = int(capture.index) + 1
+            parts.append(f"capture #{cap_num}")
+        except Exception:
+            pass
+        title = "  ·  ".join(parts)
+        # When the capture is aborted / has no trace data, append an
+        # explicit marker so the operator immediately sees WHY the
+        # plot below is blank (most common cause: scope trigger
+        # timeout, which leaves cap.v_mon_v with size = 0 and every
+        # metric at NaN).  The detailed reason is logged separately
+        # from the runner via an ``ExperimentEvent(kind="log")`` —
+        # see ``_one_capture`` for the scope-capture-error branch.
+        try:
+            aborted = bool(getattr(capture.status, "aborted", False))
+            no_data = (getattr(capture, "v_mon_v", None) is None
+                       or capture.v_mon_v.size == 0)
+            if aborted or no_data:
+                note = (getattr(capture.status, "notes", "") or "").strip()
+                tag = ("  ·  <span style='color:#d33;'>"
+                       "<b>aborted</b></span>")
+                if note:
+                    tag += f" — {note}"
+                title += tag
+        except Exception:
+            pass
+        return title
+
+    def _set_title_from(self, capture: Optional[Capture],
+                        surface_area_um2: Optional[float] = None) -> None:
+        """Update the plot-title text from ``capture`` (or hide on None)."""
+        if capture is None:
+            self._title_label.setVisible(False)
+            self._title_label.setText("")
+            return
+        self._title_label.setText(self._format_title(capture, surface_area_um2))
+        self._title_label.setVisible(True)
 
     # ---- back-compat shim: callers and tests reach for ``_latest`` ----
     @property
@@ -159,24 +292,36 @@ class _ChannelPage(QtWidgets.QWidget):
     def set_capture(self, capture: Capture, visible: Dict[str, bool],
                     axis_map: Optional[Dict[str, str]] = None,
                     inset_visible: bool = False,
-                    inset_traces: Optional[set] = None):
+                    inset_traces: Optional[set] = None,
+                    surface_area_um2: Optional[float] = None):
         """Append ``capture`` to the history and (when auto-following)
         render it. Use ``set_index`` to navigate to a different
-        capture without appending."""
+        capture without appending.
+
+        ``surface_area_um2`` (when > 0) switches the I_mon trace and
+        right-axis label from raw current (µA) to current density
+        (A/cm²).  ``None`` / 0 leaves the µA presentation in place.
+        """
         self._captures.append(capture)
         if self._auto_follow or self._current_idx < 0:
             self._current_idx = len(self._captures) - 1
-        self._refresh_traces(visible, axis_map, inset_visible, inset_traces)
+        self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
+                             surface_area_um2=surface_area_um2)
         cap = self.current_capture()
         if cap is not None:
-            self.metrics.show_capture(cap)
+            # Per-capture metrics are rendered by the experiment tab's
+            # right-side ``metrics_side`` panel (subscribed to the same
+            # capture stream via the ``CaptureBus``) — the inline table
+            # that used to live below the scope plot was removed.
+            self._set_title_from(cap, surface_area_um2=surface_area_um2)
         self._refresh_nav_row()
 
     def set_index(self, idx: int,
                   visible: Optional[Dict[str, bool]] = None,
                   axis_map: Optional[Dict[str, str]] = None,
                   inset_visible: bool = False,
-                  inset_traces: Optional[set] = None) -> bool:
+                  inset_traces: Optional[set] = None,
+                  surface_area_um2: Optional[float] = None) -> bool:
         """Render the capture at ``idx`` (0-based). Returns True on
         success, False if the index is out of range. Disables
         auto-follow so subsequent ``set_capture`` calls don't snap
@@ -187,19 +332,28 @@ class _ChannelPage(QtWidgets.QWidget):
         self._current_idx = idx
         self._auto_follow = (idx == len(self._captures) - 1)
         if visible is not None:
-            self._refresh_traces(visible, axis_map, inset_visible, inset_traces)
+            self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
+                                 surface_area_um2=surface_area_um2)
         cap = self.current_capture()
         if cap is not None:
-            self.metrics.show_capture(cap)
+            # Metric numbers come from the experiment tab's right-side
+            # panel; this page only owns the scope plot now.
+            self._set_title_from(cap, surface_area_um2=surface_area_um2)
         self._refresh_nav_row()
         return True
 
     def refresh_visibility(self, visible: Dict[str, bool],
                            axis_map: Optional[Dict[str, str]] = None,
                            inset_visible: bool = False,
-                           inset_traces: Optional[set] = None):
-        if self.current_capture() is not None:
-            self._refresh_traces(visible, axis_map, inset_visible, inset_traces)
+                           inset_traces: Optional[set] = None,
+                           surface_area_um2: Optional[float] = None):
+        cap = self.current_capture()
+        if cap is not None:
+            self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
+                                 surface_area_um2=surface_area_um2)
+            # Re-render the title too — area-toggle off / on flips
+            # whether the density line appears in the title.
+            self._set_title_from(cap, surface_area_um2=surface_area_um2)
 
     # ----- nav-row helpers -----
     def _nav_step_back(self):
@@ -241,43 +395,151 @@ class _ChannelPage(QtWidgets.QWidget):
         self._nav_kind.setText(f"— {kind}" if kind else "")
 
     def _trace_label(self, trace: str) -> str:
-        """Suffix every trace name with its display unit so the
-        legend reads cleanly. Used as the curve key in ScopePlot —
-        stable across calls so re-plotting reuses the existing
-        PlotDataItem rather than churning the legend."""
-        return f"{trace} ({'µA' if trace == TRACE_IMON else 'V'})"
+        """Legend / curve-key label for ``trace``.
+
+        Previously this baked the unit into the legend
+        (``"I_mon (µA)"``) but the unit is already shown on the
+        second line of the axis label, and baking it in here meant
+        the legend lied when I_mon was rescaled to A/cm² (the
+        axis correctly read ``Current density / A/cm²`` while
+        the legend still said ``I_mon (µA)``).  Returning the bare
+        trace name keeps the legend honest in both modes and makes
+        the curve key stable across the µA ↔ A/cm² swap so
+        ScopePlot reuses the existing PlotDataItem rather than
+        recreating it.
+        """
+        return trace
 
     def _refresh_traces(self, visible: Dict[str, bool],
                         axis_map: Optional[Dict[str, str]] = None,
                         inset_visible: bool = False,
-                        inset_traces: Optional[set] = None):
+                        inset_traces: Optional[set] = None,
+                        surface_area_um2: Optional[float] = None):
         cap = self.current_capture()
         if cap is None: return
         axis_map = axis_map or DEFAULT_TRACE_AXIS
         traces: Dict[str, np.ndarray] = {}
         axis: Dict[str, str] = {}
+        # Decide once whether to present I_mon as raw current (µA) or
+        # current density (A/cm²).  Conversion needs a strictly-
+        # positive area; anything else falls back to µA.
+        try:
+            _area_um2 = float(surface_area_um2) if surface_area_um2 else 0.0
+        except (TypeError, ValueError):
+            _area_um2 = 0.0
+        _use_density = _area_um2 > 0.0
+        # Per-capture baseline subtraction — display-only.  ``cap.v_mon_v``
+        # and ``cap.i_mon_ua`` keep their raw values for compliance
+        # checks, on-disk persistence, and polarization metrics; here
+        # we strip the channel's idle DC level *just for the rendered
+        # trace* so the operator sees the pulse start at zero (same
+        # treatment the calibration plot applies via
+        # ``CalibrationDialog._per_capture_baseline``).  Without this
+        # the experiment plot shows whatever DC offset is currently on
+        # V_mon, which drifts with scope warm-up / ambient
+        # temperature and looks like a "very bad offset" relative to
+        # the calibration plot.
+        from ..readback_calibration import per_capture_baseline
+        _t_us_for_baseline = cap.time_us if cap.time_us is not None else None
         if visible.get(TRACE_VMON, True) and cap.v_mon_v.size:
             k = self._trace_label(TRACE_VMON)
-            traces[k] = cap.v_mon_v
+            _v = np.asarray(cap.v_mon_v, dtype=float)
+            _v = _v - per_capture_baseline(_v, _t_us_for_baseline)
+            traces[k] = _v
             axis[k] = axis_map.get(TRACE_VMON, AXIS_LEFT)
         if visible.get(TRACE_IMON, True) and cap.i_mon_ua is not None and cap.i_mon_ua.size:
             k = self._trace_label(TRACE_IMON)
-            # ``i_mon_ua`` is already in microamps — no conversion.
-            traces[k] = cap.i_mon_ua
+            _i = np.asarray(cap.i_mon_ua, dtype=float)
+            _i = _i - per_capture_baseline(_i, _t_us_for_baseline)
+            if _use_density:
+                # A/cm² = (i_mon_ua × 1e-6 A/µA) / (area_um2 × 1e-8 cm²/µm²)
+                #       = i_mon_ua × 100 / area_um2
+                traces[k] = _i * (100.0 / _area_um2)
+            else:
+                # ``i_mon_ua`` is already in microamps — no conversion.
+                traces[k] = _i
             axis[k] = axis_map.get(TRACE_IMON, AXIS_RIGHT)
-        if visible.get(TRACE_EACT, True) and cap.e_act_v is not None and cap.e_act_v.size:
-            k = self._trace_label(TRACE_EACT)
-            traces[k] = cap.e_act_v
-            axis[k] = axis_map.get(TRACE_EACT, AXIS_LEFT)
+        # E_ret first (so we can use it to derive E_act below if needed).
+        _e_ret_arr = None
         if visible.get(TRACE_ERET, True) and cap.e_ret_v is not None and cap.e_ret_v.size:
             k = self._trace_label(TRACE_ERET)
-            traces[k] = cap.e_ret_v
+            _e_ret_arr = np.asarray(cap.e_ret_v, dtype=float)
+            traces[k] = _e_ret_arr
             axis[k] = axis_map.get(TRACE_ERET, AXIS_LEFT)
-        colours = {self._trace_label(t): TRACE_COLOURS[t] for t in ALL_TRACES}
-        # Clear and replot — ScopePlot.set_traces only appends/updates
-        # so toggling visibility off requires a clear() first.
-        self.scope.clear()
-        self.scope.set_traces(cap.time_us, traces, colors=colours, axis=axis)
+        # E_act — prefer the recorded trace when present, otherwise
+        # derive it from V_mon + E_ret using the differential identity
+        # ``V_mon = E_act − E_ret``  →  ``E_act = V_mon + E_ret``.  This
+        # gives the operator an active-electrode trace whenever the
+        # instrumentation amp is wired to one electrode but not both,
+        # without needing a third channel on the scope.
+        if visible.get(TRACE_EACT, True):
+            k = self._trace_label(TRACE_EACT)
+            if cap.e_act_v is not None and cap.e_act_v.size:
+                traces[k] = cap.e_act_v
+                axis[k] = axis_map.get(TRACE_EACT, AXIS_LEFT)
+            elif (_e_ret_arr is not None
+                  and cap.v_mon_v is not None
+                  and cap.v_mon_v.size == _e_ret_arr.size):
+                # Use the BASELINE-SUBTRACTED V_mon (same treatment as
+                # the displayed V_mon trace).  Scope DC drift on V_mon
+                # otherwise leaks straight into the derived E_act as a
+                # constant offset.  After baseline subtract:
+                #
+                #   V_mon_pulse   = V_mon − V_mon_baseline
+                #                 ≈ E_act_signal − E_ret_signal
+                #     (since V_mon's idle baseline for matched
+                #     electrodes is approximately zero — any non-zero
+                #     residual is scope DC drift, not real signal)
+                #   E_ret_raw     = E_ret_signal + E_ret_rest
+                #   derived_E_act = V_mon_pulse + E_ret_raw
+                #                 = E_act_signal + E_ret_rest
+                #                 ≈ E_act  (when E_act_rest ≈ E_ret_rest
+                #                            for matched coatings)
+                _v_mon_bs = np.asarray(cap.v_mon_v, dtype=float)
+                _v_mon_bs = _v_mon_bs - per_capture_baseline(
+                    _v_mon_bs, _t_us_for_baseline)
+                traces[k] = _v_mon_bs + _e_ret_arr
+                axis[k] = axis_map.get(TRACE_EACT, AXIS_LEFT)
+        # Cache the colour map on first build — it's constant for
+        # the lifetime of this widget so rebuilding the dict on
+        # every capture was pure overhead.
+        if not hasattr(self, "_trace_colours_cache"):
+            self._trace_colours_cache = {
+                self._trace_label(t): TRACE_COLOURS[t] for t in ALL_TRACES}
+        # Declarative update — ``set_traces(remove_missing=True)``
+        # both updates the curves we want and drops the curves we
+        # don't, in a single pass.  Avoids the destroy-and-recreate
+        # cost of ``clear() + set_traces(...)`` (~3-5 ms → <0.5 ms
+        # per capture) by reusing the cached PlotDataItem objects
+        # whenever the trace set hasn't actually changed.
+        self.scope.set_traces(cap.time_us, traces,
+                              colors=self._trace_colours_cache,
+                              axis=axis,
+                              remove_missing=True)
+        # Right-axis label tracks the I_mon presentation chosen above.
+        # Density mode bakes the µA equivalent of 1 A/cm² for this
+        # specific electrode area straight into the label so the
+        # operator can read the right-axis ticks in raw current
+        # without mental arithmetic.
+        #
+        # Conversion: 1 A/cm² × area (cm²) × 1e6 µA/A
+        #           = 1 × (area_um2 × 1e-8) × 1e6
+        #           = area_um2 × 0.01   µA
+        if _use_density:
+            ua_per_density = _area_um2 * 0.01
+            self.scope.set_axis_labels(
+                right=f"Current Density [A/cm² = {ua_per_density:g} µA]")
+        else:
+            self.scope.set_axis_labels(right="Current [µA]")
+        # Voltage label is constant for now but pass through every
+        # refresh so a future call that hides the left axis can
+        # restore it just by re-rendering.
+        self.scope.set_axis_labels(left="Voltage [V]")
+        # Align the 0 V tick with the 0 µA / 0 A·cm⁻² tick — port of
+        # MATLAB getPlot.m, same routine the calibration plot uses.
+        # Skipped silently if pyqtgraph is missing or the right axis
+        # has no data this frame.
+        self.scope.align_y_zeros()
         # Inset state: pass through to the plot. The inset trace
         # selection comes in as raw role tags (V_mon / I_mon / ...);
         # translate to the unit-suffixed names that ScopePlot uses
@@ -323,6 +585,11 @@ class MultiChannelScope(QtWidgets.QWidget):
         # four; ``set_available_traces`` narrows the list once the
         # experiment tab pushes its alias map.
         self._available_traces: set = set(ALL_TRACES)
+        # Electrode surface area for the current run — pushed by the
+        # experiment tab at run start.  ``None`` / 0 → plot I_mon in
+        # µA; a positive value → plot current density (A/cm²) on the
+        # right axis, with the unit on the second line of the label.
+        self._surface_area_um2: Optional[float] = None
 
         bar = QtWidgets.QHBoxLayout()
         for trace in ALL_TRACES:
@@ -671,13 +938,52 @@ class MultiChannelScope(QtWidgets.QWidget):
         page.set_capture(capture, self.visibility(),
                          axis_map=self._axis_map,
                          inset_visible=self.inset_enabled(),
-                         inset_traces=set(self.inset_traces()))
+                         inset_traces=set(self.inset_traces()),
+                         surface_area_um2=self._surface_area_um2)
         # Focus the matching list row so the right-side stack auto-
         # swaps. ``ensure_page`` already auto-focused the very first
         # entry; subsequent captures pull the active selection along
         # with them so the user doesn't have to manually click.
         idx = self._keys_in_order.index(key)
         self.entry_list.setCurrentRow(idx)
+
+    def set_surface_area_um2(self, area_um2: Optional[float]) -> None:
+        """Set (or clear) the electrode surface area used for I_mon
+        rescaling.  ``None`` / 0 → I_mon plots as raw current (µA);
+        a positive value → I_mon plots as current density (A/cm²)
+        with the unit on the second line of the right-axis label.
+
+        Idempotent: a no-change call returns without touching any
+        page.  When the area actually changes, every existing page
+        is asked to redraw with the new presentation so a mid-run
+        toggle takes effect immediately.
+        """
+        try:
+            new_area = float(area_um2) if area_um2 else None
+            if new_area is not None and new_area <= 0:
+                new_area = None
+        except (TypeError, ValueError):
+            new_area = None
+        if new_area == self._surface_area_um2:
+            return
+        self._surface_area_um2 = new_area
+        # Push the new presentation into every existing page so the
+        # axis label + I_mon scaling update without waiting for the
+        # next capture.
+        vis = self.visibility()
+        for page in self._pages.values():
+            try:
+                page.refresh_visibility(
+                    vis, axis_map=self._axis_map,
+                    inset_visible=self.inset_enabled(),
+                    inset_traces=set(self.inset_traces()),
+                    surface_area_um2=self._surface_area_um2)
+            except Exception:
+                pass
+
+    def surface_area_um2(self) -> Optional[float]:
+        """Return the area currently in effect, or ``None`` for µA mode."""
+        return self._surface_area_um2
 
     def mark_completed(self, key):
         """Tag ``key``'s entry as finished — small ✓ at the end of
@@ -730,7 +1036,8 @@ class MultiChannelScope(QtWidgets.QWidget):
             page.refresh_visibility(
                 vis, axis_map=self._axis_map,
                 inset_visible=self.inset_enabled(),
-                inset_traces=set(self.inset_traces()))
+                inset_traces=set(self.inset_traces()),
+                surface_area_um2=self._surface_area_um2)
 
     def _on_entry_changed(self, row: int) -> None:
         """User picked a different list row — swap the stacked content.

@@ -56,8 +56,23 @@ STIM_MAX_AMPLITUDE_UA = 1000.0
 #: actually delivering the programmed current.
 STIM_VOLTAGE_COMPLIANCE_V = 12.0
 
-#: Plexon's typical digital trigger / pattern start delay (µs)
-DIGITAL_DELAY_US = 1.5
+#: Plexon's typical digital trigger / pattern start delay (µs) — the gap
+#: between the digital-sync TTL rising edge and the actual phase-1 stim
+#: onset. Used to shift the captured time axis so t=0 lands on the
+#: current edge instead of the sync edge.
+#:
+#: **Applied whenever the trigger source is a TTL sync line** — that's
+#: both the EXT BNC AND a scope channel the operator tagged with
+#: Role=Trigger (typically CH3 / CH4 wired to the same digital sync
+#: wire just routed to a different physical input).  The 1.2 µs offset
+#: is a property of the stimulator's pattern-start latency, not of
+#: which input the sync lands on, so the correction is identical for
+#: either path.
+#:
+#: For I_mon channel triggering (the current edge IS the trigger) the
+#: delay is zero — pass ``digital=False`` to ``set_trigger`` /
+#: ``auto_layout_for_pulse`` in that case.
+DIGITAL_DELAY_US = 1.2
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +93,16 @@ DEFAULT_PHASE_WIDTH_US = 200.0
 
 #: Default pulse rate (pulses per second)
 DEFAULT_RATE_PPS = 50.0
+
+#: Default oscilloscope record length used by experiments (samples).
+#: 20 k is the sweet spot for TBS-series @ 50 ns/sample: a 1 ms window
+#: with ~4000 samples per 200 µs phase — plenty for the edge-step + cap-
+#: ramp fits, well below the scope's analog bandwidth, and avoids the
+#: multi-second per-capture transfer cost of 200 k / 2 M / 5 M.  TBS2204B
+#: snaps requests to {1k, 2k, 20k, 200k, 2M, 5M}; 20 k lands exactly.
+#: Lives in :mod:`stimtest.config` so the GUI and driver share one
+#: source of truth instead of cross-importing from ``hardware.tektronix``.
+DEFAULT_RECORD_LENGTH = 20_000
 
 
 # ---------------------------------------------------------------------------

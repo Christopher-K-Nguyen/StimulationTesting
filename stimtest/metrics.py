@@ -288,10 +288,23 @@ def _smooth(y: np.ndarray, window: int = 10) -> np.ndarray:
 
 def _abs_derivative(time_us: np.ndarray, v: np.ndarray,
                     smooth_window: int = 10,
-                    edge_zero: int = 30) -> np.ndarray:
+                    edge_zero: int = 30,
+                    v_smooth_precomputed: Optional[np.ndarray] = None
+                    ) -> np.ndarray:
     """|dV/dt| with the canonical pre-/post-smoothing and edge clamping
-    used by ``getAccess.m``."""
-    v_smooth = _smooth(np.asarray(v, dtype=float), smooth_window)
+    used by ``getAccess.m``.
+
+    Pass ``v_smooth_precomputed`` to skip the initial smoothing pass
+    when the caller has already computed it (saves the redundant
+    ``uniform_filter1d`` call when this is invoked alongside another
+    site that smooths the same trace — e.g.
+    ``access_voltage_and_resistance`` needs both the derivative AND a
+    smoothed V_mon for driving-extrema lookup).
+    """
+    if v_smooth_precomputed is not None:
+        v_smooth = v_smooth_precomputed
+    else:
+        v_smooth = _smooth(np.asarray(v, dtype=float), smooth_window)
     dv = np.diff(v_smooth)
     dt = np.diff(time_us)
     # protect against length mismatch (rare scope quirk)
@@ -306,23 +319,40 @@ def _abs_derivative(time_us: np.ndarray, v: np.ndarray,
 
 
 def _find_n_peaks(deriv_abs: np.ndarray, n_target: int,
-                  start_thresh: float, max_seconds: float = 2.0) -> np.ndarray:
+                  start_thresh: float, max_seconds: float = 2.0,
+                  max_iterations: int = 50) -> np.ndarray:
     """Adaptive peak finder that returns exactly ``n_target`` peaks.
 
     Mirrors the while-loop in ``getAccess.m``: start at 0.9 × peak_max, decrease
     threshold by 10%% if too few peaks, re-smooth and restart if too many.
+
+    Bounded by BOTH ``max_seconds`` and ``max_iterations`` — on a
+    pathological waveform the original time-only bound could chew
+    through hundreds of iterations of `_smooth + find_peaks` each
+    hovering near the deadline.  The iteration cap fails fast and
+    falls through to the best-effort lookup.
     """
     import time as _time
     deadline = _time.time() + max_seconds
     thresh = start_thresh
     deriv = deriv_abs.copy()
-    while _time.time() < deadline:
+    iteration = 0
+    # Adaptive smoothing-window escalation: each time we get "too
+    # many peaks" we widen the smooth window.  Starting at 5 and
+    # doubling on each over-shoot collapses the typical
+    # noise-cluster-of-many-tiny-peaks scenario in 2-3 iterations
+    # instead of 8-10 of small constant widenings — same number of
+    # peaks at the end, far fewer `_smooth + find_peaks` round-trips.
+    smooth_window = 5
+    while _time.time() < deadline and iteration < max_iterations:
+        iteration += 1
         peaks, _info = find_peaks(deriv, height=thresh)
         if peaks.size == n_target:
             return peaks
         if peaks.size > n_target:
-            # too many: smooth more and reset
-            deriv = _smooth(deriv, 5)
+            # too many: smooth more (geometric escalation) and reset
+            deriv = _smooth(deriv, smooth_window)
+            smooth_window = min(smooth_window * 2, 64)
             thresh = float(np.max(deriv)) * 0.9
         else:
             thresh *= 0.9
@@ -444,7 +474,15 @@ def access_voltage_and_resistance(
     pre_voltage = float(np.mean(v_trace[pre_mask])) if pre_mask.any() else float(v_trace[0])
 
     # --- 2. Smoothed |dV/dt| ------------------------------------------------
-    deriv_abs, deriv_signed = _abs_derivative(time_us, v_trace)
+    # Compute the smoothed V_mon trace ONCE up front and pass it to
+    # both `_abs_derivative` (which would otherwise smooth again
+    # internally) AND step 5's driving-extrema lookup.  Saves one
+    # `uniform_filter1d` call per capture; ~0.5-1 ms on a 20 k
+    # sample trace.
+    v_arr_f = np.asarray(v_trace, dtype=float)
+    v_smooth = _smooth(v_arr_f)
+    deriv_abs, deriv_signed = _abs_derivative(
+        time_us, v_arr_f, v_smooth_precomputed=v_smooth)
     peak_max = float(np.max(deriv_abs)) if deriv_abs.size else 0.0
     if peak_max <= 0:
         return [], [], []
@@ -471,7 +509,10 @@ def access_voltage_and_resistance(
         access_idx.append(-1)
 
     # --- 5. Driving voltage extrema (used as references for trailing V_a) --
-    v_filt = _smooth(np.asarray(v_trace, dtype=float))
+    # Re-use the smoothed trace computed in step 2 — same window=10
+    # so the result is identical, just without paying for the smooth
+    # twice.
+    v_filt = v_smooth
     if polarity == -1:
         driving1_idx = int(np.argmin(v_filt))
         driving2_idx = int(np.argmax(v_filt))
@@ -981,19 +1022,52 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # half is published in those split fields — the V_mon fallback is
     # NOT a measurement of any single electrode's OCP, so feeding
     # those numbers into the learning bin would corrupt it.
+    # Preference order for the interpulse-potential trace:
+    #   1. E_ret  — the return electrode's potential is the canonical
+    #               reference (matches MATLAB getVoltageMetrics.m's
+    #               ``prePulsePotenial`` and the IEEE NER paper's
+    #               definition).
+    #   2. E_act  — when only the active line is wired up, its idle
+    #               level still measures the electrode-electrolyte rest
+    #               potential, just polarity-flipped.  Better than V_mon
+    #               because V_mon carries the stimulator's DC offset.
+    #   3. V_mon  — last-resort fallback (no instrumentation amp wired).
+    #               Absolute value is biased by the stim offset but the
+    #               metric still tracks drift across captures.
     e_ret_for_potentials = (e_ret
                             if e_ret is not None and e_ret.size == capture.time_us.size
                             else None)
-    m.interpulse_potential_v = _interpulse_potential(
-        capture.time_us,
-        e_ret_for_potentials if e_ret_for_potentials is not None
-        else capture.v_mon_v,
-        pat,
-    )
+    e_act_for_potentials = (e_act
+                            if e_act is not None and e_act.size == capture.time_us.size
+                            else None)
     if e_ret_for_potentials is not None:
+        _eip_trace = e_ret_for_potentials
+        _eip_source = "e_ret"
+    elif e_act_for_potentials is not None:
+        _eip_trace = e_act_for_potentials
+        _eip_source = "e_act"
+    else:
+        _eip_trace = capture.v_mon_v
+        _eip_source = "v_mon"
+    m.interpulse_potential_v = _interpulse_potential(
+        capture.time_us, _eip_trace, pat,
+    )
+    # Split pre / post pulse means for the electrode-potential learning
+    # store — only populated when we have a real electrode trace
+    # (E_ret OR E_act), since the runner uses these to track each
+    # electrode's rest OCP across captures.  V_mon-derived numbers
+    # would corrupt the learning bin (they conflate stim offset with
+    # electrode potential), so leave them at NaN in the V_mon
+    # fallback case.
+    if _eip_source in ("e_ret", "e_act"):
         pre_v, post_v = _interpulse_potential_split(
-            capture.time_us, e_ret_for_potentials, pat,
+            capture.time_us, _eip_trace, pat,
         )
+        # Always populate the return_* fields for back-compat — they
+        # were originally E_ret-only, now they carry whichever
+        # electrode trace we ended up using (E_ret preferred).  The
+        # learning store keys by coating + electrode role, so the
+        # source-of-truth annotation isn't lost.
         m.return_pre_pulse_potential_v = pre_v
         m.return_post_pulse_potential_v = post_v
     # Else leave both at the dataclass default (NaN); the runner

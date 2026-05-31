@@ -14,7 +14,18 @@ QSpinBox / QDoubleSpinBox would be used.
 """
 from __future__ import annotations
 
+import re
+
 from PyQt6 import QtCore, QtGui, QtWidgets
+
+# Matches an *incomplete* scientific-notation literal — the part after
+# the mantissa has started but the exponent isn't yet a valid integer:
+#   "1e"   "1e-"   "1e+"   "-2.5E"   "+.3E-"
+# These would cause float() to raise ValueError, but they are legitimate
+# intermediate keystrokes on the way to a valid number like "1e-3".
+_SCI_INCOMPLETE_RE = re.compile(
+    r'^[+-]?(\d+\.?\d*|\.\d+)[eE][+-]?$'
+)
 
 
 _INITIAL_DELAY_MS = 400      # ms between press and the first auto-repeat tick
@@ -214,6 +225,11 @@ class RepeatingDoubleSpinBox(_HoldRepeatMixin, QtWidgets.QDoubleSpinBox):
         try:
             float(cleaned)
         except ValueError:
+            # Incomplete scientific notation ("1e", "1e-", "2.5E+") is a
+            # legitimate mid-keystroke state — mark Intermediate so Qt
+            # doesn't reject the 'e'/'E' character as the user types.
+            if _SCI_INCOMPLETE_RE.match(cleaned):
+                return (QtGui.QValidator.State.Intermediate, text, pos)
             return (QtGui.QValidator.State.Invalid, text, pos)
         return (QtGui.QValidator.State.Acceptable, text, pos)
 
@@ -260,3 +276,32 @@ class RepeatingSpinBox(_HoldRepeatMixin, QtWidgets.QSpinBox):
         except ValueError:
             return (QtGui.QValidator.State.Invalid, text, pos)
         return (QtGui.QValidator.State.Acceptable, text, pos)
+
+
+class ScientificDoubleSpinBox(RepeatingDoubleSpinBox):
+    """``RepeatingDoubleSpinBox`` that also formats very small or very
+    large values in scientific notation.
+
+    Inherits the hold-to-repeat buttons, SI thousands separator, and the
+    ``validate`` fix that treats incomplete exponents ("1e", "2.5E-") as
+    *Intermediate* so the user can type scientific notation naturally.
+
+    Display rules (``textFromValue``):
+    * ``0`` → fixed notation (``"0.00…"``)
+    * ``1e-4 ≤ |v| < 1e6`` → fixed notation with thousands separator
+    * otherwise → ``g``-format scientific notation (e.g. ``"1.23e-06"``)
+      using the spinbox's current :meth:`decimals` setting for precision.
+
+    ``valueFromText`` inherits the parent's implementation which calls
+    ``float()`` on the stripped text, so ``"1e-3"``, ``"2.5E+6"``, etc.
+    are parsed correctly without any extra code here.
+    """
+
+    def textFromValue(self, value: float) -> str:
+        abs_v = abs(value)
+        if abs_v == 0.0 or (1e-4 <= abs_v < 1e6):
+            return _format_with_thousands(value, self.decimals())
+        # Scientific notation: use the spinbox's decimals setting for the
+        # number of significant digits shown after the mantissa point.
+        prec = max(2, self.decimals())
+        return f"{value:.{prec}e}"

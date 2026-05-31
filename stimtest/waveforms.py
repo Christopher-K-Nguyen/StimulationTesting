@@ -2167,6 +2167,10 @@ def build_pat_pairs(pattern: "PulsePattern", *,
     n_samples = pattern.curved_sample_budget(max_pairs=max_pairs)
     pairs: List[Tuple[int, int]] = []
     for ph in pattern.phases:
+        # Skip phases whose duration is zero — nothing to play and
+        # the firmware rejects "0 nA for 0 µs" pairs.
+        if ph.width_us <= 0 and ph.delay_after_us <= 0:
+            continue
         # Per-phase sample-count clamp. The PlexStim hardware refuses
         # sub-µs durations, so ``build_pat_pairs`` already rounds each
         # segment up with ``max(1, int(round(...)))``. Without a per-
@@ -2178,53 +2182,54 @@ def build_pat_pairs(pattern: "PulsePattern", *,
         # segment ≥ 1 µs so the rounded total stays close to the
         # intended phase width. The floor at 2 keeps every curved
         # phase at least playable for very narrow widths.
-        ph_n_samples = max(2, min(n_samples, int(round(float(ph.width_us)))))
-        bps = shape_breakpoints(
-            amplitude_ua=ph.amplitude_ua,
-            width_us=ph.width_us,
-            shape=ph.shape,
-            bump_count=ph.bump_count,
-            tau_us=ph.tau_us,
-            n_samples=ph_n_samples,
-            tail_zero_us=getattr(ph, "tail_zero_us", 0.0),
-            offset_ua=getattr(ph, "offset_ua", 0.0),
-        )
-        # Convert (time, amp) breakpoints into (amp_nA, dur_us) pairs
-        # by walking consecutive points. The last breakpoint is the
-        # phase boundary marker — its amplitude doesn't get held
-        # within the phase, so we stop one short.
-        #
-        # Use CUMULATIVE rounding to integer microseconds: each pair's
-        # end-time is the rounded running cumulative time, so the
-        # phase's total duration always tracks ``int(round(W))``
-        # exactly. Previously each segment was rounded independently
-        # with ``max(1, int(round(t_next - t_k)))`` which dropped the
-        # fractional remainder on every segment — for a 500 µs phase
-        # split into 496 segments of natural width ~1.008 µs, every
-        # segment was clamped to 1 µs and 4 µs of duration vanished.
-        # Cumulative rounding distributes the rounding error across
-        # the segments (some 1 µs, some 2 µs) so the total is exact.
-        # Each segment still respects the ≥ 1 µs hardware minimum.
-        cursor_int = 0   # cumulative integer-µs time within this phase
-        phase_target_us = int(round(float(ph.width_us)))
-        for k in range(len(bps) - 1):
-            t_k, a_k = bps[k]
-            t_next, _ = bps[k + 1]
-            # Snap the segment's end-time to the integer µs grid using
-            # the cumulative running float-time. Floor below by
-            # cursor_int + 1 so each pair takes at least 1 µs (the
-            # hardware minimum).
-            next_int = int(round(float(t_next)))
-            # On the very last pair of this phase, force the end-time
-            # to exactly the phase target so the total duration
-            # equals ``W`` regardless of small rounding drifts.
-            if k == len(bps) - 2:
-                next_int = phase_target_us
-            next_int = max(cursor_int + 1, next_int)
-            duration_us = next_int - cursor_int
-            amp_nA = int(round(float(a_k) * 1000.0))
-            pairs.append((amp_nA, duration_us))
-            cursor_int = next_int
+        if ph.width_us > 0:
+            ph_n_samples = max(2, min(n_samples, int(round(float(ph.width_us)))))
+            bps = shape_breakpoints(
+                amplitude_ua=ph.amplitude_ua,
+                width_us=ph.width_us,
+                shape=ph.shape,
+                bump_count=ph.bump_count,
+                tau_us=ph.tau_us,
+                n_samples=ph_n_samples,
+                tail_zero_us=getattr(ph, "tail_zero_us", 0.0),
+                offset_ua=getattr(ph, "offset_ua", 0.0),
+            )
+            # Convert (time, amp) breakpoints into (amp_nA, dur_us) pairs
+            # by walking consecutive points. The last breakpoint is the
+            # phase boundary marker — its amplitude doesn't get held
+            # within the phase, so we stop one short.
+            #
+            # Use CUMULATIVE rounding to integer microseconds: each pair's
+            # end-time is the rounded running cumulative time, so the
+            # phase's total duration always tracks ``int(round(W))``
+            # exactly. Previously each segment was rounded independently
+            # with ``max(1, int(round(t_next - t_k)))`` which dropped the
+            # fractional remainder on every segment — for a 500 µs phase
+            # split into 496 segments of natural width ~1.008 µs, every
+            # segment was clamped to 1 µs and 4 µs of duration vanished.
+            # Cumulative rounding distributes the rounding error across
+            # the segments (some 1 µs, some 2 µs) so the total is exact.
+            # Each segment still respects the ≥ 1 µs hardware minimum.
+            cursor_int = 0   # cumulative integer-µs time within this phase
+            phase_target_us = int(round(float(ph.width_us)))
+            for k in range(len(bps) - 1):
+                t_k, a_k = bps[k]
+                t_next, _ = bps[k + 1]
+                # Snap the segment's end-time to the integer µs grid using
+                # the cumulative running float-time. Floor below by
+                # cursor_int + 1 so each pair takes at least 1 µs (the
+                # hardware minimum).
+                next_int = int(round(float(t_next)))
+                # On the very last pair of this phase, force the end-time
+                # to exactly the phase target so the total duration
+                # equals ``W`` regardless of small rounding drifts.
+                if k == len(bps) - 2:
+                    next_int = phase_target_us
+                next_int = max(cursor_int + 1, next_int)
+                duration_us = next_int - cursor_int
+                amp_nA = int(round(float(a_k) * 1000.0))
+                pairs.append((amp_nA, duration_us))
+                cursor_int = next_int
         # Inter-phase / discharge / post-phase delay — held at 0 nA.
         # Skip when delay_after_us is 0; some firmware revs reject
         # "0 nA for 0 µs" pairs. Round up to the 1 µs hardware grid.

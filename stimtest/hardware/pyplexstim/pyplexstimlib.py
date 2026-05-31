@@ -1203,19 +1203,20 @@ class PyPlexStim:
                 0 - OK
         """
         self.stim_n = c_int(stim_n)
-        self.fw_version = (c_char * 512)()
-
-        # LOCAL FIX (deviates from upstream Plexon 1.2.0): the shipped wrapper
-        # uses the mangled name suffix "PAH"/"PEAH" (int*) when the out-buffer
-        # is actually char*. Compare to ps_get_description / ps_get_serial_number
-        # which correctly use "PAD"/"PEAD" (char*). With the wrong suffix the
-        # getattr lookup either fails or resolves to the wrong overload.
+        # SDK header: PS_GetFwVersion(int StimN, int *fw_version)
+        # The firmware version is an integer (e.g. 204 = v2.0.4), NOT a char
+        # buffer.  Earlier wrapper versions used the wrong mangled name suffix
+        # (PAD / PEAD for char*); the correct suffix is PAH / PEAH for int*.
+        self.fw_version = c_int(0)
         if self.platform == '32bit':
-            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPAD@Z")(self.stim_n, byref(self.fw_version))
+            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPAH@Z")(self.stim_n, byref(self.fw_version))
         else:
-            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPEAD@Z")(self.stim_n, byref(self.fw_version))
+            self.result = getattr(self.plexstim_dll, "?PS_GetFwVersion@@YAHHPEAH@Z")(self.stim_n, byref(self.fw_version))
 
-        return self.fw_version.value, self.result
+        # Format the integer as a dotted version string (204 → "2.0.4").
+        v = self.fw_version.value
+        fw_str = f"{v // 100}.{(v % 100) // 10}.{v % 10}" if v > 0 else str(v)
+        return fw_str, self.result
     
     def ps_get_serial_number(self, stim_n):
         """

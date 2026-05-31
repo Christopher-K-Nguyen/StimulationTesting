@@ -457,18 +457,34 @@ _PLEX_DEVICE_NAME_HINTS = (
     "stim 2",
 )
 
+#: The PlexStim 2.0 hardware uses an FTDI FT4232H chip (four independent
+#: serial converters on a single USB device). Windows enumerates the
+#: composite parent as "USB Composite Device" (vendor: Standard USB Host
+#: Controller) with an InstanceId of the form:
+#:
+#:     USB\VID_0403&PID_6011\PLXxxxxx
+#:
+#: The ``PLX`` serial-number prefix is Plexon's unique discriminator
+#: within the shared FTDI VID/PID space. We match on the exact
+#: VID+PID AND the PLX prefix rather than on the VID alone so we
+#: don't false-positive on other FTDI quad-serial devices in the lab.
+#: All three components must be present in the InstanceId string.
+_PLEX_FTDI_VID_PID = "VID_0403&PID_6011"
+_PLEX_SERIAL_PREFIX = "PLX"
 
-def plexstim_device_present(timeout_s: float = 2.0) -> Optional[bool]:
+
+def plexstim_device_present(timeout_s: float = 8.0) -> Optional[bool]:
     """Probe Windows PnP for a plugged-in Plexon stimulator.
 
     Parameters
     ----------
     timeout_s : float, optional
         Seconds to wait for the PowerShell probe to respond before
-        giving up. The default 2 s is plenty on a healthy machine
-        (PowerShell startup + ``Get-PnpDevice`` typically returns
-        in well under a second), and a slow box just degrades to
-        the ``None`` (unknown) state.
+        giving up. ``Get-PnpDevice -PresentOnly`` can take 3–6 s on
+        a fully-loaded Windows 11 machine (PnP enumeration walks every
+        device class). The default 8 s covers the slow case while still
+        bounding the GUI startup lag. Degrades to the ``None``
+        (unknown) state on timeout.
 
     Returns
     -------
@@ -490,12 +506,26 @@ def plexstim_device_present(timeout_s: float = 2.0) -> Optional[bool]:
     # alphanumeric today; cheap insurance if the list grows later.
     import re
     import subprocess
-    pattern = "|".join(re.escape(h) for h in _PLEX_DEVICE_NAME_HINTS)
+    name_pattern = "|".join(re.escape(h) for h in _PLEX_DEVICE_NAME_HINTS)
+    # The PlexStim 2.0 enumerates via its FTDI FT4232H chip as
+    # "USB Composite Device" — no Plexon text in FriendlyName or
+    # Manufacturer. Match on InstanceId instead:
+    #   USB\VID_0403&PID_6011\PLXxxxxx
+    # The PLX serial prefix is Plexon's unique discriminator within
+    # the shared FTDI VID/PID space.
+    #
+    # The -like wildcard operator is used for the InstanceId check
+    # (rather than -match) because it handles the literal backslash
+    # in the InstanceId string without regex-escaping complications.
+    # The InstanceId LIKE pattern becomes: *VID_0403&PID_6011\PLX*
+    # The name_pattern still uses -match (regex) for the hints.
+    like_pat = f"*{_PLEX_FTDI_VID_PID}\\{_PLEX_SERIAL_PREFIX}*"
     ps_script = (
         "$ErrorActionPreference='SilentlyContinue';"
         "Get-PnpDevice -PresentOnly | "
-        f"Where-Object {{ $_.FriendlyName -match '{pattern}' "
-        f"-or $_.Manufacturer -match 'plexon' }} | "
+        f"Where-Object {{ $_.FriendlyName -match '{name_pattern}' "
+        f"-or $_.Manufacturer -match 'plexon' "
+        f"-or $_.InstanceId -like '{like_pat}' }} | "
         "Select-Object -ExpandProperty FriendlyName"
     )
     try:

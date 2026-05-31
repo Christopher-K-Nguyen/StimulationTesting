@@ -112,6 +112,9 @@ class RunnerWorker(QtCore.QObject):
     save_failed = QtCore.pyqtSignal(str, str)
     # Emitted once when the experiment ends (carries the ExperimentResult)
     finished = QtCore.pyqtSignal(object)
+    # Emitted when the runner pauses between channels for a physical rewire.
+    # Carries the human-readable message describing the next channel.
+    paused = QtCore.pyqtSignal(str)
 
     def __init__(self, runner: ExperimentRunner,
                  save_path: Optional[Path] = None,
@@ -146,6 +149,17 @@ class RunnerWorker(QtCore.QObject):
         self.user_email = str(user_email or "")
         self.user_name = str(user_name or "")
         self.session_subject = str(session_subject or "")
+        # Optional pre-run callable executed by ``run`` BEFORE
+        # ``self.runner.run()`` and on the worker thread.  Used to
+        # move the scope-setup SCPI burst off the GUI thread — a
+        # single hung USB-TMC round-trip in that burst used to
+        # freeze the whole GUI for several seconds, and slow setup
+        # commands (e.g. the read-back-validated ``set_acquisition_mode``
+        # on stubborn firmware) gave the user no Stop-button escape.
+        # With the callable assigned, the GUI stays responsive
+        # during scope setup and any later hang is contained to
+        # the worker thread.
+        self.pre_run: Optional[Callable[[], None]] = None
         # Wire the plain-Python event stream into our Qt signals
         runner.subscribe(self._on_event)
 
@@ -156,8 +170,25 @@ class RunnerWorker(QtCore.QObject):
         if ev.kind == "capture" and ev.capture is not None:
             ch = ev.run.configuration.active if ev.run is not None else -1
             self.captured.emit(ev.capture, int(ch))
+        if ev.kind == "paused":
+            # Surface the between-channels pause as its own signal so the
+            # tab can pop a modal "rewire to next channel, then continue"
+            # dialog and call runner.request_continue() on dismiss.
+            self.paused.emit(ev.message or "Continue to next channel?")
         if ev.message:
             self.log_msg.emit(ev.message)
+
+    def request_continue(self):
+        """Forward a continue request to the underlying runner.
+
+        Called from the GUI thread after the user dismisses the rewire
+        dialog. The runner's continue event is thread-safe so no extra
+        marshalling is needed.
+        """
+        try:
+            self.runner.request_continue()
+        except Exception:
+            pass
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -166,20 +197,44 @@ class RunnerWorker(QtCore.QObject):
         # It blocks until the experiment is complete or aborted.
         import time as _time
         run_start = _time.time()
+        # Pre-run callable — typically the scope-setup SCPI burst the
+        # tab used to run synchronously on the GUI thread (which froze
+        # the UI on slow USB-TMC round-trips).  Moving it here keeps
+        # the GUI responsive: Stop button works, log pane updates as
+        # each ``log_msg.emit`` arrives, and any hang in a single SCPI
+        # call is contained to the worker.  Failures during pre-run
+        # don't abort the experiment outright — log them and let the
+        # runner attempt the run anyway (the scope may be in a usable
+        # state from a previous run's setup, or the bug might be
+        # downstream).
+        if self.pre_run is not None:
+            try:
+                self.pre_run()
+            except Exception as e:
+                import traceback as _tb_pre
+                self.log_msg.emit(
+                    f"⚠ Scope setup error ({type(e).__name__}): {e}\n"
+                    + _tb_pre.format_exc())
         try:
             result = self.runner.run()
-        except (ValueError, RuntimeError) as e:
-            # Pre-flight or hardware-side validation failure. Surface the
-            # message in the log pane and synthesise an empty/aborted
-            # result so the GUI's ``_on_finished`` slot still fires and
-            # restores the Start button. Without this, the worker thread
-            # would die silently and leave the UI stuck on "Stop".
-            self.log_msg.emit(f"Run aborted: {e}")
+        except Exception as e:
+            # Catch everything — including code bugs (NameError,
+            # AttributeError, etc.) — so the worker NEVER dies
+            # silently leaving the GUI stuck on "Stop" with the
+            # worker thread orphaned.  Pre-flight ValueError /
+            # RuntimeError are the expected hits; the rest are
+            # bugs that the user will see as "ran aborted with X"
+            # in the log while the GUI stays responsive and lets
+            # them start another experiment.
+            import traceback as _tb
+            tb_text = _tb.format_exc()
+            self.log_msg.emit(
+                f"Run aborted ({type(e).__name__}): {e}\n{tb_text}")
             from ..experiments.base import ExperimentResult
             result = ExperimentResult(
                 session=self.runner.session,
                 aborted=True,
-                error=str(e),
+                error=f"{type(e).__name__}: {e}",
             )
             # Mirror the MATLAB ``sendError.m`` notification — only
             # if the user opted in, set an email, and SMTP creds are
@@ -353,6 +408,24 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # before each run starts.
         self._acq_mode: str = "AVERAGE"
         self._acq_n_avg: int = 16
+        # Trigger source — "EXT" for digital-sync, the physical channel
+        # name of a Trigger-role channel (e.g. "CH4"), or the I_mon
+        # channel name (e.g. "CH2") when no Trigger role is assigned.
+        # Pushed by the Setup tab via :meth:`set_trigger_source`.
+        self._trigger_source: str = "EXT"
+        # Trigger edge slope — "RISE" or "FALL".
+        # Pushed by the Setup tab via :meth:`set_trigger_slope`.
+        # Only used when the trigger source is I_mon; for EXT and
+        # channel-Trigger paths the slope is forced to RISE because
+        # they're both TTL sync lines.
+        self._trigger_slope: str = "RISE"
+        # True when the trigger source is a TTL sync line (EXT BNC or
+        # a channel carrying Role=Trigger).  Determines whether the
+        # trigger setup uses fixed TTL semantics (slope=RISE, 1.4 V) or
+        # the polarity-derived I_mon semantics (slope follows phase-1
+        # sign, level from imon_trigger_level).
+        # Pushed by the Setup tab via :meth:`set_digital_trigger`.
+        self._trigger_is_digital: bool = True
         # User-overridable water-window limits + grace tolerance.
         # Filled in by the Setup tab on first emission; the VT runner
         # reads them at start time. Defaults match the SIROF catalog
@@ -432,8 +505,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # control balance manually (symmetric, triphasic, or auto-adjust).
         self.pattern_panel.balanceWarningVisibility.connect(
             self.pattern_preview.set_balance_visible)
-        QtCore.QTimer.singleShot(0, lambda: self.pattern_preview.set_pattern(
-            self.pattern_panel.pattern()))
+        # Defer the first preview render until this tab is actually
+        # SHOWN (used to fire on the next event-loop tick via
+        # singleShot(0), which made cold-launch redraw the preview
+        # for every experiment tab even if the user never opened
+        # them).  ``_first_show_done`` is checked in
+        # :meth:`showEvent` below; subsequent shows are no-ops.
+        self._first_show_done = False
 
         # Combinations panel — every experiment now has one, so the user
         # can pick a multipolar configuration uniformly. SINGLE_CONFIG
@@ -444,6 +522,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self.combo_panel.combinationHovered.connect(
             lambda active, rets, sp: self.channel_grid.set_highlight(
                 active if active > 0 else None, rets, sp))
+        # Gate the Start button on having at least one selected
+        # configuration — without this, an operator could press Start
+        # with an empty combo list and trip the runner's "No
+        # configurations selected" preflight error mid-flight.  We
+        # re-evaluate every time the combo selection or hardware
+        # connection state changes; ``_refresh_start_enabled`` is the
+        # single decision point (hardware AND combinations).
+        self.combo_panel.combinationsChanged.connect(
+            lambda _configs: self._refresh_start_enabled())
         self.combo_panel.set_array(array)
 
         self.start_btn = QtWidgets.QPushButton("Start")
@@ -508,6 +595,23 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # reference is replaced by MainWindow with the shared instance
         # after construction; until then it points at a local placeholder.
 
+    def showEvent(self, event):
+        """First-show hook — render the initial pattern preview.
+
+        Done lazily so cold launch doesn't pay for a pyqtgraph
+        rebuild per experiment tab even when the user never opens
+        them.  ``_first_show_done`` guards against re-rendering on
+        subsequent tab switches.
+        """
+        super().showEvent(event)
+        if not getattr(self, "_first_show_done", True):
+            try:
+                self.pattern_preview.set_pattern(
+                    self.pattern_panel.pattern())
+            except Exception:
+                pass
+            self._first_show_done = True
+
     # ----- layout assembly --------------------------------------------------
     def _assemble_pages(self, params_box: QtWidgets.QWidget):
         """Lay out the Parameters and Experiment sub-tabs.
@@ -537,6 +641,12 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         left_inner = QtWidgets.QWidget()
         left = QtWidgets.QVBoxLayout(left_inner)
         left.addWidget(params_box)
+        # Camera capture controls (periodic snapshot + video recording)
+        # — applies to whatever experiment this tab runs.  Triggered
+        # at run start by the runner; both toggles default OFF so a
+        # run without camera intent is a pure no-op.  See
+        # :meth:`_build_camera_capture_group`.
+        left.addWidget(self._build_camera_capture_group())
         left.addStretch(1)
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_inner)
@@ -619,9 +729,46 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 self.multichan_scope, "Voltage Transient")
             for label, widget in extra_tabs:
                 self._experiment_inner_tabs.addTab(widget, label)
-            ep_split.addWidget(self._experiment_inner_tabs)
+            _scope_widget = self._experiment_inner_tabs
         else:
-            ep_split.addWidget(self.multichan_scope)
+            _scope_widget = self.multichan_scope
+        # Wrap the scope view + camera preview in a vertical splitter
+        # so the operator can drag the boundary to give the camera
+        # more / less screen real estate.  The CameraStreamPane is
+        # HIDDEN by default and auto-shows when ``camera_service()``
+        # connects — when no camera is in use, the splitter collapses
+        # to the scope view alone (zero visual cost).
+        from .camera import CameraStreamPane, camera_service
+        self.camera_stream_pane = CameraStreamPane(
+            parent=self, allow_snapshot_button=True)
+        # Pin a real minimum height (220 px ≈ 480p-ish preview area)
+        # so when the service connects and the pane goes visible, the
+        # splitter actually allocates room.  Without this floor, a
+        # splitter that's been laying out a hidden zero-size child can
+        # leave the newly-visible pane at literal height 0 and the
+        # operator sees nothing.
+        self.camera_stream_pane.setMinimumHeight(220)
+        scope_cam_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        scope_cam_split.setChildrenCollapsible(False)
+        scope_cam_split.addWidget(_scope_widget)
+        scope_cam_split.addWidget(self.camera_stream_pane)
+        # Scope takes 3× the height of the camera pane by default;
+        # operator can drag the boundary at runtime.
+        scope_cam_split.setStretchFactor(0, 3)
+        scope_cam_split.setStretchFactor(1, 1)
+        self._scope_cam_split = scope_cam_split
+        ep_split.addWidget(scope_cam_split)
+        # On camera connect/disconnect, re-trigger the splitter to
+        # redistribute heights.  Without this nudge, QSplitter doesn't
+        # automatically grow the camera pane just because its child
+        # widget flipped from setVisible(False) to setVisible(True) —
+        # it keeps whatever sizes it had with the pane at 0 height.
+        try:
+            svc = camera_service()
+            svc.connected.connect(self._on_camera_service_connected)
+            svc.disconnected.connect(self._on_camera_service_disconnected)
+        except Exception:
+            pass
         # Wrap the metrics table in a group box so its purpose is clear,
         # and pin a min-width so the splitter can't collapse it.
         metrics_box = QtWidgets.QGroupBox("Metric measurements")
@@ -638,6 +785,174 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         ep = QtWidgets.QVBoxLayout(self.experiment_page)
         ep.setContentsMargins(4, 4, 4, 4)
         ep.addWidget(ep_split, stretch=1)
+
+    def _on_camera_service_connected(self, _desc: str) -> None:
+        """Force the scope+camera splitter to give the pane real
+        screen space when the camera connects.
+
+        QSplitter doesn't automatically grow a child that flips from
+        invisible to visible — it preserves the prior sizes (with the
+        invisible child at 0).  We re-set sizes explicitly using a 3:1
+        scope:camera ratio over the current splitter total height.
+        Safe if the splitter has 0 total height (skip — happens when
+        the experiment tab hasn't been shown yet; the resize fires
+        again on the next splitter event).
+        """
+        try:
+            split = self._scope_cam_split
+            total = sum(split.sizes())
+            if total <= 0:
+                # Splitter not laid out yet (tab never shown).  Use
+                # the camera pane's minimum so it has SOMETHING when
+                # it becomes visible.
+                total = max(self.camera_stream_pane.minimumHeight() * 4,
+                            600)
+            scope_h = max(int(total * 0.7), 200)
+            cam_h = max(int(total * 0.3),
+                        self.camera_stream_pane.minimumHeight())
+            split.setSizes([scope_h, cam_h])
+        except Exception:
+            pass
+
+    def _on_camera_service_disconnected(self) -> None:
+        """Give the scope the full splitter height when the camera
+        disconnects (the pane auto-hides itself via its own slot;
+        we just redistribute the now-free space).
+        """
+        try:
+            split = self._scope_cam_split
+            total = sum(split.sizes())
+            if total > 0:
+                # All to the scope; the hidden camera pane retains a
+                # nominal 0 so its setSizes restore later doesn't
+                # leave a stuck divider.
+                split.setSizes([total, 0])
+        except Exception:
+            pass
+
+    def _build_camera_capture_group(self) -> QtWidgets.QGroupBox:
+        """Camera capture controls for the Test Parameters page.
+
+        Two independent toggles + one interval:
+
+          * **Periodic snapshot** — when on, the runner takes a JPEG
+            snapshot via :func:`camera_service` every ``snapshot
+            interval`` seconds for the duration of the run.  Default
+            interval is 30 s; floor 1 s so a runaway timer can't
+            saturate the disk.
+          * **Video recording** — when on, the runner starts an MP4
+            recording at run start and stops it at run end.  One
+            clip per run; filename is timestamped at start.
+
+        Both default OFF so a run without explicit camera intent is
+        a pure no-op (no extra files, no QtMultimedia activity).  The
+        group is HIDDEN ENTIRELY when the user hasn't connected a
+        camera in the ConnectionPanel — same auto-show semantics as
+        the experiment-tab stream pane.
+
+        Group state round-trips via :meth:`current_prefs` /
+        :meth:`restore_prefs` under the ``camera_capture`` key.
+        """
+        # Lazy import — camera module pulls QtMultimedia indirectly
+        # (via camera_service first call), but the import itself is
+        # cheap (just the file).
+        from .camera import camera_service
+        svc = camera_service()
+
+        grp = QtWidgets.QGroupBox("Camera capture during run")
+        grp.setToolTip(
+            "Optional camera-driven artefacts saved during a run.  "
+            "Requires a camera connected in the Hardware panel — "
+            "the group hides when no camera is set up.  Both toggles "
+            "default OFF.")
+        gl = QtWidgets.QGridLayout(grp)
+        gl.setContentsMargins(8, 6, 8, 6)
+        gl.setHorizontalSpacing(8)
+        gl.setVerticalSpacing(4)
+
+        self.cam_snapshot_chk = QtWidgets.QCheckBox(
+            "Periodic snapshot every")
+        self.cam_snapshot_chk.setChecked(False)
+        self.cam_snapshot_chk.setToolTip(
+            "Save a JPEG to <repo>\\test\\ every N seconds for the "
+            "duration of the run.  Useful for tracking electrolyte "
+            "level, bubble formation on the electrode, indicator "
+            "lamps on the bench during a long run.")
+        self.cam_snapshot_interval = QtWidgets.QDoubleSpinBox()
+        self.cam_snapshot_interval.setRange(1.0, 3600.0)
+        self.cam_snapshot_interval.setSingleStep(5.0)
+        self.cam_snapshot_interval.setDecimals(1)
+        self.cam_snapshot_interval.setValue(30.0)
+        self.cam_snapshot_interval.setSuffix(" s")
+        self.cam_snapshot_interval.setToolTip(
+            "Snapshot interval in seconds.  Floor 1 s (anything "
+            "faster would saturate the disk on a webcam-quality JPEG "
+            "stream and serves no diagnostic purpose).  Ceiling "
+            "3600 s (1 hr).")
+        # Disable the interval spinbox when the checkbox is off — a
+        # disabled visual cue is clearer than just-ignored value.
+        self.cam_snapshot_interval.setEnabled(False)
+        self.cam_snapshot_chk.toggled.connect(
+            self.cam_snapshot_interval.setEnabled)
+
+        self.cam_record_chk = QtWidgets.QCheckBox(
+            "Record MP4 video for the entire run")
+        self.cam_record_chk.setChecked(False)
+        self.cam_record_chk.setToolTip(
+            "Save one MP4 clip per run to <repo>\\test\\.  Recording "
+            "starts at run start and stops at run end; filename is "
+            "timestamped at the start moment.  Disk cost is ~10-30 "
+            "MB/min at default webcam resolution.")
+
+        gl.addWidget(self.cam_snapshot_chk,         0, 0)
+        gl.addWidget(self.cam_snapshot_interval,    0, 1)
+        gl.addWidget(self.cam_record_chk,           1, 0, 1, 2)
+
+        # Auto-show/hide tied to camera-service connection state.
+        # We don't disable the toggles when no camera is connected —
+        # the user can configure intent BEFORE plugging the camera
+        # in and the runner will pick it up.  But we DO hide the
+        # group entirely when QtMultimedia isn't available at all
+        # (e.g. a stripped headless install) since the toggles
+        # would be dead-on-click.
+        try:
+            if not svc.enumerate_devices():
+                # QtMultimedia OK but no cameras yet — show the
+                # group anyway so the user can pre-configure.
+                pass
+        except Exception:
+            grp.setVisible(False)
+
+        # Store the group on self for prefs round-trip + so the
+        # runner-bind layer (added in a later task) can read state.
+        self._camera_capture_group = grp
+        return grp
+
+    def _camera_capture_prefs(self) -> dict:
+        """Snapshot the camera-capture toggle state for prefs.json."""
+        try:
+            return {
+                "periodic_snapshot": bool(self.cam_snapshot_chk.isChecked()),
+                "snapshot_interval_s": float(self.cam_snapshot_interval.value()),
+                "record_video": bool(self.cam_record_chk.isChecked()),
+            }
+        except Exception:
+            return {}
+
+    def _restore_camera_capture_prefs(self, p: dict) -> None:
+        """Restore camera-capture toggle state from prefs.json."""
+        if not isinstance(p, dict):
+            return
+        try:
+            if "periodic_snapshot" in p:
+                self.cam_snapshot_chk.setChecked(bool(p["periodic_snapshot"]))
+            if "snapshot_interval_s" in p:
+                self.cam_snapshot_interval.setValue(
+                    float(p["snapshot_interval_s"]))
+            if "record_video" in p:
+                self.cam_record_chk.setChecked(bool(p["record_video"]))
+        except Exception:
+            pass
 
     def _extra_experiment_tabs(self):
         """Subclass hook — return an iterable of ``(label, widget)``
@@ -915,6 +1230,35 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self._anodic_limit_v = float(anodic_v)
         self._polarization_tolerance_v = max(0.0, float(tolerance_v))
 
+    def set_trigger_source(self, source: str):
+        """Store the trigger source pushed from the Setup tab.
+
+        ``source`` is ``"EXT"`` for the digital-sync BNC or the physical
+        channel name (e.g. ``"CH2"``) when I_mon is used as the trigger.
+        Applied to the scope in ``_start_runner`` before the first capture.
+        """
+        self._trigger_source = str(source) if source else "EXT"
+
+    def set_trigger_slope(self, slope: str):
+        """Store the trigger edge slope pushed from the Setup tab.
+
+        ``slope`` is ``"RISE"`` or ``"FALL"``.
+        Applied to the scope in ``_start_runner`` before the first capture.
+        """
+        self._trigger_slope = slope if slope in ("RISE", "FALL") else "RISE"
+
+    def set_digital_trigger(self, is_digital: bool):
+        """Store whether the trigger source is a TTL sync line.
+
+        Pushed by the Setup tab via ``digitalTriggerChanged`` whenever
+        the EXT checkbox toggles or a channel's role changes between
+        ``Trigger`` and anything else.  ``True`` means the trigger
+        setup uses fixed TTL semantics (slope=RISE, level=1.4 V);
+        ``False`` means it falls back to I_mon's polarity-derived
+        slope and amplitude-derived level.
+        """
+        self._trigger_is_digital = bool(is_digital)
+
     def set_acquisition(self, mode: str, n_avg: int):
         """Stash the acquisition mode + averaging count for the next run.
 
@@ -932,12 +1276,60 @@ class _BaseExperimentTab(QtWidgets.QWidget):
 
     def set_hardware(self, stim: Stimulator, scope: Oscilloscope):
         self._stim = stim; self._scope = scope
-        self.start_btn.setEnabled(True)
+        self._refresh_start_enabled()
 
     def clear_hardware(self):
         self._stim = None; self._scope = None
-        self.start_btn.setEnabled(False)
+        self._refresh_start_enabled()
         self.stop_btn.setEnabled(False)
+
+    def _refresh_start_enabled(self) -> None:
+        """Single decision point for the Start button's enabled state.
+
+        Requires BOTH:
+          * Hardware initialised (``self._stim is not None`` — set by
+            :meth:`set_hardware`)
+          * At least one combination selected in the combo panel
+
+        Wired to:
+          * ``combo_panel.combinationsChanged`` — fires whenever the
+            user adds, removes, or toggles a configuration row.
+          * ``set_hardware`` / ``clear_hardware`` — fires when the
+            Connection panel reports a stim init / close.
+
+        Also sets a tooltip on the button explaining why it's disabled
+        so the operator doesn't have to guess.
+        """
+        # Guard against partial construction: this slot is wired to
+        # ``combo_panel.combinationsChanged`` in ``__init__`` BEFORE
+        # ``self.start_btn`` is created, and ``set_array(...)`` later
+        # in ``__init__`` fires the signal during initial combo
+        # population.  Without this guard we'd raise AttributeError
+        # several times per tab during app startup (visible as
+        # tracebacks in the PULSAR.bat console).
+        if not hasattr(self, "start_btn"):
+            return
+        has_hw = self._stim is not None
+        has_cfg = False
+        try:
+            has_cfg = bool(self.combo_panel.selected_configurations())
+        except Exception:
+            has_cfg = False
+        enabled = has_hw and has_cfg
+        self.start_btn.setEnabled(enabled)
+        if not enabled:
+            if not has_hw and not has_cfg:
+                tip = ("Initialize the stimulator and select at least "
+                       "one configuration before starting.")
+            elif not has_hw:
+                tip = ("Initialize the stimulator on the Setup tab "
+                       "before starting.")
+            else:
+                tip = ("Select at least one configuration in the "
+                       "combinations list before starting.")
+            self.start_btn.setToolTip(tip)
+        else:
+            self.start_btn.setToolTip("")
 
     # ----- internal ----
     def _on_selection_changed(self, active: int, returns: list):
@@ -1026,6 +1418,14 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         tracking = getattr(self, "tracking_plot", None)
         if tracking is not None and hasattr(tracking, "current_prefs"):
             out["tracking_plot"] = tracking.current_prefs()
+        # Camera-capture toggle state (periodic snapshot interval +
+        # video recording on/off).  Round-tripped under its own key
+        # so a tab built before the camera-capture group existed
+        # doesn't see an unrecognised legacy key.
+        try:
+            out["camera_capture"] = self._camera_capture_prefs()
+        except Exception:
+            pass
         return out
 
     def restore_prefs(self, p: dict):
@@ -1073,6 +1473,16 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 # Prefs restore should never abort the tab init;
                 # silently skip a corrupt tracking-plot dict and
                 # the widget reverts to its construction defaults.
+                pass
+        # Camera-capture toggles (periodic snapshot + record).  Safe
+        # to call even when the camera-capture group hasn't been
+        # built yet (older subclasses that override _assemble_pages
+        # without inheriting the camera group); the inner method
+        # silently no-ops on missing widgets.
+        if "camera_capture" in p:
+            try:
+                self._restore_camera_capture_prefs(p["camera_capture"])
+            except Exception:
                 pass
         # Nudge preview to reflect the loaded values
         QtCore.QTimer.singleShot(0, self._refresh_preview)
@@ -1144,6 +1554,186 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             self.pattern_preview.restore_view_state(pp_state)
 
     def _start_runner(self, runner: ExperimentRunner, save_name: str):
+        # ---- Re-entry guard + IMMEDIATE Start-button disable -------
+        # MUST come before any ``processEvents`` / ``_tick()`` /
+        # modal-dialog call below.  Without these two lines a rapid
+        # double-click on Start (or a queued click that lands during
+        # the scope-setup ``_tick()`` calls a few hundred lines
+        # below) spawns a SECOND ``_start_runner`` call.  Both
+        # invocations then race through the PlexStim DLL
+        # (``stim.reinit`` → ``ps_close_all_stim``) and PyVISA scope
+        # (``single_capture`` → ``CURVe?`` / preamble query)
+        # simultaneously.  PlexStim DLL is single-producer
+        # (see CLAUDE.md "PlexStim DLL is not thread-safe"); two
+        # concurrent calls corrupt the heap and the GUI dies with
+        # ``STATUS_HEAP_CORRUPTION (0xC0000374)``.  faulthandler
+        # caught the double-thread pattern explicitly:
+        #   Thread d560: voltage_transient.run → reinit → ps_close_all_stim
+        #   Thread 4568: voltage_transient.run → _one_capture → single_capture
+        # — both inside ``run()`` of the SAME runner, two threads.
+        #
+        # ``_start_in_progress`` is set FIRST (synchronous, no event
+        # loop pump) and cleared in the matching ``_on_finished`` so
+        # a re-entry sees the flag and bails before touching any
+        # hardware.  The Start-button disable is the user-facing UX
+        # signal; the flag is the actual correctness guarantee.
+        if getattr(self, "_start_in_progress", False):
+            try:
+                self.log_pane.log(
+                    "Start re-entry blocked (a previous Start press "
+                    "is still configuring scope / spawning worker). "
+                    "Wait for the experiment view to appear, then "
+                    "use Stop if you want to abort.")
+            except Exception:
+                pass
+            return
+        self._start_in_progress = True
+        try:
+            self.start_btn.setEnabled(False)
+        except Exception:
+            pass
+        # ---- Exception-safety wrapper around the setup body --------
+        # ``_start_runner_body`` does the scope-setup + worker-build
+        # work (lines previously inlined here).  Splitting it out lets
+        # this wrapper own the flag-clear / UI-restore logic without
+        # forcing a 460-line indentation of the body inside a
+        # try/finally.  Two ways out:
+        #   • Normal: body returns having called ``worker_thread.start()``.
+        #     The flag stays set and will be cleared by ``_on_finished``
+        #     once the run actually completes.
+        #   • Exception: any uncaught raise from ``configure_channels``,
+        #     ``mkdir``, ``RunnerWorker(...)``, or a Qt signal-connect
+        #     lands here.  We log it, clear the flag, and roll back the
+        #     UI to "ready for next Start press" so the user isn't
+        #     permanently locked out by a one-off setup failure.
+        try:
+            self._start_runner_body(runner, save_name)
+        except Exception as _start_err:
+            try:
+                self.log_pane.log_now(
+                    f"Start failed during setup — rolling back: "
+                    f"{type(_start_err).__name__}: {_start_err}")
+            except Exception:
+                pass
+            self._start_in_progress = False
+            try:
+                self.start_btn.setEnabled(True)
+            except Exception:
+                pass
+            try:
+                self.stop_btn.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.pause_btn.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self._set_locked(False)
+            except Exception:
+                pass
+            try:
+                _win = self.window()
+                if hasattr(_win, "statusBar"):
+                    _win.statusBar().clearMessage()
+            except Exception:
+                pass
+            # Surface the failure to the user via a non-modal status
+            # bar message too — the log pane scrolls off-screen during
+            # a long sweep, but a status-bar line stays put.
+            try:
+                _win = self.window()
+                if hasattr(_win, "statusBar"):
+                    _win.statusBar().showMessage(
+                        f"Start failed: {type(_start_err).__name__} — "
+                        f"check the log pane for details.", 10_000)
+            except Exception:
+                pass
+
+    def _start_runner_body(self, runner: ExperimentRunner, save_name: str):
+        """Scope-setup + worker construction for :meth:`_start_runner`.
+
+        Split out so :meth:`_start_runner` can wrap the call in a
+        try/except that rolls back the UI + clears
+        ``_start_in_progress`` on any uncaught setup error, without
+        indenting this entire ~450-line body inside a try block.
+
+        Any exception raised here propagates to the wrapper which
+        does the cleanup.  Returns having called
+        ``self._worker_thread.start()`` on the normal path; the flag
+        clear for that path happens in :meth:`_on_finished` when the
+        worker thread emits ``finished``.
+        """
+        # Defensive cleanup: if a prior run died ungracefully (e.g. an
+        # uncaught code bug that bypassed _on_finished), there may be
+        # a leftover worker / thread holding GIL-side resources and
+        # signal connections.  Reassigning ``self._worker_thread``
+        # below without freeing the old one would leak a QThread and
+        # — worse — leave dangling queued connections that fire on
+        # the new worker's signals.  Quit + wait the old thread here
+        # so the slate is clean before we build the next pair.
+        if self._worker_thread is not None:
+            try:
+                self._worker_thread.quit()
+                self._worker_thread.wait(2000)   # 2 s hard cap
+            except Exception:
+                pass
+            self._worker_thread = None
+        self._worker = None
+        self._runner = None
+        # ---- User-spec: re-init the stim if a prior Stop closed it
+        # Quote: "When you restart, initialize the stimulator."
+        # ``_stim_needs_init`` is set in :meth:`_on_finished` after
+        # a Stop-triggered close.  We init HERE — before the scope
+        # setup — so:
+        #   * the runner about to be built can take a fully-init'd
+        #     stim (no special "is it connected?" handling in the
+        #     runner)
+        #   * a failure to init aborts the Start cleanly via the
+        #     wrapper's except clause, restoring UI state and
+        #     surfacing the error to the operator
+        # No-op when the stim wasn't torn down (normal end-of-run
+        # → next Start path).
+        if getattr(self, "_stim_needs_init", False):
+            self.log_pane.log_now(
+                "Re-initializing stimulator for new run "
+                "(was closed by previous Stop)…")
+            try:
+                if getattr(self, "_stim", None) is not None:
+                    self._stim.open()
+                    _serial = ""
+                    try:
+                        _serial = str(
+                            getattr(self._stim.info,
+                                    "serial_number", "") or "")
+                    except Exception:
+                        pass
+                    self.log_pane.log_now(
+                        f"Stimulator re-initialized "
+                        f"(PS_InitAllStim, S/N "
+                        f"{_serial or 'unknown'}).")
+                    self._stim_needs_init = False
+                else:
+                    # No stim object at all — operator never
+                    # initialized it via ConnectionPanel.  Surface
+                    # a friendly error instead of silently failing
+                    # downstream when the runner tries to use it.
+                    raise RuntimeError(
+                        "No stimulator object available — open the "
+                        "Setup tab → Connection panel → Initialize "
+                        "stimulator before pressing Start.")
+            except Exception as _stim_init_err:
+                # Let the wrapper's except clause handle UI
+                # rollback.  Re-raise so the rest of
+                # _start_runner_body doesn't proceed without a
+                # working stim.
+                raise RuntimeError(
+                    f"Stimulator re-init failed: "
+                    f"{type(_stim_init_err).__name__}: "
+                    f"{_stim_init_err}.  Power-cycle the "
+                    f"stimulator + re-Initialize from the "
+                    f"Connection panel."
+                ) from _stim_init_err
         # Reset the log pane's elapsed-time clock so every line emitted
         # for this run counts from "Start clicked" — mirroring the
         # MATLAB convention where each script begins with ``tic``. The
@@ -1151,15 +1741,326 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # to emit a ``getEndTime``-style "completed in X.YZ unit" line.
         self.log_pane.reset_clock()
         self.log_pane.tic("experiment")
+        # Surface the snapshot contract explicitly: the runner has
+        # already captured everything from the Setup tab (active
+        # channel, returns, pattern, ramp, surface area, …) and
+        # subsequent edits in Setup will NOT affect this run.  We
+        # print a one-liner so the operator doesn't go fiddling
+        # mid-sweep expecting the new value to land.
+        try:
+            self.log_pane.log_now(
+                "Setup-tab parameters were snapshotted at Start — "
+                "edits to Setup during this run are ignored "
+                "(they take effect on the next Start press).")
+        except Exception:
+            pass
+        # Snapshot Qt-widget state the scope-setup SCPI burst needs
+        # — read it NOW on the GUI thread, while we have safe access
+        # to ``self.pattern_panel``.  The burst itself runs later on
+        # the worker thread (see ``RunnerWorker.pre_run`` wiring
+        # below) so a slow USB-TMC round-trip in setup can no longer
+        # freeze the GUI for 5-30 seconds.
+        try:
+            self._scope_setup_pattern = (self.pattern_panel.pattern()
+                                         if hasattr(self, "pattern_panel")
+                                         else None)
+        except Exception:
+            self._scope_setup_pattern = None
         if self._scope is not None:
-            self._scope.configure_channels(self._aliases)
-            # Apply the user's chosen acquisition mode + count BEFORE
-            # the runner starts so the runner inherits the right state.
+            # All log() calls in this scope-setup block use ``_log`` =
+            # :meth:`LogPane.log_now`, which forces a GUI repaint after
+            # each line.  Without that, the ~15-30 synchronous SCPI
+            # round-trips below freeze the event loop for several
+            # seconds and every queued log line lands at once when
+            # control finally returns.  The file mirror is unaffected
+            # (line-buffered, writes synchronously); this is purely
+            # for the on-screen "what is it doing now?" feedback.
+            _log = self.log_pane.log_now
+            # Turn OFF every channel first, then ON only the ones that are
+            # actually mapped — same discipline as the calibration sweep.
+            # Leaving unused channels enabled causes CURVe? errors on scopes
+            # that don't allow reading a disabled channel, and adds noise.
             try:
+                _scope_info = getattr(self._scope, "info", None)
+                _n_ch = int(getattr(_scope_info, "n_channels", 4) or 4)
+                _used_channels = set(self._aliases.values())
+                _log(
+                    f"Scope setup: turning OFF unused channels, "
+                    f"keeping {sorted(_used_channels)} ON")
+                for _ci in range(1, _n_ch + 1):
+                    try:
+                        self._scope._w(f"SELect:CH{_ci} OFF")
+                    except Exception:
+                        pass
+                for _ch in _used_channels:
+                    try:
+                        self._scope._w(f"SELect:{_ch} ON")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._scope.configure_channels(self._aliases)
+            # Surface "scope is being configured" in the status bar so
+            # the operator can read at a glance why the experiment view
+            # hasn't shown up yet.  Cleared when the runner starts.
+            try:
+                _win = self.window()
+                if hasattr(_win, "statusBar"):
+                    _win.statusBar().showMessage(
+                        "Configuring scope (this can take 10-30 s on "
+                        "TBS2000 with large records)…")
+            except Exception:
+                pass
+            _log(
+                f"Scope setup: configure_channels {self._aliases}")
+            # Per-channel bandwidth (model-aware via TekSeriesSpec.
+            # recommended_imon_bw):  full BW on V_mon to keep pulse
+            # leading edges, 20 MHz limit on I_mon so the trigger
+            # comparator gets a clean signal.
+            try:
+                vmon_ch = self._aliases.get("vmon", "CH1")
+                imon_ch = self._aliases.get("imon", "CH2")
+                bw_v = self._scope.set_channel_bandwidth_for_purpose(
+                    vmon_ch, "vmon")
+                bw_i = self._scope.set_channel_bandwidth_for_purpose(
+                    imon_ch, "imon")
+                if bw_v is not None or bw_i is not None:
+                    _log(
+                        f"Scope setup: bandwidth limits — "
+                        f"{vmon_ch} (V_mon) ≤ {bw_v:.0f} MHz, "
+                        f"{imon_ch} (I_mon) ≤ {bw_i:.0f} MHz "
+                        f"(less I_mon noise → cleaner trigger).")
+            except Exception:
+                pass
+            # ---- Event-loop pump for the scope-setup block ---------
+            # Scope setup runs on the GUI thread (NOT the runner
+            # worker — the runner is built AFTER setup completes).
+            # Each slow scope SCPI write — especially
+            # ``set_record_length(20000)`` on TBS2204B which triggers
+            # an internal 10-30 s buffer reallocation — blocks the
+            # event loop and freezes the GUI: the operator sees the
+            # whole window stop responding for tens of seconds after
+            # pressing Start, with the log pane only catching up in
+            # a burst at the end (every log line during that window
+            # WAS written to the on-disk file via the fsync path —
+            # see widgets.LogPane — but the QPlainTextEdit can't
+            # repaint while the GUI thread is blocked).
+            #
+            # ``_tick()`` calls ``QApplication.processEvents()`` to
+            # drain pending paint events.  Sprinkle it after every
+            # human-readable log line AND after every slow scope
+            # call so the log pane catches up in real time and
+            # button clicks / tab switches stay responsive.
+            #
+            # Proper fix would be to move scope setup to a worker
+            # thread (and that's tracked separately), but pumping
+            # events here is a one-liner that eliminates the
+            # "Start button freezes the GUI" symptom without the
+            # signal-wiring complexity of a true worker.
+            def _tick():
+                try:
+                    QtWidgets.QApplication.processEvents()
+                except Exception:
+                    pass
+            try:
+                # Experiments use the 20 k record length (driver default).
+                # 20 k @ 50 ns/pt over a 1 ms window gives ~4000 samples per
+                # 200 µs phase — plenty for the Cisnal-derivative access edge
+                # and E_pol-at-12-µs metrics, well below the scope's analog
+                # bandwidth, and avoids the multi-second per-capture transfer
+                # cost of 200 k / 2 M / 5 M.  See DEFAULT_RECORD_LENGTH in
+                # ``tektronix.py`` for the full rationale.
+                from ..hardware.tektronix import DEFAULT_RECORD_LENGTH
+                _log(
+                    f"Scope setup: record length = {DEFAULT_RECORD_LENGTH}")
+                _tick()
+                self._scope.set_record_length(DEFAULT_RECORD_LENGTH)
+                _tick()
+                _log(
+                    f"Scope setup: acquisition mode = {self._acq_mode}, "
+                    f"n_avg = {self._acq_n_avg}")
+                _tick()
                 self._scope.set_acquisition_mode(self._acq_mode,
                                                  n_avg=self._acq_n_avg)
+                _tick()
+                # Trigger setup — three mutually exclusive paths driven
+                # by the Setup tab state.  See SetupTab.is_digital_trigger
+                # for the priority rules.
+                #
+                #   1. EXT BNC checkbox checked → source="EXT".  The
+                #      firmware owns the level on EXT; we still pass
+                #      1.4 V as a sensible default but the driver
+                #      no-ops the level write for EXT sources (see
+                #      tektronix.set_trigger_level).
+                #   2. A channel has Role=Trigger (typically CH3/CH4
+                #      wired to the Plexon digital sync) → source=that
+                #      channel, slope=RISE, level=1.4 V (TTL midpoint).
+                #      Active-high sync, no polarity dependence.
+                #   3. Fallback to the I_mon channel → source=that
+                #      channel, slope follows phase-1 polarity (RISE
+                #      for anodic-first, FALL for cathodic-first),
+                #      level from imon_trigger_level(amp, pw).
+                #
+                # Logged so the operator can read back which path was
+                # taken without having to grep source.
+                TTL_LEVEL_V = 1.4   # TTL midpoint (sync lines are 3.3 V / 5 V)
+                slope_resolved = self._trigger_slope
+                trig_level = TTL_LEVEL_V
+                if self._trigger_is_digital:
+                    # Path 1 or 2 — TTL sync line, fixed setup.
+                    slope_resolved = "RISE"
+                    trig_level = TTL_LEVEL_V
+                    _path_note = (
+                        "EXT BNC" if self._trigger_source == "EXT"
+                        else f"channel-Trigger ({self._trigger_source})")
+                    _log(
+                        f"Scope setup: trigger path = {_path_note}, "
+                        f"slope = RISE, level = {TTL_LEVEL_V*1000:.0f} mV "
+                        f"(TTL sync line — polarity and amplitude "
+                        f"derivation skipped)"
+                        + (" (EXT — scope firmware may auto-set level)"
+                           if self._trigger_source == 'EXT' else ''))
+                else:
+                    # Path 3 — I_mon channel trigger.  Slope follows
+                    # phase-1 polarity, level from MATLAB formula.
+                    try:
+                        from ..experiments.base import imon_trigger_level
+                        _pat = self.pattern_panel.pattern()
+                        # Use the FIRST PHASE of the pattern — NOT the
+                        # "excitation phase" — for slope + level.  The
+                        # trigger sees whichever phase fires FIRST, and
+                        # for some patterns (anodic-first protocols,
+                        # certain triphasic shapes) ``phases[0]`` and
+                        # ``excitation_phase`` differ.  ``phases[0]`` is
+                        # what's actually first at the I_mon edge, so
+                        # its polarity is what determines the trigger
+                        # slope: cathodic phase 1 (amp < 0) → FALL,
+                        # anodic phase 1 (amp > 0) → RISE.
+                        _ph0 = (_pat.phases[0]
+                                if _pat and _pat.phases else None)
+                        _amp_signed = (float(_ph0.amplitude_ua)
+                                       if _ph0 is not None else 0.0) or 10.0
+                        _pw0 = (float(_ph0.width_us)
+                                if _ph0 is not None else 200.0)
+                        # Use the actual stimulator scaling so the
+                        # threshold gets clamped below the expected
+                        # peak on NIL (1 mV/µA) devices.
+                        _si = getattr(self._stim, "info", None)
+                        _imon_vpu = float(
+                            getattr(_si, "imon_scaling_v_per_ua", 0.0) or 0.0)
+                        trig_level = imon_trigger_level(
+                            _amp_signed, _pw0,
+                            imon_v_per_ua=_imon_vpu or None)
+                        # Cathodic-first (amp < 0) → I_mon dips negative
+                        # at onset → trigger on FALL.  Anodic-first
+                        # (amp > 0) → I_mon rises at onset → trigger on
+                        # RISE.  The Setup-tab slope toggle is ignored
+                        # in this path because polarity is unambiguous
+                        # from the pattern.
+                        slope_resolved = "FALL" if _amp_signed < 0 else "RISE"
+                    except Exception:
+                        trig_level = 0.05
+                        slope_resolved = self._trigger_slope
+                        _amp_signed = 0.0
+                    _log(
+                        f"Scope setup: trigger path = I_mon "
+                        f"({self._trigger_source}), slope = "
+                        f"{slope_resolved} (from phase-1 polarity "
+                        f"{_amp_signed:+.1f} µA), level = "
+                        f"{trig_level*1000:+.2f} mV "
+                        f"(from imon_trigger_level)")
+                _tick()
+                self._scope.set_trigger(
+                    source=self._trigger_source,
+                    level_v=trig_level,
+                    slope=slope_resolved,
+                    mode="NORMAL",
+                    # The 1.2 µs Plexon digital-sync offset applies for
+                    # EXT BNC AND for any channel tagged Role=Trigger
+                    # in the Setup tab (same TTL wire, different
+                    # physical input).  Forward the Setup-tab flag so
+                    # the driver shifts the time axis + horizontal
+                    # layout for either path.
+                    digital=self._trigger_is_digital,
+                )
+                _tick()
+                pat = self.pattern_panel.pattern()
+                if pat and pat.phases:
+                    phase1_us = pat.phases[0].width_us
+                    interphase_us = pat.phases[0].delay_after_us
+                    _log(
+                        f"Scope setup: horizontal layout for "
+                        f"phase1={phase1_us:.0f} µs, "
+                        f"interphase={interphase_us:.0f} µs, "
+                        f"phase2={pat.phases[1].width_us if len(pat.phases) > 1 else 0.0:.0f} µs, "
+                        f"discharge={pat.phases[1].delay_after_us if len(pat.phases) > 1 else 0.0:.0f} µs "
+                        f"(ext_trigger={self._trigger_source == 'EXT'})")
+                    _tick()
+                    _scale_s, _pos_pct = self._scope.auto_layout_for_pulse(
+                        phase1_us=phase1_us,
+                        interphase_us=interphase_us,
+                        phase2_us=pat.phases[1].width_us if len(pat.phases) > 1 else 0.0,
+                        discharge_us=pat.phases[1].delay_after_us if len(pat.phases) > 1 else 0.0,
+                        ext_trigger=(self._trigger_source == "EXT"),
+                    )
+                    _tick()
+                    _n_divs = float(getattr(self._scope, "_n_horiz_divs", 10.0))
+                    _log(
+                        f"Scope setup: applied {_scale_s*1e6:.2f} µs/div, "
+                        f"position = {_pos_pct:.2f}% "
+                        f"(window = {_scale_s*1e6 * _n_divs:.1f} µs total)")
+                    _tick()
+                    # Initial vertical channel scales from amplitude + hardware.
+                    # This sets a sensible starting scale so the first capture
+                    # isn't clipped and the runner's per-capture adapt_channel_scale
+                    # can fine-tune from there.
+                    try:
+                        from ..config import IMON_SCALING_DEFAULT, VMON_SCALING_DEFAULT
+                        from ..experiments.base import imon_vertical_scale
+                        _stim_info = getattr(self._stim, "info", None)
+                        _imon_vpu = float(
+                            getattr(_stim_info, "imon_scaling_v_per_ua",
+                                    IMON_SCALING_DEFAULT) or IMON_SCALING_DEFAULT)
+                        _vmon_vpv = float(
+                            getattr(_stim_info, "vmon_scaling_v_per_v",
+                                    VMON_SCALING_DEFAULT) or VMON_SCALING_DEFAULT)
+                        _amp0 = (abs(pat.excitation_phase.amplitude_ua)
+                                 if pat.excitation_phase else 0.0) or 10.0
+                        # V_mon: load-agnostic estimate from initial_channel_scales
+                        # (load_r/c default to 0 → snaps to a generous 1 V/div).
+                        # The runner's adapt_channel_scale converges from here.
+                        scales = self._scope.initial_channel_scales(
+                            amp_ua=_amp0,
+                            imon_v_per_ua=_imon_vpu,
+                            vmon_v_per_v=_vmon_vpv,
+                            phase_us=phase1_us,
+                        )
+                        vmon_ch = self._aliases.get("vmon", "CH1")
+                        imon_ch = self._aliases.get("imon", "CH2")
+                        _vmon_vpd = scales.get("CH1", 1.0)
+                        _imon_vpd = imon_vertical_scale(
+                            _amp0, imon_v_per_ua=_imon_vpu)
+                        _log(
+                            f"Scope setup: vertical scale "
+                            f"{vmon_ch} (V_mon) = {_vmon_vpd*1000:.2f} mV/div, "
+                            f"{imon_ch} (I_mon) = {_imon_vpd*1000:.2f} mV/div "
+                            f"(sized for I_stim = {_amp0:.0f} µA)")
+                        self._scope.set_channel_scale(vmon_ch, _vmon_vpd)
+                        self._scope.set_channel_scale(imon_ch, _imon_vpd)
+                        _log(
+                            f"Scope setup: vertical position {vmon_ch} = 0 div, "
+                            f"{imon_ch} = 0 div")
+                        self._scope.set_channel_position(vmon_ch, 0.0)
+                        self._scope.set_channel_position(imon_ch, 0.0)
+                    except Exception as _vsc_err:
+                        _log(f"Vertical scale init: {_vsc_err}")
+                    vmon_ch = self._aliases.get("vmon", "CH1")
+                    self._scope.set_cursors(phase1_us, interphase_us,
+                                           source_channel=vmon_ch)
+                else:
+                    self._scope.set_horizontal_position(30.0)
             except Exception as e:
-                self.log_pane.log(f"set_acquisition_mode failed: {e}")
+                _log(f"Scope setup failed: {e}")
         self._save_dir.mkdir(parents=True, exist_ok=True)
         save_path = self._save_dir / save_name
         self._worker = RunnerWorker(
@@ -1178,6 +2079,10 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self._worker.log_msg.connect(self.log_pane.log)
         self._worker.save_failed.connect(self._on_save_failed)
         self._worker.finished.connect(self._on_finished)
+        # Between-channels rewire prompt — the runner emits "paused" before
+        # each non-first config when the tab's pause toggle is on.  The slot
+        # pops a modal QMessageBox; clicking OK calls request_continue().
+        self._worker.paused.connect(self._on_runner_paused)
         self._runner = runner
         # Lock all parameter inputs (this tab + Setup tab + hardware)
         # for the duration of the run. Tab-bar selection stays enabled
@@ -1194,6 +2099,28 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self.pause_btn.setText("Pause")
         self.pause_btn.blockSignals(False)
         self.multichan_scope.clear()
+        # Push the electrode surface area down to the scope view so
+        # the right-axis I_mon trace flips to current density (A/cm²)
+        # when an area is configured.  Pull from the runner first
+        # (VT exposes ``surface_area_um2`` directly); fall back to
+        # the first array site (PS/SP/LP read it lazily per channel
+        # in their runner loops, so the runner attribute doesn't
+        # exist).  ``None`` keeps the default µA presentation.
+        _area_um2 = 0.0
+        try:
+            _area_um2 = float(getattr(runner, "surface_area_um2", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _area_um2 = 0.0
+        if _area_um2 <= 0:
+            try:
+                _sites = getattr(self._array, "sites", None) or []
+                if _sites:
+                    _area_um2 = float(
+                        getattr(_sites[0], "surface_area_um2", 0.0) or 0.0)
+            except Exception:
+                _area_um2 = 0.0
+        self.multichan_scope.set_surface_area_um2(
+            _area_um2 if _area_um2 > 0 else None)
         # Pre-emptively register the configuration(s) the runner is
         # about to attempt — the entry list shows up immediately, not
         # only after the first capture lands. Pull the configs from
@@ -1216,7 +2143,124 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # is gone now that Parameters is a top-level tab in
         # MainWindow's tab bar; the experiment widget is the
         # experiment view itself, no inner sub-tabs to flip.)
+        # ---- Camera capture start hooks ---------------------------
+        # If the Test Parameters tab's camera-capture toggles are on,
+        # arm the shared ``camera_service()`` for this run.  All
+        # state lives in self._camera_run_state so _on_finished can
+        # tear it down cleanly even if the run aborts.  Best-effort:
+        # any failure here logs but doesn't block the experiment.
+        try:
+            self._arm_camera_for_run()
+        except Exception as _cam_err:
+            self.log_pane.log(
+                f"[camera] run-arm failed (continuing without capture): "
+                f"{type(_cam_err).__name__}: {_cam_err}")
+        # Clear the "Configuring scope..." status-bar message —
+        # everything that runs from this point lives on the worker
+        # thread so the GUI is responsive again.
+        try:
+            _win = self.window()
+            if hasattr(_win, "statusBar"):
+                _win.statusBar().clearMessage()
+        except Exception:
+            pass
         self._worker_thread.start()
+        # Re-entry guard stays SET throughout the worker's run so a
+        # re-press of Start (if the button somehow got re-enabled
+        # programmatically) can't queue a second runner.  The flag
+        # is cleared in :meth:`_on_finished` once the worker emits
+        # ``finished``.  The wrapper :meth:`_start_runner` clears it
+        # on the exception path (setup failed mid-stride).
+
+    # ---------------- Camera capture during run ------------------
+    def _arm_camera_for_run(self) -> None:
+        """If the camera-capture toggles are on, start a periodic
+        snapshot timer and/or video recording for the duration of
+        this run.
+
+        State lives in ``self._camera_run_state`` so :meth:`_on_finished`
+        can tear it down on ALL exit paths (normal end, abort, error).
+        No-op when the user hasn't toggled either option on, OR when
+        no camera is connected (the toggles can be pre-configured
+        before plugging in the camera; the runner just skips them
+        if the camera isn't ready).
+        """
+        from .camera import camera_service
+        svc = camera_service()
+        state: dict = {"timer": None, "was_recording_start": False}
+        self._camera_run_state = state
+        if not svc.is_connected():
+            # User pre-configured the toggles but no camera is up —
+            # silently skip.  Log so the operator sees why no clips
+            # appear.
+            try:
+                snap_on = bool(self.cam_snapshot_chk.isChecked())
+                rec_on = bool(self.cam_record_chk.isChecked())
+            except Exception:
+                snap_on = rec_on = False
+            if snap_on or rec_on:
+                self.log_pane.log(
+                    "[camera] run-arm: camera-capture toggles are on "
+                    "but no camera is connected — connect one in the "
+                    "Hardware panel to enable capture.")
+            return
+        # Recording: starts once, lasts the whole run.
+        try:
+            if bool(self.cam_record_chk.isChecked()):
+                out = svc.start_recording()
+                if out is not None:
+                    state["was_recording_start"] = True
+                    self.log_pane.log(
+                        f"[camera] recording started for this run → {out}")
+        except Exception:
+            pass
+        # Periodic snapshot: QTimer fires on the GUI thread (cheap;
+        # the actual file write is async via QImageCapture).
+        try:
+            if bool(self.cam_snapshot_chk.isChecked()):
+                interval_ms = max(
+                    1000, int(self.cam_snapshot_interval.value() * 1000))
+                timer = QtCore.QTimer(self)
+                timer.setInterval(interval_ms)
+                timer.timeout.connect(svc.take_snapshot)
+                timer.start()
+                state["timer"] = timer
+                self.log_pane.log(
+                    f"[camera] periodic snapshot armed: "
+                    f"every {self.cam_snapshot_interval.value():.1f} s "
+                    f"for the duration of the run.")
+        except Exception:
+            pass
+
+    def _disarm_camera_after_run(self) -> None:
+        """Stop the per-run camera capture (timer + recording).
+
+        Called from :meth:`_on_finished` on EVERY exit path.  Safe
+        when nothing was armed (the arm step is no-op when toggles
+        are off / no camera connected, and this method checks the
+        state dict before touching anything).
+        """
+        state = getattr(self, "_camera_run_state", None)
+        if not state:
+            return
+        # Stop the snapshot timer first so a stray fire mid-teardown
+        # doesn't queue a snapshot after recording has stopped.
+        timer = state.get("timer")
+        if timer is not None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+        # Stop the recording (the file gets finalised in the
+        # recorder's stoppedState handler — see camera.py).
+        if state.get("was_recording_start"):
+            try:
+                from .camera import camera_service
+                camera_service().stop_recording()
+            except Exception:
+                pass
+        self._camera_run_state = None
 
     @QtCore.pyqtSlot(object, int)
     def _on_capture(self, capture, channel: int):
@@ -1281,6 +2325,45 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         return channel if channel > 0 else -1
 
     @QtCore.pyqtSlot(str, str)
+    @QtCore.pyqtSlot(str)
+    def _on_runner_paused(self, message: str):
+        """Pop a modal "rewire to next channel" prompt and release the
+        runner when the user clicks Continue.
+
+        The runner thread is parked inside ``wait_for_continue`` until
+        :meth:`RunnerWorker.request_continue` fires.  Clicking Stop on
+        the dialog requests an abort instead, which also unblocks the
+        runner via its ``_continue_event``.
+        """
+        if self._worker is None:
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Re-wire next channel")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setText(message or "Re-wire to the next channel, then click "
+                                "Continue.")
+        box.setInformativeText(
+            "Stimulation has been stopped while you swap the cable. "
+            "Click <b>Continue</b> once the next channel is connected.")
+        cont_btn = box.addButton("Continue",
+                                 QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        stop_btn = box.addButton("Stop run",
+                                 QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cont_btn)
+        box.exec()
+        if box.clickedButton() is stop_btn:
+            # Abort the run — the runner's wait_for_continue sees the abort
+            # flag and exits the loop, then the runner unwinds normally.
+            try:
+                self._worker.runner.abort()
+            except Exception:
+                pass
+        else:
+            try:
+                self._worker.request_continue()
+            except Exception:
+                pass
+
     def _on_save_failed(self, path: str, err: str):
         """Pop a modal when the worker fails to write the .npz file.
 
@@ -1298,6 +2381,21 @@ class _BaseExperimentTab(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(object)
     def _on_finished(self, result):
+        # Clear the re-entry guard FIRST.  ``_start_runner_body``
+        # leaves ``_start_in_progress = True`` for the duration of
+        # the worker run; this is the normal-path clear that
+        # re-arms Start for the next press.  The exception-path
+        # clear lives in :meth:`_start_runner`'s except clause.
+        # Safe to call when the flag was never set (legacy / test
+        # paths that bypass ``_start_runner``).
+        self._start_in_progress = False
+        # Disarm camera capture FIRST so a stray snapshot timer
+        # can't fire after the run has logically ended.  Safe to
+        # call when nothing was armed.
+        try:
+            self._disarm_camera_after_run()
+        except Exception:
+            pass
         self.log_pane.log(f"Experiment finished. Captures: {len(result.captures)}.")
         # MATLAB convention (PlexStimTek.m: "Experiment completed: X.YZ unit").
         # ``toc`` auto-scales the unit through ``LogPane.format_scaled``,
@@ -1310,13 +2408,43 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self.pause_btn.setChecked(False)
         self.pause_btn.setText("Pause")
         self.pause_btn.blockSignals(False)
-        self.start_btn.setEnabled(self._stim is not None)
+        # Use the unified gate so the post-run Start state also
+        # respects the "at least one combination selected" rule.
+        self._refresh_start_enabled()
         if self._worker_thread is not None:
             self._worker_thread.quit()
             self._worker_thread.wait()
             self._worker_thread = None
         self._worker = None
         self._runner = None
+        # ---- User-spec: close the stim if Stop was pressed -----
+        # ``_stim_needs_close_after_run`` is set in
+        # :meth:`stop_clicked`.  We do the close HERE — not in
+        # stop_clicked — so it happens AFTER ``wait()`` above
+        # has confirmed the runner thread is fully dead.
+        # Closing earlier would race the runner's last DLL call
+        # (it might still be in its finally-block ``stop_all``
+        # at the moment Stop was clicked, especially if the
+        # runner was deep in a slow USB-TMC scope read).  The
+        # ``_dll_lock`` would prevent a heap race, but the
+        # runner would still see its next call hit a closed
+        # device and raise — better to defer until it's gone.
+        # Marks ``_stim_needs_init`` so the next Start press
+        # re-initializes (see :meth:`_start_runner_body`).
+        if getattr(self, "_stim_needs_close_after_run", False):
+            try:
+                if getattr(self, "_stim", None) is not None:
+                    self._stim.close()
+                    self.log_pane.log(
+                        "Stimulator closed (PS_CloseAllStim) — "
+                        "next Start will re-initialize.")
+            except Exception as _close_err:
+                self.log_pane.log(
+                    f"Stimulator close failed (continuing — "
+                    f"next Start will still attempt re-init): "
+                    f"{type(_close_err).__name__}: {_close_err}")
+            self._stim_needs_close_after_run = False
+            self._stim_needs_init = True
         # If a sequential queue has more configs lined up, mark the
         # active channel as completed and chain to the next entry —
         # keeping the params locked across the gap so the user never
@@ -1325,14 +2453,34 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # don't keep firing failed runs.
         if getattr(result, "aborted", False):
             self._pending_configs = []
-        # Mark the just-finished combination as ✓ in the entry list.
-        # Best-effort; a missing display name (legacy session) just
-        # leaves the row label untagged. Done unconditionally — the
-        # tag belongs on the row whether or not a queue follows.
+        # Mark EVERY combination that actually ran as ✓ in the entry
+        # list.  Iterates ``result.session.runs`` — each ChannelRun
+        # exposes the config it was for via ``.configuration`` —
+        # rather than the OLD ``session.test.configuration`` lookup
+        # which only returns the STATIC first-config reference and
+        # leaves configs 2+ permanently unmarked.  Falls back to the
+        # static config when ``runs`` is empty (single-config
+        # runners or runs that aborted before any config completed).
         try:
-            cfg_done = result.session.test.configuration
-            display = str(cfg_done.display_name())
-            self.multichan_scope.mark_completed(display)
+            runs = getattr(result.session, "runs", None) or []
+            marked_any = False
+            for _run in runs:
+                _cfg = getattr(_run, "configuration", None)
+                if _cfg is None:
+                    continue
+                try:
+                    self.multichan_scope.mark_completed(
+                        str(_cfg.display_name()))
+                    marked_any = True
+                except Exception:
+                    pass
+            if not marked_any:
+                # Empty runs list (preflight failure / runner that
+                # aborted before any config produced output) — fall
+                # back to the static config so SOMETHING gets marked.
+                cfg_done = result.session.test.configuration
+                self.multichan_scope.mark_completed(
+                    str(cfg_done.display_name()))
         except Exception:
             pass
         if self._pending_configs:
@@ -1380,6 +2528,49 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         if self._runner is not None:
             self._runner.abort()
             self.log_pane.log("Stop requested.")
+            # ---- User-spec: tear down the stim on Stop ----------
+            # Quote: "When you stop, abort stim and close the
+            # stimulator.  When you restart, initialize the
+            # stimulator."  Rationale: leaves the device in a
+            # FULLY CLEAN state between runs.  The next Start
+            # press re-initializes (see _start_runner_body).
+            # This sidesteps the close-while-pulsing
+            # HEAP_CORRUPTION (CLAUDE.md gotcha #31) at the
+            # source — by the time the runner calls reinit at
+            # the top of run(), the device is already aborted
+            # and closed, so reinit's open() lands on a fully
+            # quiet device.
+            #
+            # ``abort_all`` (= PS_AbortAll) is DLL-safe in ANY
+            # trigger mode and aborts a pulse already in flight,
+            # unlike ``stop_all`` which returns error 4 outside
+            # SOFT trigger mode.  The ``_dll_lock`` re-entrant
+            # mutex serializes us against any in-flight runner
+            # DLL call so we wait for the runner to release the
+            # lock before we touch the device.
+            #
+            # The actual ``close()`` happens later in
+            # :meth:`_on_finished` — AFTER the runner thread has
+            # fully exited (via ``_worker_thread.wait()``).
+            # Closing here would race the runner's next DLL call
+            # (it might still be inside ``_one_capture`` waiting
+            # on a slow USB-TMC read; on return it'll try to
+            # call ``stop_all`` in its finally, and a closed
+            # device would raise from inside the runner).  The
+            # flag ``_stim_needs_close_after_run`` carries the
+            # intent across the GUI / worker boundary.
+            try:
+                if getattr(self, "_stim", None) is not None:
+                    self._stim.abort_all()
+                    self.log_pane.log(
+                        "Stimulator aborted (PS_AbortAll).")
+            except Exception as _e:
+                self.log_pane.log(
+                    f"Stimulator abort_all failed "
+                    f"(continuing — close will still fire after "
+                    f"the runner exits): "
+                    f"{type(_e).__name__}: {_e}")
+            self._stim_needs_close_after_run = True
 
     def pause_toggled(self, paused: bool):
         """Toggle pulsing on/off without ending the run.
@@ -1533,6 +2724,22 @@ class VoltageTransientTab(_BaseExperimentTab):
         # value calculation didn't always reflect the actual pattern
         # (peak·width vs. shape-aware integral mismatch).
 
+        # Pause-between-channels toggle.  When checked the runner stops
+        # stim and waits for the operator to click Continue before moving
+        # to the next configuration — useful when only one channel can be
+        # wired up to the test/electrode rig at a time, so the operator
+        # physically swaps wires between channels.  Not connected to a
+        # handler here — the value is read at Start time and pushed onto
+        # the runner via ``runner.pause_between_channels``.
+        self.pause_between_channels_check = QtWidgets.QCheckBox(
+            "Pause after each channel (rewire prompt)")
+        self.pause_between_channels_check.setChecked(False)
+        self.pause_between_channels_check.setToolTip(
+            "When on, the runner stops stimulation after finishing one "
+            "channel (configuration) and shows a 'Continue to next channel' "
+            "dialog so you can physically re-wire the next channel before "
+            "the sweep proceeds. Off = run all channels back-to-back.")
+
         # Ramp toggle for the Fixed modes — when checked the runner
         # walks from start_ua to max_ua (or start_qinj→max_qinj for the
         # charge-density mode) using the configured step.
@@ -1665,6 +2872,7 @@ class VoltageTransientTab(_BaseExperimentTab):
         # nested inside the params_box's outer VBox.
         strategy_form = rich.make_form()
         strategy_form.addRow("", self.fixed_ramp_check)
+        strategy_form.addRow("", self.pause_between_channels_check)
         strategy_form.addRow("Ramp strategy:", self.strategy_combo)
         self._strategy_form = strategy_form
         # Form rows for ramp parameters. Stored as label widgets so we
@@ -1907,7 +3115,20 @@ class VoltageTransientTab(_BaseExperimentTab):
         """Mirror the (current, width) pair into the pattern panel's
         amp_excite + width_shared inputs so the rendered pulse
         reflects the lock-UI's current values. Sign of amp_excite is
-        preserved (the panel encodes polarity via sign)."""
+        preserved (the panel encodes polarity via sign).
+
+        Gated on Fixed-Q_ph mode: outside that mode the lock UI is
+        hidden, its values are stale, and overwriting the pattern
+        panel would destroy the user's direct edits — most visibly
+        prefs restore in Max mode used to instantly revert
+        width_shared / amp_excite to whatever the Fixed-Q_ph lock
+        radio was last computing.
+        """
+        try:
+            if self.mode_combo.currentText() != self.MODE_FIXED_QPH:
+                return
+        except Exception:
+            return
         I = float(self.qph_current.value())
         W = float(self.qph_width.value())
         # Preserve the panel's polarity sign — the lock UI only
@@ -1928,8 +3149,28 @@ class VoltageTransientTab(_BaseExperimentTab):
         """Pattern panel's amp / width was edited directly (e.g. user
         typed into the panel rather than into our 3-way lock UI).
         Mirror the new value back, then recompute whatever's locked.
+
+        Only runs while the user is in **Fixed-Q_ph** strategy mode
+        — the lock UI is hidden in every other mode, so propagating
+        constraints back into the pattern panel would otherwise
+        overwrite a fresh user edit (e.g. typing into width_shared
+        in MAX mode would instantly be reverted by
+        ``W = Q × 1000 / I`` if the lock radio happened to be on
+        "Lock phase width" from a prior session).  Bug report:
+        "I am unable to change the phase width in the test
+        parameters for Voltage Transient, symmetric."
         """
         if self._qph_in_progress:
+            return
+        # Gate on the strategy mode — outside Fixed-Q_ph the lock UI
+        # is irrelevant and the pattern panel is the source of truth.
+        try:
+            if self.mode_combo.currentText() != self.MODE_FIXED_QPH:
+                return
+        except Exception:
+            # If mode_combo isn't accessible for some reason, fall
+            # back to the conservative "do nothing" behaviour rather
+            # than risk overwriting user input.
             return
         self._qph_in_progress = True
         try:
@@ -2000,6 +3241,7 @@ class VoltageTransientTab(_BaseExperimentTab):
             lab.setVisible(visible); w.setVisible(visible)
 
     PREF_FIELDS = ("mode_combo", "strategy_combo", "fixed_ramp_check",
+                   "pause_between_channels_check",
                    "qinj_mc",
                    "qph_current", "qph_width", "qph_qph",
                    "start_ua", "coarse_ua", "fine_ua", "max_ua", "safety_factor")
@@ -2152,6 +3394,13 @@ class VoltageTransientTab(_BaseExperimentTab):
             anodic_limit_v=self._anodic_limit_v,
             polarization_tolerance_v=self._polarization_tolerance_v,
         )
+        runner.trigger_source = self._trigger_source
+        runner.trigger_is_digital = self._trigger_is_digital
+        # Push the between-channels rewire-pause flag onto the runner.
+        # Only meaningful when more than one configuration was selected;
+        # the runner's wait_for_continue short-circuits if the flag is off.
+        runner.pause_between_channels = (
+            self.pause_between_channels_check.isChecked())
         save_name = f"VT_{config.display_name().replace(' ', '_')}.npz"
         self._start_runner(runner, save_name)
 
@@ -2271,7 +3520,7 @@ class ShortPulsingTab(_BaseExperimentTab):
         self.duration_unit.setToolTip(
             "Unit for the duration spinbox. Switching converts the "
             "current value through the live pulse rate (e.g. 60 s "
-            "at 50 Hz ↔ 3000 pulses).")
+            "at 50 pps ↔ 3000 pulses).")
         self._duration_prev_unit = self.UNIT_S
 
         # Pre/post characterization toggle + mode dropdown.
@@ -2519,6 +3768,22 @@ class ShortPulsingTab(_BaseExperimentTab):
             self._scope.configure_channels(self._aliases)
             self._scope.set_acquisition_mode(self._acq_mode,
                                              n_avg=self._acq_n_avg)
+            pat = self.pattern_panel.pattern()
+            if pat and pat.phases:
+                phase1_us = pat.phases[0].width_us
+                interphase_us = pat.phases[0].delay_after_us
+                self._scope.auto_layout_for_pulse(
+                    phase1_us=phase1_us,
+                    interphase_us=interphase_us,
+                    phase2_us=pat.phases[1].width_us if len(pat.phases) > 1 else 0.0,
+                    discharge_us=pat.phases[1].delay_after_us if len(pat.phases) > 1 else 0.0,
+                    ext_trigger=(self._trigger_source == "EXT"),
+                )
+                vmon_ch = self._aliases.get("vmon", "CH1")
+                self._scope.set_cursors(phase1_us, interphase_us,
+                                       source_channel=vmon_ch)
+            else:
+                self._scope.set_horizontal_position(30.0)
             from ..session import Capture
             from ..waveforms import PulsePattern
             acq = self._scope.single_capture()
@@ -2622,6 +3887,8 @@ class ShortPulsingTab(_BaseExperimentTab):
                 capture_interval_s=max(duration_s * 2, 60.0),
                 duration_s=duration_s),
         )
+        runner.trigger_source = self._trigger_source
+        runner.trigger_is_digital = self._trigger_is_digital
         self._start_runner(runner, f"SP_{config.display_name().replace(' ','_')}.npz")
 
 
@@ -2665,7 +3932,7 @@ class LongPulsingTab(_BaseExperimentTab):
         self.duration_unit.setToolTip(
             "Unit for the total duration. Switching converts the "
             "current value through the live pulse rate (e.g. "
-            "1 hour at 50 Hz ↔ 180000 pulses).")
+            "1 hour at 50 pps ↔ 180000 pulses).")
         self._duration_prev_unit = self.UNIT_S
 
         # Periodic *snapshot* — one passive scope grab every N
@@ -2957,6 +4224,8 @@ class LongPulsingTab(_BaseExperimentTab):
                 characterize_every_s=max(duration_s, 1e9),
                 capture_during_pulsing_every_s=snap_every_s),
         )
+        runner.trigger_source = self._trigger_source
+        runner.trigger_is_digital = self._trigger_is_digital
         self._start_runner(runner, f"LP_{config.display_name().replace(' ','_')}.npz")
 
 
@@ -3216,6 +4485,8 @@ class ProgressiveStressTab(_BaseExperimentTab):
                                 sampling_period_s=self.sampling_period.value(),
                                 stop_on_voltage_compliance=self.stop_on_compliance.isChecked()),
         )
+        runner.trigger_source = self._trigger_source
+        runner.trigger_is_digital = self._trigger_is_digital
         self._start_runner(runner, f"PS_{config.display_name().replace(' ','_')}.npz")
 
     # Queue chaining + completion-marking are handled by the base

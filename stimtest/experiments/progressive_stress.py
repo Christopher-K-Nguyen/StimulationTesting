@@ -40,6 +40,7 @@ from ..config import STIM_MAX_AMPLITUDE_UA, STIM_VOLTAGE_COMPLIANCE_V
 from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
 from ..metrics import compute_metrics
+from ..readback_calibration import make_capture
 from ..session import Capture, ChannelRun, Session
 from ..waveforms import PulsePattern
 from .base import ExperimentEvent, ExperimentResult, ExperimentRunner
@@ -86,19 +87,14 @@ class ProgressiveStressExperiment(ExperimentRunner):
     # --------------------------------------------------------------
     def run(self) -> ExperimentResult:
         self.preflight()
-        # Lab convention (see voltage_transient.py): reinit at the
-        # top of every Start-press so the device starts from a clean
-        # slate. PlexStim has no PS_UnloadChannel, so any pattern
-        # left loaded from a previous run would carry into this one.
-        try:
-            self.stim.reinit()
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message="Stimulator reinit at run start (clean slate)."))
-        except Exception as e:
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message=f"Stimulator reinit at run start failed: {e}"))
+        # NOTE: the historical ``self.stim.reinit()`` at the top of
+        # run() was REMOVED — see voltage_transient.run() for the
+        # full rationale (CLAUDE.md gotcha #29b + #31).  Short
+        # version: the GUI Stop / Start lifecycle now guarantees a
+        # fresh device, and the reinit cascade was the second
+        # ``ps_close_all_stim`` in a chain that HEAP_CORRUPT'd the
+        # vendor DLL.  Stale pattern bytes from a previous run are
+        # overwritten by ``load_channel`` before stim starts.
         config = self.session.test.configuration
         surface_area = self.session.test.array[config.active].surface_area_um2
         run = ChannelRun(configuration=config, surface_area_um2=surface_area)
@@ -107,11 +103,16 @@ class ProgressiveStressExperiment(ExperimentRunner):
 
         base = self.session.test.pattern
         amp = self.policy.starting_ua
+        # Revert to default scope view at the start (MATLAB
+        # setDefaultScopeView3.m): clear adapt state, re-run layout,
+        # re-size verticals — even single-channel runs benefit so
+        # back-to-back Start presses don't inherit the previous run's
+        # final scales.
+        self.apply_default_scope_view(
+            base, amp_ua=amp,
+            reason=f"start of channel {config.active}")
         idx = 0
         compliance_hit = False
-        self.scope.set_record_length(2500)
-        self.scope.set_acquisition_mode("AVERAGE", n_avg=8)
-
         # ``next_pattern`` is the ramp-step's pattern *pre-built* during
         # the previous step's hold. Initially None — first iteration
         # falls through to the "build now" branch. Each iteration also
@@ -127,12 +128,59 @@ class ProgressiveStressExperiment(ExperimentRunner):
                     pattern = next_pattern
                 else:
                     pattern = base.scaled(amp / excite_amp_abs)
+
+                # Adaptive scope view per amplitude step: I_mon vertical
+                # scale + trigger level both updated.  Vertical scale uses
+                # the magnitude (``amp``); trigger level uses the SIGNED
+                # amplitude so the level sign matches the phase-1 polarity.
+                try:
+                    ph_us = (pattern.excitation_phase.width_us
+                             if pattern.excitation_phase else 200.0)
+                    _amp_signed = (float(pattern.excitation_phase.amplitude_ua)
+                                   if pattern.excitation_phase else float(amp))
+                    self.update_imon_vertical_scale(float(amp))
+                    self.update_imon_trigger_level(
+                        _amp_signed, phase_width_us=ph_us)
+                except Exception:
+                    pass
+
                 # Program & start
                 try:
+                    # Defensive stop BEFORE the load.  ``PS_LoadChannel``
+                    # for an arbitrary pattern uploads the full .pat byte
+                    # stream over USB (~50-200 ms) — we want the device
+                    # quiescent during that window rather than continuing
+                    # the previous amplitude's pattern.  Idempotent on a
+                    # stopped device (the end-of-iteration stop_all
+                    # below typically left us stopped); critical when the
+                    # previous iteration's stop_all was skipped (early
+                    # break on compliance hit, exception, etc.).
+                    #
+                    # Uses ``stop_all`` (= PS_StopStimAllChannels) rather
+                    # than ``stop_channel(active)`` so the unused
+                    # zero-amplitude channels from the previous iteration
+                    # are quieted too before ``load_zero_unused_channels``
+                    # reloads them.
+                    try:
+                        self.stim.stop_all()
+                    except Exception:
+                        pass
                     self.stim.set_monitor_channel(config.active)
                     self.stim.load_channel(config.active, pattern)
                     self.stim.set_repetitions(config.active, 0)
-                    self.stim.start_channel(config.active)
+                    # Load zero-amplitude same-duration copy on every
+                    # unused channel (everything not active and not in
+                    # returns).  Port of MATLAB ``setPattern.m`` Zero
+                    # Current block — keeps unused channels in cadence
+                    # with the active pulse cycle.  Returns stay
+                    # unloaded (passive sink); CG auto-skips because
+                    # returns span every other channel.
+                    self.load_zero_unused_channels(pattern, config)
+                    # PS_StartStimAllChannels — single-channel start fails
+                    # with WRONG-TRIGGER-MODE on default-mode PlexStim.
+                    # Active + unused-zero channels fire together; zero
+                    # channels deliver no current.
+                    self.stim.start_all()
                 except Exception as e:
                     self._emit(ExperimentEvent(kind="aborted", session=self.session,
                                                message=f"Step program failed: {e}"))
@@ -151,17 +199,35 @@ class ProgressiveStressExperiment(ExperimentRunner):
                 else:
                     next_pattern = None
 
+                pulse_period_s = 1.0 / pattern.rate_hz
+                navg = getattr(self.scope, "_expected_acq_navg", None) or 8
                 step_start = time.time()
                 interval = max(self.policy.sampling_period_s, 1e-3)
                 next_grab = step_start
                 step_caps: List[Capture] = []
+                _step_cap_idx = 0
                 while not self.aborted and (time.time() - step_start) < self.policy.t_step_s:
                     if time.time() >= next_grab:
                         try:
-                            acq = self.scope.single_capture()
+                            acq = self.scope.capture_while_running(
+                                wait_s=navg * pulse_period_s,
+                                reset_before_run=(_step_cap_idx == 0))
+                            # Sanity check: I_mon edge should land at t≈0
+                            try:
+                                self.check_trigger_alignment(acq)
+                            except Exception:
+                                pass
+                            _acq_ch = getattr(acq, "channels", {}) or {}
+                            for _ch, _arr in _acq_ch.items():
+                                _a = np.asarray(_arr, dtype=float)
+                                if _a.size >= 2:
+                                    self.scope.adapt_channel_scale(
+                                        _ch, v_min=float(_a.min()),
+                                        v_max=float(_a.max()))
                         except Exception:
-                            time.sleep(0.05); continue
-                        cap = _make_capture(idx, pattern, acq, self.scope, self.stim)
+                            continue
+                        cap = make_capture(idx, pattern, acq, self.scope, self.stim,
+                                           cal=self.cal, channel=config.active)
                         compute_metrics(cap, surface_area)
                         # Feed E_ret pre/post-pulse rest values into
                         # the electrode-potential learning bin. No-ops
@@ -191,18 +257,29 @@ class ProgressiveStressExperiment(ExperimentRunner):
                         except Exception:
                             pass
                         cap.status.notes = f"step={amp:.0f}uA"
-                        # Hardware-level stop condition: V_mon rail
+                        # Hardware-level stop condition: V_mon rail.
+                        # Use the same 3-consecutive-samples glitch
+                        # filter that voltage_transient uses, so a
+                        # single noisy sample (EMI transient on the
+                        # probe lead, etc.) doesn't trip the stop.
+                        # Real compliance events persist across the
+                        # whole pulse, so 3 samples is well below
+                        # any meaningful event yet well above any
+                        # single-sample artifact.
+                        from .voltage_transient import _v_compliance_tripped
                         cap.status.voltage_compliance = bool(
-                            cap.v_mon_v.size and
-                            np.max(np.abs(cap.v_mon_v)) > STIM_VOLTAGE_COMPLIANCE_V
-                        )
+                            cap.v_mon_v.size and _v_compliance_tripped(
+                                cap.v_mon_v,
+                                threshold_v=STIM_VOLTAGE_COMPLIANCE_V,
+                                min_consecutive=3))
                         run.captures.append(cap)
                         step_caps.append(cap)
                         self._emit(ExperimentEvent(kind="capture", session=self.session,
                                                    run=run, capture=cap))
                         idx += 1
+                        _step_cap_idx += 1
                         next_grab += interval
-                    time.sleep(0.02)
+                    time.sleep(0.002)
 
                 # Stop if we hit voltage compliance — the device can't push
                 # more current at this load even if the user asked for more.
@@ -215,10 +292,40 @@ class ProgressiveStressExperiment(ExperimentRunner):
                     compliance_hit = True
                     break
 
+                # ---- Stop BEFORE next amplitude's pattern load ----
+                # Port of MATLAB ``runProgressiveStress.m`` line 371:
+                # ``stopStimulation()`` fires after the capture for the
+                # current amplitude and BEFORE the next iteration's
+                # ``setPattern`` / ``loadPattern`` / ``startStimulation``
+                # sequence.  Per user spec: "Progressive stress stays
+                # pulsing until the amplitude/charge needs to be
+                # stepped up" — within one step the stim is continuous
+                # across every ``capture_while_running`` call (already
+                # the case above), but between steps the channel is
+                # explicitly stopped so the next ``load_channel`` lands
+                # on a quiescent device.
+                #
+                # ``stop_all`` (= PS_StopStimAllChannels) rather than
+                # ``stop_channel(active)`` so the unused zero-amplitude
+                # channels brought up by ``start_all`` are also quieted —
+                # otherwise they'd continue ticking through the
+                # ~50-200 ms load window while we reload the active.
+                # The next iteration also does a defensive ``stop_all``
+                # right before its load (belt-and-suspenders), so a
+                # silent failure here doesn't leak into the next step.
+                try:
+                    self.stim.stop_all()
+                except Exception:
+                    pass
+
                 amp += self.policy.step_ua
         finally:
+            # Outer safety net — fires on normal end-of-ramp, on a
+            # compliance-triggered break, and on any exception escaping
+            # the ramp loop.  ``stop_all`` matches MATLAB
+            # ``stopStimulation`` exactly.
             try:
-                self.stim.stop_channel(config.active)
+                self.stim.stop_all()
             except Exception:
                 pass
 
@@ -236,20 +343,3 @@ class ProgressiveStressExperiment(ExperimentRunner):
                                 aborted=self.aborted)
 
 
-def _make_capture(index, pattern, acq, scope, stim) -> Capture:
-    aliases = scope.channel_aliases
-    v_mon = acq.channels.get(aliases.get("vmon", ""), np.zeros(0))
-    i_mon = acq.channels.get(aliases.get("imon", ""), np.zeros(0))
-    e_ret = acq.channels.get(aliases.get("eret", ""), None)
-    e_act = acq.channels.get(aliases.get("eact", ""), None)
-    info = stim.info
-    v_mon_v = v_mon / info.vmon_scaling_v_per_v if info.vmon_scaling_v_per_v else v_mon
-    i_mon_ua = i_mon / info.imon_scaling_v_per_ua if info.imon_scaling_v_per_ua else i_mon
-    return Capture(
-        index=index, pattern=pattern,
-        time_us=np.asarray(acq.time_us),
-        v_mon_v=np.asarray(v_mon_v),
-        i_mon_ua=np.asarray(i_mon_ua),
-        e_act_v=np.asarray(e_act) if e_act is not None and e_act.size else None,
-        e_ret_v=np.asarray(e_ret) if e_ret is not None and e_ret.size else None,
-    )

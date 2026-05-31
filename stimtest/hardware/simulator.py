@@ -41,7 +41,7 @@ What's NOT modeled
 """
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -201,7 +201,22 @@ class SimulatedOscilloscope(Oscilloscope):
     The default channel mapping mirrors the IEEE NER paper setup.
     """
 
-    def __init__(self, record_length: int = 2500, sample_period_us: float = 0.4):
+    def __init__(self, record_length: int = 2500, sample_period_us: float = 0.4,
+                 *, has_ext_trigger: bool = False):
+        # ``has_ext_trigger`` defaults to **False** so the simulator
+        # matches the most common bench scope class (TBS1000C / B
+        # without an EXT BNC).  Users testing the EXT-trigger path
+        # in ``--simulate`` mode can pass ``has_ext_trigger=True``
+        # explicitly (e.g. when wiring a unit test for the
+        # digital-sync trigger flow).
+        #
+        # Background: the previous default was ``True``, which made
+        # the Setup tab show the "Use digital sync trigger (EXT)"
+        # checkbox in every simulator session — confusing because
+        # the user's actual bench scope was a TBS1000C with no EXT
+        # input.  Hiding the toggle by default in sim makes the
+        # ``--simulate`` view representative of the bench reality
+        # for the typical operator.
         self.info = ScopeInfo(
             make="SIM",
             model="SimScope-4",
@@ -209,6 +224,7 @@ class SimulatedOscilloscope(Oscilloscope):
             firmware="sim 0.1",
             resource="SIM://localhost",
             n_channels=4,
+            has_ext_trigger=has_ext_trigger,
             is_simulated=True,
         )
         self.channel_aliases = {
@@ -225,6 +241,11 @@ class SimulatedOscilloscope(Oscilloscope):
                                        r_pol_mohm=5.0, e_eq_v=0.0)
         self._return = _ElectrodeModel(r_access_kohm=1.9, c_dl_nf=80.0,
                                        r_pol_mohm=6.0, e_eq_v=0.05)
+
+        # Gated-measurement window state.  None = no gating; tuple is
+        # (t_us_start, t_us_end).  Set by :meth:`gate_measurement_window`,
+        # consumed by :meth:`measure_mean` to bound its computation.
+        self._gated_window_us: Optional[Tuple[float, float]] = None
 
     # -- lifecycle --
     def open(self, resource: Optional[str] = None) -> None:
@@ -243,13 +264,64 @@ class SimulatedOscilloscope(Oscilloscope):
     def set_trigger(self, source: str = "EXT", level_v: float = 1.0,
                     slope: str = "RISE", mode: str = "NORMAL") -> None: pass
 
+    def set_trigger_level(self, level_v: float) -> None: pass
+
+    # -- gated measurement (closed-loop bias feedback) ----------------
+    # Mirrors the Tek primitives.  The simulator implementation does
+    # a synchronous ``single_capture`` then computes the channel mean
+    # over the requested time window — exact match for what the real
+    # scope's MEASUrement subsystem reports, just done host-side here.
+    # Stored window state lets ``measure_mean`` re-use the cached
+    # bounds without the caller re-supplying them.
+    def gate_measurement_window(self, t_us_start: float,
+                                t_us_end: float) -> None:
+        if t_us_end < t_us_start:
+            raise ValueError(
+                f"gate window end ({t_us_end} µs) must be ≥ start "
+                f"({t_us_start} µs)")
+        self._gated_window_us = (float(t_us_start), float(t_us_end))
+
+    def clear_measurement_gating(self) -> None:
+        self._gated_window_us = None
+
+    def measure_mean(self, channel: str) -> float:
+        """Sample the simulator's current synthesized waveform on the
+        requested channel and return the mean over the gated window
+        (or NaN if no window is set or no samples land inside)."""
+        window = getattr(self, "_gated_window_us", None)
+        if window is None:
+            return float("nan")
+        try:
+            acq = self.single_capture()
+        except Exception:
+            return float("nan")
+        # Resolve logical-name channels via the alias map (matches the
+        # real driver: callers pass "CH3" but might also pass "eret").
+        ch = channel
+        if ch in self.channel_aliases:
+            ch = self.channel_aliases[ch]
+        data = acq.channels.get(ch)
+        if data is None or data.size == 0:
+            return float("nan")
+        t_us = acq.time_us
+        t_lo, t_hi = window
+        mask = (t_us >= t_lo) & (t_us <= t_hi)
+        if not np.any(mask):
+            return float("nan")
+        return float(np.mean(data[mask]))
+
     # -- binding --
     def bind_stimulator(self, stim: SimulatedStimulator) -> None:
         """Tell the simulated scope where to read its 'real' stimulus from."""
         self._stim = stim
 
     # -- acquisition --
-    def single_capture(self) -> ScopeAcquisition:
+    def single_capture(self, *, timeout_s=None) -> ScopeAcquisition:
+        # ``timeout_s`` is accepted for API parity with the real driver
+        # (callers pass a pulse-rate-aware budget) but the simulator
+        # returns a deterministic frame synchronously, so the budget
+        # is ignored.
+        del timeout_s
         pat = self._stim.monitored_pattern() if self._stim is not None else None
         if pat is None:
             return self._noise_capture()
@@ -269,8 +341,34 @@ class SimulatedOscilloscope(Oscilloscope):
         e_act = self._active.simulate(t_s, i_a)
         e_ret = self._return.simulate(t_s, -i_a)  # return sees opposite polarity
 
-        # V_mon = E_act - E_ret + i * R_total (small added IR drop captured here)
-        v_mon = (e_act - e_ret) + i_a * (self._active.r_access + self._return.r_access)
+        # The electrode-side differential voltage (E_act − E_ret) plus
+        # the IR drop across both access resistances.  This is what
+        # a probe at the active electrode would see relative to the
+        # return — i.e. the actual ELECTRODE voltage.
+        v_electrode = ((e_act - e_ret)
+                       + i_a * (self._active.r_access
+                                + self._return.r_access))
+        # The stim's V_mon OUTPUT pin scales the electrode voltage by
+        # ``vmon_v_per_v`` (0.25 V/V on Default, 1.0 V/V on NIL).
+        # The scope sees the V_mon-OUTPUT-pin voltage, NOT the raw
+        # electrode voltage, so emit the SCALED value here.
+        # ``make_capture`` later divides by the same factor to recover
+        # electrode volts in ``cap.v_mon_v``.
+        #
+        # Previously this stage emitted the raw electrode voltage
+        # directly, and ``make_capture``'s divide produced a 4×-too-
+        # large ``cap.v_mon_v`` on Default scaling (1/0.25 = 4).
+        # That broke the E_act = V_mon + E_ret derivation in the
+        # multichannel plot — V_mon was in 4×-electrode-volts while
+        # E_ret was in electrode-volts, so the sum had wildly wrong
+        # units.  Scaling here restores unit consistency with the
+        # real-hardware path.
+        try:
+            vmon_v_per_v = float(self._stim.info.vmon_scaling_v_per_v
+                                 or 1.0)
+        except Exception:
+            vmon_v_per_v = 1.0
+        v_mon = v_electrode * vmon_v_per_v
         # Add a touch of measurement noise
         rng = np.random.default_rng(0)
         v_mon = v_mon + rng.normal(0.0, 5e-3, size=v_mon.size)

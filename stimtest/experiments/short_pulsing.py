@@ -25,6 +25,7 @@ import numpy as np
 from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
 from ..metrics import compute_metrics
+from ..readback_calibration import make_capture
 from ..session import Capture, ChannelRun, Session
 from ..waveforms import PulsePattern
 from .base import ExperimentEvent, ExperimentResult, ExperimentRunner
@@ -52,19 +53,14 @@ class ShortPulsingExperiment(ExperimentRunner):
 
     def run(self) -> ExperimentResult:
         self.preflight()
-        # Lab convention (see voltage_transient.py): reinit at the
-        # top of every Start-press so the device starts from a clean
-        # slate. PlexStim has no PS_UnloadChannel, so any pattern
-        # left loaded from a previous run would carry into this one.
-        try:
-            self.stim.reinit()
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message="Stimulator reinit at run start (clean slate)."))
-        except Exception as e:
-            self._emit(ExperimentEvent(
-                kind="log", session=self.session,
-                message=f"Stimulator reinit at run start failed: {e}"))
+        # NOTE: the historical ``self.stim.reinit()`` at the top of
+        # run() was REMOVED — see voltage_transient.run() for the
+        # full rationale (CLAUDE.md gotcha #29b + #31).  Short
+        # version: the GUI Stop / Start lifecycle now guarantees a
+        # fresh device, and the reinit cascade was the second
+        # ``ps_close_all_stim`` in a chain that HEAP_CORRUPT'd the
+        # vendor DLL.  Stale pattern bytes from a previous run are
+        # overwritten by ``load_channel`` before stim starts.
         from datetime import datetime
         config = self.session.test.configuration
         run = ChannelRun(configuration=config,
@@ -80,28 +76,59 @@ class ShortPulsingExperiment(ExperimentRunner):
         # everywhere, which the runner programs without complaint.
         excite_amp_abs = abs(base.excitation_phase.amplitude_ua) or 1.0
         pattern = base.scaled(self.amplitude_ua / excite_amp_abs)
+        # MATLAB setDefaultScopeView3.m: revert to default per-channel
+        # scope view at the start of every channel (here: at run start,
+        # since short-pulsing is single-channel).
+        self.apply_default_scope_view(
+            pattern, amp_ua=self.amplitude_ua,
+            reason=f"start of channel {config.active}")
 
         try:
             self.stim.set_monitor_channel(config.active)
             self.stim.load_channel(config.active, pattern)
             self.stim.set_repetitions(config.active, 0)
-            self.stim.start_channel(config.active)
+            # Load a zero-amplitude, same-duration copy of the pattern
+            # on every unused channel (anything not active and not in
+            # returns).  Port of MATLAB ``setPattern.m`` Zero Current
+            # block.  SP runs continuously for many minutes, so making
+            # sure unused channels stay TICKING in sync with the active
+            # channel's pulse cycle is especially important here —
+            # without it, an unused channel carrying a stale pattern
+            # from a previous run would deliver current for the whole
+            # SP duration.
+            self.load_zero_unused_channels(pattern, config)
+            # PS_StartStimAllChannels — single-channel start fails with
+            # WRONG-TRIGGER-MODE on default-mode PlexStim devices.
+            # Loaded channels (active + unused-zero) fire together;
+            # zero channels deliver no current.
+            self.stim.start_all()
         except Exception as e:
             self._emit(ExperimentEvent(kind="aborted", session=self.session, run=run,
                                        message=f"Stim load failed: {e}"))
             return ExperimentResult(session=self.session, aborted=True, error=str(e))
 
-        self.scope.set_record_length(2500)
-        self.scope.set_acquisition_mode("AVERAGE", n_avg=8)
-
+        pulse_period_s = 1.0 / pattern.rate_hz
+        navg = getattr(self.scope, "_expected_acq_navg", None) or 8
+        v_mon_phys = self.scope.channel_aliases.get("vmon", "CH1")
+        i_mon_phys = self.scope.channel_aliases.get("imon", "CH2")
         t_start = time.time()
         next_capture_at = t_start
         idx = 0
         try:
             while not self.aborted and (time.time() - t_start) < self.policy.duration_s:
                 if time.time() >= next_capture_at:
-                    acq = self.scope.single_capture()
-                    cap = _make_capture(idx, pattern, acq, self.scope, self.stim)
+                    acq = self.scope.capture_while_running(
+                        wait_s=navg * pulse_period_s,
+                        reset_before_run=(idx == 0))
+                    chan_data = getattr(acq, "channels", {}) or {}
+                    for _ch, _arr in chan_data.items():
+                        _a = np.asarray(_arr, dtype=float)
+                        if _a.size >= 2:
+                            self.scope.adapt_channel_scale(
+                                _ch, v_min=float(_a.min()),
+                                v_max=float(_a.max()))
+                    cap = make_capture(idx, pattern, acq, self.scope, self.stim,
+                                       cal=self.cal, channel=config.active)
                     compute_metrics(cap, run.surface_area_um2)
                     # Feed the E_ret pre/post-pulse rest values into
                     # the electrode-potential learning bin keyed by
@@ -138,10 +165,14 @@ class ShortPulsingExperiment(ExperimentRunner):
                                                run=run, capture=cap))
                     idx += 1
                     next_capture_at += self.policy.capture_interval_s
-                time.sleep(0.01)
+                time.sleep(0.001)
         finally:
+            # ``stop_all`` (= PS_StopStimAllChannels, MATLAB
+            # ``stopStimulation``) — quiets both the active channel AND
+            # the unused zero-amplitude channels that were brought up
+            # alongside it via ``start_all`` at run start.
             try:
-                self.stim.stop_channel(config.active)
+                self.stim.stop_all()
             except Exception:
                 pass
 
@@ -152,20 +183,3 @@ class ShortPulsingExperiment(ExperimentRunner):
                                 aborted=self.aborted)
 
 
-def _make_capture(index: int, pattern: PulsePattern, acq, scope, stim) -> Capture:
-    aliases = scope.channel_aliases
-    v_mon = acq.channels.get(aliases.get("vmon", ""), np.zeros(0))
-    i_mon = acq.channels.get(aliases.get("imon", ""), np.zeros(0))
-    e_ret = acq.channels.get(aliases.get("eret", ""), None)
-    e_act = acq.channels.get(aliases.get("eact", ""), None)
-    info = stim.info
-    v_mon_v = v_mon / info.vmon_scaling_v_per_v if info.vmon_scaling_v_per_v else v_mon
-    i_mon_ua = i_mon / info.imon_scaling_v_per_ua if info.imon_scaling_v_per_ua else i_mon
-    return Capture(
-        index=index, pattern=pattern,
-        time_us=np.asarray(acq.time_us),
-        v_mon_v=np.asarray(v_mon_v),
-        i_mon_ua=np.asarray(i_mon_ua),
-        e_act_v=np.asarray(e_act) if e_act is not None and e_act.size else None,
-        e_ret_v=np.asarray(e_ret) if e_ret is not None and e_ret.size else None,
-    )
