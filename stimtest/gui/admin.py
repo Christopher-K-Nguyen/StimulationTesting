@@ -570,6 +570,210 @@ def prompt_login(parent, *, admin_hash: str,
 
 
 # ---------------------------------------------------------------------------
+# First-launch admin password setup
+# ---------------------------------------------------------------------------
+class _FirstLaunchSetupDialog(QtWidgets.QDialog):
+    """One-time "set up admin password" dialog.
+
+    Shown by MainWindow on the first launch of PULSAR when:
+
+    * The prefs file is missing OR has no ``admin.setup_completed``
+      flag, AND
+    * The stored ``admin.password_hash`` matches the factory
+      :data:`_DEFAULT_HASH`.
+
+    Either set a real password (Save and continue) OR explicitly
+    accept the publicly-known default for now (Use default for
+    now → confirmation popup → ``setup_completed = True`` so the
+    dialog never nags again).  ESC / window-close is treated as the
+    skip-with-confirm path; the dialog is non-skippable in the
+    sense that you either set a password or affirmatively accept
+    the default — there's no "next time" deferral.
+
+    Result accessors:
+
+    * :meth:`new_password` — the typed password, or empty string
+      when the operator skipped.
+    * :meth:`chose_skip` — True when the operator pressed "Use
+      default for now" (or cancelled via ESC and confirmed) and
+      thus accepted the default.
+
+    The wrapper :func:`prompt_first_launch_setup` is the
+    recommended entry point; it returns ``(new_hash | None, ok)``
+    and handles the confirmation popup.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PULSAR — set up admin password")
+        self.setMinimumWidth(440)
+        # We control the close path ourselves so ESC routes through
+        # the same skip-with-confirm flow as the button.  Disable
+        # the system close button cooperation.
+        self.setWindowFlags(
+            self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
+
+        self._chose_skip = False
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "<b>Welcome to PULSAR.</b><br>"
+            "Choose an admin password to protect the custom catalog "
+            "and (when installed) extension-profile management.  You "
+            "can change it later from <i>Admin → Manage Custom "
+            "Catalog → Change password…</i>"))
+
+        form = QtWidgets.QFormLayout()
+        self._pw1 = QtWidgets.QLineEdit()
+        self._pw1.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self._pw1.setPlaceholderText("New password")
+        form.addRow("New password:", self._pw1)
+        self._pw2 = QtWidgets.QLineEdit()
+        self._pw2.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self._pw2.setPlaceholderText("Confirm new password")
+        form.addRow("Confirm password:", self._pw2)
+        v.addLayout(form)
+
+        #: Inline status label — turns red when the two fields don't
+        #: match or one is empty.  Cleared when state is OK.
+        self._status = QtWidgets.QLabel("")
+        self._status.setStyleSheet("color: #c0392b;")
+        v.addWidget(self._status)
+
+        btns = QtWidgets.QHBoxLayout()
+        self._skip_btn = QtWidgets.QPushButton("Use default for now")
+        self._skip_btn.setToolTip(
+            "Accept the publicly-known factory default password.  "
+            "The dialog won't show again, but you should change the "
+            "password via Admin → Manage Custom Catalog → Change "
+            "password… when you have a moment.")
+        self._skip_btn.clicked.connect(self._on_skip)
+        self._save_btn = QtWidgets.QPushButton("Save and continue")
+        self._save_btn.setDefault(True)
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_save)
+        btns.addWidget(self._skip_btn)
+        btns.addStretch(1)
+        btns.addWidget(self._save_btn)
+        v.addLayout(btns)
+
+        # Live validation: enable Save only when both fields are
+        # non-empty AND match.  Status label gives inline feedback
+        # so the operator isn't guessing why the button is greyed.
+        self._pw1.textChanged.connect(self._validate)
+        self._pw2.textChanged.connect(self._validate)
+        # Enter on the second field submits when valid.
+        self._pw2.returnPressed.connect(self._maybe_submit_on_enter)
+
+    # ---- state predicates ----
+    def new_password(self) -> str:
+        """Typed password (empty when the operator skipped)."""
+        if self._chose_skip:
+            return ""
+        return self._pw1.text()
+
+    def chose_skip(self) -> bool:
+        return self._chose_skip
+
+    # ---- slots ----
+    def _validate(self) -> None:
+        a = self._pw1.text()
+        b = self._pw2.text()
+        if not a or not b:
+            self._status.setText("")
+            self._save_btn.setEnabled(False)
+            return
+        if a != b:
+            self._status.setText("Passwords do not match.")
+            self._save_btn.setEnabled(False)
+            return
+        self._status.setText("")
+        self._save_btn.setEnabled(True)
+
+    def _maybe_submit_on_enter(self) -> None:
+        if self._save_btn.isEnabled():
+            self._on_save()
+
+    def _on_save(self) -> None:
+        # Defensive re-check (button shouldn't be enabled otherwise).
+        if not self._pw1.text() or self._pw1.text() != self._pw2.text():
+            return
+        self._chose_skip = False
+        self.accept()
+
+    def _on_skip(self) -> None:
+        # Confirmation popup — accepting the public default is a
+        # one-way door (setup_completed gets persisted), worth a
+        # second click.
+        ok = QtWidgets.QMessageBox.question(
+            self, "Use default password?",
+            "The factory default admin password is publicly known "
+            "and shouldn't be relied on for any real security.\n\n"
+            "Continue with the default password?  This dialog "
+            "won't show again — you can change the password from "
+            "Admin → Manage Custom Catalog → Change password… at "
+            "any time.",
+            QtWidgets.QMessageBox.StandardButton.Yes |
+            QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._chose_skip = True
+        self.accept()
+
+    def closeEvent(self, event):
+        # Route window-close (X button or ESC) through the same
+        # skip-with-confirm flow as the button.  If the operator
+        # cancels the confirmation, we keep the dialog open.
+        if self._chose_skip:
+            # Already going through accept(); let the close finish.
+            return super().closeEvent(event)
+        ok = QtWidgets.QMessageBox.question(
+            self, "Use default password?",
+            "Closing this dialog without setting a password will "
+            "use the publicly-known factory default.  Continue?",
+            QtWidgets.QMessageBox.StandardButton.Yes |
+            QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+        self._chose_skip = True
+        super().closeEvent(event)
+
+
+def prompt_first_launch_setup(parent) -> Tuple[Optional[str], bool]:
+    """Show the first-launch setup dialog; return ``(new_hash, ok)``.
+
+    Returns
+    -------
+    (new_hash, ok) : tuple
+        * ``(hash_hex, True)`` — operator set a custom password.
+          Caller should persist ``new_hash`` as the admin
+          password_hash and mark ``setup_completed = True``.
+        * ``(None, False)`` — operator pressed "Use default for
+          now" (or cancelled via ESC and confirmed).  Caller
+          should mark ``setup_completed = True`` so the dialog
+          doesn't re-prompt on the next launch.
+
+    The function NEVER returns "user cancelled without confirming"
+    — closeEvent forces the confirmation path, so either the
+    operator set a password or affirmatively accepted the default.
+    """
+    dlg = _FirstLaunchSetupDialog(parent)
+    dlg.exec()  # blocks; closeEvent enforces a definitive answer
+    if dlg.chose_skip():
+        return (None, False)
+    pw = dlg.new_password()
+    if not pw:
+        # Shouldn't happen — Save button is disabled on empty —
+        # but defensive return path so the caller can recover.
+        return (None, False)
+    return (_hash(pw), True)
+
+
+# ---------------------------------------------------------------------------
 # Catalog management dialog
 # ---------------------------------------------------------------------------
 class AdminCatalogDialog(QtWidgets.QDialog):

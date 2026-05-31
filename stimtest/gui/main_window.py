@@ -21,8 +21,8 @@ from .prefs import (
 )
 from .admin import (
     AdminCatalogDialog, apply_admin_catalog, _DEFAULT_HASH,
-    prompt_login, CATALOG_KEYS, Profile, is_restricted_unlocked,
-    is_admin,
+    prompt_login, prompt_first_launch_setup, CATALOG_KEYS, Profile,
+    is_restricted_unlocked, is_admin,
 )
 from .calibration import CalibrationTab
 from .results_tab import ResultsTab
@@ -83,6 +83,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # dialog's Username dropdown so the operator doesn't retype
         # extension usernames every session.
         self._admin_login_history: list[str] = []
+        # First-launch setup-completion flag.  Loaded from prefs;
+        # gates whether ``_maybe_run_first_launch_setup`` shows the
+        # one-time admin password setup dialog.  Starts False — a
+        # fresh install (no prefs file) will see the dialog.
+        self._admin_setup_completed: bool = False
 
         self.save_dir = Path(save_dir or DEFAULT_SAVE_DIR)
         array = ElectrodeArray.utah_4x4()
@@ -1545,6 +1550,32 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
                 self._admin_login_history = clean
 
+            # Track whether the operator has been through the
+            # first-launch setup dialog.  Read here so the post-
+            # legacy-migration check below knows whether to prompt.
+            self._admin_setup_completed: bool = bool(
+                admin_prefs.get("setup_completed", False))
+            # If the loaded password_hash is custom (not the factory
+            # default), the operator already explicitly set a
+            # password — treat that as implicit setup completion so
+            # we never nag.  Existing installs that have already
+            # changed the password sail through.
+            if self._admin_password_hash != _DEFAULT_HASH:
+                self._admin_setup_completed = True
+        else:
+            # No admin prefs block at all — fresh install.  Default
+            # state means "needs setup" (setup_completed defaults to
+            # False; password_hash defaults to _DEFAULT_HASH already
+            # from __init__).
+            self._admin_setup_completed = False
+
+        # First-launch setup prompt: shown exactly once when the
+        # operator hasn't been through it AND the password is still
+        # the factory default.  Modal — blocks the rest of the
+        # prefs-restore flow until the operator answers.  See
+        # ``_maybe_run_first_launch_setup`` for the full logic.
+        self._maybe_run_first_launch_setup()
+
         try:
             self.setup_tab.restore_prefs(prefs.get(PREF_KEY_SETUP, {}))
         except Exception as e:
@@ -1811,6 +1842,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 # lowercased, capped at admin.LOGIN_HISTORY_MAX).
                 # Used to seed the login dialog's Username combobox.
                 "login_history": list(self._admin_login_history),
+                # First-launch setup completion flag.  Once True,
+                # the one-time admin password setup dialog never
+                # shows again — even if the operator chose to keep
+                # the factory default password (in which case ok=False
+                # was returned from prompt_first_launch_setup but we
+                # still mark setup_completed so the dialog doesn't
+                # nag).
+                "setup_completed": bool(self._admin_setup_completed),
             },
         }
 
@@ -3029,6 +3068,74 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         QtWidgets.QMessageBox.information(
             self, "Last stimulator verification", body)
+
+    # ------------------------------------------------- first-launch setup
+    def _maybe_run_first_launch_setup(self) -> None:
+        """Show the one-time admin password setup dialog if this is
+        a first launch.
+
+        Called from inside ``_load_prefs_into_tabs`` right after the
+        admin prefs block.  No-op when:
+
+        * ``_admin_setup_completed`` is already True (operator went
+          through the dialog or has a custom password from before
+          the dialog existed), OR
+        * Tests / programmatic instantiation set the env var
+          ``PULSAR_SKIP_FIRST_LAUNCH_SETUP=1`` (the test suite uses
+          this to avoid spawning a modal dialog from headless
+          fixtures).
+
+        On a real first launch, shows the modal dialog and persists
+        the outcome immediately so a crash before normal prefs save
+        doesn't lose the setup-completed flag (re-prompting the
+        operator who already answered would be annoying).
+        """
+        import os
+
+        if self._admin_setup_completed:
+            return
+        # Test-friendly escape hatch: integration tests want to
+        # construct a MainWindow without the modal blocking.  Set
+        # the env var in the test fixture, not in production paths.
+        if os.environ.get("PULSAR_SKIP_FIRST_LAUNCH_SETUP"):
+            self.log_pane.log(
+                "[admin] first-launch setup skipped via "
+                "PULSAR_SKIP_FIRST_LAUNCH_SETUP env var")
+            return
+
+        try:
+            new_hash, ok = prompt_first_launch_setup(self)
+        except Exception as e:
+            # Defensive — never let the setup dialog crash the
+            # whole launch.  Log and fall through with default
+            # password.
+            self.log_pane.log(
+                f"[admin] first-launch setup dialog failed: "
+                f"{type(e).__name__}: {e}; keeping factory default")
+            self._admin_setup_completed = True
+            try:
+                save_prefs(self._collect_prefs_payload())
+            except Exception:
+                pass
+            return
+
+        if ok and new_hash:
+            self._admin_password_hash = new_hash
+            self.log_pane.log(
+                "[admin] first-launch password set; saved to prefs")
+        else:
+            self.log_pane.log(
+                "[admin] first-launch setup skipped; factory default "
+                "password remains in effect (change it via Admin → "
+                "Manage Custom Catalog → Change password…)")
+        # Either way, mark setup_completed so we don't re-prompt.
+        self._admin_setup_completed = True
+        try:
+            save_prefs(self._collect_prefs_payload())
+        except Exception as _e:
+            self.log_pane.log(
+                f"[admin] first-launch setup persist failed: "
+                f"{type(_e).__name__}: {_e}")
 
     # -------------------------------------------------------------- profile
     def _on_admin_login(self) -> None:

@@ -803,6 +803,131 @@ def test_prompt_login_history_kwarg_optional():
         f"existing callers; got {history_param.default!r}")
 
 
+# ---------------------------------------------------------------------------
+# First-launch setup dialog
+# ---------------------------------------------------------------------------
+def test_first_launch_dialog_construction(qapp, clean_registry):
+    """Smoke: dialog can be instantiated without errors and the
+    'Save and continue' button starts disabled (both fields empty)."""
+    from stimtest.gui.admin import _FirstLaunchSetupDialog
+
+    dlg = _FirstLaunchSetupDialog()
+    assert dlg.windowTitle() == "PULSAR — set up admin password"
+    assert dlg._save_btn.isEnabled() is False
+    assert dlg.chose_skip() is False
+    assert dlg.new_password() == ""
+
+
+def test_first_launch_save_disabled_when_passwords_mismatch(
+        qapp, clean_registry):
+    """Save button only enables when both fields are non-empty AND
+    match.  Inline status label shows 'do not match' otherwise."""
+    from stimtest.gui.admin import _FirstLaunchSetupDialog
+
+    dlg = _FirstLaunchSetupDialog()
+    dlg._pw1.setText("hello")
+    dlg._pw2.setText("world")
+    assert dlg._save_btn.isEnabled() is False
+    assert "do not match" in dlg._status.text().lower()
+
+
+def test_first_launch_save_enabled_when_passwords_match(
+        qapp, clean_registry):
+    """Matching non-empty passwords → Save enabled, no status text."""
+    from stimtest.gui.admin import _FirstLaunchSetupDialog
+
+    dlg = _FirstLaunchSetupDialog()
+    dlg._pw1.setText("Neuron02")
+    dlg._pw2.setText("Neuron02")
+    assert dlg._save_btn.isEnabled() is True
+    assert dlg._status.text() == ""
+
+
+def test_first_launch_save_disabled_when_either_empty(
+        qapp, clean_registry):
+    """Empty fields → Save disabled, no error (we're still typing)."""
+    from stimtest.gui.admin import _FirstLaunchSetupDialog
+
+    dlg = _FirstLaunchSetupDialog()
+    dlg._pw1.setText("only_first")
+    dlg._pw2.setText("")
+    assert dlg._save_btn.isEnabled() is False
+    assert dlg._status.text() == ""
+
+
+def test_first_launch_save_path(qapp, clean_registry):
+    """Clicking Save (with valid passwords) accepts the dialog and
+    new_password returns the typed value."""
+    from stimtest.gui.admin import _FirstLaunchSetupDialog
+
+    dlg = _FirstLaunchSetupDialog()
+    dlg._pw1.setText("SecurePass123")
+    dlg._pw2.setText("SecurePass123")
+    # Directly invoke the slot (don't actually .exec() the dialog).
+    dlg._on_save()
+    assert dlg.chose_skip() is False
+    assert dlg.new_password() == "SecurePass123"
+
+
+def test_prompt_first_launch_setup_save_path(qapp, clean_registry, monkeypatch):
+    """End-to-end: monkeypatch the dialog to simulate the operator
+    typing + clicking Save; prompt_first_launch_setup returns
+    (hash, True)."""
+    import hashlib
+    from stimtest.gui import admin as admin_mod
+
+    class _StubDialog:
+        def __init__(self, parent=None):
+            self._typed = "MyPass"
+        def exec(self):
+            return 1  # Accepted (anything truthy)
+        def chose_skip(self):
+            return False
+        def new_password(self):
+            return self._typed
+
+    monkeypatch.setattr(admin_mod, "_FirstLaunchSetupDialog", _StubDialog)
+    new_hash, ok = admin_mod.prompt_first_launch_setup(None)
+    assert ok is True
+    assert new_hash == hashlib.sha256("MyPass".encode()).hexdigest()
+
+
+def test_prompt_first_launch_setup_skip_path(qapp, clean_registry, monkeypatch):
+    """Skip path returns (None, False) — caller marks setup_completed
+    without changing the password hash."""
+    from stimtest.gui import admin as admin_mod
+
+    class _StubDialog:
+        def __init__(self, parent=None): pass
+        def exec(self): return 1
+        def chose_skip(self): return True
+        def new_password(self): return ""
+
+    monkeypatch.setattr(admin_mod, "_FirstLaunchSetupDialog", _StubDialog)
+    new_hash, ok = admin_mod.prompt_first_launch_setup(None)
+    assert ok is False
+    assert new_hash is None
+
+
+def test_prompt_first_launch_setup_empty_password_defensive(
+        qapp, clean_registry, monkeypatch):
+    """If somehow the dialog returns an empty password without
+    chose_skip (shouldn't happen, but defensive), the helper
+    returns (None, False) rather than hashing empty string."""
+    from stimtest.gui import admin as admin_mod
+
+    class _StubDialog:
+        def __init__(self, parent=None): pass
+        def exec(self): return 1
+        def chose_skip(self): return False
+        def new_password(self): return ""
+
+    monkeypatch.setattr(admin_mod, "_FirstLaunchSetupDialog", _StubDialog)
+    new_hash, ok = admin_mod.prompt_first_launch_setup(None)
+    assert ok is False
+    assert new_hash is None
+
+
 def test_registry_writes_are_thread_safe(clean_registry):
     """Audit #15: concurrent register_extension_profile calls from
     multiple threads should not corrupt the registries.
