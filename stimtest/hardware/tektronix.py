@@ -1639,7 +1639,8 @@ class TektronixOscilloscope(Oscilloscope):
             info["is_probe"] = True
         return info
 
-    def apply_channel_defaults(self, channel: str) -> None:
+    def apply_channel_defaults(self, channel: str,
+                               *, probe_warning: bool = True) -> None:
         """Force DC / 1X / no-invert / 0-pos / V-units on one channel.
 
         Does NOT touch bandwidth — see :meth:`set_channel_bandwidth`
@@ -1651,9 +1652,16 @@ class TektronixOscilloscope(Oscilloscope):
         operator knows the override is masking a physical mismatch
         (e.g. a 10x probe on V_mon would otherwise read 1/10 the true
         voltage after our force-to-1x).
+
+        ``probe_warning=False`` suppresses the per-channel warning —
+        used by :meth:`configure_channels` so it can coalesce
+        warnings across all configured channels into ONE summary
+        line (LOG_ANALYSIS.md finding #9: 4× per-channel warnings
+        were unreadable noise on every connect).  Other call sites
+        (e.g. single-channel resets) keep the inline warning.
         """
         info = self.probe_info(channel)
-        if info.get("is_probe"):
+        if probe_warning and info.get("is_probe"):
             type_tok = info.get("type") or f"{info.get('gain', 1.0):g}x"
             self._log(
                 f"[scope]   ⚠ {channel}: scope reports a probe attached "
@@ -3611,8 +3619,35 @@ class TektronixOscilloscope(Oscilloscope):
             except Exception:
                 pass
         # Apply canonical bench defaults to each active channel.
+        # Suppress per-channel probe warnings — we collect them
+        # below and emit ONE summary line so the LogPane doesn't
+        # carry 4 near-identical "scope reports a probe attached"
+        # blocks on every connect (LOG_ANALYSIS.md finding #9).
+        attenuating_probes: list = []
         for ch in used:
-            self.apply_channel_defaults(ch)
+            info = self.probe_info(ch)
+            if info.get("is_probe"):
+                attenuating_probes.append((
+                    ch,
+                    info.get("type") or f"{info.get('gain', 1.0):g}x",
+                    float(info.get("gain", 1.0))))
+            self.apply_channel_defaults(ch, probe_warning=False)
+        # Coalesced probe warning — fires once when ANY configured
+        # channel reports an attenuating probe, naming all of them
+        # in one line.  No-op (silent) when every input is direct
+        # BNC, which is the bench convention and the common case.
+        if attenuating_probes:
+            ch_strs = ", ".join(
+                f"{ch} ({tok}, gain={g:g})"
+                for ch, tok, g in attenuating_probes)
+            self._log(
+                f"[scope]   ⚠ {len(attenuating_probes)} channel(s) "
+                f"report an attenuating probe: {ch_strs}.  Bench "
+                f"convention is direct BNC → BNC; forcing PRObe:GAIN 1 "
+                f"will make displayed voltages match the BNC-tip "
+                f"voltage, NOT the probe-tip voltage.  If these are "
+                f"actually probes, readings will be off by the gain "
+                f"factor.")
         # Channel ON/OFF reshuffle → all per-channel preambles
         # potentially stale (DATa:SOURce semantics, channel-position
         # defaults reset).  Invalidate all to be safe.

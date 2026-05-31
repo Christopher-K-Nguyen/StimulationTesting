@@ -1877,27 +1877,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             _log = self.log_pane.log_now
             # Turn OFF every channel first, then ON only the ones that are
             # actually mapped — same discipline as the calibration sweep.
-            # Leaving unused channels enabled causes CURVe? errors on scopes
-            # that don't allow reading a disabled channel, and adds noise.
-            try:
-                _scope_info = getattr(self._scope, "info", None)
-                _n_ch = int(getattr(_scope_info, "n_channels", 4) or 4)
-                _used_channels = set(self._aliases.values())
-                _log(
-                    f"Scope setup: turning OFF unused channels, "
-                    f"keeping {sorted(_used_channels)} ON")
-                for _ci in range(1, _n_ch + 1):
-                    try:
-                        self._scope._w(f"SELect:CH{_ci} OFF")
-                    except Exception:
-                        pass
-                for _ch in _used_channels:
-                    try:
-                        self._scope._w(f"SELect:{_ch} ON")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Channel enable/disable is the scope driver's job —
+            # ``configure_channels`` walks 1..n_channels and writes
+            # ``SELect:CHx ON`` for mapped channels, ``OFF`` for
+            # unused ones, then applies per-channel defaults.  The
+            # GUI used to run its own OFF→ON pass here before
+            # ``configure_channels`` did so itself, which produced
+            # ~80 ms of redundant SCPI traffic on every connect
+            # (LOG_ANALYSIS.md finding #10).  Removed in favor of
+            # the single-source-of-truth call below.
             self._scope.configure_channels(self._aliases)
             # Surface "scope is being configured" in the status bar so
             # the operator can read at a glance why the experiment view
