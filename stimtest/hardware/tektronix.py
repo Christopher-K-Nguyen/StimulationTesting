@@ -517,53 +517,70 @@ class TektronixOscilloscope(Oscilloscope):
         self._log(
             f"[scope] identified: make={make!r}, model={model!r}, "
             f"serial={serial!r}, firmware={firmware!r}")
-        # Channel count — start from the model number (Tek's naming
-        # convention encodes the count unambiguously: TBS2204B → 4 ch,
-        # TBS1052C → 2 ch), then verify against a live SCPI probe.
-        # Unknown models (MSO/MDO/DPO variants, OEM rebrands, future
-        # families) get the inferred value as a starting hint and the
-        # live probe as the authoritative answer.
+        # Channel count.  Tek's naming convention encodes the count
+        # unambiguously: TBS2204B → 4 ch, TBS1052C → 2 ch.  Two-tier
+        # strategy:
+        #
+        #   1. **Known model** (matches ``get_model_spec(model)``) —
+        #      trust the spec's n_channels and SKIP the live probe.
+        #      Saves ~10 s of cold-connect time on TBS2204B (the
+        #      probe walks CH1..CH8, eating ~1.25 s per attempt due
+        #      to USB-TMC error-recovery latency on misses 5-8).
+        #      Closes LOG_ANALYSIS.md finding #3.
+        #
+        #   2. **Unknown model** (no spec entry — OEM rebrand, new
+        #      family, malformed *IDN?) — fall through to the live
+        #      probe as the authoritative answer.  The probe was
+        #      designed as a safety net for this case; we still
+        #      have it, just don't run it when we don't need to.
+        #
+        # If a future bench user installs a known-model entry that's
+        # wrong, the symptom is a downstream "scope reports channel
+        # N doesn't exist" error, NOT silent data corruption.  Cheap
+        # to revert — drop the spec entry and the probe kicks back in.
         spec = get_model_spec(model)
-        n_ch_inferred = (spec.n_channels if spec else None) or \
-            channel_count_from_model(model) or 4
-        # Live probe: query CH<n>:PRObe:GAIN? for n = 1..8 and count
-        # successful responses.  This is the authoritative source —
-        # the model string is just an opening guess.  If the probe
-        # disagrees with the model string (off by one, OEM rebrand,
-        # malformed *IDN?), the probe wins and we log the mismatch
-        # so it's visible without having to read source.
-        _t0 = time.perf_counter()
-        try:
-            n_ch_probed = self.probe_channel_count(max_channels=8)
-        except Exception as e:
-            self._log(f"[scope]   ⚠ channel-count probe raised "
-                      f"{type(e).__name__}: {e!r} — falling back to "
-                      f"model-string inference ({n_ch_inferred} ch)")
-            n_ch_probed = 0
-        if n_ch_probed in (2, 4):
-            n_ch = n_ch_probed
-            if n_ch_probed != n_ch_inferred:
-                self._log(
-                    f"[scope]   ⚠ channel-count mismatch: model "
-                    f"{model!r} parsed as {n_ch_inferred} ch but "
-                    f"SCPI probe found {n_ch_probed} ch — trusting "
-                    f"the probe.  Update tektronix_models.py if this "
-                    f"model needs a new entry.")
-            else:
-                self._log(
-                    f"[scope] channel count: {n_ch} (model + live "
-                    f"probe agree)   "
-                    f"({_fmt_elapsed(time.perf_counter() - _t0)})")
-        else:
-            # Probe returned something nonsensical (0, 1, 3, 5+) —
-            # fall back to the model-string value.  Most likely the
-            # scope had a stale error queue or the firmware doesn't
-            # answer CH<n>:PRObe:GAIN?.
-            n_ch = n_ch_inferred
+        if spec is not None and spec.n_channels in (2, 4):
+            n_ch = spec.n_channels
             self._log(
-                f"[scope]   ⚠ channel-count probe returned "
-                f"{n_ch_probed} (expected 2 or 4) — falling back to "
-                f"model-string inference ({n_ch_inferred} ch)")
+                f"[scope] channel count: {n_ch} (from model spec — "
+                f"live probe skipped, saves ~10 s on cold connect)")
+        else:
+            # Unknown model OR spec with unexpected channel count —
+            # fall through to the live probe.
+            n_ch_inferred = (spec.n_channels if spec else None) or \
+                channel_count_from_model(model) or 4
+            _t0 = time.perf_counter()
+            try:
+                n_ch_probed = self.probe_channel_count(max_channels=8)
+            except Exception as e:
+                self._log(f"[scope]   ⚠ channel-count probe raised "
+                          f"{type(e).__name__}: {e!r} — falling back to "
+                          f"model-string inference ({n_ch_inferred} ch)")
+                n_ch_probed = 0
+            if n_ch_probed in (2, 4):
+                n_ch = n_ch_probed
+                if n_ch_probed != n_ch_inferred:
+                    self._log(
+                        f"[scope]   ⚠ channel-count mismatch: model "
+                        f"{model!r} parsed as {n_ch_inferred} ch but "
+                        f"SCPI probe found {n_ch_probed} ch — trusting "
+                        f"the probe.  Add a tektronix_models.py entry "
+                        f"so future cold connects skip the probe.")
+                else:
+                    self._log(
+                        f"[scope] channel count: {n_ch} (model + live "
+                        f"probe agree)   "
+                        f"({_fmt_elapsed(time.perf_counter() - _t0)})")
+            else:
+                # Probe returned something nonsensical (0, 1, 3, 5+) —
+                # fall back to the model-string value.  Most likely
+                # the scope had a stale error queue or the firmware
+                # doesn't answer CH<n>:PRObe:GAIN?.
+                n_ch = n_ch_inferred
+                self._log(
+                    f"[scope]   ⚠ channel-count probe returned "
+                    f"{n_ch_probed} (expected 2 or 4) — falling back to "
+                    f"model-string inference ({n_ch_inferred} ch)")
         self.info = ScopeInfo(
             make=make, model=model, serial=serial, firmware=firmware,
             resource=rsrc, n_channels=n_ch, is_simulated=False,
