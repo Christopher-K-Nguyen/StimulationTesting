@@ -432,8 +432,9 @@ def _patch_dialog(monkeypatch, *, username: str, password: str,
     from stimtest.gui import admin as admin_mod
 
     class _StubDialog:
-        def __init__(self, parent=None, *, show_username=False):
+        def __init__(self, parent=None, *, show_username=False, history=None):
             self._show_username = show_username
+            self._history = history  # captured for tests that care
 
         def exec(self):
             if accept:
@@ -642,6 +643,164 @@ def test_profile_name_none_returns_empty_string(clean_registry):
     from stimtest.gui.admin import _profile_name
 
     assert _profile_name(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Login history dropdown
+# ---------------------------------------------------------------------------
+def test_update_login_history_prepends_new_username():
+    """A brand-new username lands at position 0 (most-recent-first)."""
+    from stimtest.gui.admin import update_login_history
+
+    out = update_login_history(["cwru", "admin"], "lab_a")
+    assert out == ["lab_a", "cwru", "admin"]
+
+
+def test_update_login_history_dedupes_existing_entry():
+    """An already-present entry MOVES to the front, doesn't duplicate."""
+    from stimtest.gui.admin import update_login_history
+
+    out = update_login_history(["cwru", "admin", "lab_a"], "admin")
+    assert out == ["admin", "cwru", "lab_a"]
+    # No duplicate "admin"
+    assert out.count("admin") == 1
+
+
+def test_update_login_history_normalizes_case():
+    """Stored entries are lowercased + stripped — so 'CWRU' and 'cwru'
+    are the same history entry, not two."""
+    from stimtest.gui.admin import update_login_history
+
+    out = update_login_history(["cwru"], "  CWRU  ")
+    assert out == ["cwru"]
+    assert out.count("cwru") == 1
+
+
+def test_update_login_history_drops_blank_username():
+    """Blank username (admin-default path) doesn't get recorded —
+    avoids polluting the dropdown with empty entries."""
+    from stimtest.gui.admin import update_login_history
+
+    out = update_login_history(["cwru"], "")
+    assert out == ["cwru"]
+
+    out2 = update_login_history(["cwru"], "   ")
+    assert out2 == ["cwru"]
+
+
+def test_update_login_history_caps_at_max():
+    """History list is capped at LOGIN_HISTORY_MAX entries.  Old
+    entries fall off the bottom as new ones get prepended."""
+    from stimtest.gui.admin import update_login_history, LOGIN_HISTORY_MAX
+
+    # Build a maximally-full history.
+    full = [f"lab_{i:03d}" for i in range(LOGIN_HISTORY_MAX)]
+    out = update_login_history(full, "newcomer")
+    assert len(out) == LOGIN_HISTORY_MAX
+    assert out[0] == "newcomer"
+    # Last one in the original full list should have dropped off.
+    assert full[-1] not in out
+
+
+def test_update_login_history_does_not_mutate_input():
+    """``update_login_history`` is a pure function — the caller's
+    list is never mutated.  Important because MainWindow holds the
+    list as instance state."""
+    from stimtest.gui.admin import update_login_history
+
+    original = ["cwru", "admin"]
+    original_copy = list(original)
+    update_login_history(original, "lab_a")
+    assert original == original_copy
+
+
+def test_login_dialog_seeds_combobox_from_history(qapp, clean_registry):
+    """The QComboBox is populated with history entries in order.
+    Current text starts blank so the operator must explicitly
+    choose / type rather than getting auto-filled."""
+    from stimtest.gui.admin import _LoginDialog
+
+    history = ["lab_a", "cwru", "admin"]
+    dlg = _LoginDialog(show_username=True, history=history)
+    assert dlg._user.count() == 3
+    assert dlg._user.itemText(0) == "lab_a"
+    assert dlg._user.itemText(1) == "cwru"
+    assert dlg._user.itemText(2) == "admin"
+    # Field starts blank — no auto-fill.
+    assert dlg._user.currentText() == ""
+
+
+def test_login_dialog_is_editable(qapp, clean_registry):
+    """Operator can type a brand-new username even if not in history
+    (editable combobox semantics)."""
+    from stimtest.gui.admin import _LoginDialog
+
+    dlg = _LoginDialog(show_username=True, history=["cwru"])
+    assert dlg._user.isEditable() is True
+    # Simulate operator typing.
+    dlg._user.setCurrentText("brand_new_lab")
+    assert dlg.username() == "brand_new_lab"
+
+
+def test_login_dialog_handles_empty_history(qapp, clean_registry):
+    """No prior history (new install) shows an empty dropdown but
+    the combobox still works."""
+    from stimtest.gui.admin import _LoginDialog
+
+    dlg = _LoginDialog(show_username=True, history=[])
+    assert dlg._user.count() == 0
+    assert dlg._user.currentText() == ""
+
+
+def test_login_dialog_history_skips_malformed_entries(qapp, clean_registry):
+    """Defensive: a stale prefs.json with non-string entries in the
+    history shouldn't crash the dialog — only string entries land
+    in the combobox."""
+    from stimtest.gui.admin import _LoginDialog
+
+    history = ["cwru", None, 42, "", "  ", "admin"]  # type: ignore
+    dlg = _LoginDialog(show_username=True, history=history)  # type: ignore
+    # Only "cwru" and "admin" should survive — None/42/blank dropped.
+    items = [dlg._user.itemText(i) for i in range(dlg._user.count())]
+    assert items == ["cwru", "admin"]
+
+
+def test_prompt_login_accepts_history_kwarg(qapp, clean_registry, monkeypatch):
+    """The history kwarg is plumbed through to _LoginDialog — pinning
+    the call-site contract so a future refactor that drops the
+    keyword fails this test loudly.
+    """
+    from stimtest.gui.admin import prompt_login
+
+    # Use the cancel-stub so we don't have to feed credentials —
+    # we only care that prompt_login accepts the history kwarg
+    # AND passes it to the dialog constructor (which is also a
+    # stub that captures the kwarg).
+    _patch_dialog(monkeypatch, username="", password="", accept=False)
+
+    # Should not raise.  The stub captures history into self._history.
+    name, ok = prompt_login(
+        None, admin_hash=_admin_hash(),
+        history=["cwru", "admin"])
+    assert ok is False  # cancel path
+    assert name == "none"  # Profile.NONE.value
+
+
+def test_prompt_login_history_kwarg_optional():
+    """``history`` should default to None / empty — callers that
+    don't care about the dropdown can omit it.  Same signature-
+    compat test as the kwarg-acceptance one, but covers the
+    omitted case."""
+    import inspect
+    from stimtest.gui.admin import prompt_login
+
+    sig = inspect.signature(prompt_login)
+    history_param = sig.parameters.get("history")
+    assert history_param is not None, (
+        "prompt_login must expose a history kwarg")
+    assert history_param.default is None or history_param.default == [], (
+        f"history default should be None or [] for back-compat with "
+        f"existing callers; got {history_param.default!r}")
 
 
 def test_registry_writes_are_thread_safe(clean_registry):

@@ -351,6 +351,54 @@ def _hash(password: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Login history helpers (prefs-backed convenience for the login dialog)
+# ---------------------------------------------------------------------------
+#: Maximum number of usernames retained in the dropdown history.  Old
+#: entries fall off the bottom as new ones get prepended.  Ten is
+#: enough to cover a handful of regularly-rotated extensions plus
+#: the built-in admin without becoming unwieldy.
+LOGIN_HISTORY_MAX = 10
+
+
+def update_login_history(history: List[str], new_username: str) -> List[str]:
+    """Return a new history list with ``new_username`` recorded.
+
+    * Lowercased and stripped for storage consistency.
+    * Empty username is silently dropped (the anonymous-admin path
+      doesn't deserve a history entry — operator left the field
+      blank).
+    * Already-present entry is **moved to the front** (most-recent-
+      first ordering), not duplicated.
+    * Cap at :data:`LOGIN_HISTORY_MAX`; entries past the cap fall off.
+
+    Pure function — does not touch prefs or the file system.  Caller
+    is responsible for persisting the returned list.
+
+    Parameters
+    ----------
+    history :
+        Current history list (most-recent-first).  Treated as read-
+        only; the input list is never mutated.
+    new_username :
+        Username that just successfully authenticated.  Will be
+        normalized to lowercase + stripped before storage.
+
+    Returns
+    -------
+    list[str]
+        New history list with ``new_username`` at position 0,
+        deduplicated, capped at ``LOGIN_HISTORY_MAX``.
+    """
+    name = (new_username or "").strip().lower()
+    if not name:
+        # Blank username (admin-default path) — don't pollute history.
+        return list(history)[:LOGIN_HISTORY_MAX]
+    # Build the new list by removing any prior copy then prepending.
+    out = [name] + [u for u in history if u.strip().lower() != name]
+    return out[:LOGIN_HISTORY_MAX]
+
+
+# ---------------------------------------------------------------------------
 # Login dialog
 # ---------------------------------------------------------------------------
 class _LoginDialog(QtWidgets.QDialog):
@@ -367,8 +415,19 @@ class _LoginDialog(QtWidgets.QDialog):
 
     The caller (:func:`prompt_login`) decides which mode based on
     :func:`_any_extension_registered`.
+
+    Username history
+    ----------------
+    When ``show_username`` is True, the Username widget is an
+    **editable QComboBox** seeded from the caller's ``history`` list
+    (most-recent-first).  Operator can pick from the dropdown OR
+    type a brand new name.  History persists in prefs under
+    ``admin.login_history`` — see :func:`update_login_history` for
+    the pure-function update + cap logic, and ``MainWindow.
+    _on_admin_login`` for the read/write integration.
     """
-    def __init__(self, parent=None, *, show_username: bool = False):
+    def __init__(self, parent=None, *, show_username: bool = False,
+                 history: Optional[List[str]] = None):
         super().__init__(parent)
         # Title adapts: in admin-only mode (no extensions) the dialog
         # is about Admin specifically; in extension-aware mode it
@@ -387,13 +446,38 @@ class _LoginDialog(QtWidgets.QDialog):
             v.addWidget(QtWidgets.QLabel("Enter the admin password:"))
 
         form = QtWidgets.QFormLayout()
-        # Always construct the username widget so :meth:`username`
-        # can read from it unconditionally — but only add it to the
-        # form when ``show_username`` is True (so it's invisible in
-        # Admin-only mode).
-        self._user = QtWidgets.QLineEdit()
+        # Username widget: editable QComboBox so prior successful
+        # logins appear in a dropdown the operator can pick from
+        # without retyping.  Always construct it so :meth:`username`
+        # can read uniformly; only add it to the form when
+        # ``show_username`` is True so it's invisible in Admin-only
+        # mode.  An empty current text is the canonical "blank =
+        # admin" signal — same as the old QLineEdit behavior.
+        self._user = QtWidgets.QComboBox()
+        self._user.setEditable(True)
+        # Populate from history (already lowercased/deduped by
+        # update_login_history — but be defensive about external
+        # input here: a stale prefs.json could contain non-string
+        # entries, ints, None, etc.).
+        seen: set[str] = set()
+        for entry in (history or []):
+            if not isinstance(entry, str):
+                continue
+            norm = entry.strip().lower()
+            if norm and norm not in seen:
+                seen.add(norm)
+                self._user.addItem(norm)
+        # Start with the field blank regardless of history — the
+        # operator should explicitly choose, not get auto-filled
+        # with whatever they typed last time (which could be wrong
+        # for the current session).
+        self._user.setCurrentText("")
+        # Placeholder hint inside the inner line edit.  setEditable
+        # constructs a child QLineEdit accessible via ``lineEdit()``.
+        _le = self._user.lineEdit()
+        if _le is not None:
+            _le.setPlaceholderText("(blank = admin)")
         if show_username:
-            self._user.setPlaceholderText("(blank = admin)")
             form.addRow("Username:", self._user)
         self._pw = QtWidgets.QLineEdit()
         self._pw.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
@@ -409,19 +493,25 @@ class _LoginDialog(QtWidgets.QDialog):
         v.addWidget(btns)
 
         self._pw.returnPressed.connect(self.accept)
-        if show_username:
-            # Enter on the username field focuses password rather
-            # than submitting an empty password.
-            self._user.returnPressed.connect(self._pw.setFocus)
+        if show_username and _le is not None:
+            # Enter on the username's inner line edit focuses
+            # password rather than submitting an empty password.
+            # QComboBox itself has no ``returnPressed``; the inner
+            # ``lineEdit()`` does.
+            _le.returnPressed.connect(self._pw.setFocus)
 
     def username(self) -> str:
-        return self._user.text().strip()
+        # ``currentText()`` returns whatever's typed OR selected from
+        # the dropdown.  Strip so trailing-space typos don't blow
+        # up the lookup.
+        return self._user.currentText().strip()
 
     def password(self) -> str:
         return self._pw.text()
 
 
-def prompt_login(parent, *, admin_hash: str) -> Tuple[str, bool]:
+def prompt_login(parent, *, admin_hash: str,
+                 history: Optional[List[str]] = None) -> Tuple[str, bool]:
     """Show the login dialog and resolve to a profile name.
 
     Returns ``(profile_name, ok)``:
@@ -442,13 +532,27 @@ def prompt_login(parent, *, admin_hash: str) -> Tuple[str, bool]:
       path); any other username is looked up in the extension
       registry.
 
+    Parameters
+    ----------
+    parent :
+        Qt parent widget.
+    admin_hash :
+        SHA-256 hex digest of the admin password.
+    history :
+        Optional list of past successful usernames (most-recent-
+        first) — populates the dialog's Username dropdown.  Pass
+        ``prefs["admin"].get("login_history", [])`` from the caller.
+        After a successful login, the caller should call
+        :func:`update_login_history` with the returned profile_name
+        and persist the result.
+
     The caller is responsible for showing an error message when
     ``ok`` is False and the user clicked OK (cancel returns the same
     tuple, so the caller has to track its own "dialog actually
     submitted vs cancelled" state if it wants to distinguish).
     """
     show_username = _any_extension_registered()
-    dlg = _LoginDialog(parent, show_username=show_username)
+    dlg = _LoginDialog(parent, show_username=show_username, history=history)
     if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
         return (Profile.NONE.value, False)
     pw_hash = _hash(dlg.password())

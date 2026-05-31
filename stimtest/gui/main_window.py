@@ -77,6 +77,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_profile: str = Profile.NONE.value
         self._admin_password_hash: str = _DEFAULT_HASH
         self._admin_catalog: dict = {k: [] for k in CATALOG_KEYS}
+        # Login-history list (most-recent-first, lowercased).  Seeded
+        # from prefs at load time; prepended on each successful login
+        # via update_login_history.  Used to populate the login
+        # dialog's Username dropdown so the operator doesn't retype
+        # extension usernames every session.
+        self._admin_login_history: list[str] = []
 
         self.save_dir = Path(save_dir or DEFAULT_SAVE_DIR)
         array = ElectrodeArray.utah_4x4()
@@ -1520,6 +1526,24 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._admin_catalog[k] = [
                             str(e) for e in entries if str(e).strip()]
             apply_admin_catalog(self.setup_tab, self._admin_catalog)
+            # Restore login-history dropdown contents.  Sanitize:
+            # only keep string entries, lowercased + stripped + non-
+            # empty; cap at the same LOGIN_HISTORY_MAX the dialog
+            # honors.  Malformed JSON (someone hand-edited
+            # prefs.json) falls back to an empty list.
+            saved_history = admin_prefs.get("login_history", [])
+            if isinstance(saved_history, list):
+                from .admin import LOGIN_HISTORY_MAX
+                clean: list[str] = []
+                for e in saved_history:
+                    if not isinstance(e, str):
+                        continue
+                    norm = e.strip().lower()
+                    if norm and norm not in clean:
+                        clean.append(norm)
+                    if len(clean) >= LOGIN_HISTORY_MAX:
+                        break
+                self._admin_login_history = clean
 
         try:
             self.setup_tab.restore_prefs(prefs.get(PREF_KEY_SETUP, {}))
@@ -1783,6 +1807,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 # here — extensions own their own credential storage.
                 # See EXTENSION_PLUGIN_DESIGN.md.
                 "catalog": self._admin_catalog,
+                # Login dropdown history (most-recent-first,
+                # lowercased, capped at admin.LOGIN_HISTORY_MAX).
+                # Used to seed the login dialog's Username combobox.
+                "login_history": list(self._admin_login_history),
             },
         }
 
@@ -3017,9 +3045,16 @@ class MainWindow(QtWidgets.QMainWindow):
         profile — extensions are documented separately to the
         people who need them).
         """
+        # Seed the dialog's Username dropdown with the user's prior
+        # successful logins — convenience so they don't retype
+        # extension usernames every session.  History persists in
+        # prefs under ``admin.login_history`` (most-recent-first,
+        # capped at admin.LOGIN_HISTORY_MAX).
+        history = list(self._admin_login_history)
         profile_name, ok = prompt_login(
             self,
             admin_hash=self._admin_password_hash,
+            history=history,
         )
         if not ok:
             # Cancel and wrong-password both return (NONE, False).
@@ -3040,6 +3075,19 @@ class MainWindow(QtWidgets.QMainWindow):
                        "Enter the admin password to continue.")
             QtWidgets.QMessageBox.warning(self, "Log in failed", msg)
             return
+        # Successful login — record the username in history (admin
+        # path with blank username is silently dropped by
+        # update_login_history).  Persist immediately so a crash
+        # before normal save doesn't lose the entry.
+        from .admin import update_login_history
+        self._admin_login_history = update_login_history(
+            self._admin_login_history, profile_name)
+        try:
+            save_prefs(self._collect_prefs_payload())
+        except Exception as _e:
+            self.log_pane.log(
+                f"Login-history persist failed: "
+                f"{type(_e).__name__}: {_e}")
         self._set_profile(profile_name)
         # Status bar message uses the extension's display_name when
         # one was registered (e.g., "CWRU collaborator" instead of
