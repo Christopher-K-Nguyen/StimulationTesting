@@ -115,6 +115,11 @@ class RunnerWorker(QtCore.QObject):
     # Emitted when the runner pauses between channels for a physical rewire.
     # Carries the human-readable message describing the next channel.
     paused = QtCore.pyqtSignal(str)
+    # Emitted on progress events from the runner.  Carries a
+    # ProgressInfo dataclass (step, total, label, started_at).
+    # _BaseExperimentTab routes these to the status bar for a live
+    # "VT 7/16 channels | elapsed 1:47 | ETA 3:24"-style indicator.
+    progress = QtCore.pyqtSignal(object)
 
     def __init__(self, runner: ExperimentRunner,
                  save_path: Optional[Path] = None,
@@ -226,6 +231,11 @@ class RunnerWorker(QtCore.QObject):
             # tab can pop a modal "rewire to next channel, then continue"
             # dialog and call runner.request_continue() on dismiss.
             self.paused.emit(ev.message or "Continue to next channel?")
+        if ev.kind == "progress" and ev.progress is not None:
+            # Forward step/total/label/started_at to the tab's
+            # status-bar slot.  Object signal — Qt auto-marshals to
+            # the GUI thread via QueuedConnection.
+            self.progress.emit(ev.progress)
         if ev.message:
             self.log_msg.emit(ev.message)
 
@@ -2172,6 +2182,11 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # each non-first config when the tab's pause toggle is on.  The slot
         # pops a modal QMessageBox; clicking OK calls request_continue().
         self._worker.paused.connect(self._on_runner_paused)
+        # Progress events drive the status-bar step / elapsed / ETA
+        # indicator (Task #56).  No-op when the runner doesn't emit
+        # progress; just keeps the slot disconnected from the
+        # captured-event spam.
+        self._worker.progress.connect(self._on_runner_progress)
         self._runner = runner
         # Lock all parameter inputs (this tab + Setup tab + hardware)
         # for the duration of the run. Tab-bar selection stays enabled
@@ -2415,6 +2430,58 @@ class _BaseExperimentTab(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(str, str)
     @QtCore.pyqtSlot(str)
+    def _on_runner_progress(self, prog):
+        """Update the main window's status bar with step / elapsed /
+        ETA so long sweeps don't look frozen.
+
+        ``prog`` is a :class:`stimtest.experiments.base.ProgressInfo`
+        (passed through as ``object`` over the Qt signal).  Format:
+        ``"VT 7/16 channels | elapsed 1:47 | ETA 3:24"``.  ETA is
+        suppressed when ``started_at`` is 0 (runner opted out of
+        time-tracking) or when only one step has completed (no
+        rate estimate yet).
+        """
+        import time as _time
+
+        def _fmt_dur(seconds: float) -> str:
+            seconds = max(0.0, float(seconds))
+            mins, secs = divmod(int(round(seconds)), 60)
+            hrs, mins = divmod(mins, 60)
+            return (f"{hrs:d}:{mins:02d}:{secs:02d}" if hrs
+                    else f"{mins:d}:{secs:02d}")
+
+        try:
+            label = (prog.label or "").strip()
+            step = max(int(prog.step), 0)
+            total = max(int(prog.total), 1)
+            started = float(prog.started_at)
+        except Exception:
+            return  # malformed progress event — ignore rather than crash
+
+        parts = []
+        if label:
+            parts.append(label)
+        parts.append(f"step {step}/{total}")
+        if started > 0:
+            elapsed = _time.monotonic() - started
+            parts.append(f"elapsed {_fmt_dur(elapsed)}")
+            # ETA only after we've seen at least one step complete —
+            # otherwise the per-step time estimate is undefined.
+            if step >= 1 and step <= total:
+                avg = elapsed / step
+                remaining = (total - step) * avg
+                parts.append(f"ETA {_fmt_dur(remaining)}")
+        msg = " | ".join(parts)
+        # Show in the MainWindow's status bar with a long timeout so
+        # the message persists between progress updates (a 0 timeout
+        # would let other showMessage calls overwrite it; default Qt
+        # behavior).  10-second timeout = the next progress event
+        # arrives well before this expires under any normal cadence.
+        try:
+            self.window().statusBar().showMessage(msg, 10_000)
+        except Exception:
+            pass
+
     def _on_runner_paused(self, message: str):
         """Pop a modal "rewire to next channel" prompt and release the
         runner when the user clicks Continue.

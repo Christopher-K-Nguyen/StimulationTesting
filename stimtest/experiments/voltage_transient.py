@@ -279,9 +279,31 @@ class VoltageTransientExperiment(ExperimentRunner):
         self.current_configuration = None
         try:
             n_configs = len(self.configurations)
+            # Track wall-clock start so the GUI's progress widget can
+            # compute elapsed + ETA.  Single timestamp at run begin;
+            # downstream emits pass it through unchanged.
+            import time as _time_run_start
+            _run_started_at = _time_run_start.monotonic()
+            _total_configs = max(len(self.configurations), 1)
             for cfg_idx, config in enumerate(self.configurations):
                 if self.aborted:
                     break
+                # Progress emit (Task #56): one event per
+                # configuration so the operator sees "VT 3/16
+                # channels" in the status bar.  Per-amplitude
+                # progress would be noisier (~10 events / channel)
+                # without adding much — channel-level granularity is
+                # the right resolution for the long-sweep
+                # frozen-looking experience this addresses.
+                try:
+                    self._emit_progress(
+                        step=cfg_idx + 1,
+                        total=_total_configs,
+                        label=f"VT {config.display_name()}",
+                        started_at=_run_started_at,
+                    )
+                except Exception:
+                    pass
                 # Update the live-config marker so any ``capture`` event
                 # the runner emits below resolves to THIS config's
                 # display name in the GUI.
@@ -727,6 +749,16 @@ class VoltageTransientExperiment(ExperimentRunner):
                     f"available_roles="
                     f"{[r for r in _voltage_roles if aliases_obs.get(r)]}")
                 for _attempt in range(MAX_RECAPTURE + 1):
+                    # Abort-responsiveness check (Task #56): each
+                    # rescale-loop iteration involves a scope CURVe?
+                    # transfer that can take 3-5 s.  Checking abort
+                    # between iterations cuts worst-case Stop latency
+                    # from MAX_RECAPTURE+1 iterations (~15 s) down to
+                    # one iteration (~5 s).  We can't interrupt the
+                    # scope SCPI in flight, but we can decline to
+                    # start the next one.
+                    if self._abort_requested:
+                        break
                     _any_rescaled = False
                     _chan_data = getattr(acq, "channels", {}) or {}
                     _t_us_arr = _np.asarray(

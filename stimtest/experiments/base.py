@@ -189,14 +189,53 @@ def imon_vertical_scale(amp_ua: float,
 
 
 @dataclass
+class ProgressInfo:
+    """Snapshot of run progress for the status-bar display.
+
+    Emitted alongside ``ExperimentEvent`` when the runner advances
+    to a new logical step (next amplitude in VT, next snapshot in
+    SP/LP, next staircase step in PS).  The GUI uses these to
+    update a "step X/Y, elapsed mm:ss, ETA mm:ss" indicator so
+    long sweeps don't look frozen.
+
+    Fields
+    ------
+    step : int
+        1-based current step number.  ``step == total`` indicates
+        the final step is starting (NOT that the run finished).
+    total : int
+        Total expected steps.  Best estimate at emit time — for
+        adaptive sweeps that may early-exit (e.g., VT stopping at
+        a water-window hit), the actual completed step count can
+        be smaller.
+    label : str
+        Short human-readable description of what step ``step`` is
+        ("amplitude 350 µA on CH 5", "snapshot 7", etc.).  Shown
+        in the status bar verbatim — keep it under ~60 chars.
+    started_at : float
+        ``time.monotonic()`` timestamp at run START (not step
+        start).  GUI uses this to compute elapsed + simple ETA
+        (``(total - step) * (elapsed / step)``).
+    """
+    step: int
+    total: int
+    label: str = ""
+    started_at: float = 0.0
+
+
+@dataclass
 class ExperimentEvent:
     """Posted to subscribers as the experiment progresses."""
     kind: str            # 'capture' | 'run_start' | 'run_end' | 'paused' |
-                         # 'session_end' | 'log' | 'aborted'
+                         # 'session_end' | 'log' | 'aborted' | 'progress'
     session: Session
     run: Optional[ChannelRun] = None
     capture: Optional[Capture] = None
     message: str = ""
+    #: Optional progress snapshot.  Set on ``kind == "progress"``
+    #: events; ``None`` on all other event kinds.  GUI consumers
+    #: that don't care about progress can ignore this field.
+    progress: Optional[ProgressInfo] = None
 
 
 @dataclass
@@ -813,6 +852,72 @@ class ExperimentRunner(ABC):
     @property
     def aborted(self) -> bool:
         return self._abort_requested
+
+    # ----- abort-aware sleep --------
+    def abort_sleep(self, seconds: float, *,
+                    chunk_s: float = 0.05) -> bool:
+        """Sleep ``seconds`` total in ``chunk_s`` chunks, checking the
+        abort flag between chunks.  Returns True if the sleep ran to
+        completion; False if the abort flag tripped partway through.
+
+        Use anywhere a runner previously did ``time.sleep(N)`` for
+        seconds-scale intervals — replacing with ``abort_sleep`` keeps
+        the Stop button responsive within ``chunk_s`` (default 50 ms)
+        rather than after the full sleep.
+
+        Sub-chunk sleeps (``seconds < chunk_s``) sleep once for the
+        full duration and check abort once at the end.  Negative /
+        zero ``seconds`` is a no-op that just checks abort.
+        """
+        import time as _time
+        if seconds <= 0:
+            return not self._abort_requested
+        if seconds < chunk_s:
+            _time.sleep(seconds)
+            return not self._abort_requested
+        deadline = _time.monotonic() + seconds
+        while True:
+            if self._abort_requested:
+                return False
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return True
+            _time.sleep(min(chunk_s, remaining))
+
+    # ----- progress emit --------
+    def _emit_progress(self, step: int, total: int, label: str = "",
+                       *, started_at: float = 0.0) -> None:
+        """Convenience wrapper: emit a ``kind="progress"`` event with
+        a populated :class:`ProgressInfo`.
+
+        Subscribers that don't care about progress simply ignore
+        events with no useful ``message`` and ``progress is not None``.
+        The GUI's RunnerWorker forwards progress events as a
+        dedicated Qt signal that drives the status-bar indicator.
+
+        Parameters
+        ----------
+        step, total :
+            1-based step number + total expected.  ``step == total``
+            means the LAST step is starting (not that the run is
+            done).
+        label :
+            Short human-readable description (see ProgressInfo doc).
+        started_at :
+            ``time.monotonic()`` at run start, used by the GUI to
+            compute elapsed + ETA.  Pass 0.0 if you don't want ETA
+            shown (the GUI suppresses ETA when started_at is 0).
+        """
+        self._emit(ExperimentEvent(
+            kind="progress",
+            session=self.session,
+            progress=ProgressInfo(
+                step=int(step),
+                total=int(total),
+                label=str(label),
+                started_at=float(started_at),
+            ),
+        ))
 
     # ----- preflight -----
     def preflight(self) -> None:
