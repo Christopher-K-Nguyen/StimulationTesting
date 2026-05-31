@@ -1078,11 +1078,37 @@ class TektronixOscilloscope(Oscilloscope):
         return result
 
     # ----- configuration -----
+    @staticmethod
+    def _new_adapt_state() -> Dict[str, object]:
+        """Default per-channel adapt-state dict.
+
+        Single source of truth — used by both ``set_channel_scale``
+        (which seeds the cache for the per-channel V/div) and
+        ``adapt_channel_scale`` (which adds the autorange-specific
+        bookkeeping).  Audit finding from Task #58: when these two
+        setdefault initializers diverged, ``set_channel_scale``
+        running FIRST left a partial dict missing ``history``, then
+        ``adapt_channel_scale``'s setdefault was a no-op (key
+        already exists), and the next line ``history = st["history"]``
+        raised KeyError.  Factoring into one default closes that
+        whole class of bug.
+        """
+        return {
+            "shrink_count": 0,
+            "last_scale": None,
+            "history": [],          # list of scales we've picked
+            "settled_count": 0,     # consecutive no-op returns
+            "locked": False,        # True after repeat / max-tries
+        }
+
     def set_channel_scale(self, channel: str, volts_per_div: float) -> None:
         self._w(f"{channel}:SCAle {volts_per_div:g}")
         if hasattr(self, "_adapt_state"):
+            # Use the canonical default (see _new_adapt_state) so
+            # ``adapt_channel_scale`` finds the full schema if it
+            # runs after us.  Audit Task #58.
             self._adapt_state.setdefault(
-                channel, {"shrink_count": 0, "last_scale": None}
+                channel, self._new_adapt_state()
             )["last_scale"] = float(volts_per_div)
 
     def set_channel_scale_for_peak(self, channel: str,
@@ -2299,15 +2325,20 @@ class TektronixOscilloscope(Oscilloscope):
         """
         # Internal per-channel state — hysteresis vote count, last
         # scale we wrote, and the history of every scale we've picked
-        # on this channel since open().  Lazy-init.
+        # on this channel since open().  Lazy-init.  Default schema
+        # lives in :meth:`_new_adapt_state` so ``set_channel_scale``
+        # and this method can't diverge — see audit Task #58 for the
+        # bug that lived in the divergence.
         if not hasattr(self, "_adapt_state"):
             self._adapt_state: Dict[str, Dict[str, object]] = {}
         st = self._adapt_state.setdefault(
-            channel, {"shrink_count": 0,
-                      "last_scale": None,
-                      "history": [],     # list of scales we've picked
-                      "settled_count": 0,  # consecutive no-op returns
-                      "locked": False})  # True after repeat / max-tries
+            channel, self._new_adapt_state())
+        # Defensive: if a previous code path created a partial dict
+        # (from a pre-fix install or a future divergent setdefault),
+        # back-fill the missing keys with defaults so we don't
+        # KeyError below.  Cheap belt-and-braces.
+        for k, v in self._new_adapt_state().items():
+            st.setdefault(k, v)
         history: List[float] = st["history"]  # type: ignore[assignment]
 
         # Use cached scale — avoids a USB-TMC round-trip every capture.
