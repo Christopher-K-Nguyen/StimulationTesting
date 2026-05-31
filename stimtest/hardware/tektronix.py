@@ -416,6 +416,19 @@ class TektronixOscilloscope(Oscilloscope):
         self._log("[scope] === Initializing oscilloscope ===")
         if resource:
             self._resource_hint = resource
+        # Reset per-session USB-stall stats so the count + worst-offender
+        # tracking starts fresh every connect.  Without this, the
+        # session-end summary in close() would aggregate stats from
+        # earlier connects (e.g. across a USB hot-unplug → reconnect)
+        # and the operator would see misleading "100 stalls this
+        # session" numbers for a session that actually only had 3.
+        # LOG_ANALYSIS.md finding #6.
+        self._stall_stats: Dict[str, object] = {
+            "count": 0,
+            "worst_s": 0.0,
+            "worst_cmd": "",
+            "first_logged": False,
+        }
         # ---- Step 1: pick + open VISA resource --------------------
         self._log("[scope] Step 1/6: Open VISA resource")
         _t0 = time.perf_counter()
@@ -764,6 +777,23 @@ class TektronixOscilloscope(Oscilloscope):
     def close(self) -> None:
         if self._inst is not None:
             self._log("[scope] close")
+            # USB-stall summary: emit once per session right before
+            # the close so the operator can see the total count + worst
+            # offender in the LogPane without having to grep.  Suppressed
+            # when zero stalls happened (no point logging a clean
+            # session).  LOG_ANALYSIS.md finding #6.
+            stats = getattr(self, "_stall_stats", None)
+            if stats is not None and int(stats.get("count", 0)) > 0:
+                n = int(stats["count"])
+                worst_s = float(stats["worst_s"])
+                worst_cmd = str(stats["worst_cmd"])
+                self._log(
+                    f"[scope] session USB-stall summary: {n} SCPI call(s) "
+                    f"exceeded {int(self._STALL_THRESHOLD_S * 1000)} ms.  "
+                    f"Worst: {_fmt_elapsed(worst_s)} on {worst_cmd!r}.  "
+                    f"Stalls are libusb-win32 / USB-TMC transient hiccups; "
+                    f"a high count (>50 / session) suggests cable / hub "
+                    f"issues — try a different USB port or a powered hub.")
             try:
                 self._inst.close()
             except Exception:
@@ -779,18 +809,104 @@ class TektronixOscilloscope(Oscilloscope):
         self._cached_resources = None
 
     # ----- helpers -----
+    #: USB-stall detection threshold (seconds).  Operations that
+    #: take longer than this AND aren't on the exempt list (which
+    #: covers legitimately-slow ops like ``HORizontal:RECOrdlength``,
+    #: ``ACQuire:MODe``, the CURVe? / WFMOutpre? capture-data queries)
+    #: get flagged as USB stalls in the log + counted in
+    #: ``_stall_stats``.  Default 500 ms is well above CURVe?'s typical
+    #: 110 ms and well below the legitimate-slow ops (most of which
+    #: take 1-30 s).  LOG_ANALYSIS.md finding #6.
+    _STALL_THRESHOLD_S: float = 0.5
+
+    #: SCPI mnemonics whose latency is INTRINSICALLY high — the scope
+    #: takes its time on these by design (internal buffer reallocation,
+    #: full waveform readout, etc.).  Latency on these isn't a USB stall
+    #: even when large, so they're suppressed from the stall counter.
+    #: Match is substring (case-insensitive) so "HORizontal:RECOrdlength"
+    #: covers both the long-form and the short-form ``HOR:RECO``.
+    _STALL_EXEMPT_CMDS: Tuple[str, ...] = (
+        "horizontal:recordlength",  # internal buffer realloc, ~10-30 s
+        "horizontal:recordl",
+        "hor:reco",
+        "acquire:mode",             # AVERAGE-mode switch on long records
+        "acquire:state",            # arms acquisition; can spin briefly
+        "*rst",                     # reset, by definition slow
+        "*cls",                     # error-queue drain after slow ops
+        "curve?",                   # full waveform readout, typically ~110 ms
+        "wfmoutpre?",               # full preamble, typically ~110 ms
+        "wfmpre?",                  # legacy preamble (TDS-era)
+    )
+
+    def _track_query_latency(self, cmd: str, elapsed_s: float) -> None:
+        """Update USB-stall stats for ``cmd`` taking ``elapsed_s``.
+
+        Called by ``_w`` / ``_q`` after every SCPI round-trip.  Three
+        outputs:
+
+        * Bumps ``_stall_stats["count"]`` when ``elapsed_s >
+          _STALL_THRESHOLD_S`` and ``cmd`` isn't exempt.
+        * Tracks the worst-stall record (latency + command).
+        * Emits a `[scope]   ⚠ USB STALL` log line every 10th stall
+          plus the very first one, giving the operator visibility
+          into the spike rate without spamming on every event.
+
+        Final session-wide summary is emitted by :meth:`close`.
+        """
+        # Lazy-init the stats dict so the helper is safe before
+        # ``open()`` has fully initialized.
+        if not hasattr(self, "_stall_stats"):
+            self._stall_stats: Dict[str, object] = {
+                "count": 0,
+                "worst_s": 0.0,
+                "worst_cmd": "",
+                "first_logged": False,
+            }
+        if elapsed_s <= self._STALL_THRESHOLD_S:
+            return
+        # Exempt-list check: substring match against the lowercased
+        # command so both VERBose long-form and abbreviated forms hit.
+        cmd_low = cmd.lower()
+        for hint in self._STALL_EXEMPT_CMDS:
+            if hint in cmd_low:
+                return
+        # Real stall — bump stats.
+        self._stall_stats["count"] = int(self._stall_stats["count"]) + 1
+        if elapsed_s > float(self._stall_stats["worst_s"]):
+            self._stall_stats["worst_s"] = float(elapsed_s)
+            self._stall_stats["worst_cmd"] = cmd
+        # Log: every first stall, then every 10th, so the operator
+        # sees stalls happen + the running count without flooding
+        # the log on heavy-stall sessions.
+        n = int(self._stall_stats["count"])
+        if not self._stall_stats["first_logged"] or n % 10 == 0:
+            self._stall_stats["first_logged"] = True
+            self._log(
+                f"[scope]   ⚠ USB STALL #{n}: {cmd!r} took "
+                f"{_fmt_elapsed(elapsed_s)} (>{int(self._STALL_THRESHOLD_S * 1000)} ms "
+                f"threshold).  Worst this session: "
+                f"{_fmt_elapsed(float(self._stall_stats['worst_s']))} "
+                f"on {self._stall_stats['worst_cmd']!r}.  These are "
+                f"typically libusb-win32 / USB-TMC transient hiccups; "
+                f"if the rate climbs persistently, check the USB cable "
+                f"and downstream hubs.")
+
     def _w(self, cmd: str) -> None:
         if self._inst is None: raise RuntimeError("Scope not open")
         t0 = time.perf_counter()
         self._inst.write(cmd)
-        self._log(f"[scope] > {cmd}   ({_fmt_elapsed(time.perf_counter() - t0)})")
+        dt = time.perf_counter() - t0
+        self._log(f"[scope] > {cmd}   ({_fmt_elapsed(dt)})")
+        self._track_query_latency(cmd, dt)
 
     def _q(self, cmd: str) -> str:
         if self._inst is None: raise RuntimeError("Scope not open")
         t0 = time.perf_counter()
         resp = self._inst.query(cmd).strip()
+        dt = time.perf_counter() - t0
         self._log(f"[scope] > {cmd}   < {resp}   "
-                  f"({_fmt_elapsed(time.perf_counter() - t0)})")
+                  f"({_fmt_elapsed(dt)})")
+        self._track_query_latency(cmd, dt)
         return resp
 
     def _w_checked(self, cmd: str) -> None:
