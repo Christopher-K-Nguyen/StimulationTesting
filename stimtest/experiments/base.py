@@ -490,14 +490,41 @@ class ExperimentRunner(ABC):
             if len(t_us) < 2 or len(i_mon) != len(t_us):
                 return None
             di = _np.abs(_np.diff(_np.asarray(i_mon, dtype=float)))
-            edge_idx = int(_np.argmax(di))
+            # Find the FIRST edge that exceeds 80 % of the max edge,
+            # NOT the absolute argmax.  A biphasic pulse has multiple
+            # edges of comparable magnitude (phase 1 onset, phase 1
+            # end, phase 2 onset, phase 2 end) — argmax can land on
+            # any of them depending on noise, producing apparent
+            # offsets at +200 µs / +250 µs / +450 µs etc. that aren't
+            # actually trigger-alignment errors.  Picking the FIRST
+            # large edge consistently lands on the leading-edge
+            # transition (phase 1 onset) which IS where the trigger
+            # should be.  Closes Task #59 (false-positive cluster).
+            max_di = float(_np.max(di))
+            if max_di <= 0:
+                return None
+            threshold = 0.80 * max_di
+            edge_candidates = _np.where(di >= threshold)[0]
+            if edge_candidates.size == 0:
+                return None
+            edge_idx = int(edge_candidates[0])  # FIRST such edge
             t_edge = float(t_us[edge_idx])
             if abs(t_edge) > float(tolerance_us):
+                # Surface the diagnostic context the operator needs
+                # to triage: how many candidate edges, their times,
+                # and the ratio of the picked edge to max.  When
+                # multiple edges are close to the threshold, the
+                # warning is more likely a multi-edge biphasic and
+                # less likely an actual time-axis bug.
+                n_cand = int(edge_candidates.size)
+                t_max = float(t_us[int(_np.argmax(di))])
                 self._emit(ExperimentEvent(
                     kind="log", session=self.session,
-                    message=(f"⚠ trigger/pulse alignment off: largest "
-                             f"I_mon edge at t={t_edge:+.2f} µs "
-                             f"(expected ≈ 0 µs)")))
+                    message=(f"⚠ trigger/pulse alignment off: first "
+                             f"≥80%-max I_mon edge at t={t_edge:+.2f} µs "
+                             f"(expected ≈ 0 µs; {n_cand} candidate "
+                             f"edge(s) ≥ threshold; absolute-max edge "
+                             f"at t={t_max:+.2f} µs)")))
             return t_edge
         except Exception:
             return None
