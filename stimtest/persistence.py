@@ -11,7 +11,7 @@ import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -46,11 +46,27 @@ def _capture_to_dict(c: Capture) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # .npz
 # ---------------------------------------------------------------------------
-def save_session_npz(session: Session, path: Path | str) -> Path:
+def save_session_npz(session: Session, path: Path | str,
+                     *, incomplete: bool = False) -> Path:
     """Pack a session into a single .npz file.
 
     Layout: a JSON metadata blob is stored under key ``meta.json``; each
     capture's arrays are stored under ``r{run}_c{capture}_{field}``.
+
+    Parameters
+    ----------
+    session :
+        Session dataclass to serialize.  Whatever's currently in
+        ``session.runs[*].captures`` lands in the file — for an
+        incremental save mid-run, this will be a partial set.
+    path :
+        Output .npz file path.  Parent directory created if missing.
+    incomplete :
+        When True, ``meta["incomplete"]`` is set so POLARIS / loaders
+        know this is a mid-run snapshot, not a finished session.
+        Cleared (False) on the final end-of-run save.  See
+        :func:`save_session_npz_incremental` for the throttled wrapper
+        used during a run.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,12 +130,93 @@ def save_session_npz(session: Session, path: Path | str) -> Path:
             },
         },
         "runs": runs_meta,
+        # Mid-run snapshot marker.  False (the default) for finished
+        # sessions.  True only when ``save_session_npz_incremental``
+        # is writing during a run — loaders can surface a "[INCOMPLETE
+        # RUN]" badge so the operator knows the data isn't final.
+        # See ``save_session_npz_incremental`` for the throttled wrapper.
+        "incomplete": bool(incomplete),
     }
     arrays["meta.json"] = np.frombuffer(
         json.dumps(meta, default=_default).encode("utf-8"), dtype=np.uint8,
     )
     np.savez_compressed(path, **arrays)
     return path
+
+
+def save_session_npz_incremental(
+    session: Session,
+    path: Path | str,
+    *,
+    last_save_at: Optional[float] = None,
+    min_interval_s: float = 2.0,
+    last_capture_count: int = 0,
+    min_capture_interval: int = 1,
+) -> Tuple[Path, float, int, bool]:
+    """Throttled mid-run save for crash recovery.
+
+    Called by experiment runners after each capture.  Writes the
+    same .npz the final save would (same path, same schema, same
+    arrays) but marks ``incomplete=True`` in meta so loaders can
+    distinguish a mid-run snapshot from a finished session.
+
+    Throttling prevents per-capture saves from dominating runtime
+    on long runs.  Default: write at most once every 2 seconds OR
+    every capture (whichever is more often).  Tune via
+    ``min_interval_s`` / ``min_capture_interval``.
+
+    Parameters
+    ----------
+    session, path :
+        Same as :func:`save_session_npz`.
+    last_save_at :
+        ``time.monotonic()`` timestamp from the previous successful
+        save (None on first call).  Compared against ``min_interval_s``.
+    min_interval_s :
+        Minimum seconds between consecutive incremental writes.
+        ``0`` disables the time throttle.
+    last_capture_count :
+        Total captures across all runs at the previous successful
+        save.  Compared against ``min_capture_interval``.
+    min_capture_interval :
+        Minimum new captures since last save before writing.  ``1``
+        means save after every new capture (most frequent).
+
+    Returns
+    -------
+    (path, new_last_save_at, new_last_capture_count, did_write) :
+        ``did_write`` is False when throttled — caller passes the
+        existing throttle state through unchanged.  When True,
+        ``new_last_save_at`` and ``new_last_capture_count`` are the
+        updated throttle state to thread into the next call.
+
+    Failures are LOGGED via the standard Python logging module and
+    re-raised — callers should catch + log to LogPane + continue
+    the run.  Losing the partial-save is annoying; aborting the run
+    over a partial-save failure is worse.
+    """
+    import time
+    import logging
+
+    _log = logging.getLogger(__name__)
+
+    # Throttle check: skip the write if we're inside the min-interval
+    # AND haven't accumulated enough new captures.  Either condition
+    # being satisfied (enough time OR enough captures) triggers a write.
+    now = time.monotonic()
+    current_capture_count = sum(len(r.captures) for r in session.runs)
+    new_captures = current_capture_count - last_capture_count
+    time_elapsed = (now - last_save_at) if last_save_at is not None else float("inf")
+
+    enough_time = time_elapsed >= min_interval_s
+    enough_captures = new_captures >= min_capture_interval
+
+    # First call always writes (last_save_at is None).
+    if last_save_at is not None and not (enough_time or enough_captures):
+        return (Path(path), last_save_at, last_capture_count, False)
+
+    written_path = save_session_npz(session, path, incomplete=True)
+    return (written_path, now, current_capture_count, True)
 
 
 def _pattern_dict(p) -> Dict[str, Any]:

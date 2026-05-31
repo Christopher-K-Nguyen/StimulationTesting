@@ -59,7 +59,7 @@ from ..experiments.progressive_stress import StressPolicy
 from ..experiments.short_pulsing import ShortPulsingPolicy
 from ..experiments.voltage_transient import RampPolicy
 from ..hardware.base import Oscilloscope, Stimulator
-from ..persistence import save_session_npz
+from ..persistence import save_session_npz, save_session_npz_incremental
 from ..session import Session, TestParameters
 from ..waveforms import PulsePattern
 from . import rich
@@ -160,6 +160,15 @@ class RunnerWorker(QtCore.QObject):
         # during scope setup and any later hang is contained to
         # the worker thread.
         self.pre_run: Optional[Callable[[], None]] = None
+        # Incremental-save throttle state.  See
+        # ``persistence.save_session_npz_incremental`` — every capture
+        # event triggers a throttled write so a mid-run crash leaves
+        # the partial session on disk rather than only the in-memory
+        # state.  Default throttle (2 s OR every capture) means short
+        # runs (VT) save per capture; long runs (LP) save at most
+        # twice a second.
+        self._incr_last_save_at: Optional[float] = None
+        self._incr_last_capture_count: int = 0
         # Wire the plain-Python event stream into our Qt signals
         runner.subscribe(self._on_event)
 
@@ -170,6 +179,48 @@ class RunnerWorker(QtCore.QObject):
         if ev.kind == "capture" and ev.capture is not None:
             ch = ev.run.configuration.active if ev.run is not None else -1
             self.captured.emit(ev.capture, int(ch))
+            # Incremental save trigger.  Runs on the WORKER thread (we
+            # are in the runner's thread here), so the disk IO doesn't
+            # block the GUI.  Throttled so long LP runs don't write per
+            # capture — see ``save_session_npz_incremental`` for the
+            # time / capture-count throttle.  ``incomplete=True`` marker
+            # is set by the helper; the final ``save_session_npz`` at
+            # end-of-run overwrites with ``incomplete=False`` so the
+            # POLARIS load surfaces an "incomplete run" badge only for
+            # genuinely-crashed sessions.
+            if self.save_path is not None:
+                try:
+                    (
+                        _,
+                        self._incr_last_save_at,
+                        self._incr_last_capture_count,
+                        did_write,
+                    ) = save_session_npz_incremental(
+                        self.runner.session,
+                        self.save_path,
+                        last_save_at=self._incr_last_save_at,
+                        last_capture_count=self._incr_last_capture_count,
+                    )
+                    if did_write:
+                        # Quietly note the snapshot in the log so the
+                        # operator (and post-hoc analysis) can verify
+                        # that mid-run saves are happening.  Use
+                        # log_msg signal so it crosses to the GUI
+                        # thread alongside the runner's normal log
+                        # output.
+                        self.log_msg.emit(
+                            f"[partial-save] mid-run snapshot written "
+                            f"({self._incr_last_capture_count} caps)")
+                except Exception as e:
+                    # Disk full, permission denied, network share
+                    # disconnect, etc.  Surface as a log line but
+                    # NEVER raise — losing one partial save is
+                    # annoying, aborting the run over it is much
+                    # worse.  The final end-of-run save will retry.
+                    self.log_msg.emit(
+                        f"[partial-save] failed: "
+                        f"{type(e).__name__}: {e} — run continues, "
+                        f"final save will retry")
         if ev.kind == "paused":
             # Surface the between-channels pause as its own signal so the
             # tab can pop a modal "rewire to next channel, then continue"
