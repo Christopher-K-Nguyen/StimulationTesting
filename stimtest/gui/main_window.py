@@ -3041,8 +3041,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Log in failed", msg)
             return
         self._set_profile(profile_name)
+        # Status bar message uses the extension's display_name when
+        # one was registered (e.g., "CWRU collaborator" instead of
+        # just "CWRU"); falls back to the uppercase profile name
+        # for built-in Admin or extensions without a display_name.
+        # Audit #17.
+        from .admin import _extension_display_names
+        display = _extension_display_names.get(
+            profile_name.lower(), profile_name.upper())
         self.statusBar().showMessage(
-            f"Logged in as {profile_name.upper()}.", 4000)
+            f"Logged in as {display}.", 4000)
 
     def _on_admin_logout(self) -> None:
         """Admin → Log Out — drop to anonymous (Profile.NONE)."""

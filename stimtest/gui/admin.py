@@ -65,9 +65,31 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import keyword
+import re
+import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 from PyQt6 import QtCore, QtWidgets
+
+# Module-level lock guarding writes to the plugin registries
+# (``_extension_profiles``, ``_extension_display_names``,
+# ``RESTRICTED_SHAPES``).  MainWindow.__init__ runs on the GUI thread
+# so the canonical extension-load path doesn't race, but an
+# extension's ``__init__`` could legitimately spawn a worker thread
+# that later calls ``register_extension_profile``.  This lock makes
+# the two-dict-plus-set write block atomic, closing audit #15.
+_registry_lock = threading.RLock()
+
+# Allowed-character regex for extension profile names.  Names must
+# start with a lowercase ASCII letter and contain only lowercase
+# letters, digits, and underscores — keeps them well-behaved as
+# Python identifiers / dict keys / future ``setattr`` targets.
+# Audit #9: prevents reserved keywords like "class" from being
+# accepted as profile names (the dict-key path doesn't care, but
+# any future code that does ``setattr`` based on name would silently
+# break).
+_VALID_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # ---------------------------------------------------------------------------
 # Built-in admin password
@@ -128,7 +150,11 @@ def register_extension_profile(
         Profile identifier — also the username the operator types at
         the login dialog.  Case-insensitive (normalized to lowercase
         internally).  Must NOT collide with the built-in profile
-        names ``"none"`` or ``"admin"``.
+        names ``"none"`` or ``"admin"`` and must match the regex
+        ``^[a-z][a-z0-9_]*$`` (start with a lowercase letter; only
+        lowercase letters, digits, and underscores allowed).  This
+        keeps names well-behaved as Python identifiers / dict keys
+        and matches the importable Python package name convention.
     password_hash :
         SHA-256 hex digest the entered password must match.  The
         extension is responsible for choosing / storing the password;
@@ -148,12 +174,20 @@ def register_extension_profile(
         messages (e.g., ``"My Lab collaborator"``).  Defaults to the
         uppercase ``name``.
 
-    Idempotency
-    -----------
-    Re-registering the same ``(name, password_hash)`` pair is a no-op
-    (handles accidental double-import of the same extension).
-    Re-registering the same ``name`` with a DIFFERENT ``password_hash``
-    raises :class:`ValueError`.
+    Idempotency contract
+    --------------------
+    The ``(name, password_hash)`` pair is hash-idempotent:
+    re-registering the SAME ``(name, password_hash)`` does not
+    raise.  Re-registering the same ``name`` with a DIFFERENT
+    ``password_hash`` raises :class:`ValueError`.
+
+    ``shapes`` and ``display_name`` are **last-write-wins** on
+    re-register, not idempotent — the second call's ``shapes`` get
+    unioned into ``RESTRICTED_SHAPES`` again (no-op since the set
+    already contains them) and the second call's ``display_name``
+    REPLACES the first.  This means an extension can change its
+    display_name between releases by reimporting; useful for branding
+    refreshes, occasionally confusing if you forget.  See audit #14.
 
     Side effects
     ------------
@@ -165,12 +199,34 @@ def register_extension_profile(
     * The login dialog grows a Username field on its next display
       (driven by :func:`_any_extension_registered`).
 
+    Thread safety
+    -------------
+    All registry writes go through ``_registry_lock`` (RLock) so
+    extensions whose ``__init__`` spawns a worker thread that
+    re-enters this function don't corrupt the registries.  The
+    canonical extension-load path (MainWindow.__init__) is single-
+    threaded; this lock exists for unusual cases.  See audit #15.
+
+    Package naming convention
+    -------------------------
+    Distribution names should match the importable Python package
+    name (``[a-z][a-z0-9_]*`` form).  PULSAR's ``_load_extensions``
+    walks ``importlib.metadata.distributions()`` and converts the
+    distribution name to a module name via lowercase + ``-`` → ``_``
+    (so ``stimtest-cwru`` imports as ``stimtest_cwru``).  Avoid
+    names with adjacent or mid-name hyphens — Python identifiers
+    can't contain ``-`` so the conversion is one-way, and a
+    distribution like ``stimtest-a-b`` would still import fine but
+    only because its on-disk package directory is named
+    ``stimtest_a_b``.  See audit #3.
+
     Raises
     ------
     ValueError
-        If ``name`` is empty, collides with a built-in profile
-        (``"none"`` / ``"admin"``), or duplicates a prior registration
-        with a different password hash.
+        If ``name`` is empty, fails the ``[a-z][a-z0-9_]*`` regex,
+        collides with a built-in profile (``"none"`` / ``"admin"``),
+        or duplicates a prior registration with a different
+        password hash.
     """
     if not isinstance(name, str):
         raise ValueError(
@@ -182,6 +238,21 @@ def register_extension_profile(
         raise ValueError(
             f"Cannot register extension profile {name!r}: collides "
             f"with built-in profile {name_lower!r}")
+    if not _VALID_NAME_RE.match(name_lower):
+        raise ValueError(
+            f"Extension profile name {name!r} fails the "
+            f"^[a-z][a-z0-9_]*$ regex.  Must start with a lowercase "
+            f"letter and contain only lowercase letters, digits, "
+            f"and underscores.")
+    # Reject Python reserved words even though they'd match the
+    # regex — ``class`` / ``def`` / ``if`` etc. work fine as dict
+    # keys but break any future code that uses ``setattr`` to bind
+    # dynamic menu actions or attributes named after the profile.
+    # Cheap belt-and-braces gate.  Audit #9.
+    if keyword.iskeyword(name_lower):
+        raise ValueError(
+            f"Extension profile name {name!r} is a reserved Python "
+            f"keyword.  Pick a different name (e.g. {name_lower}_lab).")
     existing = _extension_profiles.get(name_lower)
     if existing is not None and existing != password_hash:
         raise ValueError(
@@ -207,11 +278,17 @@ def register_extension_profile(
             f"Strings iterate by character — pass {{{shapes!r}}} to "
             f"register one shape, or wrap multiple IDs in a "
             f"collection.")
-    _extension_profiles[name_lower] = password_hash
-    if display_name:
-        _extension_display_names[name_lower] = display_name
-    if shapes:
-        RESTRICTED_SHAPES.update(str(s) for s in shapes)
+    # All registry writes happen under the module-level lock so
+    # concurrent registration calls from extension worker threads
+    # don't interleave (audit #15).  RLock so a re-entrant call from
+    # the same thread (e.g. via an extension's own validation
+    # callback) doesn't deadlock.
+    with _registry_lock:
+        _extension_profiles[name_lower] = password_hash
+        if display_name:
+            _extension_display_names[name_lower] = display_name
+        if shapes:
+            RESTRICTED_SHAPES.update(str(s) for s in shapes)
 
 
 def _any_extension_registered() -> bool:
@@ -227,7 +304,15 @@ def _any_extension_registered() -> bool:
 def _profile_name(profile) -> str:
     """Normalize a profile (enum member, enum-value str, raw str) to
     its lowercase string form for registry lookups.  Returns ``""``
-    on any unrecognizable input."""
+    on any unrecognizable input.
+
+    Explicit ``None`` returns ``""`` rather than ``"none"`` — without
+    this guard, ``str(None) == "None"`` lowercased to ``"none"``
+    would silently match the anonymous-profile value, which is
+    coincidence rather than intent.  Audit #16.
+    """
+    if profile is None:
+        return ""
     try:
         if hasattr(profile, "value"):
             return str(profile.value).strip().lower()
@@ -285,7 +370,11 @@ class _LoginDialog(QtWidgets.QDialog):
     """
     def __init__(self, parent=None, *, show_username: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("Admin log in")
+        # Title adapts: in admin-only mode (no extensions) the dialog
+        # is about Admin specifically; in extension-aware mode it
+        # could be either Admin or an extension profile, so the
+        # generic "Log in" is more accurate.  Audit #8.
+        self.setWindowTitle("Log in" if show_username else "Admin log in")
         self.setMinimumWidth(360)
         v = QtWidgets.QVBoxLayout(self)
 

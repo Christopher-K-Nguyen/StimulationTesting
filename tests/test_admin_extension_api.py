@@ -354,15 +354,21 @@ def test_profile_name_accepts_string(clean_registry):
 
 def test_profile_name_gracefully_handles_garbage(clean_registry):
     """Unrecognizable input returns empty string rather than raising
-    — keeps the gate helpers safe under bad input."""
+    — keeps the gate helpers safe under bad input.
+
+    Note: ``None`` returns ``""`` (NOT ``"none"``) — see audit #16.
+    The dedicated ``test_profile_name_none_returns_empty_string``
+    asserts this specifically; the test below covers other garbage.
+    """
     from stimtest.gui.admin import _profile_name
-    assert _profile_name(None) == "none"  # str(None) → "none"
     # An object whose .value access raises must fall through to "".
     class _Bad:
         @property
         def value(self):
             raise RuntimeError("boom")
     assert _profile_name(_Bad()) == ""
+    # Mixed-case is normalized.
+    assert _profile_name("AdMiN") == "admin"
 
 
 # ---------------------------------------------------------------------------
@@ -575,3 +581,106 @@ def test_prompt_login_unknown_username(
     name, ok = prompt_login(None, admin_hash=_admin_hash())
     assert ok is False
     assert name == Profile.NONE.value
+
+
+# ---------------------------------------------------------------------------
+# Audit-cleanup regressions (#8 dialog title, #9 name regex, #15 thread lock, #16 None)
+# ---------------------------------------------------------------------------
+def test_login_dialog_title_adapts_to_extension_mode(qapp, clean_registry):
+    """Audit #8: title is 'Admin log in' when admin-only,
+    'Log in' when at least one extension is registered."""
+    from stimtest.gui.admin import _LoginDialog, register_extension_profile
+
+    dlg_admin_only = _LoginDialog(show_username=False)
+    assert dlg_admin_only.windowTitle() == "Admin log in"
+
+    register_extension_profile(
+        name="testlab", password_hash="abc123")
+    dlg_ext_mode = _LoginDialog(show_username=True)
+    assert dlg_ext_mode.windowTitle() == "Log in"
+
+
+def test_register_extension_rejects_invalid_name_chars(clean_registry):
+    """Audit #9: names must match ^[a-z][a-z0-9_]*$.  Reserved
+    Python keywords, names with uppercase, names with hyphens, and
+    names starting with a digit all fail.  Two-tier rejection:
+    the regex catches bad characters, a separate keyword.iskeyword
+    check catches reserved words like 'class' that pass the regex."""
+    from stimtest.gui.admin import register_extension_profile
+
+    # Reserved keyword — caught by the keyword.iskeyword check.
+    with pytest.raises(ValueError, match="reserved Python keyword"):
+        register_extension_profile(name="class", password_hash="x")
+    # Hyphen — caught by the regex.
+    with pytest.raises(ValueError, match="regex"):
+        register_extension_profile(name="my-lab", password_hash="x")
+    # Starts with digit — caught by the regex.
+    with pytest.raises(ValueError, match="regex"):
+        register_extension_profile(name="3rdparty", password_hash="x")
+    # Contains a space — caught by the regex.
+    with pytest.raises(ValueError, match="regex"):
+        register_extension_profile(name="lab a", password_hash="x")
+
+
+def test_register_extension_accepts_valid_name_chars(clean_registry):
+    """Audit #9 positive case: typical lowercase + underscore + digit
+    names pass.  Catches over-tightening of the regex."""
+    from stimtest.gui.admin import register_extension_profile
+
+    # Plain lowercase.
+    register_extension_profile(name="cwru", password_hash="x")
+    # Underscore.
+    register_extension_profile(name="my_lab", password_hash="y")
+    # Trailing digit.
+    register_extension_profile(name="lab123", password_hash="z")
+
+
+def test_profile_name_none_returns_empty_string(clean_registry):
+    """Audit #16: explicit None must return '' not 'none'.  Pre-fix,
+    ``str(None).lower() == "none"`` was an accidental match against
+    ``Profile.NONE.value``."""
+    from stimtest.gui.admin import _profile_name
+
+    assert _profile_name(None) == ""
+
+
+def test_registry_writes_are_thread_safe(clean_registry):
+    """Audit #15: concurrent register_extension_profile calls from
+    multiple threads should not corrupt the registries.
+
+    Stress-test by spawning N threads each registering a unique
+    profile name.  After they all join, the registry should contain
+    exactly N entries (none lost to races, none duplicated).
+    """
+    import threading
+    from stimtest.gui.admin import register_extension_profile
+
+    n_threads = 32
+    errors: list = []
+
+    def _register(i: int) -> None:
+        try:
+            register_extension_profile(
+                name=f"threadtest_{i:03d}",
+                password_hash=f"hash_{i}",
+                shapes={f"shape_{i}"})
+        except Exception as e:
+            errors.append((i, e))
+
+    threads = [
+        threading.Thread(target=_register, args=(i,))
+        for i in range(n_threads)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"thread errors: {errors[:5]}"
+    # Every profile should have landed.
+    for i in range(n_threads):
+        name = f"threadtest_{i:03d}"
+        assert name in clean_registry._extension_profiles, (
+            f"profile {name!r} missing — concurrent registration "
+            f"lost it (race despite the RLock?)")
+        assert f"shape_{i}" in clean_registry.RESTRICTED_SHAPES

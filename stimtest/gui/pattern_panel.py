@@ -4323,9 +4323,28 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             new_profile = "none"
         self._current_profile = new_profile
         # Rebuild the symmetric biphasic shape combo, preserving
-        # the user's current selection if still legal.
+        # the user's current selection if still legal.  Safety note
+        # (audit #6): ``_rebuild_shape_combo`` compares the post-
+        # rebuild ``new_sid`` with the pre-rebuild ``prev_sid`` and
+        # only emits ``patternChanged`` when they differ.  So a
+        # re-broadcast of the SAME profile (used by main_window
+        # after auto-loading extensions) won't spuriously fire
+        # downstream pattern-rebuild work — the selection survives
+        # the clear-and-repopulate.  If a future refactor changes
+        # the default-selection logic, re-verify that property.
         self._rebuild_shape_combo(self.shape_combo, SYMMETRIC_BIPHASIC_SHAPES,
                                   preview_renderer=_render_shape_pixmap)
+        # NOTE: ``asym_shape_combo`` (the parent dropdown for
+        # asymmetric pulse shape — Rectangular / Cap-coupled /
+        # Mix-and-match) is INTENTIONALLY not rebuilt here.  None of
+        # the three entries in ``ASYMMETRIC_BIPHASIC_SHAPES`` are
+        # restricted shape IDs — only the per-phase entries inside
+        # the Mix-and-match flavour are (those live in
+        # ``mix_phase_shape_combo`` below).  Audit #7 flagged this
+        # as a future-proofing concern: if you ever add a restricted
+        # ID to ASYMMETRIC_BIPHASIC_SHAPES, also add a
+        # ``self._rebuild_shape_combo(self.asym_shape_combo, ...)``
+        # call right here.
         # Rebuild each mix-and-match per-phase combo too.  These
         # exist only in asymmetric mode; the loop guard handles the
         # symmetric-mode (no list) case.
