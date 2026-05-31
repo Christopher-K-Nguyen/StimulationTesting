@@ -1127,6 +1127,10 @@ class TektronixOscilloscope(Oscilloscope):
             self._adapt_state.setdefault(
                 channel, self._new_adapt_state()
             )["last_scale"] = float(volts_per_div)
+        # Y-side change → channel's preamble (YMUlt) is now stale.
+        # See LOG_ANALYSIS.md finding #4 and ``_read_channel``'s
+        # preamble-cache section.
+        self._invalidate_preamble_cache(channel)
 
     def set_channel_scale_for_peak(self, channel: str,
                                    peak_v: float, *,
@@ -1779,6 +1783,8 @@ class TektronixOscilloscope(Oscilloscope):
         # Cache the readback (post-rounding) so the host-side time-
         # axis computation matches what the scope actually applied.
         self._expected_horiz_scale_s = float(applied)
+        # X-side change → ALL channels' preambles (XINcr) are stale.
+        self._invalidate_preamble_cache()
         return applied
 
     def set_horizontal_position(self, percent: float) -> None:
@@ -1845,6 +1851,8 @@ class TektronixOscilloscope(Oscilloscope):
             # the raw input) so the cached % matches what the scope
             # actually applied.
             self._expected_horiz_position_pct = float(pct)
+            # X-side change → ALL channels' preambles (XZEro) are stale.
+            self._invalidate_preamble_cache()
             return
         # Legacy seconds form — convert percent to a time offset.
         try:
@@ -1854,10 +1862,13 @@ class TektronixOscilloscope(Oscilloscope):
         position_s = (pct / 100.0) * timebase_s * float(self._n_horiz_divs)
         self._w(f"{self._cmds.horiz_position} {position_s:g}")
         self._expected_horiz_position_pct = float(pct)
+        self._invalidate_preamble_cache()
 
     def set_channel_position(self, channel: str, divisions: float) -> None:
         """Set the per-channel vertical position (in divisions, +/- ~5)."""
         self._w(f"{channel}:POSition {divisions:g}")
+        # Y-side change → channel's preamble (YOFf / YZEro) is stale.
+        self._invalidate_preamble_cache(channel)
 
     def set_trigger_level(self, level_v: float) -> None:
         # Hard rule: when the digital sync (EXT) is the trigger source, the
@@ -2515,6 +2526,28 @@ class TektronixOscilloscope(Oscilloscope):
         else:
             self._adapt_state.pop(channel, None)
 
+    # ----- preamble cache (LOG_ANALYSIS.md finding #4) ---------------
+    def _invalidate_preamble_cache(self, channel: Optional[str] = None) -> None:
+        """Drop cached ``WFMOutpre?`` results.
+
+        Called by every scope-side write that could change a cached
+        preamble field — Y-side writes invalidate the affected
+        channel only; X-side / record-length / acquisition-mode /
+        channel-enable writes invalidate everything (those affect
+        XINcr / XZEro / NR_Pt / encoding for every channel).
+
+        ``channel=None`` drops all entries (global invalidation).
+        Safe to call before :attr:`_preamble_cache` is initialized
+        — early-out makes the invalidator a no-op during
+        construction or in unit tests that bypass ``open()``.
+        """
+        if not hasattr(self, "_preamble_cache"):
+            return
+        if channel is None:
+            self._preamble_cache = {}
+        else:
+            self._preamble_cache.pop(channel, None)
+
     def set_record_length(self, n: int) -> None:
         n = snap_record_length(int(n), getattr(self.info, "model", ""))
         if n <= 0:
@@ -2544,6 +2577,9 @@ class TektronixOscilloscope(Oscilloscope):
         self._log(
             f"[scope] set_record_length({n}): OK, scope confirmed "
             f"{actual} points  (total {_fmt_elapsed(_dt)})")
+        # Record-length change → ALL channels' preambles (NR_Pt /
+        # XINcr) are stale.
+        self._invalidate_preamble_cache()
 
     def _refresh_record_length(self) -> int:
         """Query the scope for the record length and cache it.
@@ -2625,6 +2661,10 @@ class TektronixOscilloscope(Oscilloscope):
         self._log(
             f"[scope] set_acquisition_mode({mode_u}, n_avg={n_avg}): "
             f"OK, scope confirmed   (total {_fmt_elapsed(_dt)})")
+        # Acquisition-mode change can affect Y-side encoding (some
+        # firmware reformats the preamble for AVERAGE vs SAMPLE).
+        # Invalidate all to be safe.
+        self._invalidate_preamble_cache()
 
     def acquisition_modes(self):
         modes = ["SAMPLE", "AVERAGE"]
@@ -3213,7 +3253,23 @@ class TektronixOscilloscope(Oscilloscope):
         identical across all channels in one acquisition, so the array
         can be passed through and the per-channel arange + multiply
         skipped (~100-200 µs / channel on a 20k-sample record).
+
+        **Preamble cache** (LOG_ANALYSIS.md finding #4): the
+        per-channel preamble (YMUlt / YOFf / YZEro / XINcr / XZEro /
+        PT_Off / BN_Fmt / BYT_Or) is cached in
+        ``self._preamble_cache`` keyed by channel.  On a hit we skip
+        the ``WFMOutpre?`` query (~110 ms saved per channel after
+        the first capture).  Invalidation is the safety contract:
+        every scope write that could change a cached field MUST
+        call ``_invalidate_preamble_cache(...)`` (per-channel for
+        Y-side writes, global for X-side / record-length / acq-mode
+        writes).  See :meth:`_invalidate_preamble_cache` for the
+        registered invalidation sites; the env var
+        ``PULSAR_DISABLE_PREAMBLE_CACHE=1`` disables the cache
+        entirely for debugging.
         """
+        import os as _os
+
         # Ensure the channel is displayed on screen.  CURVe? returns
         # error 2244 ("waveform not activated") for a channel that is
         # turned off (SELect:CH<x> OFF), even if DATa:SOUrce points to it.
@@ -3225,9 +3281,31 @@ class TektronixOscilloscope(Oscilloscope):
         if self._cmds.use_data_source:
             self._w(f"DATa:SOUrce {ch}")
 
-        pre = self._cmds.preamble
-        ymult, yoff, yzero, xinc, xzero, pt_off, is_signed, is_big_endian = (
-            self._read_preamble(pre))
+        # Preamble cache check.  Disabled when PULSAR_DISABLE_PREAMBLE_CACHE
+        # is set in the env (useful for diagnosing stale-cache bugs).
+        cache_disabled = bool(
+            _os.environ.get("PULSAR_DISABLE_PREAMBLE_CACHE"))
+        cached_preamble = None
+        if not cache_disabled and hasattr(self, "_preamble_cache"):
+            cached_preamble = self._preamble_cache.get(ch)
+        if cached_preamble is not None:
+            (ymult, yoff, yzero, xinc, xzero, pt_off,
+             is_signed, is_big_endian) = cached_preamble
+        else:
+            pre = self._cmds.preamble
+            ymult, yoff, yzero, xinc, xzero, pt_off, is_signed, is_big_endian = (
+                self._read_preamble(pre))
+            # Populate the cache for next time.  Skip if we're
+            # disabled OR if the attribute hasn't been initialized
+            # (happens for class-construction-without-open paths in
+            # tests; the runtime population in open() guarantees it
+            # exists in production paths).
+            if not cache_disabled:
+                if not hasattr(self, "_preamble_cache"):
+                    self._preamble_cache: Dict[str, Tuple] = {}
+                self._preamble_cache[ch] = (
+                    ymult, yoff, yzero, xinc, xzero, pt_off,
+                    is_signed, is_big_endian)
 
         # ----- Curve as a binary stream ----------------------------------
         # dtype and byte-order are derived from WFMOutpre:BN_Fmt? / BYT_Or?
@@ -3535,3 +3613,7 @@ class TektronixOscilloscope(Oscilloscope):
         # Apply canonical bench defaults to each active channel.
         for ch in used:
             self.apply_channel_defaults(ch)
+        # Channel ON/OFF reshuffle → all per-channel preambles
+        # potentially stale (DATa:SOURce semantics, channel-position
+        # defaults reset).  Invalidate all to be safe.
+        self._invalidate_preamble_cache()
