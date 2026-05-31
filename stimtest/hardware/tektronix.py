@@ -3534,14 +3534,62 @@ class TektronixOscilloscope(Oscilloscope):
         # Slow fallback — per-field queries
         return self._read_preamble_per_field(preamble_root)
 
+    #: Positional field order for ``WFMOutpre?`` responses when
+    #: ``HEADer OFF`` strips the field names.  Order is documented in
+    #: the TBS / TDS / MDO / DPO programmer manuals and stable across
+    #: all the Tek scope families we support — the response always
+    #: emits these fields in this order whether VERBose is ON or OFF,
+    #: HEADer is ON or OFF.  Trailing positions (NR_FR, sample rate)
+    #: vary by firmware and aren't required by us, so they're not in
+    #: this list.
+    _PREAMBLE_POSITIONAL_FIELDS: Tuple[str, ...] = (
+        "BYT_NR",   # bytes per data point (1 for int8, 2 for int16)
+        "BIT_NR",   # bits per data point
+        "ENCDG",    # BIN / BINARY / ASCII
+        "BN_FMT",   # RI (signed) / RP (unsigned)
+        "BYT_OR",   # MSB / LSB
+        "WFID",     # quoted descriptive string
+        "NR_PT",    # number of points
+        "PT_FMT",   # Y / ENV / etc.
+        "XUNIT",    # quoted X-axis unit
+        "XINCR",    # X sample period (seconds)
+        "XZERO",    # X of first sample (relative to trigger)
+        "PT_OFF",   # trigger sample index
+        "YUNIT",    # quoted Y-axis unit
+        "YMULT",    # Y scale (volts per code)
+        "YOFF",     # Y zero offset in codes
+        "YZERO",    # Y absolute offset in volts
+    )
+
     @staticmethod
     def _parse_batch_preamble(raw: str) -> Dict[str, str]:
         """Parse a ``WFMOutpre?`` batch response into a NAME → value dict.
 
-        Strips the leading ``:WFMOUTPRE:`` namespace, splits on
-        semicolons, then a per-chunk regex pulls out ``FIELDNAME`` and
-        ``VALUE``.  Quoted string values have their surrounding double
-        quotes stripped.  Keys are upper-cased for stable lookup.
+        Handles BOTH response shapes the scope can produce:
+
+        * **HEADer ON** (``BYT_NR 1;BIT_NR 8;...``) — each chunk
+          starts with a field name.  Per-chunk regex pulls out
+          (FIELDNAME, VALUE).  This is the shape the Tek programmer
+          manual's examples show.
+
+        * **HEADer OFF** (``1;8;BINARY;RI;...``) — values only, no
+          field names.  Positional parse uses the
+          :data:`_PREAMBLE_POSITIONAL_FIELDS` order, mapping chunk
+          ``i`` to the field name at position ``i``.  This is what
+          PULSAR's ``open()`` configures (``HEADer OFF`` strips
+          the namespace prefix from every response to reduce log
+          chatter), and was the root cause of LOG_ANALYSIS.md
+          finding #5: the name-based parser missed every chunk
+          (none started with letters), populated nothing, raised
+          the "missing required fields" error, and fell back to
+          9 per-field queries (~450 ms per channel).
+
+        Quoted string values have their surrounding double quotes
+        stripped.  Keys are upper-cased for stable lookup.  The two
+        parsers run in sequence: name-first, then positional fallback
+        if name-mode didn't produce any of the required fields.
+        Either path produces the same ``{NAME: VALUE}`` dict shape
+        for downstream consumers.
         """
         import re
         out: Dict[str, str] = {}
@@ -3552,13 +3600,14 @@ class TektronixOscilloscope(Oscilloscope):
             if text.upper().startswith(prefix):
                 text = text[len(prefix):]
                 break
-        for chunk in text.split(";"):
-            chunk = chunk.strip().lstrip(":")
-            if not chunk:
-                continue
+        chunks = [c.strip().lstrip(":") for c in text.split(";")]
+        chunks = [c for c in chunks if c]
+
+        # ---- Name-first parse (HEADer ON path) ----
+        for chunk in chunks:
             # Some VERBose firmware concatenates name + value with no
             # space (e.g. "BYT_NR2") — handle both cases with a regex.
-            m = re.match(r"([A-Za-z_]+)\s*(.*)", chunk)
+            m = re.match(r"([A-Za-z_]+)\s+(.+)", chunk)
             if not m:
                 continue
             name = m.group(1).upper()
@@ -3566,6 +3615,22 @@ class TektronixOscilloscope(Oscilloscope):
             if value.startswith('"') and value.endswith('"'):
                 value = value[1:-1]
             out[name] = value
+
+        # ---- Did we get any of the fields downstream code needs?
+        # If not, we're in HEADer OFF mode and need positional parse.
+        required_y_or_x = {"YMULT", "XINCR", "XZERO", "YOFF", "YZERO"}
+        if not required_y_or_x & set(out.keys()):
+            # Positional fallback.  Walk chunks against the documented
+            # field order.  Extra chunks past the known list (e.g.
+            # NR_FR, sample rate) are silently dropped.
+            for idx, value in enumerate(chunks):
+                if idx >= len(TektronixOscilloscope._PREAMBLE_POSITIONAL_FIELDS):
+                    break
+                name = TektronixOscilloscope._PREAMBLE_POSITIONAL_FIELDS[idx]
+                value = value.strip()
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                out[name] = value
         return out
 
     def _read_preamble_per_field(self, preamble_root: str):
