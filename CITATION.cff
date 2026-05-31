@@ -1,0 +1,35 @@
+# Citation File Format — https://citation-file-format.github.io/
+# Rendered by GitHub at the top of the repo page as "Cite this
+# repository" and consumed by Zenodo / JOSS / academic indexers.
+cff-version: 1.2.0
+title: "PULSAR — Python characterization suite for neural-stimulation electrodes"
+message: "If you use PULSAR in academic work, please cite it as below."
+type: software
+authors:
+  - family-names: Nguyen
+    given-names: Christopher K.
+    # ORCID / affiliation can be added here when available.
+abstract: >
+  PULSAR is a PyQt6 desktop application for characterizing neural-
+  stimulation microelectrode arrays.  It drives a Plexon PlexStim 2.0
+  stimulator and a Tektronix TBS-series oscilloscope through a
+  guided experimental workflow: voltage-transient sweeps, progressive
+  stress staircases, short pulsing, and long pulsing.  Live metrics
+  cover Shannon k-value, injected charge (Q_inj), driving voltage
+  (V_d), access voltage (V_a), access resistance (R_a), polarization
+  potential (E_pol), double-layer capacitance (C_d), and interpulse
+  potential.  A companion viewer (POLARIS) renders saved sessions
+  with channel-mapped metric tables, multi-channel overlays, and
+  Q_inj vs. amplitude / V_d vs. Q_inj analysis plots.
+keywords:
+  - neural stimulation
+  - microelectrode characterization
+  - voltage transient
+  - charge injection
+  - Plexon PlexStim
+  - Tektronix oscilloscope
+  - electrophysiology
+license: MIT
+repository-code: "https://github.com/Bortz1234/StimulationTesting"
+url: "https://github.com/Bortz1234/StimulationTesting"
+version: 0.2.0

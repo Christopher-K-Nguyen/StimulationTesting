@@ -96,6 +96,17 @@ python -m pytest tests/ -q
 python run_gui.py --simulate
 ```
 
+### Hardware prerequisites
+
+| Prerequisite | Required for | Download |
+|---|---|---|
+| **NI-VISA** | Tektronix oscilloscope over USB | [ni.com/en/support/downloads/drivers/download.ni-visa.html](https://www.ni.com/en/support/downloads/drivers/download.ni-visa.html) |
+| **Plexon PlexStim 2.0 SDK** | Real PlexStim stimulator | Contact Plexon Inc. |
+
+Install NI-VISA and restart your computer before connecting the scope.
+Both prerequisites are detected and prompted during the Windows installer
+setup. The GUI works without hardware using `--simulate`.
+
 ### Production installer (Windows end users)
 
 The `installer/` folder builds a single `.exe` installer that drops the GUI,
@@ -238,7 +249,7 @@ StimulationTesting/
 │       ├── ingest.py            # Append-only CSV training-set ingestion
 │       └── weakness_analysis.py # Cohort-level analysis helpers
 │
-├── tests/                       # pytest suite (391 tests, runs in ~12 s)
+├── tests/                       # pytest suite (397 tests, runs in ~12 s)
 │   ├── test_waveforms.py        # pulse pattern + .pat writer + charge balance
 │   ├── test_metrics.py          # V_d / V_a / R_a / E_pol / Q_inj math
 │   ├── test_persistence.py      # save / load round-trip (every metric field)
@@ -276,7 +287,7 @@ StimulationTesting/
 # Editable install with dev extras
 pip install -e ".[dev]"
 
-# Tests (391 of them; runs in ~12 s)
+# Tests (397 of them; runs in ~12 s)
 python -m pytest tests/ -q
 
 # Tests with verbose output for a single file

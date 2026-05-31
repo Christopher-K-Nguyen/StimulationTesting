@@ -14,6 +14,21 @@ what-is-and-isn't-renamed list.
 
 ### Added
 
+- **Plugin-host architecture for login profiles.**  The
+  `stimtest.gui.admin` module is now an extension host: external
+  packages whose distribution name starts with `stimtest_` are
+  auto-discovered at MainWindow startup (via
+  `importlib.metadata.distributions()`) and can register additional
+  login profiles + restricted pulse shapes by calling
+  `register_extension_profile(name=…, password_hash=…, shapes=…)` as
+  an import side-effect.  Built-in profiles unchanged: anonymous
+  (default) + Admin (Manage Custom Catalog access).  The login
+  dialog adapts automatically — password-only when no extensions are
+  installed, username+password when one or more are.  22 new tests
+  in `tests/test_admin_extension_api.py` pin the contract.
+- `CITATION.cff` — machine-readable academic citation metadata,
+  rendered by GitHub as "Cite this repository" and consumed by
+  Zenodo / JOSS.
 - Top-level `README.md` rewritten with badges, table of contents,
   accurate file-tree, quick-start, installation, and explicit
   documentation links.
@@ -24,7 +39,7 @@ what-is-and-isn't-renamed list.
 - `.github/pull_request_template.md`.
 - 59 new tests across three new files (`tests/test_ml_qinj.py`,
   `tests/test_voltage_transient_helpers.py`,
-  `tests/test_tektronix_probes.py`). Suite total: **391** (was 332).
+  `tests/test_tektronix_probes.py`). Suite total: **397** (was 332).
 
 ### Changed
 

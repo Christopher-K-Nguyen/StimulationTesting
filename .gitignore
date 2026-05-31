@@ -47,3 +47,28 @@ TBS2000B_manual.txt
 # drops one here by mistake, don't push it.
 email_config.json
 .stimtest/
+
+# --- Local-only planning / private docs ---
+# CLAUDE.md is the AI-agent project memory (auto-loaded by Claude
+# Code from the project root).  It accumulates design notes,
+# gotchas, and ongoing-work context — including collaborator-only
+# (CWRU) material that should NOT be on GitHub.  The repo already
+# lives in OneDrive (C:\Users\chris\OneDrive\GitHub\…), so the file
+# is automatically backed up via OneDrive sync; gitignore just
+# prevents accidental `git add` from pushing it.
+#
+# EXTENSION_PLUGIN_DESIGN.md is the design doc for the
+# stimtest_cwru extension refactor — same confidentiality reason.
+#
+# Future agents: if you write a new design / planning markdown that
+# mentions the CWRU profile or any collaborator-only feature, add
+# it to this section too.  Public-facing docs (README.md,
+# CHANGELOG.md, docstrings) stay tracked as normal.
+CLAUDE.md
+EXTENSION_PLUGIN_DESIGN.md
+# Defensive: if someone scaffolds the CWRU extension as a
+# subdirectory of THIS repo instead of as a sibling (per the design
+# doc §3), don't push it.  The extension is meant to live in its
+# own private repo, not this one.
+stimtest_cwru/
+stimtest_*/
