@@ -277,15 +277,53 @@ class RunnerWorker(QtCore.QObject):
             # bugs that the user will see as "ran aborted with X"
             # in the log while the GUI stays responsive and lets
             # them start another experiment.
+            #
+            # Hardware-disconnect detection (Task #55): inspect the
+            # exception against known disconnect fingerprints (or
+            # check if the runner already raised the structured
+            # form).  When classified, the error string is prefixed
+            # with the canonical ``[DISCONNECT:scope]`` /
+            # ``[DISCONNECT:stim]`` marker so the GUI's
+            # ``_on_finished`` handler can show a tailored
+            # reconnect dialog instead of the generic "Run aborted"
+            # path.  The partial-save mechanism (Task #54) already
+            # wrote whatever captures completed before the
+            # disconnect to the .npz, so prior data is preserved
+            # regardless of what the operator picks in the dialog.
+            from ..experiments.errors import (
+                HardwareDisconnectError, looks_like_disconnect,
+            )
             import traceback as _tb
             tb_text = _tb.format_exc()
-            self.log_msg.emit(
-                f"Run aborted ({type(e).__name__}): {e}\n{tb_text}")
+            if isinstance(e, HardwareDisconnectError):
+                _device = e.device
+                _where = e.where or "(unknown)"
+                self.log_msg.emit(
+                    f"⚠ HARDWARE DISCONNECT — {_device.upper()} "
+                    f"went away during {_where}.  Underlying error: "
+                    f"{type(e.original).__name__}: {e.original}")
+                _error_str = (
+                    f"[DISCONNECT:{_device}] "
+                    f"{type(e.original).__name__}: {e.original}")
+            else:
+                _classified = looks_like_disconnect(e)
+                if _classified is not None:
+                    self.log_msg.emit(
+                        f"⚠ HARDWARE DISCONNECT — {_classified.upper()} "
+                        f"appears to have disconnected.  Underlying error: "
+                        f"{type(e).__name__}: {e}")
+                    _error_str = (
+                        f"[DISCONNECT:{_classified}] "
+                        f"{type(e).__name__}: {e}")
+                else:
+                    self.log_msg.emit(
+                        f"Run aborted ({type(e).__name__}): {e}\n{tb_text}")
+                    _error_str = f"{type(e).__name__}: {e}"
             from ..experiments.base import ExperimentResult
             result = ExperimentResult(
                 session=self.runner.session,
                 aborted=True,
-                error=f"{type(e).__name__}: {e}",
+                error=_error_str,
             )
             # Mirror the MATLAB ``sendError.m`` notification — only
             # if the user opted in, set an email, and SMTP creds are
@@ -2504,6 +2542,56 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # don't keep firing failed runs.
         if getattr(result, "aborted", False):
             self._pending_configs = []
+            # Hardware-disconnect detection (Task #55): the worker
+            # marks disconnect-shaped errors with the canonical
+            # ``[DISCONNECT:scope]`` / ``[DISCONNECT:stim]`` prefix.
+            # Surface a tailored dialog instead of letting the
+            # generic abort path silently roll forward — the
+            # operator deserves to know WHICH device went away and
+            # WHAT their next step is.  Prior captures are already
+            # safely on disk via the per-capture incremental save
+            # (Task #54); we explicitly tell the operator that here
+            # so they don't panic.  We do NOT attempt automatic
+            # reconnect-and-resume — stim/scope state restoration
+            # mid-run is fragile (loaded patterns / repetition
+            # counts / scope V/div + trigger settings vary by model
+            # and reset differently on reconnect).  Manual
+            # reconnect via the Connection Panel + restart is the
+            # safe option.
+            err_str = (getattr(result, "error", "") or "")
+            if err_str.startswith("[DISCONNECT:"):
+                _close_bracket = err_str.find("]")
+                _device = err_str[len("[DISCONNECT:"):_close_bracket] \
+                    if _close_bracket > 0 else "device"
+                _device_label = (
+                    "Scope (Tektronix)" if _device == "scope"
+                    else "Stimulator (PlexStim)" if _device == "stim"
+                    else _device)
+                _save_status = (
+                    f"\n\nPrior captures from this run have been "
+                    f"saved incrementally and are available at:\n"
+                    f"  {self.save_path}\n"
+                    f"(marked 'incomplete' in metadata — POLARIS "
+                    f"will surface a badge so you know it's a "
+                    f"partial run.)"
+                    if self.save_path is not None
+                    else "")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    f"{_device_label} disconnected mid-run",
+                    f"PULSAR detected that the {_device_label} "
+                    f"disconnected during the run.  The run has "
+                    f"been aborted to prevent further errors."
+                    f"{_save_status}"
+                    f"\n\nWhat to do:\n"
+                    f"  1. Re-plug the {_device_label} USB cable "
+                    f"(or power-cycle the device).\n"
+                    f"  2. Click Disconnect → Connect in the "
+                    f"Setup tab's Connection Panel to re-open the "
+                    f"connection.\n"
+                    f"  3. Click Start again to begin a new run "
+                    f"from where you left off."
+                )
         # Mark EVERY combination that actually ran as ✓ in the entry
         # list.  Iterates ``result.session.runs`` — each ChannelRun
         # exposes the config it was for via ``.configuration`` —
