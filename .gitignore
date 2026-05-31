@@ -66,6 +66,13 @@ email_config.json
 # CHANGELOG.md, docstrings) stay tracked as normal.
 CLAUDE.md
 EXTENSION_PLUGIN_DESIGN.md
+# LOG_ANALYSIS.md is the rolling log-file findings report — kept
+# private so internal observations about bench-session glitches,
+# perf hot-spots, and recurring errors don't ship to GitHub.
+# Findings here either get distilled into CLAUDE.md gotchas (when
+# the fix lands) or into task-tracker items (for unresolved bugs).
+# See "Performance / log monitoring discipline" in CLAUDE.md.
+LOG_ANALYSIS.md
 # Defensive: if someone scaffolds the CWRU extension as a
 # subdirectory of THIS repo instead of as a sibling (per the design
 # doc §3), don't push it.  The extension is meant to live in its
