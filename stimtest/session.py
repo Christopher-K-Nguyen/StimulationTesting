@@ -238,6 +238,27 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     finished_at: Optional[datetime] = None
     save_dir: str = ""
+    #: Operator-typed free-text notes attached to this session.  Set
+    #: from the Test Parameters panel's "Notes" textarea before /
+    #: during / after the run; persisted in the .npz so it's
+    #: searchable in POLARIS.  Multi-line; no length cap on the
+    #: Python side (JSON in meta.json scales fine into the KB range).
+    notes: str = ""
+    #: Operator-set categorical tags ("post-coating", "control",
+    #: "discard", "pilot", etc.).  Stored as a list of normalized
+    #: lowercase strings; POLARIS filters / groups sessions by tag.
+    #: Set from the Test Parameters "Tags" line edit (comma-separated
+    #: in the UI, list under the hood).
+    tags: List[str] = field(default_factory=list)
+    #: Reproducibility metadata captured at run time — PULSAR git
+    #: hash, Python + key package versions, OS info, hardware
+    #: serials/firmware, setup-snapshot hash.  Populated by
+    #: :func:`stimtest.session_metadata.capture_system_metadata`
+    #: at runner construction.  Stored as a flat str → str dict so
+    #: JSON round-trip is trivial; values are stringified at capture
+    #: time.  Months later, "what version of PULSAR produced this
+    #: .npz?" is answerable without git archeology.
+    system_metadata: Dict[str, str] = field(default_factory=dict)
 
     @property
     def name(self) -> str:

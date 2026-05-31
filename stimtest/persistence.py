@@ -136,6 +136,20 @@ def save_session_npz(session: Session, path: Path | str,
         # RUN]" badge so the operator knows the data isn't final.
         # See ``save_session_npz_incremental`` for the throttled wrapper.
         "incomplete": bool(incomplete),
+        # Task #57 — richer session metadata + per-run notes / tags.
+        # Operator-typed free-text notes; multi-line; round-trips
+        # verbatim including newlines.
+        "notes": getattr(session, "notes", "") or "",
+        # Categorical tags (lowercase, normalized).  Stored as a
+        # list of strings so loaders can iterate.
+        "tags": list(getattr(session, "tags", []) or []),
+        # Reproducibility metadata snapshot — git hash, package
+        # versions, OS, hardware identity, setup-snapshot SHA-256.
+        # See stimtest/session_metadata.py for the field catalog
+        # and capture_system_metadata() for the canonical builder.
+        # Flat str → str dict to keep JSON round-trip trivial.
+        "system_metadata": dict(
+            getattr(session, "system_metadata", {}) or {}),
     }
     arrays["meta.json"] = np.frombuffer(
         json.dumps(meta, default=_default).encode("utf-8"), dtype=np.uint8,
@@ -390,6 +404,18 @@ def load_session_npz(path: Path | str) -> "Session":
         target_charge_phase_nc=meta["test"].get("target_charge_phase_nc", float("inf")),
     )
 
+    # Task #57: notes / tags / system_metadata are NEW fields.
+    # Defensive defaults make loading legacy .npz files (no key)
+    # still work — meta.get() returns the default rather than
+    # KeyError'ing.  Tags get sanitized to a list of strings.
+    _notes = meta.get("notes", "") or ""
+    _tags_raw = meta.get("tags", []) or []
+    _tags = [str(t).strip().lower() for t in _tags_raw
+             if isinstance(t, str) and str(t).strip()]
+    _sysmd_raw = meta.get("system_metadata", {}) or {}
+    _sysmd = {str(k): str(v) for k, v in _sysmd_raw.items()
+              if isinstance(_sysmd_raw, dict)}
+
     session = Session(
         notebook=meta.get("notebook", ""),
         subject=meta.get("subject", ""),
@@ -398,6 +424,9 @@ def load_session_npz(path: Path | str) -> "Session":
         user_email=meta.get("user_email", ""),
         created_at=_parse_iso(meta.get("created_at")),
         finished_at=_parse_iso(meta.get("finished_at")),
+        notes=_notes,
+        tags=_tags,
+        system_metadata=_sysmd,
     )
 
     # ----- runs and captures -----

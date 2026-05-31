@@ -333,6 +333,25 @@ class ExperimentRunner(ABC):
             "coating_props": coating_props,
             "depolarization_us": DEPOLARIZATION_TIME_US,
         })
+        # Task #57: capture reproducibility metadata once at runner
+        # construction (PULSAR git hash + version, Python + package
+        # versions, OS, hardware identity, setup-snapshot hash).
+        # Stored on the Session itself (NOT on test.extras) so it
+        # round-trips through the .npz under ``meta.system_metadata``
+        # — see persistence.save_session_npz.  Best-effort: any
+        # individual probe failure becomes an empty string in the
+        # dict rather than raising.
+        try:
+            from ..session_metadata import capture_system_metadata
+            self.session.system_metadata = capture_system_metadata(
+                self.session,
+                stimulator=self.stim,
+                oscilloscope=self.scope,
+            )
+        except Exception:
+            # Defensive — system_metadata is informational, never
+            # block runner construction over it.
+            pass
 
     # ----- pub/sub --------
     def subscribe(self, cb: ProgressCallback) -> None:
