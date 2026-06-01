@@ -390,6 +390,15 @@ class VoltageTransientExperiment(ExperimentRunner):
             is_multipolar=_is_multipolar,
             environment_short=_env_short,
             reason=f"start of channel {config.active}")
+        # Arm closed-loop bias feedback if the GUI pushed a controller
+        # onto this runner.  Must happen AFTER apply_default_scope_view
+        # so the controller's MEASUrement-gating SCPI writes aren't
+        # clobbered.  Re-armed per configuration because each config's
+        # apply_default_scope_view above clears the gating window.
+        # Disarmed at the end of the configuration (before stop_all)
+        # so the next config's apply + arm sees a clean state.  No-op
+        # when no controller is attached.
+        self.arm_bias_feedback()
         amp = self.ramp.starting_ua
         capture_idx = 0
         # Reset the adaptive bookkeeping so each new configuration
@@ -408,30 +417,45 @@ class VoltageTransientExperiment(ExperimentRunner):
         # mid-sweep — preflight will already have flagged a no-phases
         # pattern, so we only need to defend against the zero case.
         excite_amp_abs = abs(base_pattern.excitation_phase.amplitude_ua) or 1.0
-        while amp <= self.ramp.max_ua and not self.aborted:
-            # Scale the template pattern so its *excitation* phase magnitude
-            # equals ``amp``. Other phases scale by the same factor, which
-            # preserves the biphasic / triphasic ratio specified by the user.
-            pattern = base_pattern.scaled(amp / excite_amp_abs)
-            cap = self._one_capture(config, pattern, capture_idx)
-            run.captures.append(cap)
-            capture_idx += 1
-            self._emit(ExperimentEvent(
-                kind="capture", session=self.session, run=run, capture=cap,
-            ))
+        try:
+            while amp <= self.ramp.max_ua and not self.aborted:
+                # Scale the template pattern so its *excitation* phase magnitude
+                # equals ``amp``. Other phases scale by the same factor, which
+                # preserves the biphasic / triphasic ratio specified by the user.
+                pattern = base_pattern.scaled(amp / excite_amp_abs)
+                cap = self._one_capture(config, pattern, capture_idx)
+                run.captures.append(cap)
+                capture_idx += 1
+                self._emit(ExperimentEvent(
+                    kind="capture", session=self.session, run=run, capture=cap,
+                ))
+                # Closed-loop bias step at amplitude-step cadence.  Same
+                # placement as SP / PS / LP: AFTER the capture event so
+                # the GUI's status badge update lands alongside the
+                # just-emitted metrics row.  Cheap no-op when the
+                # controller isn't armed.
+                self.bias_step_if_armed()
 
-            if cap.status.aborted:
-                break
+                if cap.status.aborted:
+                    break
 
-            limit_hit = self._potential_limit_hit(cap)
-            compliance = cap.status.voltage_compliance
+                limit_hit = self._potential_limit_hit(cap)
+                compliance = cap.status.voltage_compliance
 
-            if limit_hit or compliance:
-                cap.status.reached_potential_limit = limit_hit
-                # Walk back to last good amplitude and stop
-                break
+                if limit_hit or compliance:
+                    cap.status.reached_potential_limit = limit_hit
+                    # Walk back to last good amplitude and stop
+                    break
 
-            amp += self._next_step(cap, amp, run.captures)
+                amp += self._next_step(cap, amp, run.captures)
+        finally:
+            # Disarm bias feedback at the end of THIS configuration's
+            # sweep so the NEXT configuration's apply_default_scope_view
+            # + arm_bias_feedback above start from a clean scope state.
+            # Finally-safe so a mid-sweep exception leaves the
+            # controller properly disarmed.  Idempotent + swallows
+            # controller failures.
+            self.disarm_bias_feedback()
 
         # Stop output for safety.  ``stop_all`` (= PS_StopStimAllChannels,
         # MATLAB ``stopStimulation``) so the unused zero-amplitude
