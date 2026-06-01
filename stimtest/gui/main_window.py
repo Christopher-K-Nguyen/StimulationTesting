@@ -105,6 +105,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ps_tab = ProgressiveStressTab(array)
         self.res_tab = ResultsTab(self.save_dir)
 
+        # Plumb the shared ConnectionPanel into each experiment tab as
+        # the bias-module host (per-tab BiasFeedbackPanel widgets
+        # delegate Connect / Disconnect to the same driver instance).
+        # Done eagerly after construction; tabs accept the host being
+        # set before they're shown.  No-op for tabs without a bias
+        # panel (defensive — every concrete experiment tab inherits
+        # the panel from _BaseExperimentTab, so this is just
+        # belt-and-braces).
+        for tab in (self.vt_tab, self.sp_tab, self.lp_tab, self.ps_tab):
+            try:
+                tab.set_bias_host(self.conn)
+            except AttributeError:
+                pass
+
         # ``_current_exp_code`` must exist before the tabs are added —
         # adding a tab to an empty QTabWidget fires ``currentChanged``,
         # and our handler reads ``self._current_exp_code``. Set it

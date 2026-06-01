@@ -163,6 +163,64 @@ class BiasConnector(QtWidgets.QWidget):
         # with the scope / stim detect indicators).
         QtCore.QTimer.singleShot(0, self.refresh_ports)
 
+    # ============================================================ host
+    def set_host(self, host: Optional[object]) -> None:
+        """Attach a ConnectionPanel-shaped host AFTER construction.
+
+        Mirrors the ``host=`` kwarg accepted by ``__init__`` — useful
+        for the per-experiment-tab case where the tab is constructed
+        before it knows about ConnectionPanel.  Idempotent + safe to
+        call with ``None`` to detach.
+
+        If the connector is currently in standalone mode with a live
+        driver, the caller is responsible for closing that driver
+        BEFORE swapping hosts — this method does not migrate live
+        connections.
+        """
+        # No-op when re-setting the same host — both the disconnect
+        # and re-connect would be wasted work, and the connect path
+        # with UniqueConnection RAISES TypeError on a duplicate
+        # connection (PyQt6 behaviour, not silently-suppress) which
+        # would land in our except clause and incorrectly null out
+        # _host.  Easier to short-circuit here.
+        if self._host is host:
+            return
+        # If we already had a (different) host, drop its signal
+        # bindings so the connector doesn't keep mirroring state from
+        # the old one.
+        if self._host is not None:
+            try:
+                self._host.biasConnected.disconnect(self._on_host_connected)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self._host.biasDisconnected.disconnect(
+                    self._on_host_disconnected)
+            except (TypeError, RuntimeError):
+                pass
+        self._host = host
+        if host is not None:
+            try:
+                host.biasConnected.connect(
+                    self._on_host_connected,
+                    QtCore.Qt.ConnectionType.UniqueConnection)
+                host.biasDisconnected.connect(
+                    self._on_host_disconnected,
+                    QtCore.Qt.ConnectionType.UniqueConnection)
+            except Exception:
+                # Host doesn't expose the expected signals.  Drop the
+                # ref so subsequent calls don't try to use it.
+                self._host = None
+                return
+            # If the host already has an open driver (e.g. user
+            # connected via another tab before this one was shown),
+            # mirror that state immediately rather than waiting for
+            # the next connect/disconnect signal.
+            existing = getattr(host, "bias", None)
+            if existing is not None:
+                self.bias = existing
+                self._apply_connected_ui(getattr(existing, "info", None))
+
     # ============================================================ public API
     def refresh_ports(self) -> None:
         """Re-enumerate serial ports and rebuild the combobox.

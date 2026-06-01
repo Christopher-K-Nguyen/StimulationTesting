@@ -746,6 +746,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # run without camera intent is a pure no-op.  See
         # :meth:`_build_camera_capture_group`.
         left.addWidget(self._build_camera_capture_group())
+        # Interpulse-bias feedback (closed-loop) — sits below the
+        # camera group on the Test Parameters page.  Shares the bias
+        # driver across every tab via the ConnectionPanel host (set
+        # by MainWindow via :meth:`set_bias_host`).  Master Enable
+        # checkbox defaults OFF so the loop is a no-op until the
+        # operator opts in.  See :meth:`_build_bias_feedback_group`.
+        left.addWidget(self._build_bias_feedback_group())
         left.addStretch(1)
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_inner)
@@ -1050,6 +1057,49 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                     float(p["snapshot_interval_s"]))
             if "record_video" in p:
                 self.cam_record_chk.setChecked(bool(p["record_video"]))
+        except Exception:
+            pass
+
+    # ---- Interpulse-bias feedback (per-tab) ----------------------------
+    def _build_bias_feedback_group(self) -> QtWidgets.QGroupBox:
+        """Build the per-tab BiasFeedbackPanel and stash a reference.
+
+        The widget is a QGroupBox-shaped composite (connector + config
+        spinboxes + status badge) defined in
+        :mod:`stimtest.gui.bias_feedback_panel`.  Until MainWindow
+        calls :meth:`set_bias_host`, the connector's Connect button
+        is disabled (no host to delegate to) — operator sees the
+        widget at startup but can't open a parallel driver instance.
+
+        Master Enable checkbox defaults OFF, so a run without bias
+        intent is a pure no-op: :meth:`BiasFeedbackPanel.feedback_config`
+        returns ``None`` and the runner skips the closed loop
+        entirely.
+
+        Per-tab prefs round-trip via ``current_prefs`` /
+        ``restore_prefs`` under the ``bias_feedback`` key.
+        """
+        from .bias_feedback_panel import BiasFeedbackPanel
+        grp = BiasFeedbackPanel(self)
+        # Store on self for prefs round-trip + so the runner-bind
+        # layer (#43) can call .feedback_config() at run start.
+        self._bias_feedback_panel = grp
+        return grp
+
+    def set_bias_host(self, host: Optional[object]) -> None:
+        """Plumb the shared ConnectionPanel host into this tab's
+        BiasFeedbackPanel connector.
+
+        Called by MainWindow once per tab right after construction
+        (parallel to :meth:`set_hardware`).  Idempotent + safe with
+        ``None`` to detach.  No-op when the tab's panel wasn't built
+        yet (e.g. a test stub).
+        """
+        panel = getattr(self, "_bias_feedback_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.set_bias_host(host)
         except Exception:
             pass
 
@@ -1525,6 +1575,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             out["camera_capture"] = self._camera_capture_prefs()
         except Exception:
             pass
+        # Per-tab bias-feedback state — setpoint / tolerance / gain /
+        # V_mon sanity / gating window + Enable checkbox.  Same
+        # safety as camera_capture above: own key, missing-tolerant.
+        panel = getattr(self, "_bias_feedback_panel", None)
+        if panel is not None:
+            try:
+                out["bias_feedback"] = panel.prefs_dict()
+            except Exception:
+                pass
         return out
 
     def restore_prefs(self, p: dict):
@@ -1581,6 +1640,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         if "camera_capture" in p:
             try:
                 self._restore_camera_capture_prefs(p["camera_capture"])
+            except Exception:
+                pass
+        # Per-tab bias-feedback prefs — partial-restore via the panel's
+        # own tolerance for missing / malformed keys.  Safe even when
+        # the panel wasn't built (test stubs / pre-bias-feature prefs).
+        panel = getattr(self, "_bias_feedback_panel", None)
+        if "bias_feedback" in p and panel is not None:
+            try:
+                panel.restore_prefs(p["bias_feedback"])
             except Exception:
                 pass
         # Nudge preview to reflect the loaded values

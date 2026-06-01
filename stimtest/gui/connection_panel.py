@@ -487,42 +487,44 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         cal_row.addWidget(self.cal_label, stretch=1)
         v.addLayout(cal_row)
 
-        # ----- Bias module (STM32 interpulse-bias) ------------------
-        # Sits between scope and camera per the user's placement
-        # decision — bias is a bench-instrument, used during runs,
-        # synced to PlexStim's TTL via a GPIO on the Nucleo.  Owned
-        # directly by this panel (no service singleton — unlike the
-        # camera, the bias module has a single consumer at a time:
-        # the active experiment runner).  See
-        # ``stm32_bias_protocol.md`` for the wire protocol.
-        from .bias_panel import BiasConnector
-        self.bias_connector = BiasConnector(parent=self)
-        # Mirror log lines into the connection-panel's log signal so
-        # they land in the MainWindow LogPane alongside scope / stim
-        # / camera traffic.
-        self.bias_connector.log.connect(self.log.emit)
-        # ConnectionPanel publishes ``self.bias`` as a convenience
-        # attribute mirror of ``self.bias_connector.bias`` — main_window
-        # and experiment tabs read it without touching the connector
-        # directly.  Updated by the connector's connected/disconnected
-        # signals.
+        # ----- Bias module (STM32 interpulse-bias) — moved per-tab --
+        # The bias-module CONNECTOR + closed-loop FEEDBACK CONFIG live
+        # in each experiment tab's "Test parameters" page now (see
+        # :class:`BiasFeedbackPanel`).  Per-tab placement lets every
+        # experiment carry its own setpoint / tolerance / gating
+        # window in prefs, and avoids cluttering this Hardware panel
+        # with controls that only the active runner uses.
+        #
+        # ConnectionPanel still OWNS the driver — every per-tab
+        # BiasConnector runs in host-delegated mode against the
+        # facade methods + signals defined further down
+        # (:meth:`open_bias_module`, :meth:`close_bias_module`,
+        # ``biasConnected`` / ``biasDisconnected`` signals).  This
+        # means: (a) the driver is opened ONCE regardless of which
+        # tab the operator clicks Connect from, (b) tabs see each
+        # other's Connect / Disconnect in lockstep via signal
+        # mirroring, (c) the lifecycle still belongs to a panel that
+        # outlives any single run.
+        #
+        # ``self.bias`` mirror attribute kept here for the same
+        # reason — main_window + experiment runners read it without
+        # touching whichever connector raised the open call.
         self.bias = None
-        self.bias_connector.connected.connect(self._on_bias_connected)
-        self.bias_connector.disconnected.connect(self._on_bias_disconnected)
-        bias_group = QtWidgets.QGroupBox("Interpulse Bias Module (STM32)")
-        bias_group.setToolTip(
-            "Optional external bias module on a NUCLEO-64 STM32G474RE.  "
-            "Applies a DC bias to the electrode during the interpulse "
-            "interval (when PlexStim's EXT-trigger TTL is LOW).  "
-            "Pulse-train timing is taken from a hardware GPIO link to "
-            "PlexStim's trigger output; this panel handles configuration "
-            "+ buffered measurement readback over the Nucleo's USB CDC "
-            "serial port.")
-        _bg = QtWidgets.QVBoxLayout(bias_group)
-        _bg.setContentsMargins(8, 4, 8, 4)
-        _bg.setSpacing(6)
-        _bg.addWidget(self.bias_connector)
-        v.addWidget(bias_group)
+        # Tiny info notice so the operator looking for the bias UI
+        # in the Hardware panel finds the new home.  No widgets — just
+        # a hint label.  Removed entirely if it proves redundant after
+        # one bench session.
+        bias_notice = QtWidgets.QLabel(
+            "Interpulse-bias module configured per-experiment "
+            "(see Test parameters tab).")
+        bias_notice.setStyleSheet("color: #777; font-style: italic;")
+        bias_notice.setToolTip(
+            "The STM32 bias module's Connect button + closed-loop "
+            "feedback parameters moved to each experiment tab's "
+            "Test parameters page.  ConnectionPanel still owns the "
+            "shared driver — every tab's connector talks to the "
+            "same instance.")
+        v.addWidget(bias_notice)
 
         # ----- Camera (bench monitor) -------------------------------
         # The camera is part of the bench-instrument cluster (alongside
@@ -1016,24 +1018,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.bias = None
         self.log.emit("[bias] disconnected")
         self.biasDisconnected.emit()
-
-    # ---- legacy in-panel BiasConnector forwarding --------------------
-    # The original ConnectionPanel embedded a BiasConnector that owned
-    # its own driver.  That widget is being moved to per-experiment
-    # Test Parameters; until that move lands these slots keep the
-    # legacy direct-owned connector and the new facade in sync, so the
-    # interim state is functional.  Remove once the per-tab move is in.
-    def _on_bias_connected(self, info) -> None:
-        """Mirror the legacy in-panel BiasConnector's driver into
-        ``self.bias`` so existing readers keep working."""
-        if self.bias is None:
-            self.bias = self.bias_connector.bias
-            self.biasConnected.emit(info)
-
-    def _on_bias_disconnected(self) -> None:
-        if self.bias is not None and self.bias_connector.bias is None:
-            self.bias = None
-            self.biasDisconnected.emit()
 
     def _refresh_stim_detection_indicator(self):
         """Drive the stimulator detect dot from a Windows-PnP probe.
