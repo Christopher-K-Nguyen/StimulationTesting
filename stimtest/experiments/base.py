@@ -290,6 +290,28 @@ class ExperimentRunner(ABC):
         # Load readback calibration for this stimulator serial, if available.
         serial = getattr(getattr(stimulator, "info", None), "serial_number", "") or ""
         self.cal: Optional[ReadbackCalibration] = load_calibration(stim_serial=serial)
+        # ---- closed-loop bias-feedback wiring ---------------------------
+        #
+        # Optional :class:`BiasFeedbackController` instance — None when the
+        # operator hasn't enabled feedback for this run (the GUI's
+        # :class:`BiasFeedbackPanel.feedback_config()` returns None when its
+        # master checkbox is off, and the worker constructs the controller
+        # only when a config comes back).  Runners call
+        # :meth:`bias_step_if_armed` at safe points in their loop (between
+        # captures, between amplitudes); the helper short-circuits when
+        # ``bias_controller is None`` so the no-op path costs ~0.
+        #
+        # Set by the GUI worker AFTER runner construction and BEFORE
+        # ``run()``; mirrors how ``trigger_source`` is pushed.  Tests can
+        # also set it directly.
+        from .bias_feedback import BiasFeedbackController as _BFC
+        self.bias_controller: Optional[_BFC] = None
+        # When True, every ``bias_step_if_armed`` call counts as a step
+        # for the per-iteration cadence; when False the runner has to call
+        # the helper manually.  Most runners flip this on at ``arm`` time
+        # and off at ``disarm`` time.  Kept as a per-runner attribute so
+        # the GUI can interrogate state from a separate thread.
+        self.bias_armed: bool = False
         # Snapshot the hardware identity into session.extras so the Gamry-DTA
         # exporter can write it out without holding a live reference to the
         # drivers. We do this here (in __init__) so subclasses don't have to
@@ -407,6 +429,135 @@ class ExperimentRunner(ABC):
             self._continue_event.set()
         except Exception:
             pass
+
+    # ----- closed-loop bias feedback ----------------------------------
+    def arm_bias_feedback(self) -> bool:
+        """Activate the optional :class:`BiasFeedbackController`.
+
+        Called by the runner right before its first capture iteration
+        (typically after ``apply_default_scope_view`` so the scope's
+        gating window writes don't get clobbered).  No-op when no
+        controller is attached.  Returns True when the controller
+        actually armed, False otherwise — runners can use this to
+        skip status emission entirely for an unarmed loop.
+
+        On any failure the controller is treated as unarmed; the
+        operator sees a log message but the experiment continues.
+        Feedback is a *best-effort overlay*: a broken bias module
+        must not break the underlying data collection.
+        """
+        if self.bias_controller is None:
+            self.bias_armed = False
+            return False
+        try:
+            self.bias_controller.arm()
+        except Exception as exc:
+            self._emit(ExperimentEvent(
+                kind="log",
+                session=self.session,
+                message=(
+                    f"[bias] arm() raised "
+                    f"{type(exc).__name__}: {exc}; "
+                    f"closed-loop feedback disabled for this run."),
+            ))
+            self.bias_controller = None
+            self.bias_armed = False
+            return False
+        self.bias_armed = True
+        self._emit(ExperimentEvent(
+            kind="log",
+            session=self.session,
+            message=(
+                f"[bias] armed: setpoint="
+                f"{self.bias_controller.config.setpoint_v:.3f} V, "
+                f"tolerance=±"
+                f"{self.bias_controller.config.tolerance_v * 1e3:.1f} mV, "
+                f"k_i={self.bias_controller.config.k_i:.3f}, "
+                f"gating="
+                f"{self.bias_controller.config.gating_window_us[0]:.0f}-"
+                f"{self.bias_controller.config.gating_window_us[1]:.0f} µs."),
+        ))
+        return True
+
+    def disarm_bias_feedback(self) -> None:
+        """Disarm the controller + restore scope MEASUrement defaults.
+
+        Idempotent + safe to call from a ``finally`` block — wraps the
+        controller's ``disarm()`` in a try/except so a scope SCPI
+        failure during teardown doesn't mask the run's actual error.
+        Does NOT change the bias-module's master enable; the runner
+        decides whether to leave the DAC armed for the next run.
+        """
+        self.bias_armed = False
+        ctrl = self.bias_controller
+        if ctrl is None:
+            return
+        try:
+            ctrl.disarm()
+        except Exception as exc:
+            # Log + swallow.  Letting a teardown failure escape would
+            # mask the run's actual error in the GUI dialog.
+            try:
+                self._emit(ExperimentEvent(
+                    kind="log",
+                    session=self.session,
+                    message=(
+                        f"[bias] disarm() raised "
+                        f"{type(exc).__name__}: {exc}; ignored."),
+                ))
+            except Exception:
+                pass
+
+    def bias_step_if_armed(self) -> None:
+        """Run one feedback iteration when the controller is armed.
+
+        Called at safe per-iteration points in each runner's loop
+        (typically right after a capture lands or between amplitude
+        steps).  No-op when ``bias_armed`` is False — runners can
+        call this unconditionally without checking; the helper does
+        the cheap early-out.
+
+        Status surfaces as a ``log`` event with the
+        ``[bias-step]`` prefix; the GUI parses these to update the
+        BiasFeedbackPanel status badge.  Future-proofing: when the
+        progress-channel needs become richer we'll add a dedicated
+        ``bias_status`` event kind, but log lines keep the wire
+        format flexible while #43's first-runner-wiring lands.
+        """
+        if not self.bias_armed or self.bias_controller is None:
+            return
+        try:
+            step = self.bias_controller.step()
+        except Exception as exc:
+            # A failed step doesn't disarm the loop — transient scope
+            # / SDK failures are exactly what the controller's own
+            # try/except envelopes handle.  If the failure is at this
+            # OUTER level, surface and continue.
+            self._emit(ExperimentEvent(
+                kind="log",
+                session=self.session,
+                message=(
+                    f"[bias-step] outer-level "
+                    f"{type(exc).__name__}: {exc}"),
+            ))
+            return
+        # Emit a tagged log line so the GUI can route it (a dedicated
+        # event kind comes later; for now a structured prefix is
+        # cheap and lets bench operators grep the session log).
+        msg = (f"[bias-step] measured={step.measured_v:+.4f} V, "
+               f"error={step.error_v * 1e3:+.2f} mV, "
+               f"bias={step.bias_v_after:+.4f} V")
+        if step.saturated:
+            msg += " ⚠ SATURATED"
+        if not step.vmon_sane:
+            msg += " ⚠ V_mon insane"
+        if step.note:
+            msg += f"  ({step.note})"
+        self._emit(ExperimentEvent(
+            kind="log",
+            session=self.session,
+            message=msg,
+        ))
 
     def wait_for_continue(self, next_config_label: str = "") -> bool:
         """Block until :meth:`request_continue` (or :meth:`abort`) fires.
