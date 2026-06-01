@@ -630,6 +630,16 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # single decision point (hardware AND combinations).
         self.combo_panel.combinationsChanged.connect(
             lambda _configs: self._refresh_start_enabled())
+        # Bias-feedback visibility tracks the configuration mix: the
+        # STM32 bias module only makes sense for MONOPOLAR configs
+        # (in BP / TP / CG the return current goes through another
+        # array electrode, not the STM32-driven counter electrode).
+        # Hide the whole bias panel when no MP configs are queued so
+        # operators on bipolar-only sessions aren't tempted to flip
+        # the closed-loop checkbox.  See
+        # :meth:`_refresh_bias_visibility`.  Task #47.
+        self.combo_panel.combinationsChanged.connect(
+            lambda _configs: self._refresh_bias_visibility())
         self.combo_panel.set_array(array)
 
         self.start_btn = QtWidgets.QPushButton("Start")
@@ -753,6 +763,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # checkbox defaults OFF so the loop is a no-op until the
         # operator opts in.  See :meth:`_build_bias_feedback_group`.
         left.addWidget(self._build_bias_feedback_group())
+        # Initial visibility based on the currently-selected configs
+        # (combinationsChanged has likely already fired during
+        # combo_panel.set_array(...) in __init__; this catches any
+        # construction-order edge cases where the panel didn't exist
+        # yet when the signal fired).  Hidden when no MP configs are
+        # queued — the bias module only works with monopolar.
+        self._refresh_bias_visibility()
         left.addStretch(1)
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_inner)
@@ -1479,6 +1496,43 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             self.start_btn.setToolTip(tip)
         else:
             self.start_btn.setToolTip("")
+
+    def _refresh_bias_visibility(self) -> None:
+        """Show / hide the BiasFeedbackPanel based on the queued
+        configuration mix.
+
+        The STM32 bias module drives a dedicated counter electrode,
+        which only makes sense in MONOPOLAR (``id == "MP"``) configs
+        — every other config kind (BP / TP / CG / PBP / PTP) uses one
+        or more array electrodes as the return path, so the bias
+        module has nothing to do and the closed-loop checkbox would
+        be misleading.
+
+        Decision matrix:
+
+        * **At least one MP config queued** → panel VISIBLE.  The
+          operator may want to pre-configure setpoint / tolerance
+          even before the runner reaches the MP iteration.
+        * **No MP configs (BP / TP / CG only)** → panel HIDDEN.  No
+          operator confusion about "why isn't the bias working."
+        * **No configs at all** → panel HIDDEN.  Symmetric with the
+          Start-button disabled state.
+
+        Wired to ``combo_panel.combinationsChanged`` in ``__init__``
+        and called once after construction so the initial state is
+        correct.  Same construction-order guard as
+        :meth:`_refresh_start_enabled` (signal fires during initial
+        ``set_array(...)`` before the panel exists).
+        """
+        panel = getattr(self, "_bias_feedback_panel", None)
+        if panel is None:
+            return
+        try:
+            configs = self.combo_panel.selected_configurations()
+        except Exception:
+            configs = []
+        has_monopolar = any(getattr(c, "id", "") == "MP" for c in configs)
+        panel.setVisible(has_monopolar)
 
     # ----- internal ----
     def _on_selection_changed(self, active: int, returns: list):
