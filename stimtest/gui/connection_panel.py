@@ -282,6 +282,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Closing the device clears it again.
         self.stim_label = _make_label("")
         self.stim_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        # Dynamic content (S/N + firmware + channel count + scaling
+        # preset) can run long; reflow when the splitter narrows the
+        # Hardware panel rather than truncating mid-string.
+        self.stim_label.setWordWrap(True)
         self.scaling_combo = QtWidgets.QComboBox()
         for preset in (self.SCALE_AUTO, self.SCALE_DEFAULT, self.SCALE_NIL):
             self.scaling_combo.addItem(preset)
@@ -305,6 +309,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.scaling_label = _make_label("")
         self.scaling_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.scaling_label.setStyleSheet("color: #555; font-size: 9pt;")
+        # Scaling text ("V_mon = 0.250 V/V, I_mon = 2.5 mV/µA, source:
+        # auto-detected from serial") can be a full sentence on a
+        # NIL device — reflow on narrow panel widths.
+        self.scaling_label.setWordWrap(True)
         self.init_btn = QtWidgets.QPushButton("Initialize")
         self.close_btn = QtWidgets.QPushButton("Close")
         self.close_btn.setEnabled(False)
@@ -347,6 +355,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # Description label — empty until Connect succeeds and fills
         # it with make + model + VISA resource. Cleared on Disconnect.
         self.scope_label = _make_label("")
+        # Description text combines vendor + model + VISA resource
+        # string (e.g. "TEKTRONIX TBS2204B (USB0::0x0699::0x03C0::...)").
+        # Easily 60-80 chars — reflow when the panel narrows.
+        self.scope_label.setWordWrap(True)
         # VISA resource picker — editable combo populated with whichever
         # scope-shaped resources the detection probe finds.  Kept editable
         # so users can paste a non-USB resource (e.g. TCPIP) that isn't
@@ -409,6 +421,10 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             "Initialize the stimulator and connect the oscilloscope first.")
         self.calibrate_btn.clicked.connect(self.calibrationRequested.emit)
         self.cal_label = _make_label("")
+        # Calibration status text (date / fit RMSE summary / "not yet
+        # calibrated") is dynamic and can run long when multiple
+        # channels are reported.
+        self.cal_label.setWordWrap(True)
         self._refresh_cal_label()
 
         # ----- layout -----
@@ -517,6 +533,12 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         bias_notice = QtWidgets.QLabel(
             "Interpulse-bias module configured per-experiment "
             "(see Test parameters tab).")
+        # Reflow on width changes — the Hardware panel sits in a
+        # splitter the operator may drag to give more space to the
+        # log pane / camera preview.  Without word-wrap the italic
+        # one-liner would either stretch the panel sideways or
+        # truncate at the edge.
+        bias_notice.setWordWrap(True)
         bias_notice.setStyleSheet("color: #777; font-style: italic;")
         bias_notice.setToolTip(
             "The STM32 bias module's Connect button + closed-loop "

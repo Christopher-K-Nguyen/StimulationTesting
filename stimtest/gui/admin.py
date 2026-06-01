@@ -438,10 +438,12 @@ class _LoginDialog(QtWidgets.QDialog):
         v = QtWidgets.QVBoxLayout(self)
 
         if show_username:
-            v.addWidget(QtWidgets.QLabel(
+            _intro = QtWidgets.QLabel(
                 "Log in to unlock restricted features.\n"
                 "Leave Username blank (or type 'admin') to log in "
-                "as Admin."))
+                "as Admin.")
+            _intro.setWordWrap(True)
+            v.addWidget(_intro)
         else:
             v.addWidget(QtWidgets.QLabel("Enter the admin password:"))
 
@@ -615,12 +617,14 @@ class _FirstLaunchSetupDialog(QtWidgets.QDialog):
         self._chose_skip = False
 
         v = QtWidgets.QVBoxLayout(self)
-        v.addWidget(QtWidgets.QLabel(
+        _welcome = QtWidgets.QLabel(
             "<b>Welcome to PULSAR.</b><br>"
             "Choose an admin password to protect the custom catalog "
             "and (when installed) extension-profile management.  You "
             "can change it later from <i>Admin → Manage Custom "
-            "Catalog → Change password…</i>"))
+            "Catalog → Change password…</i>")
+        _welcome.setWordWrap(True)
+        v.addWidget(_welcome)
 
         form = QtWidgets.QFormLayout()
         self._pw1 = QtWidgets.QLineEdit()

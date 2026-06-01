@@ -340,6 +340,7 @@ class ContributeDialog(QtWidgets.QDialog):
             "<b>Payload preview</b> — exactly the JSON that would "
             "be uploaded:")
         self.preview_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.preview_label.setWordWrap(True)
 
         # Wire every input to refresh the preview.
         for w in (self.cb_name, self.cb_email,

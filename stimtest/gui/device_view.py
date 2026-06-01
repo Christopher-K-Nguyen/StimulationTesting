@@ -244,6 +244,7 @@ class DeviceView(QtWidgets.QGroupBox):
             "Per-channel overrides (shown when surface area or coating is "
             "<i>different per electrode</i>):")
         _perchan_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        _perchan_lbl.setWordWrap(True)
         v.addWidget(_perchan_lbl)
         v.addWidget(self.perchan, stretch=0)
 

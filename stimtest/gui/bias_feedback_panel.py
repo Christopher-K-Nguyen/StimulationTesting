@@ -107,6 +107,11 @@ class BiasFeedbackPanel(QtWidgets.QGroupBox):
         self.enable_check.toggled.connect(self.feedbackChanged.emit)
 
         self.status_badge = QtWidgets.QLabel("● DISARMED")
+        # ARMED text expands to e.g. "● ARMED  bias=+0.300 V
+        # err=+5.20 mV" (~35 chars).  The Test Parameters page sits
+        # in a splitter so the panel can be narrowed — reflow rather
+        # than truncate the per-step diagnostic text.
+        self.status_badge.setWordWrap(True)
         self.status_badge.setToolTip(
             "Closed-loop status.  DISARMED = checkbox off / runner "
             "hasn't started.  ARMED = runner is calling step() and "

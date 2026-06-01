@@ -106,6 +106,11 @@ class BiasConnector(QtWidgets.QWidget):
             "green = at least one candidate port present (ST-LINK USB CDC "
             "device preferred).")
         self.status_label = QtWidgets.QLabel("Bias module detection pending…")
+        # Detection messages can get long (e.g. "3 serial port(s)
+        # available (ST-LINK first if present).") and the connector
+        # sits in a splittable panel that the operator may narrow.
+        # Reflow rather than truncate.
+        self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #555;")
         self.connected_dot = self._make_dot(_DOT_OFF)
         self.connected_dot.setToolTip(

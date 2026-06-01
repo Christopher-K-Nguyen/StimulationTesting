@@ -804,12 +804,16 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # between the grid and the combo panel so either can grow.
         right_inner = QtWidgets.QWidget()
         right = QtWidgets.QVBoxLayout(right_inner)
-        right.addWidget(QtWidgets.QLabel(
+        _ch_legend = QtWidgets.QLabel(
             "<b>Channel selection</b> &nbsp;—&nbsp; "
             "click = toggle active &nbsp;·&nbsp; "
             "Ctrl + click = remove &nbsp;·&nbsp; "
             "External Return square = external counter"
-        ))
+        )
+        # Reflow on narrow column widths — the splitter to the left
+        # can be dragged to shrink the right column.
+        _ch_legend.setWordWrap(True)
+        right.addWidget(_ch_legend)
         v_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         v_split.addWidget(self.channel_grid)
         v_split.addWidget(self.combo_panel)
