@@ -607,7 +607,12 @@ class _FirstLaunchSetupDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PULSAR — set up admin password")
-        self.setMinimumWidth(440)
+        # Width matches the regular login dialog (360 px).  The
+        # welcome label sets wordWrap=True so the paragraph reflows
+        # to fit; the password fields + button row need ~320 px
+        # comfortably, so 360 px gives a balanced shape without
+        # the operator-reported "too wide" feel.
+        self.setMinimumWidth(360)
         # We control the close path ourselves so ESC routes through
         # the same skip-with-confirm flow as the button.  Disable
         # the system close button cooperation.
