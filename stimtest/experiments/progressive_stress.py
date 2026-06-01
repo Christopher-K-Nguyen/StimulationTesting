@@ -111,6 +111,14 @@ class ProgressiveStressExperiment(ExperimentRunner):
         self.apply_default_scope_view(
             base, amp_ua=amp,
             reason=f"start of channel {config.active}")
+        # Arm closed-loop bias feedback if the GUI pushed a controller
+        # onto this runner.  Must happen AFTER apply_default_scope_view
+        # so the controller's MEASUrement-gating SCPI writes aren't
+        # clobbered.  Arms ONCE before the ramp loop — the gating
+        # window stays in effect across amplitude steps (it's a scope
+        # state, not an amplitude-dependent value).  No-op when no
+        # controller is attached.
+        self.arm_bias_feedback()
         idx = 0
         compliance_hit = False
         # ``next_pattern`` is the ramp-step's pattern *pre-built* during
@@ -276,6 +284,13 @@ class ProgressiveStressExperiment(ExperimentRunner):
                         step_caps.append(cap)
                         self._emit(ExperimentEvent(kind="capture", session=self.session,
                                                    run=run, capture=cap))
+                        # Closed-loop bias step at the same cadence as
+                        # the capture loop.  Same placement as SP:
+                        # AFTER the capture event so the GUI's status
+                        # badge update lands alongside the just-emitted
+                        # metrics row.  Cheap no-op when the controller
+                        # isn't armed.
+                        self.bias_step_if_armed()
                         idx += 1
                         _step_cap_idx += 1
                         next_grab += interval
@@ -320,6 +335,13 @@ class ProgressiveStressExperiment(ExperimentRunner):
 
                 amp += self.policy.step_ua
         finally:
+            # Disarm bias feedback FIRST so the controller's scope-
+            # gating teardown happens before the stim quiets — keeps
+            # the order consistent with how we armed it (arm AFTER
+            # scope view, disarm BEFORE stim stop).  Finally-safe +
+            # idempotent + swallows controller failures so a teardown
+            # SCPI error doesn't mask the run's actual error.
+            self.disarm_bias_feedback()
             # Outer safety net — fires on normal end-of-ramp, on a
             # compliance-triggered break, and on any exception escaping
             # the ramp loop.  ``stop_all`` matches MATLAB
