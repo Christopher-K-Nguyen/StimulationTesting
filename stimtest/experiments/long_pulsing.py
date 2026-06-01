@@ -111,6 +111,14 @@ class LongPulsingExperiment(ExperimentRunner):
         self.apply_default_scope_view(
             pattern, amp_ua=self.amplitude_ua,
             reason=f"start of channel {config.active}")
+        # Arm closed-loop bias feedback if the GUI pushed a controller
+        # onto this runner.  Must happen AFTER apply_default_scope_view
+        # so the controller's MEASUrement-gating SCPI writes aren't
+        # clobbered.  We disarm + re-arm around each ``_characterize``
+        # sub-VT below — the sub-runner's own apply_default_scope_view
+        # would otherwise tear down the gating window.  No-op when no
+        # controller is attached.
+        self.arm_bias_feedback()
 
         try:
             self.stim.set_monitor_channel(config.active)
@@ -151,6 +159,14 @@ class LongPulsingExperiment(ExperimentRunner):
                         kind="log", session=self.session, run=run,
                         message=f"Re-characterizing at t = {now - t_start:.0f}s",
                     ))
+                    # Disarm bias feedback BEFORE the sub-VT runs —
+                    # the sub-runner's own apply_default_scope_view +
+                    # per-amplitude scope writes would otherwise clobber
+                    # the gating-window state the controller depends on.
+                    # We re-arm below AFTER the post-recharacterization
+                    # restore.  Disarm is idempotent + no-op when no
+                    # controller is attached.
+                    self.disarm_bias_feedback()
                     _char_aborted = self._characterize(
                         run, base_pattern=base, t_offset_s=now - t_start)
                     # If the user aborted DURING the inline VT sub-run,
@@ -199,6 +215,11 @@ class LongPulsingExperiment(ExperimentRunner):
                             reason="post-recharacterization restore")
                     except Exception:
                         pass
+                    # Re-arm closed-loop feedback AFTER the scope-view
+                    # restore so the controller's gating SCPI writes
+                    # take precedence over the post-restore state.
+                    # Mirror image of the disarm before _characterize.
+                    self.arm_bias_feedback()
 
                 # Lightweight snapshot capture
                 if now >= next_snapshot_at:
@@ -258,10 +279,26 @@ class LongPulsingExperiment(ExperimentRunner):
                     run.captures.append(cap)
                     self._emit(ExperimentEvent(kind="capture", session=self.session,
                                                run=run, capture=cap))
+                    # Closed-loop bias step at snapshot cadence.  Same
+                    # placement as SP / PS: AFTER the capture event so
+                    # the GUI's status badge update lands alongside the
+                    # just-emitted metrics row.  Cheap no-op when the
+                    # controller isn't armed (or when we're currently
+                    # disarmed across a ``_characterize`` window).
+                    self.bias_step_if_armed()
                     idx += 1
                     next_snapshot_at = now + self.policy.capture_during_pulsing_every_s
                 time.sleep(0.005)
         finally:
+            # Disarm bias feedback FIRST so the controller's scope-
+            # gating teardown happens before the stim quiets — keeps
+            # the order consistent with how we armed it (arm AFTER
+            # scope view, disarm BEFORE stim stop).  Finally-safe +
+            # idempotent + swallows controller failures so a teardown
+            # SCPI error doesn't mask the run's actual error.  Also
+            # covers the case where the outer ``break`` fired (e.g.
+            # aborted during ``_characterize``) and we never re-armed.
+            self.disarm_bias_feedback()
             # ``stop_all`` (= PS_StopStimAllChannels) — matches MATLAB
             # ``stopStimulation`` and quiets both the active channel
             # AND the unused zero-amplitude channels that were brought
