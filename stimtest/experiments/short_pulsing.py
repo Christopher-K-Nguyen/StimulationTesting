@@ -83,6 +83,14 @@ class ShortPulsingExperiment(ExperimentRunner):
             pattern, amp_ua=self.amplitude_ua,
             reason=f"start of channel {config.active}")
 
+        # Arm closed-loop bias feedback if the GUI pushed a controller
+        # onto this runner.  Must happen AFTER apply_default_scope_view
+        # so the controller's MEASUrement-gating SCPI writes aren't
+        # clobbered by the scope-view defaults.  No-op when no
+        # controller is attached (the common case until the operator
+        # flips the master Enable checkbox on the BiasFeedbackPanel).
+        self.arm_bias_feedback()
+
         try:
             self.stim.set_monitor_channel(config.active)
             self.stim.load_channel(config.active, pattern)
@@ -165,8 +173,24 @@ class ShortPulsingExperiment(ExperimentRunner):
                                                run=run, capture=cap))
                     idx += 1
                     next_capture_at += self.policy.capture_interval_s
+                    # Closed-loop bias step happens at the same cadence
+                    # as the capture loop — measured E_ret from the
+                    # gated MEASUrement window is the input, programmed
+                    # bias DAC voltage is the output.  Cheap no-op when
+                    # the controller isn't armed.  Placed AFTER the
+                    # capture event so the GUI's BiasFeedbackPanel
+                    # status badge can sit alongside the just-emitted
+                    # metrics row.
+                    self.bias_step_if_armed()
                 time.sleep(0.001)
         finally:
+            # Disarm bias feedback FIRST so the controller's scope-
+            # gating teardown happens before the stim quiets — keeps
+            # the order consistent with how we armed it (arm AFTER
+            # scope view, disarm BEFORE stim stop).  Finally-safe +
+            # idempotent + swallows controller failures so a teardown
+            # SCPI error doesn't mask the run's actual error.
+            self.disarm_bias_feedback()
             # ``stop_all`` (= PS_StopStimAllChannels, MATLAB
             # ``stopStimulation``) — quiets both the active channel AND
             # the unused zero-amplitude channels that were brought up

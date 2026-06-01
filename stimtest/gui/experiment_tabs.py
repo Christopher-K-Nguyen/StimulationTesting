@@ -36,6 +36,7 @@ naturally event-driven: the GUI never has to poll.
 """
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,24 @@ from ..persistence import save_session_npz, save_session_npz_incremental
 from ..session import Session, TestParameters
 from ..waveforms import PulsePattern
 from . import rich
+
+
+#: Regex for parsing ``[bias-step]`` log lines emitted by
+#: :meth:`ExperimentRunner.bias_step_if_armed`.  Captures measured /
+#: error / bias voltages + the trailing flags portion (saturation, V_mon
+#: insanity, deadband note).  Module-level so test stubs that delegate
+#: into :meth:`_BaseExperimentTab._on_bias_step_log` via the unbound
+#: method find the same constant the production tab does — referencing
+#: through ``self`` would resolve against the stub's empty class, raise
+#: AttributeError, get swallowed by the slot's defensive try/except,
+#: and silently no-op.  Module-level dodges that asymmetry.
+_BIAS_STEP_LINE_RE = re.compile(
+    r"\[bias-step\]\s*"
+    r"measured=(?P<measured>[-+0-9.eE]+)\s*V,\s*"
+    r"error=(?P<error>[-+0-9.eE]+)\s*mV,\s*"
+    r"bias=(?P<bias>[-+0-9.eE]+)\s*V"
+    r"(?P<flags>.*)$"
+)
 from .channel_selector import ChannelSelector
 from .combination_panel import CombinationPanel
 from .multichannel_scope import MultiChannelScope
@@ -1118,6 +1137,118 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         try:
             panel.set_bias_host(host)
         except Exception:
+            pass
+        # Stash the host so :meth:`_attach_bias_controller_to_runner`
+        # can pull the shared driver out of it at run start without
+        # having to walk the connector's private host pointer.
+        self._bias_host = host
+
+    def _attach_bias_controller_to_runner(self, runner) -> None:
+        """Build a :class:`BiasFeedbackController` from the panel's
+        current settings + the shared bias driver, and push it onto
+        ``runner.bias_controller`` so :meth:`arm_bias_feedback` finds
+        a controller when the runner reaches that point.
+
+        Three early-out cases (any of them → leave the controller
+        unset; runner's arm/disarm helpers short-circuit silently):
+
+        * BiasFeedbackPanel master Enable is OFF (``feedback_config()``
+          returns ``None``).
+        * No bias driver has been opened in the shared host (operator
+          either didn't press Connect or the STM32 isn't on the bus).
+        * The panel / host attribute is missing (tests, partial
+          construction).
+
+        Logs the decision exactly once per start so the operator's
+        intent + the runner's resolution are visible in the session
+        log alongside other run-start setup.
+        """
+        panel = getattr(self, "_bias_feedback_panel", None)
+        host = getattr(self, "_bias_host", None)
+        if panel is None:
+            return
+        try:
+            cfg = panel.feedback_config()
+        except Exception as exc:
+            self.log_pane.log(
+                f"[bias] feedback_config() raised "
+                f"{type(exc).__name__}: {exc} — closed-loop skipped.")
+            return
+        if cfg is None:
+            self.log_pane.log(
+                "[bias] closed-loop feedback disabled "
+                "(BiasFeedbackPanel master Enable is off).")
+            return
+        bias_driver = getattr(host, "bias", None) if host is not None else None
+        if bias_driver is None:
+            self.log_pane.log(
+                "[bias] closed-loop feedback skipped: master Enable "
+                "is on but no bias driver is open (press Connect on "
+                "the BiasFeedbackPanel first).")
+            return
+        try:
+            from ..experiments.bias_feedback import BiasFeedbackController
+            controller = BiasFeedbackController(
+                scope=self._scope, bias_module=bias_driver, config=cfg)
+        except Exception as exc:
+            self.log_pane.log(
+                f"[bias] controller construction raised "
+                f"{type(exc).__name__}: {exc} — closed-loop skipped.")
+            return
+        runner.bias_controller = controller
+        # The panel's status badge subscribes to log lines via
+        # _on_bias_step_log (wired in _start_runner_body alongside
+        # the log_msg → log_pane connection).  No additional wiring
+        # needed here.
+        self.log_pane.log(
+            f"[bias] closed-loop feedback enabled: setpoint="
+            f"{cfg.setpoint_v:.3f} V, tolerance=±"
+            f"{cfg.tolerance_v * 1e3:.1f} mV, k_i={cfg.k_i:.3f}.")
+
+    def _on_bias_step_log(self, message: str) -> None:
+        """Parse a ``[bias-step]`` log line and push the resulting
+        :class:`BiasFeedbackStep` into the panel's status badge.
+
+        Wired to ``RunnerWorker.log_msg`` in :meth:`_start_runner_body`
+        so every log line passes through here; non-matching lines
+        early-out cheaply.  See the docstring + comment on the
+        module-level ``_BIAS_STEP_LINE_RE`` constant for the parsed
+        format.
+
+        Defensive: any parse failure or panel access error is
+        silently swallowed — letting an exception here propagate
+        would corrupt the worker's log stream.
+        """
+        try:
+            panel = getattr(self, "_bias_feedback_panel", None)
+            if panel is None:
+                return
+            if not isinstance(message, str):
+                return
+            m = _BIAS_STEP_LINE_RE.search(message)
+            if m is None:
+                return
+            from ..experiments.bias_feedback import BiasFeedbackStep
+            measured = float(m.group("measured"))
+            error_mv = float(m.group("error"))
+            bias = float(m.group("bias"))
+            flags = m.group("flags") or ""
+            saturated = "SATURATED" in flags
+            vmon_sane = "V_mon insane" not in flags
+            step = BiasFeedbackStep(
+                measured_v=measured,
+                error_v=error_mv * 1e-3,
+                in_deadband=False,
+                bias_v_before=bias,
+                bias_v_after=bias,
+                saturated=saturated,
+                vmon_sane=vmon_sane,
+                skipped=saturated or not vmon_sane,
+                note="",
+            )
+            panel.set_status(step)
+        except Exception:
+            # Never let a parse error kill the log stream.
             pass
 
     def _extra_experiment_tabs(self):
@@ -2286,6 +2417,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         self._worker_thread.started.connect(self._worker.run)
         self._worker.captured.connect(self._on_capture)
         self._worker.log_msg.connect(self.log_pane.log)
+        # Closed-loop bias-feedback status badge — parse log lines
+        # with the ``[bias-step]`` prefix into BiasFeedbackStep-like
+        # state and push to the panel's status badge.  Keeps the
+        # GUI wire format flexible while a dedicated event kind
+        # gets designed (#43 follow-up).  No-op when no panel exists
+        # or the line doesn't match the prefix.
+        self._worker.log_msg.connect(self._on_bias_step_log)
         self._worker.save_failed.connect(self._on_save_failed)
         self._worker.finished.connect(self._on_finished)
         # Between-channels rewire prompt — the runner emits "paused" before
@@ -2298,6 +2436,17 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # captured-event spam.
         self._worker.progress.connect(self._on_runner_progress)
         self._runner = runner
+        # Closed-loop bias-feedback wiring (#43).  Construct the
+        # controller from the BiasFeedbackPanel's current state +
+        # the shared bias driver; push onto the runner BEFORE the
+        # worker starts so arm_bias_feedback() (called in
+        # short_pulsing.run() and friends) sees a controller to arm.
+        # No-op when the panel's master Enable is off OR no bias
+        # driver is open OR the panel isn't built (test stubs).  The
+        # log_pane gets a one-line "[bias] feedback enabled / skipped"
+        # message either way so the operator's intent is visible in
+        # the session log.
+        self._attach_bias_controller_to_runner(runner)
         # Lock all parameter inputs (this tab + Setup tab + hardware)
         # for the duration of the run. Tab-bar selection stays enabled
         # so the user can flip between Parameters / Experiment / Results
