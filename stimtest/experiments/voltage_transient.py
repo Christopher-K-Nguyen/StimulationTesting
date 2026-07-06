@@ -48,8 +48,66 @@ from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
 from ..metrics import compute_metrics
 from ..session import Capture, ChannelRun, Session
-from ..waveforms import PulsePattern
+from ..waveforms import Phase, PulsePattern
 from .base import ExperimentEvent, ExperimentResult, ExperimentRunner
+
+
+# ---------------------------------------------------------------------------
+# Multi-parameter sweep
+# ---------------------------------------------------------------------------
+@dataclass
+class SweepPoint:
+    """One point in a multi-parameter VT sweep.
+
+    A VT session normally ramps amplitude for a single pulse pattern on
+    each electrode configuration. A sweep adds an outer axis: for every
+    configuration, the runner walks a list of ``SweepPoint`` s, each of
+    which transforms the session's *base* pattern before the amplitude
+    ramp begins. Every point produces its own :class:`ChannelRun` so the
+    results stay separable in the saved session and the Results tab.
+
+    * ``rate_hz`` — override the pulse repetition rate (pps). ``None``
+      keeps the base pattern's rate.
+    * ``width_ratio`` — target ``W2:W1`` phase-width ratio for a
+      *biphasic* pattern. The recharge phase's width becomes
+      ``W1 * width_ratio`` and its amplitude is rebalanced so the pulse
+      stays charge-balanced (``A1·W1 = -A2·W2``). ``None`` (or ``1.0``)
+      leaves the pattern symmetric. Ignored for triphasic patterns.
+    * ``label`` — short human tag (e.g. ``"200pps_asym2x"``) recorded on
+      the resulting run.
+    """
+    rate_hz: Optional[float] = None
+    width_ratio: Optional[float] = None
+    label: str = ""
+
+
+def pattern_for_sweep_point(base: PulsePattern,
+                            point: SweepPoint) -> PulsePattern:
+    """Return a copy of ``base`` transformed by a :class:`SweepPoint`.
+
+    Overrides the rate and — for biphasic patterns with a non-trivial
+    ``width_ratio`` — rewrites the recharge phase width and amplitude to
+    keep the pulse charge-balanced. All other phase attributes (delays,
+    shapes, bump counts) are preserved. Because the amplitude ramp later
+    scales *every* phase by the same factor, a pattern that starts
+    balanced here stays balanced at every step of the ramp.
+    """
+    phases = [Phase(p.amplitude_ua, p.width_us, p.delay_after_us,
+                    p.shape, p.bump_count) for p in base.phases]
+    rate = point.rate_hz if point.rate_hz is not None else base.rate_hz
+
+    ratio = point.width_ratio
+    if ratio is not None and ratio > 0 and len(phases) == 2:
+        w1 = phases[0].width_us
+        a1 = phases[0].amplitude_ua
+        new_w2 = w1 * ratio
+        # Charge balance: A1·W1 + A2·W2 = 0  ⇒  A2 = -A1·W1 / W2.
+        new_a2 = (-a1 * w1 / new_w2) if new_w2 != 0 else phases[1].amplitude_ua
+        phases[1] = Phase(new_a2, new_w2, phases[1].delay_after_us,
+                          phases[1].shape, phases[1].bump_count)
+
+    return PulsePattern(phases=phases, rate_hz=rate,
+                        repetitions=base.repetitions)
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +161,18 @@ class VoltageTransientExperiment(ExperimentRunner):
                  predictor: Optional[object] = None,
                  cathodic_limit_v: Optional[float] = None,
                  anodic_limit_v: Optional[float] = None,
-                 polarization_tolerance_v: float = 0.0):
+                 polarization_tolerance_v: float = 0.0,
+                 sweep_points: Optional[List[SweepPoint]] = None):
         super().__init__(session, stimulator, oscilloscope)
         self.ramp = ramp or RampPolicy()
         self.polarization_source = polarization_source
         self.configurations = configurations or [session.test.configuration]
+        # Multi-parameter sweep axis. Each point transforms the session's
+        # base pattern (rate and/or phase-width asymmetry) before its own
+        # amplitude ramp. ``None`` → a single implicit point that leaves
+        # the base pattern untouched, i.e. the original single-parameter
+        # behaviour.
+        self.sweep_points = sweep_points or [SweepPoint(label="")]
         # Optional :class:`stimtest.ml.QinjPredictor`. When the strategy
         # is ``"predictive"``, we ask this model for a one-shot estimate
         # of the maximum injectable amplitude up-front. ``None`` (the
@@ -226,10 +291,32 @@ class VoltageTransientExperiment(ExperimentRunner):
                         self._emit(ExperimentEvent(
                             kind="log", session=self.session,
                             message=f"Stimulator reinit failed: {e}"))
-                run = self._run_one_configuration(config)
-                self.session.add_run(run)
-                all_captures.extend(run.captures)
-                self._emit(ExperimentEvent(kind="run_end", session=self.session, run=run))
+                # Inner axis: walk each sweep point for this config. The
+                # common (non-sweep) case is a single point that leaves
+                # the base pattern untouched.
+                for point in self.sweep_points:
+                    if self.aborted:
+                        break
+                    base = pattern_for_sweep_point(self.session.test.pattern,
+                                                   point)
+                    # A sweep point can produce an out-of-range pattern
+                    # (e.g. a long asymmetric recharge phase that no
+                    # longer fits inside the period at a high rate).
+                    # Skip just that point with a clear log line rather
+                    # than aborting the whole sweep.
+                    try:
+                        base.validate()
+                    except ValueError as e:
+                        self._emit(ExperimentEvent(
+                            kind="log", session=self.session,
+                            message=(f"Skipping sweep point "
+                                     f"{point.label or '(base)'}: {e}")))
+                        continue
+                    run = self._run_one_configuration(config, base, point.label)
+                    self.session.add_run(run)
+                    all_captures.extend(run.captures)
+                    self._emit(ExperimentEvent(
+                        kind="run_end", session=self.session, run=run))
         except Exception as e:
             self._emit(ExperimentEvent(
                 kind="aborted", session=self.session,
@@ -243,14 +330,20 @@ class VoltageTransientExperiment(ExperimentRunner):
                                 aborted=self.aborted)
 
     # ------------------------------------------------------------------
-    def _run_one_configuration(self, config: Configuration) -> ChannelRun:
-        run = ChannelRun(configuration=config, surface_area_um2=self.surface_area_um2)
+    def _run_one_configuration(self, config: Configuration,
+                               base_pattern: Optional[PulsePattern] = None,
+                               label: str = "") -> ChannelRun:
+        run = ChannelRun(configuration=config,
+                         surface_area_um2=self.surface_area_um2,
+                         label=label)
+        suffix = f" [{label}]" if label else ""
         self._emit(ExperimentEvent(
             kind="run_start", session=self.session, run=run,
-            message=f"Sweep {config.display_name()}",
+            message=f"Sweep {config.display_name()}{suffix}",
         ))
 
-        base_pattern = self.session.test.pattern
+        if base_pattern is None:
+            base_pattern = self.session.test.pattern
         amp = self.ramp.starting_ua
         capture_idx = 0
         last_good_amp = amp

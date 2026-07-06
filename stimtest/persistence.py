@@ -73,6 +73,7 @@ def save_session_npz(session: Session, path: Path | str) -> Path:
             "surface_area_um2": run.surface_area_um2,
             "started_at": run.started_at.isoformat(),
             "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "label": run.label,
             "captures": captures_meta,
         })
 
@@ -278,6 +279,7 @@ def load_session_npz(path: Path | str) -> "Session":
             surface_area_um2=run_meta.get("surface_area_um2", 5000.0),
             started_at=_parse_iso(run_meta.get("started_at")) or session.created_at,
             finished_at=_parse_iso(run_meta.get("finished_at")),
+            label=run_meta.get("label", ""),
         )
         for cap_idx, cap_meta in enumerate(run_meta.get("captures", [])):
             tag = f"r{run_idx}_c{cap_idx}"

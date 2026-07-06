@@ -727,6 +727,8 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 out[name] = w.currentText()
             elif isinstance(w, QtWidgets.QCheckBox):
                 out[name] = w.isChecked()
+            elif isinstance(w, QtWidgets.QLineEdit):
+                out[name] = w.text()
         # Pattern panel state — sub-dict so the keys can't collide with
         # the field-walked ones above.
         out["pattern"] = self.pattern_panel.current_prefs()
@@ -746,6 +748,8 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                     w.setCurrentText(str(p[name]))
                 elif isinstance(w, QtWidgets.QCheckBox):
                     w.setChecked(bool(p[name]))
+                elif isinstance(w, QtWidgets.QLineEdit):
+                    w.setText(str(p[name]))
             except (TypeError, ValueError):
                 pass
         if "pattern" in p:
@@ -1107,6 +1111,44 @@ class VoltageTransientTab(_BaseExperimentTab):
         ramp_box = QtWidgets.QGroupBox("Ramp policy")
         QtWidgets.QVBoxLayout(ramp_box).addLayout(ramp_form)
 
+        # ----- multi-parameter sweep -----
+        # Optional outer axis on top of the amplitude ramp: repeat the
+        # whole ramp at several stimulation rates and/or phase-width
+        # asymmetry ratios. Each (rate × ratio) combination becomes its
+        # own labelled ChannelRun so results stay separable on disk and
+        # in the Results tab. Left blank / unchecked → single run, exactly
+        # as before.
+        self.sweep_check = QtWidgets.QCheckBox(
+            "Sweep multiple rates / asymmetries")
+        self.sweep_check.setChecked(False)
+        self.sweep_check.toggled.connect(self._on_sweep_toggled)
+        self.sweep_rates = QtWidgets.QLineEdit()
+        self.sweep_rates.setPlaceholderText(
+            "e.g. 50, 100, 200   (blank = pattern rate)")
+        self.sweep_rates.setToolTip(
+            "Comma- or space-separated pulse rates in pps. The full "
+            "amplitude ramp is repeated at each rate. Blank keeps the "
+            "pulse pattern's own rate.")
+        self.sweep_asym = QtWidgets.QLineEdit()
+        self.sweep_asym.setPlaceholderText(
+            "e.g. 1, 2, 4   (W2:W1 ratio; blank = 1)")
+        self.sweep_asym.setToolTip(
+            "Comma- or space-separated recharge:excitation phase-width "
+            "ratios (W2:W1) for a biphasic pattern. The recharge phase "
+            "amplitude is rebalanced so each pulse stays charge-balanced. "
+            "Ignored for triphasic patterns. Blank / 1 = symmetric.")
+        sweep_form = rich.make_form()
+        sweep_form.addRow("", self.sweep_check)
+        sweep_form.addRow("Rates (pps):", self.sweep_rates)
+        sweep_form.addRow("Asymmetry (W2:W1):", self.sweep_asym)
+        self._sweep_rows = {
+            "rates": (sweep_form.labelForField(self.sweep_rates), self.sweep_rates),
+            "asym": (sweep_form.labelForField(self.sweep_asym), self.sweep_asym),
+        }
+        sweep_box = QtWidgets.QGroupBox("Multi-parameter sweep")
+        QtWidgets.QVBoxLayout(sweep_box).addLayout(sweep_form)
+        self._sweep_box = sweep_box
+
         # Combine into one parameters group. Vertical order:
         #
         #   1. VT-mode form  (pick mode + see/set the charge target)
@@ -1126,11 +1168,13 @@ class VoltageTransientTab(_BaseExperimentTab):
         v.addWidget(self.pattern_preview)
         v.addLayout(strategy_form)
         v.addWidget(ramp_box)
+        v.addWidget(sweep_box)
         self._ramp_box = ramp_box
 
         # Apply initial visibility
         self._on_mode_changed()
         self._on_strategy_changed()
+        self._on_sweep_toggled()
         # Initial Q_ph readout (deferred so the pattern panel has had a
         # chance to render its first patternChanged tick).
         QtCore.QTimer.singleShot(0, self._refresh_fixed_qph)
@@ -1306,9 +1350,78 @@ class VoltageTransientTab(_BaseExperimentTab):
 
     PREF_FIELDS = ("mode_combo", "strategy_combo", "fixed_ramp_check",
                    "qinj_mc",
-                   "start_ua", "coarse_ua", "fine_ua", "max_ua", "safety_factor")
+                   "start_ua", "coarse_ua", "fine_ua", "max_ua", "safety_factor",
+                   "sweep_check", "sweep_rates", "sweep_asym")
 
     def experiment_type(self) -> str: return "VT"
+
+    def _on_sweep_toggled(self, *_):
+        """Show the rate / asymmetry inputs only when sweeping is on."""
+        on = self.sweep_check.isChecked()
+        for _key, (lab, w) in self._sweep_rows.items():
+            w.setVisible(on)
+            if lab is not None:
+                lab.setVisible(on)
+
+    @staticmethod
+    def _parse_float_list(text: str) -> list:
+        """Parse a comma/space-separated list of positive floats.
+
+        Silently drops blanks and non-numeric tokens, and de-duplicates
+        while preserving first-seen order. Returns ``[]`` for empty input.
+        """
+        out: list = []
+        seen: set = set()
+        for tok in text.replace(",", " ").split():
+            try:
+                val = float(tok)
+            except ValueError:
+                continue
+            if val <= 0:
+                continue
+            if val not in seen:
+                seen.add(val)
+                out.append(val)
+        return out
+
+    def _build_sweep_points(self, pattern: PulsePattern):
+        """Turn the sweep line-edits into a list of ``SweepPoint`` s.
+
+        Returns ``None`` when sweeping is off or the inputs reduce to a
+        single untouched point — the runner then behaves exactly as the
+        original single-parameter path. Asymmetry ratios are ignored for
+        triphasic patterns (a phase-width ratio has no single meaning
+        across three phases); a log line explains the skip.
+        """
+        from ..experiments.voltage_transient import SweepPoint
+        if not self.sweep_check.isChecked():
+            return None
+        rates = self._parse_float_list(self.sweep_rates.text())
+        ratios = self._parse_float_list(self.sweep_asym.text())
+        if ratios and pattern.is_triphasic:
+            self.log_pane.log(
+                "Sweep: asymmetry ratios ignored for a triphasic pattern; "
+                "sweeping rate only.")
+            ratios = []
+        rate_axis = rates or [None]
+        ratio_axis = ratios or [None]
+        if rate_axis == [None] and ratio_axis == [None]:
+            return None
+        points = []
+        for r in rate_axis:
+            for a in ratio_axis:
+                parts = []
+                if r is not None:
+                    parts.append(f"{r:g}pps")
+                if a is not None and a != 1:
+                    parts.append(f"asym{a:g}x")
+                label = "_".join(parts) or "base"
+                points.append(SweepPoint(rate_hz=r, width_ratio=a, label=label))
+        self.log_pane.log(
+            f"Multi-parameter sweep: {len(rate_axis)} rate(s) × "
+            f"{len(ratio_axis)} ratio(s) = {len(points)} run(s) per "
+            f"configuration.")
+        return points
 
     def start_clicked(self):
         if self._stim is None or self._scope is None:
@@ -1379,12 +1492,14 @@ class VoltageTransientTab(_BaseExperimentTab):
                     f"Predictive: no trained model usable ({e}); the "
                     f"runner will fall back to adaptive regression.")
                 predictor = None
+        sweep_points = self._build_sweep_points(pattern)
         runner = VoltageTransientExperiment(
             session, self._stim, self._scope,
             configurations=configs, ramp=ramp, predictor=predictor,
             cathodic_limit_v=self._cathodic_limit_v,
             anodic_limit_v=self._anodic_limit_v,
             polarization_tolerance_v=self._polarization_tolerance_v,
+            sweep_points=sweep_points,
         )
         save_name = f"VT_{config.display_name().replace(' ', '_')}.npz"
         self._start_runner(runner, save_name)

@@ -77,10 +77,17 @@ class ChannelRun:
     captures: List[Capture] = field(default_factory=list)
     started_at: datetime = field(default_factory=datetime.now)
     finished_at: Optional[datetime] = None
+    #: Optional sweep-point tag (e.g. "200pps_asym2x"). Empty for a
+    #: plain single-parameter run. Set by the runner when a
+    #: multi-parameter sweep produces several runs for the same
+    #: configuration so they stay distinguishable in the saved session
+    #: and the Results tab.
+    label: str = ""
 
     @property
     def name(self) -> str:
-        return self.configuration.display_name()
+        base = self.configuration.display_name()
+        return f"{base} — {self.label}" if self.label else base
 
     @property
     def max_q_inj(self) -> float:
