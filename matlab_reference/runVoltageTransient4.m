@@ -197,7 +197,7 @@ try
                     isAmplitudeRepeat = false;
                 end
                 
-                amplitude2_new = -amplitude1_sign * currentStim * (phaseWidth1 / phaseWidth2); % charge-balanced second phase amplitude (A1*W1 = A2*W2)
+                amplitude2_new = -amplitude1_sign * currentStim; % new second phase amplitude
 
                 % Set rectangular pulse parameters
                 pattern.A1 = amplitude1_new;   	% first phase amplitude
