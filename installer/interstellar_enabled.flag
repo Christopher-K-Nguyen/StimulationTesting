@@ -1,0 +1,13 @@
+INTERSTELLAR (experimental interpulse-bias module) enabled for this build.
+
+This tiny marker file is bundled next to the frozen PULSAR executable
+ONLY by the opt-in experimental build (`python installer/build.py
+--with-interstellar`, which sets the PULSAR_WITH_INTERSTELLAR env var
+that installer/StimulationTesting.spec checks).  At runtime,
+stimtest.feature_flags.interstellar_enabled() returns True when it finds
+this file, so the experimental installer shows the INTERSTELLAR
+connector + closed-loop bias UI.
+
+The DEFAULT (public) installer never bundles this file, so a normal
+install has no INTERSTELLAR UI at all.  Its contents are irrelevant —
+only its presence matters.
