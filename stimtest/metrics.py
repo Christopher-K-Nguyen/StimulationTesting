@@ -77,8 +77,36 @@ def phase_windows(time_us: np.ndarray, pattern: PulsePattern) -> List[PhaseWindo
 # ---------------------------------------------------------------------------
 # Driving voltage (V_d)
 # ---------------------------------------------------------------------------
+def pulse_region_mask(time_us: np.ndarray, pattern: PulsePattern,
+                      recovery_us: float = 0.0) -> np.ndarray:
+    """Boolean mask selecting the pulse: ``t <= total_pulse_us + recovery``.
+
+    Metrics like V_d are defined *during the pulse* (IEEE NER Fig. 3b),
+    but the scope record routinely runs far past it —
+    ``DEFAULT_RECORD_LENGTH`` is 20 000 points, so the pulse fills only
+    a fraction of the window and the rest is post-pulse tail. That tail
+    can carry a real transient (auto-discharge shorting at the end of
+    the period, the leading edge of the next pulse if the timebase is
+    "wide", or open-input noise) whose magnitude has nothing to do with
+    the driving voltage. Restricting the abs-max scan to the pulse
+    region keeps such a tail transient from masquerading as V_d.
+
+    The pre-pulse baseline (``t < 0``) is kept — it sits near 0 V and is
+    harmless — so only the tail is excluded. Matches the ``t = 0`` pulse
+    start convention already used by :func:`phase_windows`.
+    """
+    t = np.asarray(time_us, dtype=float)
+    upper = float(pattern.total_pulse_us) + float(recovery_us)
+    return t <= upper
+
+
 def driving_voltage_from_vmon(v_mon: np.ndarray) -> float:
-    """V_d = max |V_mon| over the whole pulse (per IEEE NER Fig. 3b)."""
+    """V_d = max |V_mon| (per IEEE NER Fig. 3b).
+
+    The caller is responsible for restricting ``v_mon`` to the pulse
+    region (see :func:`pulse_region_mask`) — this helper just takes the
+    abs-max of whatever it's given.
+    """
     if v_mon.size == 0:
         return float("nan")
     return float(np.max(np.abs(v_mon)))
@@ -562,7 +590,19 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # ----- 2. Driving voltage V_d -----------------------------------------
     # V_mon = E_act - E_ret straight off the stimulator's monitor output.
     # Always available; we use its abs-max as the baseline V_d estimate.
-    v_d_vmon = driving_voltage_from_vmon(capture.v_mon_v)
+    #
+    # Restrict the abs-max scan to the pulse region. The scope record
+    # runs well past the pulse (DEFAULT_RECORD_LENGTH = 20 000 pts) into
+    # a tail that can carry a discharge / next-period / open-input
+    # transient — without this window that tail spike would be reported
+    # as V_d (and corrupt C_d = Q_inj / V_d). Per-phase metrics below
+    # already window via phase_windows; this brings V_d into line.
+    roi = pulse_region_mask(capture.time_us, pat)
+    if capture.v_mon_v.size == capture.time_us.size:
+        v_mon_roi = capture.v_mon_v[roi]
+    else:
+        v_mon_roi = capture.v_mon_v
+    v_d_vmon = driving_voltage_from_vmon(v_mon_roi)
 
     # If the instrumentation amplifier is wired up we get the active and
     # return potentials separately, which gives a slightly cleaner V_d
@@ -574,7 +614,9 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     has_potentials = (e_act is not None and e_ret is not None
                       and e_act.size == e_ret.size == capture.time_us.size)
     if has_potentials and polarization_source != "vmon":
-        v_d = driving_voltage_from_potentials(e_act, e_ret)
+        # Same pulse-region restriction as V_mon so a tail transient on
+        # the instrumentation-amp traces can't inflate V_d either.
+        v_d = driving_voltage_from_potentials(e_act[roi], e_ret[roi])
         m.driving_voltage_v = max(v_d_vmon, v_d)
     else:
         m.driving_voltage_v = v_d_vmon
