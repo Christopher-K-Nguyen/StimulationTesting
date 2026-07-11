@@ -20,7 +20,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 
 from ..hardware.base import Oscilloscope, Stimulator
 from ..hardware.simulator import SimulatedOscilloscope, SimulatedStimulator
@@ -69,13 +68,12 @@ class ShortPulsingExperiment(ExperimentRunner):
         self._emit(ExperimentEvent(kind="run_start", session=self.session, run=run))
 
         base = self.session.test.pattern
-        # Guard against a zero excitation amplitude (preflight already
-        # rejects empty patterns, but a fully-zero asymmetric template
-        # would still divide by zero here). 1.0 fallback keeps us out
-        # of the ZeroDivisionError; the scaled pattern is then 0 µA
-        # everywhere, which the runner programs without complaint.
-        excite_amp_abs = abs(base.excitation_phase.amplitude_ua) or 1.0
-        pattern = base.scaled(self.amplitude_ua / excite_amp_abs)
+        # Build the fixed-amplitude pulsing pattern.  ``_pattern_at_amplitude``
+        # is identical to ``base.scaled(self.amplitude_ua / |excitation|)`` for
+        # a normal template, but also GROWS a zero-amplitude template (plain
+        # scaling can't grow a zero → it would pulse at 0 µA regardless of the
+        # requested amplitude).  See base.py.
+        pattern = self._pattern_at_amplitude(base, self.amplitude_ua)
         # MATLAB setDefaultScopeView3.m: revert to default per-channel
         # scope view at the start of every channel (here: at run start,
         # since short-pulsing is single-channel).
@@ -105,6 +103,10 @@ class ShortPulsingExperiment(ExperimentRunner):
             # from a previous run would deliver current for the whole
             # SP duration.
             self.load_zero_unused_channels(pattern, config)
+            # MONOPOLAR commit (config.returns empty) → ONE
+            # PS_LoadAllChannels; multipolar no-op (MATLAB loadPattern.m
+            # parity — see ExperimentRunner.commit_loaded_channels).
+            self.commit_loaded_channels(config)
             # PS_StartStimAllChannels — single-channel start fails with
             # WRONG-TRIGGER-MODE on default-mode PlexStim devices.
             # Loaded channels (active + unused-zero) fire together;
@@ -119,58 +121,82 @@ class ShortPulsingExperiment(ExperimentRunner):
         navg = getattr(self.scope, "_expected_acq_navg", None) or 8
         v_mon_phys = self.scope.channel_aliases.get("vmon", "CH1")
         i_mon_phys = self.scope.channel_aliases.get("imon", "CH2")
+
+        def _snapshot(snap_idx: int, *, reset_before_run: bool,
+                      context: str) -> Capture:
+            """Take one averaged snapshot, compute metrics, record + emit it.
+
+            Shared by the cadence loop AND the end-of-run final capture so
+            the two never drift.  ``context`` is the rescale-loop log tag.
+            """
+            acq = self.scope.capture_while_running(
+                wait_s=navg * pulse_period_s,
+                reset_before_run=reset_before_run)
+            # SHARED fit-the-view rescale loop (same coarse/fine scaling +
+            # positioning as VT — operator request).  Stim runs for the
+            # whole SP session (gotcha #8); recapture = another
+            # continuous-run grab whose sleep IS the fresh-frame settle.
+            # Converged stationary signal → one pass, zero writes, zero
+            # re-captures — the snapshot cadence is unaffected.
+            acq = self.rescale_to_fit(
+                acq, pattern=pattern,
+                recapture=lambda _t:
+                    self.scope.capture_while_running(
+                        wait_s=navg * pulse_period_s),
+                timeout_s=navg * pulse_period_s + 6.0,
+                context=context)
+            self._smooth_acquisition(acq)
+            cap = make_capture(snap_idx, pattern, acq, self.scope, self.stim,
+                               cal=self.cal, channel=config.active)
+            compute_metrics(cap, run.surface_area_um2)
+            # Feed the E_ret pre/post-pulse rest values into the electrode-
+            # potential learning bin keyed by the return coating.  Silently
+            # no-ops when the capture has no E_ret trace (NaN rest values)
+            # or when the session lacks a setup snapshot.
+            try:
+                from ..electrode_potential_history import record_capture
+                record_capture(cap, self.session)
+            except Exception:
+                pass
+            # Per-capture damage warning — environment-posture aware.
+            # ``info`` (PBS / mISF / etc.) suppresses per-capture log spam;
+            # ``warn`` / ``alert`` emit one log line per flagged capture.
+            try:
+                from ..damage_warnings import assess_finished_capture
+                snap = (self.session.test.extras or {}).get(
+                    "setup_snapshot") or {}
+                env_short = (snap.get("environment_short")
+                             if isinstance(snap, dict) else None) or "pbs"
+                warn = assess_finished_capture(
+                    cap, environment_short=env_short)
+                if warn is not None:
+                    self._emit(ExperimentEvent(
+                        kind="log", session=self.session, capture=cap,
+                        message=f"{warn.title}\n{warn.body}"))
+            except Exception:
+                pass
+            run.captures.append(cap)
+            self._emit(ExperimentEvent(kind="capture", session=self.session,
+                                       run=run, capture=cap))
+            return cap
+
         t_start = time.time()
         next_capture_at = t_start
         idx = 0
         try:
             while not self.aborted and (time.time() - t_start) < self.policy.duration_s:
+                # User PAUSE checkpoint — SP pulses CONTINUOUSLY, so halt +
+                # restart pulsing (start_all resumes the RETAINED pattern).
+                # Exclude the paused wall-clock from the duration + cadence so
+                # a pause doesn't eat into the run ("continue where it left off").
+                if not self.wait_if_paused(restart=lambda: self.stim.start_all()):
+                    break
+                if self._last_pause_duration_s > 0:
+                    t_start += self._last_pause_duration_s
+                    next_capture_at += self._last_pause_duration_s
                 if time.time() >= next_capture_at:
-                    acq = self.scope.capture_while_running(
-                        wait_s=navg * pulse_period_s,
-                        reset_before_run=(idx == 0))
-                    chan_data = getattr(acq, "channels", {}) or {}
-                    for _ch, _arr in chan_data.items():
-                        _a = np.asarray(_arr, dtype=float)
-                        if _a.size >= 2:
-                            self.scope.adapt_channel_scale(
-                                _ch, v_min=float(_a.min()),
-                                v_max=float(_a.max()))
-                    cap = make_capture(idx, pattern, acq, self.scope, self.stim,
-                                       cal=self.cal, channel=config.active)
-                    compute_metrics(cap, run.surface_area_um2)
-                    # Feed the E_ret pre/post-pulse rest values into
-                    # the electrode-potential learning bin keyed by
-                    # the return coating. Silently no-ops when the
-                    # capture has no E_ret trace (NaN rest values)
-                    # or when the session lacks a setup snapshot.
-                    try:
-                        from ..electrode_potential_history import record_capture
-                        record_capture(cap, self.session)
-                    except Exception:
-                        pass
-                    # Per-capture damage warning — environment-posture
-                    # aware. ``info`` (PBS / mISF / etc.) suppresses
-                    # per-capture log spam; ``warn`` / ``alert`` emit
-                    # one log line per flagged capture.
-                    try:
-                        from ..damage_warnings import assess_finished_capture
-                        snap = (self.session.test.extras or {}).get(
-                            "setup_snapshot") or {}
-                        env_short = (snap.get("environment_short")
-                                     if isinstance(snap, dict) else None
-                                     ) or "pbs"
-                        warn = assess_finished_capture(
-                            cap, environment_short=env_short)
-                        if warn is not None:
-                            self._emit(ExperimentEvent(
-                                kind="log", session=self.session,
-                                capture=cap,
-                                message=f"{warn.title}\n{warn.body}"))
-                    except Exception:
-                        pass
-                    run.captures.append(cap)
-                    self._emit(ExperimentEvent(kind="capture", session=self.session,
-                                               run=run, capture=cap))
+                    _snapshot(idx, reset_before_run=(idx == 0),
+                              context=f"(capture #{idx + 1})")
                     idx += 1
                     next_capture_at += self.policy.capture_interval_s
                     # Closed-loop bias step happens at the same cadence
@@ -183,6 +209,18 @@ class ShortPulsingExperiment(ExperimentRunner):
                     # metrics row.
                     self.bias_step_if_armed()
                 time.sleep(0.001)
+            # Final capture at the END of the run (operator: "When SP ends,
+            # add another capture") — captures the electrode state right
+            # after the full pulsing window so a start-vs-end comparison is
+            # always available (the default cadence takes only the opening
+            # snapshot for a short run).  Stim is still live here — the
+            # ``finally`` below stops it.  Skipped on an abort (the operator
+            # pressed Stop; Continuous Pulsing also exits only via abort, so
+            # it never takes this extra capture).
+            if not self.aborted:
+                _snapshot(idx, reset_before_run=(idx == 0),
+                          context="(final capture)")
+                idx += 1
         finally:
             # Disarm bias feedback FIRST so the controller's scope-
             # gating teardown happens before the stim quiets — keeps

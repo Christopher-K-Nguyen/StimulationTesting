@@ -68,6 +68,13 @@ End If
 LauncherLog "---- " & Now() & " ----"
 LauncherLog "Launcher: PULSAR.vbs"
 LauncherLog "Script dir: " & scriptDir
+' Record which PULSAR version this silent launch is about to run, and when
+' the code was last updated (the __version__ line is bumped on every
+' shippable change; its file's mtime is that update time).  Read straight
+' from the file — no Python spawn.  The GUI title bar shows the same
+' version live; logging it here gives a per-launch record for this
+' windowless path, which has no console banner like PULSAR.bat's.
+LauncherLog "PULSAR version: " & ReadInitVersion() & "  (code updated " & InitFileMTime() & ")"
 
 ' --- Probe each candidate Python version for PyQt6 -----------------
 '
@@ -200,3 +207,43 @@ Sub LauncherLog(msg)
     Err.Clear
     On Error Goto 0
 End Sub
+
+' ReadInitVersion — parse __version__ out of stimtest\__init__.py without
+' spawning Python.  Best-effort: returns "unknown" if the file is missing
+' or the line can't be parsed.
+Function ReadInitVersion()
+    On Error Resume Next
+    Dim vf, ln, p1, p2, v
+    v = "unknown"
+    Set vf = fso.OpenTextFile(scriptDir & "\stimtest\__init__.py", 1, False)  ' 1 = ForReading
+    If Err.Number = 0 Then
+        Do Until vf.AtEndOfStream
+            ln = vf.ReadLine
+            If Left(ln, 11) = "__version__" Then
+                p1 = InStr(ln, """")
+                If p1 > 0 Then
+                    p2 = InStr(p1 + 1, ln, """")
+                    If p2 > p1 Then v = Mid(ln, p1 + 1, p2 - p1 - 1)
+                End If
+                Exit Do
+            End If
+        Loop
+        vf.Close
+    End If
+    Err.Clear
+    On Error Goto 0
+    ReadInitVersion = v
+End Function
+
+' InitFileMTime — last-modified time of stimtest\__init__.py, i.e. when the
+' code was last updated (the version is bumped on every shippable change).
+Function InitFileMTime()
+    On Error Resume Next
+    Dim r
+    r = "unknown"
+    r = fso.GetFile(scriptDir & "\stimtest\__init__.py").DateLastModified
+    If Err.Number <> 0 Then r = "unknown"
+    Err.Clear
+    On Error Goto 0
+    InitFileMTime = r
+End Function

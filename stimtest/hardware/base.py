@@ -185,6 +185,25 @@ class Stimulator(ABC):
         """
         raise NotImplementedError
 
+    def load_all_channels(self) -> None:
+        """Commit the staged parameters of EVERY channel to the device
+        in one call.
+
+        On Plexon hardware this maps to ``PS_LoadAllChannels`` — the
+        commit step the working MATLAB used for MONOPOLAR configs (no
+        return channels): stage every channel's pattern, then ONE
+        ``PS_LoadAllChannels``, then ``PS_StartStimAllChannels``.
+        Multipolar configs instead committed each NON-return channel
+        individually (returns stay unloaded as passive sinks), so
+        callers gate this on an empty return set — see
+        :meth:`ExperimentRunner.commit_loaded_channels`.
+
+        Default implementation is a NO-OP: backends that already commit
+        per-channel at :meth:`load_channel` time (e.g. the simulator)
+        have nothing extra to do here.
+        """
+        return
+
     def loaded_channels(self) -> "set[int]":
         """Channels that currently have a pattern loaded on the device.
 
@@ -365,10 +384,10 @@ class Oscilloscope(ABC):
         Default no-op; overridden by real driver."""
 
     # ----- gated measurement primitives (closed-loop feedback path) -----
-    # These provide a *fast* read of a per-channel statistic (mean / min /
-    # max) over a user-selected time window WITHOUT pulling the full
-    # waveform off the wire.  Used by the closed-loop interpulse-bias
-    # feedback controller (~10-20 Hz update rate is the design target).
+    # These provide a *fast* read of a per-channel statistic (mean) over a
+    # user-selected time window WITHOUT pulling the full waveform off the
+    # wire.  Used by the closed-loop interpulse-bias feedback controller
+    # (~10-20 Hz update rate is the design target).
     #
     # Implementation pattern on real Tek scopes:
     #   1. Place vertical (time-axis) cursors at ``t_us_start`` and
@@ -409,6 +428,15 @@ class Oscilloscope(ABC):
         """
         return float("nan")
 
+    def settle_one_acquisition(self, *,
+                               timeout_s: "Optional[float]" = None) -> None:
+        """Wait for one fresh averaged acquisition WITHOUT transferring
+        the waveform.  Used by the rescale loop's recapture before a
+        ``CURVe?`` so the transferred frame reflects the post-rescale
+        V/div, not a stale frame from the previous scale (gotcha #40).
+        Default no-op; real drivers override."""
+        return None
+
     def set_acquisition_mode(self, mode: str = "AVERAGE", n_avg: int = 16) -> None:
         """SAMPLE | AVERAGE | PEAK; n_avg only used for AVERAGE."""
 
@@ -439,6 +467,33 @@ class Oscilloscope(ABC):
         """
         return 512
 
+    def set_trigger_pulse_width(self, source: str, level_v: float,
+                                polarity: str, width_s: float,
+                                when: str = "MOREthan") -> bool:
+        """Switch to a pulse-width-qualified trigger; return True if applied.
+
+        Base default returns False — "not supported" — so callers keep the
+        edge trigger.  The Tektronix MODERN dialect (TBS2000/B, TBS1000C)
+        overrides this; the simulator + legacy families inherit the
+        decline.  See the Tektronix override for the semantics.
+        """
+        return False
+
+    def set_average_count(self, n_avg: int) -> int:
+        """Apply the AVERAGE-mode averaging count and RETURN the value the
+        scope actually applied, confirmed by reading it back.
+
+        The GUI calls this when the operator changes the average count so
+        it can reflect the REAL applied value (a fixed-grid scope snaps an
+        off-grid request to its nearest supported count).  This base
+        default just echoes the request — arbitrary-count scopes and the
+        simulator impose no grid, so there's nothing to snap or confirm.
+        The Tektronix override writes ``ACQuire:NUMAVg`` and re-queries the
+        device.  Touches only the averaging count, never the acquisition
+        mode, so it's cheap enough to run interactively.
+        """
+        return int(n_avg)
+
     def set_record_length(self, n: int) -> None:
         """Set the number of samples per acquisition (e.g. 2500 for TBS scopes)."""
 
@@ -461,6 +516,29 @@ class Oscilloscope(ABC):
             default (typically 10 s via the VISA session timeout).
         """
 
+    # ----- abort responsiveness -----------------------------------------
+    def set_abort_check(self, fn) -> None:
+        """Install a no-arg callable that returns True when the current
+        run is aborting.  The driver's blocking poll / sleep loops
+        (``single_capture``'s NUMACq poll, ``settle_one_acquisition``,
+        ``capture_while_running``'s wait) consult it so STOP halts the
+        run promptly instead of waiting out a full averaging window
+        (operator: "When pressing STOP, the program should immediately
+        stop when it is safely possible").  Pass ``None`` to clear it
+        (runners do so in their ``finally``).
+        """
+        self._abort_check = fn
+
+    def _should_abort(self) -> bool:
+        """True when the installed abort-check fires.  Never raises."""
+        fn = getattr(self, "_abort_check", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
     def capture_while_running(self, wait_s: float = 0.0, *,
                               reset_before_run: bool = False,
                               tick_fn=None) -> ScopeAcquisition:
@@ -472,6 +550,8 @@ class Oscilloscope(ABC):
         import time
         remaining = max(float(wait_s), 0.0)
         while remaining > 0.0:
+            if self._should_abort():
+                break
             chunk = min(0.05, remaining)
             time.sleep(chunk)
             remaining -= chunk
@@ -483,7 +563,8 @@ class Oscilloscope(ABC):
                             v_min: float, v_max: float,
                             divs: float = 4.0,
                             shrink_threshold: float = 0.30,
-                            shrink_stable_count: int = 2):
+                            shrink_stable_count: int = 2,
+                            force_grow: bool = False):
         """Post-capture autorange — default no-op; returns None."""
         return None
 
@@ -524,7 +605,7 @@ class Oscilloscope(ABC):
 
     def channel_in_view(self, channel: str,
                         v_min: float, v_max: float,
-                        *, margin_divs: float = 3.9) -> Optional[bool]:
+                        *, margin_divs: float = 3.95) -> Optional[bool]:
         """Does ``[v_min, v_max]`` fit inside the channel's visible window?
 
         Port of the in-view check from MATLAB ``getWaveform2.m``::
@@ -553,7 +634,7 @@ class Oscilloscope(ABC):
 
     def channel_clip_sides(self, channel: str,
                            v_min: float, v_max: float,
-                           *, margin_divs: float = 3.9):
+                           *, margin_divs: float = 3.95):
         """Directional companion to :meth:`channel_in_view` — returns
         which side(s) of the screen the trace exceeds.
 
@@ -570,6 +651,24 @@ class Oscilloscope(ABC):
         """Set the per-channel vertical position in divisions from screen
         centre.  Default no-op so simulator-style drivers don't have
         to override; the Tek driver overrides with a SCPI write."""
+
+    def set_channel_coupling(self, channel: str, coupling: str) -> None:
+        """Set AC / DC input coupling on one channel.  Default no-op so
+        simulator-style drivers don't have to override; the Tek driver
+        writes ``CHx:COUPling AC|DC``.  Used by the electrode-offset
+        capture (measure the DC rest potential, then AC-couple so the
+        small pulse swing can be fine-scaled)."""
+
+    def zero_all_channel_positions(self) -> None:
+        """Centre EVERY physical channel (vertical position 0 div).
+
+        Operator spec: "all channels default to vertical position 0
+        before running the experiment."  Called at run start (and at
+        each VT channel change via ``apply_default_scope_view``) so a
+        run always begins from a known centred baseline regardless of
+        whatever position a previous run / the adaptive rescale loop
+        left a channel at.  Default no-op for simulator-style drivers;
+        the Tek driver overrides to walk ``CH1…CHn``."""
 
     def set_channel_scale_and_position_for_range(
             self, channel: str, *,

@@ -9,17 +9,20 @@ Workbook layout
    area. Same DTA-preamble style.
 3. **Values** — MATLAB-style compiled metrics table: one column per channel
    ID, one row per metric (``Istim``, ``Qph``, ``Qinj``, ``Active Emc``,
-   ``Active Ema``, ``Return Emc``, ``Vd1..Vd3``, ``Ceff``, ``Val1..Vat3``,
+   ``Active Ema``, ``Return Emc``, ``Vd1..Vd3``, ``Val1..Vat3``,
    ``Ral1..Rat3``, ``Cch``, optional ``Eda`` / ``Edr``). This is the sheet
    you copy-paste straight into GraphPad: rows = variables, columns = subjects.
-4. **One sheet per ChannelRun** — MATLAB ``writetable`` layout: time-series
-   columns (``Time``, ``Voltage``, ``Current``, ``Active``, ``Return``,
-   ``Current Density``) on the left, per-capture metric columns
-   (``Amplitude``, ``Qph``, ``Area``, ``Qinj``, ``Epola``, ``Epolr``, ``Vd``,
-   ``Ceff``, ``Va``, ``Ra``, ``Cch``, optional ``Eda`` / ``Edr``,
-   ``Date Time``, ``Status``) on the right. Each metric occupies the first
-   one-to-six rows of its column (depends on phase count) and is blank
-   thereafter, exactly like the MATLAB script.
+4. **One sheet per ChannelRun** — **Gamry ``.DTA`` vertical layout**
+   (operator request): a metadata preamble (``TAG | KIND | VALUE |
+   COMMENT``) at the TOP, then a ``SUMMARY`` table with one row per
+   capture (``Capture``, ``Amplitude``, ``Qph``, ``Qinj``, ``Vd act/ret``,
+   ``Eip``, ``Va act/ret``, ``Ra act/ret``, ``Cd``, ``Status``),
+   then the raw-waveform ``DATA`` table (``Pt``, ``Time``, ``Voltage``,
+   ``Current``, optional ``Active`` / ``Return``, ``Current Density``) at
+   the END of the sheet — the same shape as a Gamry ``.DTA`` text file.
+   The SUMMARY header/units/rows come from the shared
+   :func:`_summary_headers_units` / :func:`_summary_row` helpers so this
+   sheet and the ``.DTA`` file stay byte-aligned.
 
 A companion :func:`save_session_dta` writes genuine tab-delimited ``.DTA``
 text files (one per ChannelRun) for downstream Gamry pipelines.
@@ -251,10 +254,10 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
                     ("Monophasic" if p.num_phases == 1 else "Biphasic"),
                     "Pattern type")
     row = _meta_row(ws, row, "POLARITY", "LABEL",
-                    "Cathodic-first" if p.polarity == -1 else "Anodic-first",
+                    "Cathodal-first" if p.polarity == -1 else "Anodal-first",
                     "Sign of excitation phase")
     row = _meta_row(ws, row, "RATE", "QUANT", _fmt(p.rate_hz),
-                    "Pulse repetition rate (Hz)")
+                    "Pulse repetition rate (pps)")
     row = _meta_row(ws, row, "REPS", "QUANT", _fmt_int(p.repetitions),
                     "Repetitions per train (0 = infinite)")
     for i, ph in enumerate(p.phases, start=1):
@@ -519,7 +522,6 @@ class _ChannelMetricSet:
         "amplitude_ua", "q_ph_nc", "q_inj_mc_per_cm2", "area_um2",
         "active_excursions", "return_excursions",   # E_pol per phase
         "driving_voltages",                          # V_d per phase
-        "effective_capacitance_nf",
         "access_voltages_v", "access_resistances_kohm",  # 4 (biphasic) or 6 (triphasic)
         "charging_capacitance_nf",
         "active_driving_potentials", "return_driving_potentials",
@@ -538,7 +540,6 @@ class _ChannelMetricSet:
         self.active_excursions: List[float] = []
         self.return_excursions: List[float] = []
         self.driving_voltages: List[float] = []
-        self.effective_capacitance_nf = nan
         self.access_voltages_v: List[float] = []
         self.access_resistances_kohm: List[float] = []
         self.charging_capacitance_nf = nan
@@ -598,6 +599,8 @@ def _gather_channel_metrics(run: ChannelRun, channel_id: str) -> _ChannelMetricS
         out.status_label = "Aborted"
     elif cap.status.voltage_compliance:
         out.status_label = "Voltage compliance"
+    elif getattr(cap.status, "exceeded_potential_limit", False):
+        out.status_label = "Limit exceeded"
     elif cap.status.reached_potential_limit:
         out.status_label = "Limit reached"
     elif not cap.status.good:
@@ -620,7 +623,6 @@ def _gather_channel_metrics(run: ChannelRun, channel_id: str) -> _ChannelMetricS
     out.active_excursions = list(m.polarization_per_phase_v)
     out.return_excursions = list(m.return_polarization_per_phase_v)
     out.driving_voltages = [float(m.driving_voltage_v)] * cap.pattern.num_phases
-    out.effective_capacitance_nf = float(m.effective_capacitance_nf)
     out.access_voltages_v = [abs(v) for v in m.access_voltage_per_phase_v]
     out.access_resistances_kohm = list(m.access_resistance_per_phase_kohm)
     out.charging_capacitance_nf = float(m.driving_capacitance_mf_per_cm2)
@@ -702,6 +704,79 @@ def _ra_labels(num_access: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-capture SUMMARY table — SHARED by the .DTA text writer and the
+# per-channel xlsx sheet so the two never drift.
+# ---------------------------------------------------------------------------
+def _summary_headers_units() -> Tuple[List[str], List[str]]:
+    """``(headers, units)`` for the per-capture SUMMARY table."""
+    from .gui.rich import plain_label as _L
+    headers = [
+        "Capture", "Fixed Time", "Elapsed Time", "Amplitude",
+        _L("Q", "ph"), _L("Q", "inj"),
+        f"{_L('V', 'd')} act", f"{_L('V', 'd')} ret",
+        _L("E", "ip"),
+        f"{_L('V', 'a')} act", f"{_L('R', 'a')} act",
+        f"{_L('V', 'a')} ret", f"{_L('R', 'a')} ret",
+        _L("C", "d"),
+        _L("Z", "d"), "Energy",
+        "Status",
+    ]
+    units = [
+        "#", "s", "s", "µA",
+        "nC", _L("mC/cm", sup="2"),
+        "V", "V",
+        "V",
+        "V", "kΩ", "V", "kΩ",
+        _L("mF/cm", sup="2"),
+        "kΩ", "µJ",
+        "",
+    ]
+    return headers, units
+
+
+def _summary_row(cap: Capture) -> List[str]:
+    """One SUMMARY row of formatted strings for a single capture."""
+    m = cap.metrics
+    if cap.status.reached_potential_limit:
+        status = "limit"
+    elif cap.status.voltage_compliance:
+        status = "compliance"
+    elif not cap.status.good:
+        status = "bad"
+    else:
+        status = "ok"
+    va = m.access_voltage_per_phase_v
+    ra = m.access_resistance_per_phase_kohm
+    var = m.return_access_voltage_per_phase_v
+    rar = m.return_access_resistance_per_phase_kohm
+    vd_act = m.active_driving_voltage_per_phase_v
+    vd_ret = m.return_driving_voltage_per_phase_v
+    return [
+        str(cap.index),
+        # Fixed (scheduled, cadence-grid) + actual elapsed time, in
+        # seconds — populated for the periodic-sampling experiments
+        # (PS/LP); blank for adaptive VT.  Operator: "have the fixed
+        # time and elapsed time columns."
+        _fmt(m.scheduled_time_s),
+        _fmt(m.elapsed_time_s),
+        _fmt(cap.pattern.excitation_phase.amplitude_ua),
+        _fmt(m.charge_per_phase_nc),
+        _fmt(m.charge_injection_mc_per_cm2),
+        _fmt(vd_act[0] if vd_act else m.driving_voltage_v),
+        _fmt(vd_ret[0] if vd_ret else None),
+        _fmt(m.interpulse_potential_v),
+        _fmt(va[0] if va else None),
+        _fmt(ra[0] if ra else None),
+        _fmt(var[0] if var else None),
+        _fmt(rar[0] if rar else None),
+        _fmt(m.driving_capacitance_mf_per_cm2),
+        _fmt(m.driving_impedance_kohm),
+        _fmt(m.driving_energy_uj),
+        status,
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Sheet 3: Values (MATLAB-style metrics-as-rows)
 # ---------------------------------------------------------------------------
 def _write_values_sheet(wb: Workbook, session: Session,
@@ -750,9 +825,8 @@ def _write_values_sheet(wb: Workbook, session: Session,
         rows.append((f"Vd{k} (V)",
                      [_safe_index(ms.driving_voltages, k - 1) for ms in metric_sets]))
 
-    # --- effective capacitance ---
-    rows.append(("Ceff (mF/cm2)",
-                 [ms.effective_capacitance_nf for ms in metric_sets]))
+    # (C_eff row REMOVED — pulse-derived effective capacitance is not a
+    # valid metric; see metrics.py.)
 
     # --- access voltages and resistances ---
     n_access = _expected_access_count(n_phases, has_interphase, has_discharge)
@@ -825,133 +899,154 @@ def _expected_access_count(n_phases: int, has_interphase: bool,
 # ---------------------------------------------------------------------------
 # Sheets 4+: per-electrode (MATLAB writetable layout)
 # ---------------------------------------------------------------------------
+def _table_header_row(ws, row: int, headers: Sequence[str]) -> int:
+    """Write a styled TABLE header row (bold white on blue)."""
+    for col, h in enumerate(headers, start=1):
+        c = ws.cell(row=row, column=col, value=h)
+        c.font = BOLD_HEADER
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="center")
+    return row + 1
+
+
 def _write_electrode_sheet(wb: Workbook, session: Session, run: ChannelRun,
                            run_idx: int, metric_set: _ChannelMetricSet,
                            include_raw_traces: bool) -> None:
-    """One sheet per channel, mirroring ``saveVoltageTransientData.m`` line 498-648.
+    """One sheet per channel/combo in **Gamry ``.DTA`` style** (operator:
+    "Have the excel sheets for each channel/combo in the same style as
+    Gamry DTA with the data table at the end").
 
-    Columns (left → right):
-        Time | Voltage | Current | Active | Return | Current Density |
-        Amplitude | Qph | Area | Qinj | Epola | Epolr | Vd | Ceff |
-        Va | Ra | Cch | [Eda] | [Edr] | Date Time | Status
+    Vertical layout, top → bottom — the same shape a Gamry ``.DTA`` text
+    file has (and what :func:`save_session_dta` writes), so the xlsx sheet
+    and the ``.DTA`` file read identically:
 
-    Metric columns hold one to three values in their first rows and are
-    blank in the rest of the sheet, matching the MATLAB output.
+        ELECTRODE        ← metadata preamble (TAG | KIND | VALUE | COMMENT)
+        SUMMARY  TABLE   ← per-capture metrics, one row per capture
+        DATA     TABLE   ← raw waveform of the representative capture,
+                           placed at the END of the sheet
+
+    The earlier MATLAB ``writetable`` layout (time-series columns on the
+    left, metric columns on the right, side-by-side) is gone — the
+    operator reads Gamry ``.DTA`` files all day and wants the familiar
+    preamble-then-data-table-at-the-end shape.
     """
     ws = wb.create_sheet(_safe_sheet_name(metric_set.channel_id,
                                           fallback=f"CH{run_idx + 1}",
                                           taken=set(wb.sheetnames)))
+    _set_dta_column_widths(ws)
     p = session.test.pattern
+    cfg = run.configuration
+
+    # ----- 1. Metadata preamble (DTA TAG | KIND | VALUE | COMMENT) -------
+    row = _section_header(ws, 1, "ELECTRODE")
+    row = _meta_row(ws, row, "TAG", "",
+                    _experiment_tag(session.test.experiment), "Experiment tag")
+    row = _meta_row(ws, row, "TITLE", "LABEL", session.name, "Test identifier")
+    row = _meta_row(ws, row, "DATE", "LABEL",
+                    session.created_at.strftime("%Y-%m-%d"), "Session date")
+    row = _meta_row(ws, row, "TIME", "LABEL",
+                    session.created_at.strftime("%H:%M:%S"), "Session time")
+    row = _meta_row(ws, row, "CHANNEL", "LABEL", metric_set.channel_id,
+                    "Active vs return electrode(s)")
+    row = _meta_row(ws, row, "CONFIG", "LABEL", cfg.id,
+                    "MP / BP / TP / PBP / PTP / CG")
+    # Wall-clock time to complete this channel/combo (operator: "add time
+    # elapsed for complete channel/combo on the metric measurements").
+    # Tag "ELAPSED" (not "DURATION" — that's the CONFIGURED pulsing duration
+    # in the Parameters sheet).
+    _dur = run.duration_s
+    row = _meta_row(ws, row, "ELAPSED", "QUANT",
+                    _fmt(_dur) if _dur == _dur else "",   # NaN → blank
+                    "Time to complete channel/combo (s)")
+    row = _meta_row(ws, row, "AREA", "QUANT",
+                    _fmt(metric_set.area_um2 * 1e-8),
+                    "Geometric surface area (cm^2)")
+    row = _meta_row(ws, row, "POLARITY", "LABEL",
+                    "Cathodal-first" if p.polarity == -1 else "Anodal-first",
+                    "Pulse polarity")
+    row = _meta_row(ws, row, "PATTERN", "LABEL",
+                    "Triphasic" if p.is_triphasic else
+                    ("Monophasic" if p.num_phases == 1 else "Biphasic"),
+                    "Pulse pattern")
+    row = _meta_row(ws, row, "RATE", "QUANT", _fmt(p.rate_hz),
+                    "Repetition rate (pps)")
+    for k, ph in enumerate(p.phases, start=1):
+        row = _meta_row(ws, row, f"AMP{k}", "QUANT", _fmt(ph.amplitude_ua),
+                        f"Phase {k} amplitude (uA)")
+        row = _meta_row(ws, row, f"PHASEW{k}", "QUANT",
+                        _fmt(ph.width_us * 1e-6), f"Phase {k} width (s)")
+        if ph.delay_after_us > 0:
+            label = "DISCHARGE" if k == len(p.phases) else f"DELAY{k}"
+            comment = ("Discharge delay (s)" if k == len(p.phases)
+                       else f"Inter-phase delay {k} (s)")
+            row = _meta_row(ws, row, label, "QUANT",
+                            _fmt(ph.delay_after_us * 1e-6), comment)
+    row = _meta_row(ws, row, "NCAPTURE", "QUANT", _fmt_int(len(run.captures)),
+                    "Number of captures on this channel")
+    row = _meta_row(ws, row, "STATUS", "LABEL", metric_set.status_label,
+                    "Final run status")
+    row += 1
+
+    # ----- 2. SUMMARY table (one row per capture) -----------------------
+    row = _section_header(ws, row, "SUMMARY")
+    headers, units = _summary_headers_units()
+    row = _table_header_row(ws, row, headers)
+    for col, u in enumerate(units, start=1):
+        ws.cell(row=row, column=col, value=u).font = ITALIC_GRAY
+    row += 1
+    for cap in run.captures:
+        for col, val in enumerate(_summary_row(cap), start=1):
+            ws.cell(row=row, column=col, value=val)
+        row += 1
+    row += 1
+
+    # ----- 3. DATA table — raw waveform, at the END of the sheet --------
     cap = _final_capture(run) if include_raw_traces else None
-    has_return_in_capture = cap is not None and cap.e_ret_v is not None and cap.e_ret_v.size
-    has_active_in_capture = cap is not None and cap.e_act_v is not None and cap.e_act_v.size
-
-    # ----- column layout ---------------------------------------------
-    # Time-series columns first, then metric columns, mirroring MATLAB.
-    ts_headers = ["Time (us)", "Voltage (V)", "Current (uA)"]
-    if has_active_in_capture:
-        ts_headers.append("Active (V)")
-    if has_return_in_capture:
-        ts_headers.append("Return (V)")
-    ts_headers.append("Current Density (A/cm2)")
-
-    metric_headers = [
-        "Amplitude (uA)", "Qph (nC/ph)", "Area (um2)", "Qinj (mC/cm2)",
-        "Epola (V)",
-    ]
-    if has_return_in_capture:
-        metric_headers.append("Epolr (V)")
-    metric_headers += ["Vd (V)", "Ceff (mF/cm2)", "Va (V)", "Ra (kOhm)",
-                       "Cch (nF)"]
-    if metric_set.active_driving_potentials:
-        metric_headers.append("Eda (V)")
-    if metric_set.return_driving_potentials:
-        metric_headers.append("Edr (V)")
-    metric_headers += ["Date Time", "Status"]
-
-    headers = ts_headers + metric_headers
-    for col, h in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=col, value=h)
-        c.font = BOLD_HEADER
-        c.fill = HEADER_FILL
-        c.alignment = Alignment(horizontal="center")
-
-    # ----- waveform rows ------------------------------------------------
     if include_raw_traces and cap is not None and cap.time_us.size:
+        has_active = cap.e_act_v is not None and cap.e_act_v.size == cap.time_us.size
+        has_return = cap.e_ret_v is not None and cap.e_ret_v.size == cap.time_us.size
+        amp = cap.pattern.excitation_phase.amplitude_ua
+        row = _section_header(ws, row, "DATA")
+        row = _meta_row(ws, row, "CAPTURE", "QUANT", _fmt_int(cap.index),
+                        f"Representative capture @ {amp:.1f} uA "
+                        f"(largest good amplitude)")
+        data_headers = ["Pt", "Time (us)", "Voltage (V)", "Current (uA)"]
+        data_units = ["#", "us", "V", "uA"]
+        if has_active:
+            data_headers.append("Active (V)"); data_units.append("V")
+        if has_return:
+            data_headers.append("Return (V)"); data_units.append("V")
+        data_headers.append("Current Density (A/cm2)"); data_units.append("A/cm2")
+        row = _table_header_row(ws, row, data_headers)
+        for col, u in enumerate(data_units, start=1):
+            ws.cell(row=row, column=col, value=u).font = ITALIC_GRAY
+        row += 1
+
         n = cap.time_us.size
         t_us = np.asarray(cap.time_us)
         v_mon = np.asarray(cap.v_mon_v)
         i_ua = np.asarray(cap.i_mon_ua)
-        eact = np.asarray(cap.e_act_v) if has_active_in_capture else None
-        eret = np.asarray(cap.e_ret_v) if has_return_in_capture else None
+        eact = np.asarray(cap.e_act_v) if has_active else None
+        eret = np.asarray(cap.e_ret_v) if has_return else None
         area_cm2 = max(metric_set.area_um2 * 1e-8, 1e-12)
-        # Current density = I (A) / area (cm^2)
         j_density = i_ua * 1e-6 / area_cm2
-
         for k in range(n):
-            r = k + 2   # data starts at row 2
-            ws.cell(row=r, column=1, value=_fmt(t_us[k]))
-            ws.cell(row=r, column=2, value=_fmt(v_mon[k]))
-            ws.cell(row=r, column=3, value=_fmt(i_ua[k]))
-            col = 4
+            ws.cell(row=row, column=1, value=k)
+            ws.cell(row=row, column=2, value=_fmt(t_us[k]))
+            ws.cell(row=row, column=3, value=_fmt(v_mon[k]))
+            ws.cell(row=row, column=4, value=_fmt(i_ua[k]))
+            col = 5
             if eact is not None:
-                ws.cell(row=r, column=col, value=_fmt(eact[k])); col += 1
+                ws.cell(row=row, column=col, value=_fmt(eact[k])); col += 1
             if eret is not None:
-                ws.cell(row=r, column=col, value=_fmt(eret[k])); col += 1
-            ws.cell(row=r, column=col, value=_fmt(j_density[k]))
+                ws.cell(row=row, column=col, value=_fmt(eret[k])); col += 1
+            ws.cell(row=row, column=col, value=_fmt(j_density[k]))
+            row += 1
 
-    # ----- metric columns (first few rows only) -------------------------
-    n_ts = len(ts_headers)
-    col = n_ts + 1   # first metric column
-
-    # Single-cell metrics (row 2 only)
-    ws.cell(row=2, column=col, value=_fmt(metric_set.amplitude_ua)); col += 1
-    ws.cell(row=2, column=col, value=_fmt(metric_set.q_ph_nc)); col += 1
-    ws.cell(row=2, column=col, value=_fmt(metric_set.area_um2, 0)); col += 1
-    ws.cell(row=2, column=col, value=_fmt(metric_set.q_inj_mc_per_cm2)); col += 1
-
-    # Per-phase excursions
-    for k, val in enumerate(metric_set.active_excursions):
-        ws.cell(row=2 + k, column=col, value=_fmt(val))
-    col += 1
-    if has_return_in_capture:
-        for k, val in enumerate(metric_set.return_excursions):
-            ws.cell(row=2 + k, column=col, value=_fmt(val))
-        col += 1
-
-    # Per-phase driving voltages (rows 2..N_phases+1)
-    for k, val in enumerate(metric_set.driving_voltages):
-        ws.cell(row=2 + k, column=col, value=_fmt(val))
-    col += 1
-
-    ws.cell(row=2, column=col, value=_fmt(metric_set.effective_capacitance_nf)); col += 1
-
-    # Access voltages and resistances (one per access point)
-    for k, val in enumerate(metric_set.access_voltages_v):
-        ws.cell(row=2 + k, column=col, value=_fmt(val))
-    col += 1
-    for k, val in enumerate(metric_set.access_resistances_kohm):
-        ws.cell(row=2 + k, column=col, value=_fmt(val))
-    col += 1
-
-    ws.cell(row=2, column=col, value=_fmt(metric_set.charging_capacitance_nf)); col += 1
-
-    if metric_set.active_driving_potentials:
-        for k, val in enumerate(metric_set.active_driving_potentials):
-            ws.cell(row=2 + k, column=col, value=_fmt(val))
-        col += 1
-    if metric_set.return_driving_potentials:
-        for k, val in enumerate(metric_set.return_driving_potentials):
-            ws.cell(row=2 + k, column=col, value=_fmt(val))
-        col += 1
-
-    # Date Time and Status (text cells)
-    ws.cell(row=2, column=col, value=metric_set.date_time); col += 1
-    ws.cell(row=2, column=col, value=metric_set.status_label)
-
-    # Reasonable column widths so headers don't clip
-    for j in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 16
+    # Column widths: keep the DTA preamble proportions (cols 1-4) but make
+    # sure the wider SUMMARY / DATA tables (up to 14 cols) stay readable.
+    for j in range(5, 15):
+        ws.column_dimensions[get_column_letter(j)].width = 13
 
 
 # ---------------------------------------------------------------------------
@@ -1053,11 +1148,11 @@ def _dta_write(f, session: Session, run: ChannelRun, channel_id: str,
         ("AREA", "QUANT", _fmt(run.surface_area_um2 * 1e-8),
          "Geometric surface area (cm^2)"),
         ("POLARITY", "LABEL",
-         "Cathodic-first" if p.polarity == -1 else "Anodic-first",
+         "Cathodal-first" if p.polarity == -1 else "Anodal-first",
          "Pulse polarity"),
         ("PATTERN", "LABEL",
          "Triphasic" if p.is_triphasic else "Biphasic", "Pulse pattern"),
-        ("RATE", "QUANT", _fmt(p.rate_hz), "Repetition rate (Hz)"),
+        ("RATE", "QUANT", _fmt(p.rate_hz), "Repetition rate (pps)"),
     ]
     for tag, kind, val, comment in rows:
         f.write(f"{tag}\t{kind}\t{val}\t{comment}\n")
@@ -1075,62 +1170,16 @@ def _dta_write(f, session: Session, run: ChannelRun, channel_id: str,
 
     f.write("\nSUMMARY\tTABLE\t" + str(len(run.captures)) +
             "\tPer-capture metrics\n")
-    # Use Unicode subscripts / superscripts in the column headers so
-    # Excel renders pretty labels straight from the tsv. Plain-text
-    # ``Vd``/``Ceff`` fallback whenever a subscript letter (d, f, c)
-    # has no Unicode codepoint — see ``rich.plain_label``.
-    from .gui.rich import plain_label as _L
-    f.write("\t".join([
-        "Capture", "Amplitude",
-        _L("Q", "ph"), _L("Q", "inj"),
-        f"{_L('V','d')} act", f"{_L('V','d')} ret",
-        _L("E", "ip"),
-        f"{_L('V','a')} act", f"{_L('R','a')} act",
-        f"{_L('V','a')} ret", f"{_L('R','a')} ret",
-        _L("C", "eff"), _L("C", "d"),
-        "Status",
-    ]) + "\n")
-    f.write("\t".join([
-        "#", "µA",
-        "nC", _L("mC/cm", sup="2"),
-        "V", "V",
-        "V",
-        "V", "kΩ", "V", "kΩ",
-        "nF", _L("mF/cm", sup="2"),
-        "",
-    ]) + "\n")
+    # Column headers + units come from the SHARED helper so this .DTA
+    # text file and the per-channel xlsx sheet never drift. Unicode
+    # subscripts/superscripts render pretty labels straight from the tsv;
+    # plain-text fallback when a subscript letter has no codepoint (see
+    # ``rich.plain_label``).
+    headers, units = _summary_headers_units()
+    f.write("\t".join(headers) + "\n")
+    f.write("\t".join(units) + "\n")
     for cap in run.captures:
-        m = cap.metrics
-        if cap.status.reached_potential_limit:
-            status = "limit"
-        elif cap.status.voltage_compliance:
-            status = "compliance"
-        elif not cap.status.good:
-            status = "bad"
-        else:
-            status = "ok"
-        va  = m.access_voltage_per_phase_v
-        ra  = m.access_resistance_per_phase_kohm
-        var = m.return_access_voltage_per_phase_v
-        rar = m.return_access_resistance_per_phase_kohm
-        vd_act = m.active_driving_voltage_per_phase_v
-        vd_ret = m.return_driving_voltage_per_phase_v
-        f.write("\t".join([
-            str(cap.index),
-            _fmt(cap.pattern.excitation_phase.amplitude_ua),
-            _fmt(m.charge_per_phase_nc),
-            _fmt(m.charge_injection_mc_per_cm2),
-            _fmt(vd_act[0] if vd_act else m.driving_voltage_v),
-            _fmt(vd_ret[0] if vd_ret else None),
-            _fmt(m.interpulse_potential_v),
-            _fmt(va[0] if va else None),
-            _fmt(ra[0] if ra else None),
-            _fmt(var[0] if var else None),
-            _fmt(rar[0] if rar else None),
-            _fmt(m.effective_capacitance_nf),
-            _fmt(m.driving_capacitance_mf_per_cm2),
-            status,
-        ]) + "\n")
+        f.write("\t".join(_summary_row(cap)) + "\n")
 
     if not include_raw_traces:
         return

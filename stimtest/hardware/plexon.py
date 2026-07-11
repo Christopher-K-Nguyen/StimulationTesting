@@ -123,6 +123,16 @@ class PlexonStimulator(Stimulator):
         # ``PlexonStimulator()`` correctly skips the close on first
         # ``open()`` (nothing to close yet).
         self._is_open: bool = False
+        # Running-state flag — True between a start (start_all /
+        # start_channel) and the next stop_all / abort_all.  Makes
+        # ``stop_all`` IDEMPOTENT so the sweep's redundant
+        # PS_StopStimAllChannels calls (the per-capture ``finally`` stop
+        # + the next step's explicit pre-load stop, gotcha #15) collapse
+        # to a single DLL round-trip instead of firing twice back-to-back.
+        # Invariant: ``_is_running == False`` ⇒ the device is genuinely
+        # stopped (only the real-stop paths clear it; any start sets it),
+        # so skipping a stop when False can never leave the device live.
+        self._is_running: bool = False
         # Channels that have successfully passed period / repetitions
         # read-back validation since the most recent open(). The
         # read-back catches a class of firmware quirks (silent rounding
@@ -133,6 +143,34 @@ class PlexonStimulator(Stimulator):
         # Set is wiped by open()/close() since reinit changes the
         # firmware state.
         self._validated_channels: set = set()
+        # Value-keyed per-channel timing caches.  PS_SetPeriod (rate) and
+        # PS_SetRepetitions are SEPARATE device state — NOT embedded in
+        # the .pat file (see _load_arbitrary's content_signature comment)
+        # — and the device PERSISTS them across .pat reloads and
+        # stop/start cycles.  So once a channel's rate + repetitions are
+        # programmed they don't need re-setting every sweep step
+        # (operator: "rate and repetitions do not need to be set for
+        # every iteration if all involved channels are set at the
+        # beginning").  load_channel / set_repetitions skip the DLL call
+        # when the requested value already matches the cache; a genuine
+        # rate / reps CHANGE (different value) re-programs and re-caches.
+        # Wiped by open()/close() since PS_InitAllStim resets the device.
+        self._channel_period_ms: dict = {}
+        self._channel_reps: dict = {}
+        # Per-channel .pat CONTENT signature currently loaded ON THE
+        # DEVICE.  The device retains each channel's arbitrary pattern
+        # across stop/start cycles (only open()/close()/reinit() —
+        # PS_InitAllStim — clears it), so re-issuing
+        # ps_set_pattern_type / ps_load_arb_pattern / ps_load_channel for
+        # a channel that already holds the EXACT same pattern is pure
+        # redundant USB-TMC traffic.  A VT sweep reloads the 15 static
+        # zero-amplitude unused channels on EVERY amplitude step even
+        # though their pattern never changes (operator: efficiency — that
+        # was ~120 s of a 15-min 16-channel run).  load_channel skips the
+        # ~4 DLL round-trips when (content, period, reps) all match this
+        # cache AND the channel is already in ``_loaded_channels``.
+        # Wiped by open()/close() alongside the timing caches.
+        self._channel_content_sig: dict = {}
         # User's auto-discharge preference, applied on every open() so
         # the setting survives reinit cycles. ``None`` means "leave at
         # the SDK default (enabled)" — the panel hasn't pushed an
@@ -381,6 +419,19 @@ class PlexonStimulator(Stimulator):
         # channel must re-pass read-back validation before we can
         # trust it to skip the per-step verification round trips.
         self._validated_channels = set()
+        # PS_InitAllStim leaves the device stopped — reset the
+        # running-state flag so the first stop_all after a (re)open isn't
+        # wrongly skipped/fired.
+        self._is_running = False
+        # PS_InitAllStim also resets the device-side period / repetitions,
+        # so the value-keyed timing caches must be dropped — the next
+        # load_channel on each channel re-programs from scratch.
+        self._channel_period_ms = {}
+        self._channel_reps = {}
+        # …and clears every channel's loaded pattern, so the per-channel
+        # content cache must be dropped too (else load_channel would skip
+        # a genuinely-needed reload onto a freshly-wiped device).
+        self._channel_content_sig = {}
         # Re-apply the user's auto-discharge preference. The SDK
         # resets this to its default (enabled) on PS_InitAllStim,
         # so a reinit between configs would silently re-enable it
@@ -391,6 +442,42 @@ class PlexonStimulator(Stimulator):
                     self._stim_n, bool(self._auto_discharge_pref))
             except Exception:
                 pass
+        # Trigger mode — PULSAR controls start/stop PROGRAMMATICALLY via
+        # PS_StartStimAllChannels / PS_StopStimAllChannels, both of which
+        # REQUIRE PS_TRIG_SOFT (0) and return error 4 in any other mode.
+        # PS_InitAllStim resets the trigger mode and the power-on default
+        # is NOT guaranteed to be soft across firmware revisions, so we
+        # (re)assert it on every open.  Symptom of a device left in
+        # PS_TRIG_PULSE / PS_TRIG_LEVEL: the stim "starts" but waits for a
+        # hardware trigger that never arrives, so it never actually
+        # pulses (no output, no digital-sync edge → scope NUMACq stays 0).
+        # Read the prior mode first so the session log records what the
+        # device came up in (diagnostic for the "armed but not pulsing"
+        # class of bug).
+        from .pyplexstim.pyplexstimlib import PS_TRIG_SOFT
+        try:
+            _prior_mode, _gm_res = self._lib.ps_get_trigger_mode(self._stim_n)
+            if _gm_res == self._PS_OK:
+                _mode_name = {0: "SOFT", 1: "PULSE", 2: "LEVEL"}.get(
+                    int(_prior_mode), "?")
+                self._log(f"[stim] trigger mode at init = "
+                          f"{int(_prior_mode)} ({_mode_name})")
+        except Exception:
+            pass
+        try:
+            self._invoke("ps_set_trigger_mode", self._stim_n, PS_TRIG_SOFT,
+                         what="set_trigger_mode(PS_TRIG_SOFT=0)")
+            _new_mode, _res = self._lib.ps_get_trigger_mode(self._stim_n)
+            if _res == self._PS_OK and int(_new_mode) != PS_TRIG_SOFT:
+                self._log(
+                    f"[stim] ⚠ trigger mode read-back = {int(_new_mode)}, "
+                    f"expected {PS_TRIG_SOFT} (SOFT) — programmatic "
+                    f"start/stop may not work")
+        except Exception:
+            # _check already logged the FAILED line; the first start_all
+            # will surface the hard error 4 if soft mode didn't take.
+            # Don't abort the whole open over the trigger-mode set.
+            pass
         # Device-level open state.  Set TRUE only after a successful
         # ps_init_all_stim + post-init reads succeed (we made it
         # past every raise above).  The matching FALSE assignments
@@ -421,6 +508,10 @@ class PlexonStimulator(Stimulator):
         # somehow bypassed the flag).
         self._loaded_channels = set()
         self._validated_channels = set()
+        self._is_running = False
+        self._channel_period_ms = {}
+        self._channel_reps = {}
+        self._channel_content_sig = {}
         # Clean up the pinned .pat file so we don't leak temp files
         # across re-init cycles (and the next session starts fresh).
         if self._pat_path is not None:
@@ -448,8 +539,6 @@ class PlexonStimulator(Stimulator):
         # negative widths or amplitudes past the ±1000 µA limit.
         pattern.validate()
 
-        self._load_arbitrary(channel, pattern)
-
         # PS_SetPeriod / PS_GetPeriod both operate in **milliseconds**
         # per the MATLAB SDK docs (Help/PS_SetPeriod.m: "Period - period
         # value in milliseconds, valid values are from 0.020 ms <= Period
@@ -458,11 +547,45 @@ class PlexonStimulator(Stimulator):
         # for a requested 50 Hz train. Use the float as-is so we keep
         # sub-ms precision for high-rate (>1 kHz) trains.
         period_ms = 1e3 / pattern.rate_hz
-        self._invoke("ps_set_period", self._stim_n, channel, period_ms,
-                     what=f"set_period(ch={channel}, period={period_ms:.3f} ms)")
-        self._invoke("ps_set_repetitions",
-                     self._stim_n, channel, int(pattern.repetitions),
-                     what=f"set_repetitions(ch={channel}, n={pattern.repetitions})")
+        _ch = int(channel)
+        _reps = int(pattern.repetitions)
+        sig = self._content_signature(pattern)
+        # ---- Per-channel content cache (operator: efficiency) ----------
+        # The device retains each channel's loaded arbitrary pattern +
+        # period + repetitions across stop/start cycles — only
+        # open()/close()/reinit() (PS_InitAllStim) clears them.  So when
+        # this channel ALREADY holds this exact (content, period, reps),
+        # re-issuing ps_set_pattern_type / ps_load_arb_pattern /
+        # ps_load_channel is pure redundant USB-TMC traffic (~4 round
+        # trips, ~120 ms).  This is what collapses a VT sweep's reload of
+        # the 15 static zero-amplitude unused channels EVERY amplitude
+        # step down to once per configuration.  ``_loaded_channels`` gates
+        # the skip so a channel that was never committed (or was wiped by
+        # a reinit) still gets a full load.  A subsequent
+        # commit_loaded_channels (PS_LoadAllChannels) re-arms the retained
+        # pattern, so the unused channels keep ticking in cadence.
+        if (_ch in self._loaded_channels
+                and self._channel_content_sig.get(_ch) == sig
+                and self._channel_period_ms.get(_ch) == period_ms
+                and self._channel_reps.get(_ch) == _reps):
+            return False   # cache hit — device already holds this pattern
+
+        self._load_arbitrary(channel, pattern, content_signature=sig)
+
+        # Value-keyed timing cache: re-program the rate only when it
+        # differs from what this channel already holds (the device
+        # persists PS_SetPeriod across .pat reloads + stop/start).  A
+        # sweep that keeps the same rate every step thus programs it once
+        # per channel; a genuine rate change re-programs.
+        if self._channel_period_ms.get(_ch) != period_ms:
+            self._invoke("ps_set_period", self._stim_n, channel, period_ms,
+                         what=f"set_period(ch={channel}, period={period_ms:.3f} ms)")
+            self._channel_period_ms[_ch] = period_ms
+        if self._channel_reps.get(_ch) != _reps:
+            self._invoke("ps_set_repetitions",
+                         self._stim_n, channel, _reps,
+                         what=f"set_repetitions(ch={channel}, n={_reps})")
+            self._channel_reps[_ch] = _reps
         self._invoke("ps_load_channel", self._stim_n, channel,
                      what=f"load_channel(ch={channel})")
 
@@ -507,13 +630,72 @@ class PlexonStimulator(Stimulator):
         # Track the loaded state so the runner can decide whether
         # the next configuration's return-channel set requires a
         # reinit. See Stimulator.loaded_channels for the rule.
-        self._loaded_channels.add(int(channel))
+        self._loaded_channels.add(_ch)
+        # Record what this channel now holds on the device so a later
+        # identical load_channel (same content + period + reps) can skip
+        # the DLL round-trips above.  Set LAST, only after a fully
+        # successful load + read-back, so a partial / failed load never
+        # leaves a stale "already loaded" cache entry.
+        self._channel_content_sig[_ch] = sig
+        return True    # actually uploaded a (new/changed) pattern
+
+    @staticmethod
+    def _content_signature(pattern: PulsePattern) -> tuple:
+        """Hashable per-channel signature of a pattern's .pat CONTENT.
+
+        Covers ONLY what ends up in the .pat file (the phase geometry) —
+        NOT rate / repetitions, which are programmed separately via
+        PS_SetPeriod / PS_SetRepetitions and tracked by their own caches.
+        Used by :meth:`load_channel` (skip an already-loaded channel) and
+        :meth:`_load_arbitrary` (skip the shared-file rewrite).  Must stay
+        in lock-step with the pair list ``build_pat_pairs`` renders.
+
+        **CRITICAL — the amplitude is quantised to the DEVICE nA grid EXACTLY
+        as ``build_pat_pairs`` does** (``int(round(amp_ua*1000/step))*step``,
+        step = 100 nA rectangular / 30 nA shaped, ``waveforms.build_pat_pairs``
+        line ~2424), NOT rounded to integer µA.  An integer-µA amplitude was a
+        SAFETY bug: the per-channel content cache in :meth:`load_channel`
+        short-circuits (``return False`` → ``ps_load_channel`` SKIPPED) on a
+        signature match, so a fine VT/PS ramp step — the 0.1 µA testing
+        resolution (`voltage_transient._snap_test_ua`) + the back-off/oscillate
+        0.1 µA increments — from e.g. 50.0 → 50.4 µA COLLIDED under int-µA
+        rounding (both → 50): the upload was skipped, the electrode kept
+        delivering the OLD lower current, and the runner captured believing the
+        NEW current was applied → read E_pol below the water-window band → and
+        stepped the amplitude UP again, advancing PAST the true crossing (drive
+        an electrode past its water window → physically ruined).  The nA-grid
+        signature is identical iff the rendered .pat is identical, so the
+        efficiency skip (gotcha #65) is preserved for a genuinely-unchanged
+        pattern while every device-distinct amplitude forces a real reload.
+        Tests: `tests/test_plexon_timing_cache.py`.
+        """
+        from ..config import (STIM_CURRENT_STEP_RECT_NA,
+                              STIM_CURRENT_STEP_FINE_NA)
+        from ..waveforms import SHAPE_RECTANGULAR
+
+        def _amp_nA(ph) -> int:
+            step = (STIM_CURRENT_STEP_RECT_NA if ph.shape == SHAPE_RECTANGULAR
+                    else STIM_CURRENT_STEP_FINE_NA)
+            return int(round(float(ph.amplitude_ua) * 1000.0 / step)) * step
+
+        return tuple(
+            (_amp_nA(ph),
+             round(ph.width_us, 3),
+             round(ph.delay_after_us, 3),
+             ph.shape,
+             int(ph.bump_count),
+             round(ph.tau_us, 3),
+             round(getattr(ph, "tail_zero_us", 0.0), 3),
+             round(getattr(ph, "offset_ua", 0.0), 3))
+            for ph in pattern.phases
+        )
 
     def loaded_channels(self) -> set:
         """Channels with a pattern currently loaded (PlexStim-side)."""
         return set(self._loaded_channels)
 
-    def _load_arbitrary(self, channel: int, pattern: PulsePattern) -> None:
+    def _load_arbitrary(self, channel: int, pattern: PulsePattern,
+                        content_signature: tuple | None = None) -> None:
         """Write the .pat file for ``pattern`` and load it onto ``channel``.
 
         The path is pinned per stimulator instance — created on the
@@ -545,18 +727,10 @@ class PlexonStimulator(Stimulator):
         # change alone shouldn't force a rewrite + fsync. Previously
         # rate/reps were folded into the signature and every sweep
         # step that touched the rate burned ~5-50 ms re-flushing
-        # bytes the DLL already had.
-        content_signature = tuple(
-            (int(round(ph.amplitude_ua)),
-             round(ph.width_us, 3),
-             round(ph.delay_after_us, 3),
-             ph.shape,
-             int(ph.bump_count),
-             round(ph.tau_us, 3),
-             round(getattr(ph, "tail_zero_us", 0.0), 3),
-             round(getattr(ph, "offset_ua", 0.0), 3))
-            for ph in pattern.phases
-        )
+        # bytes the DLL already had.  The caller (load_channel) usually
+        # passes the precomputed signature so it isn't built twice.
+        if content_signature is None:
+            content_signature = self._content_signature(pattern)
         # Lazy-allocate the pinned path on first use. ``delete=False``
         # because we want it to outlive the with-block; unlinked in
         # ``close()`` instead.
@@ -628,6 +802,7 @@ class PlexonStimulator(Stimulator):
         self._validate_channel(channel, self.info.n_channels or 16)
         self._invoke("ps_start_stim_channel", self._stim_n, channel,
                      what=f"start_stim_channel(ch={channel})")
+        self._is_running = True
 
     @_dll_locked
     def stop_channel(self, channel: int) -> None:
@@ -637,8 +812,19 @@ class PlexonStimulator(Stimulator):
 
     @_dll_locked
     def stop_all(self) -> None:
+        # Idempotent: skip the redundant PS_StopStimAllChannels when we
+        # already know the device is stopped (see _is_running).  The sweep
+        # issues TWO stops between steps — the per-capture ``finally`` stop
+        # + the next step's explicit pre-load stop (gotcha #15) — and on
+        # the normal path the second is a no-op.  This collapses it to ONE
+        # DLL round-trip while the explicit stop STILL fires if the finally
+        # was skipped (running would still be True then), so the
+        # belt-and-suspenders safety is preserved.
+        if not self._is_running:
+            return
         self._invoke("ps_stop_stim_all_channels", self._stim_n,
                      what="stop_stim_all_channels")
+        self._is_running = False
 
     @_dll_locked
     def abort_all(self) -> None:
@@ -652,6 +838,41 @@ class PlexonStimulator(Stimulator):
         in flight rather than letting it complete.
         """
         self._invoke("ps_abort_all", what="abort_all")
+        # Abort halts everything → device is now stopped.  Always fires
+        # (emergency cease), but keeps _is_running coherent so a follow-up
+        # stop_all collapses to a no-op.
+        self._is_running = False
+
+    @_dll_locked
+    def set_trigger_mode(self, mode: int) -> None:
+        """Set the device trigger mode (0=SOFT, 1=PULSE, 2=LEVEL).
+
+        PULSAR starts and stops stimulation PROGRAMMATICALLY, which the
+        SDK only permits in ``PS_TRIG_SOFT`` (0): both
+        ``PS_StartStimAllChannels`` and ``PS_StopStimAllChannels`` return
+        error 4 ("wrong trigger mode") in any other mode.  :meth:`open`
+        asserts SOFT on every connect (``PS_InitAllStim`` resets it and
+        the power-on default isn't guaranteed soft across firmware
+        revisions); this method exists for explicit callers and tests.
+        """
+        self._invoke("ps_set_trigger_mode", self._stim_n, int(mode),
+                     what=f"set_trigger_mode({int(mode)})")
+
+    @_dll_locked
+    def load_all_channels(self) -> None:
+        """Commit every channel's staged parameters in one call
+        (``PS_LoadAllChannels``).
+
+        Mirrors the MONOPOLAR commit in the MATLAB original
+        (``loadPattern.m``: ``isempty(channelReturn_arr) ->
+        PS_LoadAllChannels``).  Used by
+        :meth:`ExperimentRunner.commit_loaded_channels` for configs with
+        NO return channels; multipolar configs commit per-channel via
+        :meth:`load_channel` instead so the return channels stay
+        unloaded (passive sinks).
+        """
+        self._invoke("ps_load_all_channels", self._stim_n,
+                     what="load_all_channels")
 
     @_dll_locked
     def start_all(self) -> None:
@@ -669,14 +890,40 @@ class PlexonStimulator(Stimulator):
         """
         self._invoke("ps_start_stim_all_channels", self._stim_n,
                      what="start_stim_all_channels")
+        self._is_running = True
 
     @_dll_locked
     def set_repetitions(self, channel: int, n: int) -> None:
         self._validate_channel(channel, self.info.n_channels or 16)
         if n < 0:
             raise ValueError(f"repetitions must be ≥ 0 (0 = infinite), got {n}.")
+        _ch = int(channel)
+        # Value-keyed cache (see __init__): skip when the channel already
+        # holds this repetition count.  The sweep runners call this with
+        # n=0 ("infinite") right after load_channel — which already
+        # programmed reps=0 from the pattern (default repetitions=0) — so
+        # the redundant re-set collapses to a no-op rather than a USB
+        # round-trip per step.
+        if self._channel_reps.get(_ch) == int(n):
+            return
         self._invoke("ps_set_repetitions", self._stim_n, channel, int(n),
                      what=f"set_repetitions(ch={channel}, n={n})")
+        # Read-back confirm (operator: "Do the same checks with the
+        # PlexStim … getting what is set to confirm").  The standalone
+        # setter now mirrors ``load_channel``'s reps validation — a silent
+        # mismatch means the wrong number of pulses per burst, so surface
+        # it NOW rather than after a capture looks wrong.  Fires only on a
+        # GENUINE change (the value cache above collapses the sweep's
+        # no-op re-sets), so the extra USB round-trip is rare.  Confirm
+        # BEFORE caching so a failed read-back never leaves a wrong
+        # "already set" entry.
+        got_reps, res = self._lib.ps_get_repetitions(self._stim_n, channel)
+        self._check(res, f"get_repetitions(ch={channel}) read-back")
+        if int(got_reps) != int(n):
+            raise RuntimeError(
+                f"PlexStim repetitions mismatch on ch{channel}: requested "
+                f"{n}, device reports {got_reps}.")
+        self._channel_reps[_ch] = int(n)
 
     # ----- auto-discharge -----
     @_dll_locked
@@ -690,6 +937,19 @@ class PlexonStimulator(Stimulator):
         self._auto_discharge_pref = bool(enabled)
         self._invoke("ps_set_auto_discharge", self._stim_n, bool(enabled),
                      what=f"set_auto_discharge(enabled={enabled})")
+        # Read-back confirm (operator: "Do the same checks with the
+        # PlexStim … getting what is set to confirm").  Non-fatal ⚠ log
+        # (like the trigger-mode read-back in open()) — auto-discharge is a
+        # preference, not a per-capture safety value, so a mismatch is
+        # surfaced in the session log without aborting.
+        try:
+            got, res = self._lib.ps_get_auto_discharge(self._stim_n)
+            if res == self._PS_OK and bool(got) != bool(enabled):
+                self._log(
+                    f"[stim] ⚠ auto-discharge read-back = {bool(got)}, "
+                    f"expected {bool(enabled)}")
+        except Exception:
+            pass
 
     @_dll_locked
     def get_auto_discharge(self) -> Optional[bool]:

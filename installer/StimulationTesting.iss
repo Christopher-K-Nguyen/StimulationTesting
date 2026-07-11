@@ -60,9 +60,9 @@
 ; tree without re-running build.py) using whatever version the
 ; codebase had at the time this file was last edited.
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+    #define AppVersion "0.2.195"
 #endif
-#define AppPublisher "Neural Interfaces Lab"
+#define AppPublisher "Solzbacher Lab, University of Utah"
 ; Launcher .exe filenames — intentionally NOT renamed so existing
 ; users' Start-Menu / desktop shortcuts (and the file-system layout
 ; under {app}) continue to work across the rename. To repath these,
@@ -102,7 +102,27 @@ LicenseFile=
 OutputDir={#SourcePath}\Output
 ; Audit finding #29 — the installer .exe filename is the first thing
 ; users see at download time. Show the new branding.
+;
+; The DEFAULT build is the REGULAR / public installer — share it with
+; anyone.  Two INDEPENDENT opt-in flags each append a suffix so every
+; artifact has a distinct filename:
+;   /DWITH_CWRU_PROFILE=1  → bundles the CWRU login profile  (-CWRU)
+;   /DWITH_INTERSTELLAR=1  → experimental interpulse-bias build
+;                            (-INTERSTELLAR; build.py --with-interstellar)
+; Both together → -CWRU-INTERSTELLAR.
+#ifdef WITH_INTERSTELLAR
+  #ifdef WITH_CWRU_PROFILE
+OutputBaseFilename=PULSAR-Setup-{#AppVersion}-CWRU-INTERSTELLAR
+  #else
+OutputBaseFilename=PULSAR-Setup-{#AppVersion}-INTERSTELLAR
+  #endif
+#else
+  #ifdef WITH_CWRU_PROFILE
+OutputBaseFilename=PULSAR-Setup-{#AppVersion}-CWRU
+  #else
 OutputBaseFilename=PULSAR-Setup-{#AppVersion}
+  #endif
+#endif
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -145,14 +165,46 @@ Name: "viewericon"; Description: "Add a desktop shortcut for {#ViewerDisplayName
 Name: "app"; Description: "{#AppName} (required)"; Types: full compact custom; Flags: fixed
 Name: "prereq"; Description: "Install missing prerequisites"; Types: full
 Name: "prereq\vcredist"; Description: "Microsoft Visual C++ 2015-2022 Redistributable (x64) -- required"; Types: full compact
-Name: "prereq\plexstim"; Description: "Plexon PlexStim 2.0 SDK (real stimulator)"; Types: full
-Name: "prereq\nivisa"; Description: "NI-VISA runtime (real Tektronix scope)"; Types: full
+; Stim-2 (PlexStim) and NI-VISA are no longer component checkboxes here —
+; they're handled by the "Required hardware drivers" wizard page (which
+; auto-runs their installers on click) so they can be installed + the PC
+; rebooted BEFORE PULSAR, per the operator's requested flow.
 
 [Files]
 ; Drop the entire PyInstaller dist tree (StimulationTesting + its DLLs +
 ; the vendored PlexStim64.dll) under {app}.
 Source: "dist\StimulationTesting\*"; DestDir: "{app}"; Components: app; \
     Flags: ignoreversion recursesubdirs createallsubdirs
+; OPTIONAL bundled prerequisite installers — so the wizard page can
+; AUTO-RUN them instead of opening a website.  ``dontcopy`` keeps them
+; out of {app} (extracted to {tmp} on demand via ExtractTemporaryFile);
+; ``skipifsourcedoesntexist`` means the build still succeeds when they're
+; absent (the wizard then downloads Stim-2 / opens NI's page instead).
+; To enable full offline auto-run, drop the vendor installers here:
+;   installer/prereqs/stim2-setup.exe   (Plexon Stimulator V2 setup)
+;   installer/prereqs/nivisa-setup.exe  (NI-VISA, e.g. the online installer)
+Source: "prereqs\stim2-setup.exe";  Flags: dontcopy skipifsourcedoesntexist
+Source: "prereqs\nivisa-setup.exe"; Flags: dontcopy skipifsourcedoesntexist
+; CWRU collaborator login profile.  Pure DATA (login name + SHA-256
+; password hash + the shape IDs it unlocks) — NO code, so distributing
+; it is safe and importing it never executes anything.  Lands in
+; {app}\profiles\ so a collaborator can Admin -> Import Profile... and
+; point at it right from the install directory; logging in as ``cwru``
+; then unlocks the halfpipe / bowtie / speedbumps shapes.  The shape
+; GEOMETRY already ships in PULSAR (stimtest.waveforms.SHAPE_*); the
+; profile only flips the visibility gate.
+; ``skipifsourcedoesntexist`` — the profile is gitignored (CWRU-private,
+; see .gitignore), so it's present in the operator's local build tree but
+; absent on a public-repo checkout; the build still succeeds either way.
+;
+; OPT-IN: only bundled when ``/DWITH_CWRU_PROFILE=1`` is passed to ISCC, so
+; the DEFAULT (public) installer never ships the CWRU profile.  A public
+; install therefore has no "cwru" login mystery (the login dialog mentions
+; only Admin).
+#ifdef WITH_CWRU_PROFILE
+Source: "profiles\cwru.pulsarprofile.json"; DestDir: "{app}\profiles"; \
+    Components: app; Flags: ignoreversion skipifsourcedoesntexist
+#endif
 
 [Icons]
 ; Audit finding #28 — shortcut labels use {#AppName} ("PULSAR") for
@@ -185,11 +237,14 @@ const
   VCRuntimesPath = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
   NiVisaPath     = 'SOFTWARE\National Instruments\NI-VISA';
   IviVisaPath    = 'SOFTWARE\IVI Foundation\VISA\Win64\CurrentVersion';
-  { Inno Setup's Pascal scripting layer doesn't predeclare Win32 file
-    attribute constants. We only need DIRECTORY here for the FindFirst
-    walk in PlexonSdkFolderExists. Value matches the Win32 SDK header
-    (0x10). }
-  FILE_ATTRIBUTE_DIRECTORY = $00000010;
+  { We only need the DIRECTORY attribute for the FindFirst walk in
+    PlexonSdkFolderExists.  Use a PRIVATE name — NOT the Win32
+    ``FILE_ATTRIBUTE_DIRECTORY`` — because newer Inno Setup (6.3+, seen
+    on 6.7.3) PREDECLARES the Win32 file-attribute constants as built-ins,
+    so re-declaring one aborts the compile with "Duplicate identifier".
+    A private name compiles on every Inno version.  Value matches the
+    Win32 SDK header (0x10). }
+  FILE_ATTR_DIRECTORY = $00000010;
 
 { ----- Generic helpers ----------------------------------------------------- }
 
@@ -297,79 +352,76 @@ end;
 
 { ----- Prereq 2: Plexon PlexStim 2.0 SDK ----------------------------------- }
 
-function PlexonSdkFolderExists(): Boolean;
-{ Modern Plexon installers (Stimulator V2 / Sim-2) drop their SDK
-  folder under C:\PlexonSDKs and a sibling C:\PlexonData for runtime
-  data. Walk PlexonSDKs and look for any subdirectory whose name
-  mentions "plexstim" or "stimulator" (case-insensitive) — Plexon's
-  exact SDK folder name has varied across releases. Older installers
-  used C:\Program Files\Plexon Inc\PlexStim 2.0\; that's checked too.
-
-  Used as a filesystem fallback for IsPlexStimInstalled when the
-  registry uninstall entry is missing (e.g. user-mode install, manual
-  copy, or registry was wiped). }
-var
-  FindRec: TFindRec;
-  RootDir, Lower: String;
-  ProgramFiles64, ProgramFiles32: String;
+function PlexStimDllInDir(const Dir: String): Boolean;
+{ True if either PlexStim driver DLL (64-bit PlexStim64.dll or 32-bit
+  PlexStim.dll) is present directly in Dir or in Dir\bin. }
 begin
-  Result := False;
-
-  RootDir := 'C:\PlexonSDKs';
-  if DirExists(RootDir) then
-  begin
-    if FindFirst(RootDir + '\*', FindRec) then
-    begin
-      try
-        repeat
-          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
-          begin
-            if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
-            begin
-              Lower := LowerCase(FindRec.Name);
-              if (Pos('plexstim', Lower) > 0) or
-                 (Pos('stimulator', Lower) > 0) then
-              begin
-                Result := True;
-                Exit;
-              end;
-            end;
-          end;
-        until not FindNext(FindRec);
-      finally
-        FindClose(FindRec);
-      end;
-    end;
-  end;
-
-  ProgramFiles64 := ExpandConstant('{commonpf64}');
-  ProgramFiles32 := ExpandConstant('{commonpf32}');
-  if DirExists(ProgramFiles64 + '\Plexon Inc\PlexStim 2.0') or
-     DirExists(ProgramFiles32 + '\Plexon Inc\PlexStim 2.0') or
-     DirExists(ProgramFiles64 + '\Plexon Inc\PlexStim') or
-     DirExists(ProgramFiles32 + '\Plexon Inc\PlexStim') then
-    Result := True;
+  Result :=
+    FileExists(Dir + '\PlexStim64.dll') or
+    FileExists(Dir + '\PlexStim.dll')   or
+    FileExists(Dir + '\bin\PlexStim64.dll') or
+    FileExists(Dir + '\bin\PlexStim.dll');
 end;
 
 function IsPlexStimInstalled(): Boolean;
-{ True if the PlexStim 2.0 SDK ("Sim-2") looks installed. We check
-  the registry uninstall hive first (most reliable, gives us the
-  install version too) and fall back to a filesystem probe of
-  C:\PlexonSDKs / C:\Program Files for users where the registry
-  entry is missing or stale. }
+{ Operator's criterion: "the Stim-2 installation check is to see if the
+  DLL has been installed."  The Stim-2 (PlexStim 2.0) installer drops
+  the PlexStim driver DLL — PlexStim64.dll (64-bit) / PlexStim.dll
+  (32-bit) — on the system.  We probe, in order:
+    1. the Windows system dirs (System32 / SysWOW64),
+    2. the fixed Plexon install folders (older installers),
+    3. a walk of C:\PlexonSDKs subfolders (modern installer; the exact
+       SDK subfolder name varies across releases).
+  Any hit ⇒ installed.  (Note: this is the OS-installed driver DLL, NOT
+  the copy PULSAR vendors in stimtest/hardware/pyplexstim/bin.) }
 var
-  Needles: array of String;
+  FindRec: TFindRec;
+  Sys32, SysWow, Root: String;
 begin
-  SetArrayLength(Needles, 3);
-  Needles[0] := 'plexstim';
-  Needles[1] := 'stimulator v2';
-  Needles[2] := 'plexon inc';
-  { PlexStim's installer is 32-bit, so its uninstall entry historically
-    lives under WOW6432Node on 64-bit Windows. We check both hives so the
-    detection works whether Plexon ships a 32- or 64-bit installer. }
-  Result := UninstallEntryMatches(HKLM, Needles) or
-            UninstallEntryMatches(HKLM32, Needles) or
-            PlexonSdkFolderExists();
+  Result := False;
+
+  { 1. Windows system directories. }
+  Sys32  := ExpandConstant('{sys}');         { System32 (native bitness) }
+  SysWow := ExpandConstant('{syswow64}');     { 32-bit DLLs on 64-bit Win }
+  if FileExists(Sys32 + '\PlexStim64.dll') or
+     FileExists(Sys32 + '\PlexStim.dll') or
+     FileExists(SysWow + '\PlexStim.dll') or
+     FileExists(SysWow + '\PlexStim64.dll') then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  { 2. Fixed Plexon install folders. }
+  if PlexStimDllInDir(ExpandConstant('{commonpf64}') + '\Plexon Inc\PlexStim 2.0') or
+     PlexStimDllInDir(ExpandConstant('{commonpf32}') + '\Plexon Inc\PlexStim 2.0') or
+     PlexStimDllInDir(ExpandConstant('{commonpf64}') + '\Plexon Inc\PlexStim') or
+     PlexStimDllInDir(ExpandConstant('{commonpf32}') + '\Plexon Inc\PlexStim') then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  { 3. Modern installer: C:\PlexonSDKs\<varying-name>\... — walk subdirs. }
+  Root := 'C:\PlexonSDKs';
+  if DirExists(Root) and FindFirst(Root + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if ((FindRec.Attributes and FILE_ATTR_DIRECTORY) <> 0) and
+           (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          if PlexStimDllInDir(Root + '\' + FindRec.Name) then
+          begin
+            Result := True;
+            Exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
 end;
 
 procedure InstallPlexStimIfMissing();
@@ -464,19 +516,178 @@ begin
            mbInformation, MB_OK);
 end;
 
+{ ----- Prerequisite wizard page (Stim-2 + NI-VISA) ------------------------- }
+{ Shown right after the Welcome page, BEFORE anything is installed, so the
+  operator can install the hardware drivers and reboot FIRST (the order the
+  user asked for): "After rebooting the computer, the user may try installing
+  PULSAR and POLARIS."  Each missing driver gets a clickable blue hyperlink
+  that opens its download page in the default browser; both drivers need a
+  restart, which the page spells out. }
+
+function RunBundledInstaller(const TmpName: String): Boolean;
+(* Run a prerequisite installer BUNDLED into this setup via a [Files]
+  ``dontcopy`` entry (extracted on demand to the temp folder).  NOTE: do
+  NOT write the literal tmp constant in this brace comment — an Inno
+  ``{ }`` comment ends at the FIRST close brace, so a brace-constant here
+  would terminate the comment early and break the compile.  Returns False
+  when
+  it wasn't bundled (the file was absent at build time and skipped via
+  ``skipifsourcedoesntexist``) so the caller can fall back to a download
+  / web page.  ``ewNoWait`` so the PULSAR wizard stays responsive while
+  the driver installer's own UI runs. *)
+var
+  ExtractedPath: String;
+  ResultCode: Integer;
+begin
+  Result := False;
+  try
+    ExtractTemporaryFile(TmpName);   { raises if not compiled into setup }
+  except
+    Exit;                            { not bundled — caller falls back }
+  end;
+  ExtractedPath := ExpandConstant('{tmp}\') + TmpName;
+  if FileExists(ExtractedPath) then
+    Result := Exec(ExtractedPath, '', '', SW_SHOW, ewNoWait, ResultCode);
+end;
+
+procedure RunStimInstaller(Sender: TObject);
+{ Automatically install Stim-2: run a bundled installer if the build
+  included one (installer/prereqs/stim2-setup.exe), else download the
+  ~5 MB Plexon Stimulator V2 setup and run it, else open the page. }
+var
+  Tmp: String;
+  ResultCode: Integer;
+begin
+  if RunBundledInstaller('stim2-setup.exe') then Exit;
+  Tmp := ExpandConstant('{tmp}\StimulatorV2Setup.exe');
+  if DownloadFile('{#PlexStimUrl}', Tmp) and
+     Exec(Tmp, '', '', SW_SHOW, ewNoWait, ResultCode) then Exit;
+  ShellExec('open', '{#PlexStimUrl}', '', '', SW_SHOW, ewNoWait, ResultCode);
+end;
+
+procedure RunVisaInstaller(Sender: TObject);
+{ Automatically install NI-VISA: run a bundled installer if the build
+  included one (installer/prereqs/nivisa-setup.exe).  NI gates its
+  downloads behind a free login + rotating URLs and the runtime is
+  ~700 MB, so we can NOT reliably fetch it automatically — fall back to
+  opening NI's download page.  Bundle installer/prereqs/nivisa-setup.exe
+  (e.g. the NI-VISA *online* installer) to make this auto-run too. }
+var
+  ResultCode: Integer;
+begin
+  if RunBundledInstaller('nivisa-setup.exe') then Exit;
+  if not ShellExec('open', '{#NiVisaPageUrl}', '', '', SW_SHOW, ewNoWait, ResultCode) then
+    MsgBox('Could not open the browser. Please visit:' #13#10 +
+           '{#NiVisaPageUrl}', mbInformation, MB_OK);
+end;
+
+procedure AddPageLabel(APage: TWizardPage; const ACaption: String;
+                       ATop, AHeight: Integer; AWrap: Boolean);
+{ A plain (black) text label spanning the page width. }
+var
+  L: TNewStaticText;
+begin
+  L := TNewStaticText.Create(APage);
+  L.Parent := APage.Surface;
+  L.Left := 0;
+  L.Top := ATop;
+  L.Width := APage.SurfaceWidth;
+  L.AutoSize := False;
+  L.WordWrap := AWrap;
+  L.Height := AHeight;
+  L.Caption := ACaption;
+end;
+
+procedure AddPageLink(APage: TWizardPage; const ACaption: String;
+                      ATop: Integer; AOnClick: TNotifyEvent);
+{ A blue, underlined, hand-cursor label that acts as a clickable hyperlink. }
+var
+  L: TNewStaticText;
+begin
+  L := TNewStaticText.Create(APage);
+  L.Parent := APage.Surface;
+  L.Left := ScaleX(12);
+  L.Top := ATop;
+  L.AutoSize := True;
+  L.Caption := ACaption;
+  L.Cursor := crHand;
+  L.Font.Color := clBlue;
+  L.Font.Style := [fsUnderline];
+  L.OnClick := AOnClick;
+end;
+
+procedure InitializeWizard();
+var
+  PrereqPage: TWizardPage;
+  StimOk, VisaOk: Boolean;
+  y: Integer;
+begin
+  PrereqPage := CreateCustomPage(wpWelcome,
+    'Required hardware drivers',
+    'These must be installed (and the PC restarted) before PULSAR can control the stimulator and oscilloscope.');
+
+  StimOk := IsPlexStimInstalled();
+  VisaOk := IsVisaInstalled();
+  y := ScaleY(4);
+
+  { --- Stim-2 (Plexon PlexStim 2.0) --- }
+  if StimOk then
+    AddPageLabel(PrereqPage,
+      'Plexon Stim-2 (PlexStim 2.0):   INSTALLED', y, ScaleY(15), False)
+  else
+  begin
+    AddPageLabel(PrereqPage,
+      'Plexon Stim-2 (PlexStim 2.0):   NOT FOUND', y, ScaleY(15), False);
+    AddPageLink(PrereqPage,
+      'Click here to download and run the Stim-2 installer',
+      y + ScaleY(17), @RunStimInstaller);
+    y := y + ScaleY(17);
+  end;
+  y := y + ScaleY(30);
+
+  { --- NI-VISA --- }
+  if VisaOk then
+    AddPageLabel(PrereqPage,
+      'NI-VISA runtime:   INSTALLED', y, ScaleY(15), False)
+  else
+  begin
+    AddPageLabel(PrereqPage,
+      'NI-VISA runtime:   NOT FOUND', y, ScaleY(15), False);
+    AddPageLink(PrereqPage,
+      'Click here to download and run NI-VISA (opens NI''s page if not bundled)',
+      y + ScaleY(17), @RunVisaInstaller);
+    y := y + ScaleY(17);
+  end;
+  y := y + ScaleY(36);
+
+  { --- Restart notice + recommended order --- }
+  if StimOk and VisaOk then
+    AddPageLabel(PrereqPage,
+      'Both drivers are installed. Click Next to continue installing PULSAR and POLARIS.',
+      y, ScaleY(40), True)
+  else
+    AddPageLabel(PrereqPage,
+      'Click a link above to download and run that driver''s installer now.' + #13#10 +
+      'IMPORTANT: installing Stim-2 and/or NI-VISA REQUIRES restarting your computer.' + #13#10 +
+      'Recommended order: install the missing driver(s), RESTART Windows, then run ' +
+      'this installer again to install PULSAR and POLARIS.' + #13#10 + #13#10 +
+      'You can still click Next to continue now, but PULSAR will run in simulator mode ' +
+      'until the drivers are installed.',
+      y, ScaleY(112), True);
+end;
+
 { ----- Wizard hooks -------------------------------------------------------- }
 
 procedure CurStepChanged(CurStep: TSetupStep);
-{ Run all three prereq checks immediately after our files are on disk
-  but before the final wizard page so the user sees the result inside
-  the install flow rather than after the wizard has dismissed. Each
-  check is gated by the corresponding component selection so a user
-  who unticks "Install missing prerequisites" gets a clean app-only
-  install. }
+{ Stim-2 and NI-VISA are now handled by the prerequisite wizard page
+  (the "Required hardware drivers" page) BEFORE install, per the
+  operator's "install drivers + reboot first, then PULSAR" flow — the
+  page auto-runs their installers on click.  Only the quiet, required
+  VC++ runtime is still auto-installed here at post-install. }
 begin
   if CurStep <> ssPostInstall then Exit;
 
-  if IsComponentSelected('prereq\vcredist') then InstallVCRedistIfMissing();
-  if IsComponentSelected('prereq\plexstim') then InstallPlexStimIfMissing();
-  if IsComponentSelected('prereq\nivisa')   then InstallNiVisaIfMissing();
+  { ``WizardIsComponentSelected`` — the modern name; ``IsComponentSelected``
+    still works on Inno 6.7.3 but emits a deprecation hint. }
+  if WizardIsComponentSelected('prereq\vcredist') then InstallVCRedistIfMissing();
 end;

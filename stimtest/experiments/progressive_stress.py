@@ -1,8 +1,10 @@
 """Progressive Stress / Stepped-Current Pulsing experiment.
 
-Drives a single channel through a staircase amplitude ramp, holding each
-step for ``t_step_s`` seconds and grabbing several averaged scope frames so
-metric drift within a step is captured. Continues until any of:
+Drives ONE SAMPLE — a channel (monopolar) OR a combo (bipolar / multipolar,
+i.e. an active + return set) — through a staircase amplitude ramp, holding
+each step for ``t_step_s`` seconds and grabbing several averaged scope frames
+so metric drift within a step is captured.  (The active channel delivers the
+current; for a combo its returns are passive sinks.)  Continues until any of:
 
 * the configured ``max_ua`` ceiling is reached (default = the PlexStim
   hardware limit, ~1 mA/channel);
@@ -34,7 +36,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
-import numpy as np
 
 from ..config import STIM_MAX_AMPLITUDE_UA, STIM_VOLTAGE_COMPLIANCE_V
 from ..hardware.base import Oscilloscope, Stimulator
@@ -129,13 +130,29 @@ class ProgressiveStressExperiment(ExperimentRunner):
         # The cost is the cheap ``scaled()`` call, which we move from
         # the critical path into the long settling window.
         next_pattern = None
-        excite_amp_abs = abs(base.excitation_phase.amplitude_ua) or 1.0
+        # Global monotonic run anchor for the precise-sampling time
+        # columns.  ``time.monotonic()`` (NOT ``time.time()``) so the
+        # cadence math can't jump on an NTP step / DST change — the
+        # equivalent of MATLAB's ``tic``/``toc`` high-resolution
+        # counter.  Each capture records the elapsed time vs this
+        # anchor (actual) AND the fixed cadence-grid time it aimed for
+        # (scheduled).  Operator: "make sure the timing is precise" +
+        # "have the fixed time and elapsed time columns".
+        run_t0 = time.monotonic()
         try:
             while not self.aborted and amp <= self.policy.max_ua:
+                # User PAUSE checkpoint (between staircase steps — stim already
+                # stopped here, next step reloads+starts on resume → restart=None).
+                if not self.wait_if_paused():
+                    break
                 if next_pattern is not None:
                     pattern = next_pattern
                 else:
-                    pattern = base.scaled(amp / excite_amp_abs)
+                    # Identical to base.scaled(amp/|excite|) for a normal
+                    # template; also grows a ZERO-amplitude template so a
+                    # PS staircase "starting at 0 µA" actually increases the
+                    # current (plain scaling can't grow a zero).  See base.py.
+                    pattern = self._pattern_at_amplitude(base, amp)
 
                 # Adaptive scope view per amplitude step: I_mon vertical
                 # scale + trigger level both updated.  Vertical scale uses
@@ -184,6 +201,10 @@ class ProgressiveStressExperiment(ExperimentRunner):
                     # unloaded (passive sink); CG auto-skips because
                     # returns span every other channel.
                     self.load_zero_unused_channels(pattern, config)
+                    # MONOPOLAR commit (config.returns empty) → ONE
+                    # PS_LoadAllChannels; multipolar no-op (MATLAB
+                    # loadPattern.m parity).
+                    self.commit_loaded_channels(config)
                     # PS_StartStimAllChannels — single-channel start fails
                     # with WRONG-TRIGGER-MODE on default-mode PlexStim.
                     # Active + unused-zero channels fire together; zero
@@ -203,37 +224,53 @@ class ProgressiveStressExperiment(ExperimentRunner):
                 # is no next step.
                 next_amp = amp + self.policy.step_ua
                 if next_amp <= self.policy.max_ua:
-                    next_pattern = base.scaled(next_amp / excite_amp_abs)
+                    next_pattern = self._pattern_at_amplitude(base, next_amp)
                 else:
                     next_pattern = None
 
                 pulse_period_s = 1.0 / pattern.rate_hz
                 navg = getattr(self.scope, "_expected_acq_navg", None) or 8
-                step_start = time.time()
+                step_start = time.monotonic()
                 interval = max(self.policy.sampling_period_s, 1e-3)
+                # FIXED cadence grid anchored to the step start: each grab
+                # targets ``step_start + k·interval``, NOT ``now + interval``
+                # — so a slow capture doesn't push every later grab late
+                # (the drift MATLAB's ``rateControl`` failed to avoid).
                 next_grab = step_start
                 step_caps: List[Capture] = []
                 _step_cap_idx = 0
-                while not self.aborted and (time.time() - step_start) < self.policy.t_step_s:
-                    if time.time() >= next_grab:
+                while not self.aborted and (time.monotonic() - step_start) < self.policy.t_step_s:
+                    now = time.monotonic()
+                    if now >= next_grab:
                         try:
                             acq = self.scope.capture_while_running(
                                 wait_s=navg * pulse_period_s,
                                 reset_before_run=(_step_cap_idx == 0))
-                            # Sanity check: I_mon edge should land at t≈0
-                            try:
-                                self.check_trigger_alignment(acq)
-                            except Exception:
-                                pass
-                            _acq_ch = getattr(acq, "channels", {}) or {}
-                            for _ch, _arr in _acq_ch.items():
-                                _a = np.asarray(_arr, dtype=float)
-                                if _a.size >= 2:
-                                    self.scope.adapt_channel_scale(
-                                        _ch, v_min=float(_a.min()),
-                                        v_max=float(_a.max()))
+                            # (No trigger/pulse-alignment check — operator:
+                            # "Do not have warnings about the trigger
+                            # warning"; the I_mon edge isn't a reliable
+                            # time-axis signal.  See check_trigger_alignment.)
+                            # SHARED fit-the-view rescale loop (same
+                            # coarse/fine scaling + positioning as VT —
+                            # operator request).  Stim keeps running
+                            # (continuous within a step, gotcha #6);
+                            # recapture = another continuous-run grab
+                            # whose sleep IS the fresh-frame settle.  On
+                            # a converged stationary signal the loop
+                            # exits after ONE pass with no writes, so
+                            # the snapshot cadence is unaffected.
+                            acq = self.rescale_to_fit(
+                                acq, pattern=pattern,
+                                recapture=lambda _t:
+                                    self.scope.capture_while_running(
+                                        wait_s=navg * pulse_period_s),
+                                timeout_s=navg * pulse_period_s + 6.0,
+                                context=(f"at step {amp:.0f} µA "
+                                         f"(snapshot "
+                                         f"#{_step_cap_idx + 1})"))
                         except Exception:
                             continue
+                        self._smooth_acquisition(acq)
                         cap = make_capture(idx, pattern, acq, self.scope, self.stim,
                                            cal=self.cal, channel=config.active)
                         compute_metrics(cap, surface_area)
@@ -265,6 +302,14 @@ class ProgressiveStressExperiment(ExperimentRunner):
                         except Exception:
                             pass
                         cap.status.notes = f"step={amp:.0f}uA"
+                        # Precise-sampling time columns: the fixed
+                        # cadence-grid time this grab AIMED for
+                        # (``next_grab``) and the actual monotonic
+                        # elapsed when it fired — both vs the global
+                        # run anchor so the whole staircase shares ONE
+                        # timeline for failure-marker analysis over time.
+                        cap.metrics.scheduled_time_s = next_grab - run_t0
+                        cap.metrics.elapsed_time_s = now - run_t0
                         # Hardware-level stop condition: V_mon rail.
                         # Use the same 3-consecutive-samples glitch
                         # filter that voltage_transient uses, so a
@@ -282,6 +327,14 @@ class ProgressiveStressExperiment(ExperimentRunner):
                                 min_consecutive=3))
                         run.captures.append(cap)
                         step_caps.append(cap)
+                        # Per-capture pulse count + cumulative delivered
+                        # charge (building on this run's earlier captures) —
+                        # PS is a discrete per-amplitude staircase like VT,
+                        # so the cumulative is the true delivered dose.
+                        self._record_capture_dose(run, cap)
+                        # Nonparametric access-resistance drift monitor
+                        # (Mann-Whitney vs the run's earlier R_a; warn-only).
+                        self.check_access_resistance_drift(run)
                         self._emit(ExperimentEvent(kind="capture", session=self.session,
                                                    run=run, capture=cap))
                         # Closed-loop bias step at the same cadence as
@@ -293,7 +346,15 @@ class ProgressiveStressExperiment(ExperimentRunner):
                         self.bias_step_if_armed()
                         idx += 1
                         _step_cap_idx += 1
+                        # Advance the fixed grid by exactly one interval.
+                        # If the capture overran a whole interval, skip
+                        # the missed slot(s) rather than firing a
+                        # back-to-back catch-up burst (snap to the next
+                        # grid point strictly after ``now``).
                         next_grab += interval
+                        if next_grab <= now:
+                            missed = int((now - next_grab) // interval) + 1
+                            next_grab += missed * interval
                     time.sleep(0.002)
 
                 # Stop if we hit voltage compliance — the device can't push

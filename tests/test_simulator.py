@@ -40,7 +40,8 @@ def test_vt_runner_end_to_end_finds_max_q_inj():
 
     runner = VoltageTransientExperiment(
         session, stim, scope,
-        ramp=RampPolicy(starting_ua=5, coarse_step_ua=20, fine_step_ua=5, max_ua=400),
+        # Ramp starts at the pattern's amplitude (5 µA) — starting_ua removed.
+        ramp=RampPolicy(coarse_step_ua=20, fine_step_ua=5, max_ua=400),
     )
     result = runner.run()
     assert len(result.captures) > 0

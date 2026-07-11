@@ -120,6 +120,9 @@ class StaircasePlot(QtWidgets.QWidget):
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("w")
+        # Mouse wheel must NOT zoom (operator request).
+        from .widgets import disable_plot_wheel_zoom
+        disable_plot_wheel_zoom(self.plot)
         # Gridlines default OFF on experiment plots so subtle
         # trace features aren't obscured. The main window's View
         # → Gridlines action toggles them on/off for every

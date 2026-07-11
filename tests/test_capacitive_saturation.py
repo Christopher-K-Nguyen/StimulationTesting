@@ -216,7 +216,7 @@ def test_pattern_panel_saturated_path_builds_three_phases():
     # Configure for biphasic + asymmetric + cap-coupled.
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     assert idx >= 0
     panel.asym_shape_combo.setCurrentIndex(idx)
@@ -259,7 +259,7 @@ def test_pattern_panel_unsaturated_cap_coupled_keeps_two_phases():
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     # Modest cathodic that won't saturate at the locked width.
@@ -294,7 +294,7 @@ def test_pattern_panel_pseudo_cap_coupled_blocks_infeasible_inputs():
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     # Q_cath = 1000 × 500 = 500 nC. Minimum feasible anodic width
@@ -341,7 +341,7 @@ def test_saturated_net_charge_balance_within_30nA_quantum():
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     # The user's reported case verbatim.
@@ -506,7 +506,7 @@ def test_n_samples_sync_drives_residual_to_sub_pc():
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     # The case that previously had the largest unsaturated
@@ -553,7 +553,7 @@ def test_saturated_pattern_respects_pat_pair_limit():
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.phase_amp[0].setValue(-1000.0)

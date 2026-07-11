@@ -1,6 +1,7 @@
 """PyQt6 main window — connects all the tabs together."""
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,8 @@ from ..config import DEFAULT_SAVE_DIR
 from ..electrode import ElectrodeArray
 from .connection_panel import ConnectionPanel
 from .experiment_tabs import (
-    LongPulsingTab, ProgressiveStressTab, ShortPulsingTab, VoltageTransientTab,
+    ContinuousPulsingTab, GalvanostaticEISTab, LongPulsingTab,
+    ProgressiveStressTab, ShortPulsingTab, VoltageTransientTab,
 )
 from .prefs import (
     load_prefs, load_prefs_from, prefs_dir, prefs_path,
@@ -23,6 +25,8 @@ from .admin import (
     AdminCatalogDialog, apply_admin_catalog, _DEFAULT_HASH,
     prompt_login, prompt_first_launch_setup, CATALOG_KEYS, Profile,
     is_restricted_unlocked, is_admin,
+    register_extension_profile, list_extension_profiles,
+    get_extension_profile,
 )
 from .calibration import CalibrationTab
 from .results_tab import ResultsTab
@@ -35,6 +39,7 @@ from .widgets import LogPane
 PREF_KEY_SETUP = "setup"
 PREF_KEY_VT = "vt"
 PREF_KEY_SP = "sp"
+PREF_KEY_CP = "cp"
 PREF_KEY_LP = "lp"
 PREF_KEY_PS = "ps"
 PREF_KEY_VIEW = "view"
@@ -48,7 +53,14 @@ PREF_KEY_RESULTS = "results"
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, simulate_default: bool = True, save_dir: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("PULSAR")
+        # Show the app version beside the name in the title bar (operator:
+        # "put the version number by PULSAR on the window") so a bench
+        # screenshot / bug report always says which build is running.
+        try:
+            from .. import __version__ as _pulsar_version
+            self.setWindowTitle(f"PULSAR v{_pulsar_version}")
+        except Exception:
+            self.setWindowTitle("PULSAR")
         self.resize(1500, 950)
 
         # ---- Profile login state ------------------------------------
@@ -88,6 +100,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # one-time admin password setup dialog.  Starts False — a
         # fresh install (no prefs file) will see the dialog.
         self._admin_setup_completed: bool = False
+        # Profiles the operator imported via Admin → Import Profile…
+        # (plugin-host profiles distributed as .json files, e.g. CWRU).
+        # Each entry is ``{name, display_name, password_hash, shapes}``.
+        # Persisted in prefs and re-registered at launch by
+        # ``_load_imported_profiles`` so an imported profile survives
+        # restarts WITHOUT the pip package being installed.
+        self._imported_profiles: list[dict] = []
 
         self.save_dir = Path(save_dir or DEFAULT_SAVE_DIR)
         array = ElectrodeArray.utah_4x4()
@@ -101,23 +120,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_tab = SetupTab(connection_panel=self.conn)
         self.vt_tab = VoltageTransientTab(array)
         self.sp_tab = ShortPulsingTab(array)
+        self.cp_tab = ContinuousPulsingTab(array)
         self.lp_tab = LongPulsingTab(array)
         self.ps_tab = ProgressiveStressTab(array)
+        self.eis_tab = GalvanostaticEISTab(array)
         self.res_tab = ResultsTab(self.save_dir)
 
         # Plumb the shared ConnectionPanel into each experiment tab as
-        # the bias-module host (per-tab BiasFeedbackPanel widgets
-        # delegate Connect / Disconnect to the same driver instance).
-        # Done eagerly after construction; tabs accept the host being
-        # set before they're shown.  No-op for tabs without a bias
-        # panel (defensive — every concrete experiment tab inherits
-        # the panel from _BaseExperimentTab, so this is just
-        # belt-and-braces).
-        for tab in (self.vt_tab, self.sp_tab, self.lp_tab, self.ps_tab):
-            try:
-                tab.set_bias_host(self.conn)
-            except AttributeError:
-                pass
+        # the INTERSTELLAR (interpulse-bias) driver host, so every tab's
+        # config panel shows/hides in lockstep with the single Connect
+        # button in the Setup tab.  Done ONLY when the experimental
+        # feature is enabled — the public build has no bias UI or wiring
+        # at all (stimtest.feature_flags — gotcha #103).
+        from ..feature_flags import interstellar_enabled
+        if interstellar_enabled():
+            for tab in (self.vt_tab, self.sp_tab, self.cp_tab, self.lp_tab,
+                        self.ps_tab):
+                try:
+                    tab.set_bias_host(self.conn)
+                except AttributeError:
+                    pass
 
         # ``_current_exp_code`` must exist before the tabs are added —
         # adding a tab to an empty QTabWidget fires ``currentChanged``,
@@ -125,6 +147,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # here, then point the per-experiment dict at it later once
         # the experiment widgets exist.
         self._current_exp_code: Optional[str] = None
+        # When the operator opens the Test parameters page, pull the
+        # current Setup parameters into the active experiment tab IF
+        # they're stale (a Setup change is pending, or this is the first
+        # entry).  Initialised True so the first entry always syncs —
+        # this closes the gap where aliases / limits don't re-fire their
+        # change signal on prefs restore and so never reached the tab.
+        # Flipped True on every Setup change (in _log_setup_change),
+        # cleared after the pull (in _on_top_tab_changed).
+        self._setup_dirty_for_test: bool = True
         self.tabs = QtWidgets.QTabWidget()
         # Swallow mouse-wheel events on the tab bar so accidental
         # scrolling over the tabs doesn't flip the user between
@@ -137,8 +168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # parameters or the experiment view) — the buttons should
         # appear in the same bottom-of-tab position regardless of
         # which one is focused.
-        self.tabs.currentChanged.connect(
-            lambda *_: self._refresh_button_row_placement())
+        self.tabs.currentChanged.connect(self._on_top_tab_changed)
         self.tabs.addTab(self.setup_tab, "Setup")
         # Calibration tab is created lazily — only when the user clicks
         # "Run Calibration" on the ConnectionPanel (or Run → Calibrate in
@@ -168,8 +198,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._exp_tab_by_code = {
             "VT": (self.vt_tab, "Voltage Transient"),
             "SP": (self.sp_tab, "Short-Term Pulsing"),
+            "CP": (self.cp_tab, "Continuous Pulsing"),
             "LP": (self.lp_tab, "Long-Term Pulsing"),
             "PS": (self.ps_tab, "Progressive Stress"),
+            "EIS": (self.eis_tab, "Galvanostatic Electrochemical Impedance Spectroscopy"),
         }
 
         # Shared log pane — pinned to the bottom of the central widget so
@@ -445,6 +477,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if 10.0 in self._font_size_actions:
             self._font_size_actions[10.0].setChecked(True)
         view_menu.addSeparator()
+        # Theme submenu — Light / Dark / System (operator: "let in View to
+        # change between light mode and dark mode … and system").  Applies a
+        # Fusion palette to the GUI chrome; the plots stay white in both
+        # themes.  Exclusive (radio) via a QActionGroup; persisted under the
+        # ``theme`` pref and re-applied at launch (see _apply_saved_theme).
+        theme_menu = view_menu.addMenu("&Theme")
+        self._theme_group = QtGui.QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        self._theme_actions: Dict[str, "QtGui.QAction"] = {}
+        for _mode, _label in (("system", "&System"),
+                              ("light", "&Light"),
+                              ("dark", "&Dark")):
+            act = theme_menu.addAction(_label)
+            act.setCheckable(True)
+            self._theme_group.addAction(act)
+            act.triggered.connect(
+                lambda _c=False, m=_mode: self._on_theme_selected(m))
+            self._theme_actions[_mode] = act
+        view_menu.addSeparator()
         # Gridlines toggle — applies to every experiment plot
         # (pattern preview, staircase, tracking, scope). Default
         # OFF so the trace area stays clean. The Viewer has its
@@ -513,6 +564,14 @@ class MainWindow(QtWidgets.QMainWindow):
         act_contribute = help_menu.addAction(
             "&Contribute electrode data…")
         act_contribute.triggered.connect(self._on_help_contribute_data)
+        # Reset the learned per-coating open-circuit potentials.  The
+        # operator hit bad Pt values accumulated by earlier PULSAR
+        # builds (the baseline-subtraction bugs since fixed) and turned
+        # OFF the reference toggle to avoid them — this clears the
+        # contaminated store so future captures re-learn from scratch.
+        act_reset_ocp = help_menu.addAction(
+            "&Reset learned electrode potentials…")
+        act_reset_ocp.triggered.connect(self._on_help_reset_potentials)
         # Tissue-damage prediction info — opens an explainer dialog
         # describing the Shannon equation + the modified-Shannon
         # macro/micro caps + the Li et al. 2024 NeurostimML web
@@ -554,6 +613,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "&Manage Custom Catalog…")
         self._act_admin_catalog.triggered.connect(self._on_admin_catalog)
         self._act_admin_catalog.setEnabled(False)
+        admin_menu.addSeparator()
+        # Plugin-host profile import / export (e.g. the CWRU custom
+        # shapes).  Import is OPEN to all users — it only ADDS a
+        # profile + its shapes to the registry; logging in to USE them
+        # still requires the password.  Export is ADMIN-gated because
+        # distributing a profile is a privileged action.
+        self._act_import_profile = admin_menu.addAction(
+            "Import &Profile…")
+        self._act_import_profile.triggered.connect(self._on_import_profile)
+        self._act_export_profile = admin_menu.addAction(
+            "&Export Profile…")
+        self._act_export_profile.triggered.connect(self._on_export_profile)
+        self._act_export_profile.setEnabled(False)  # admin-gated
 
         # Status bar
         self.statusBar().showMessage(
@@ -587,6 +659,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # focus to the embedded Calibration tab.
         self.conn.calibrationRequested.connect(self._on_run_calibrate)
         self.setup_tab.arrayChanged.connect(self._on_array_changed)
+        # Electrode-config sub-inputs (return / reference electrode, geometry,
+        # connector, remember-potential toggle) that don't change the generic
+        # `array = …` description carry their OWN ready-to-log string here, so
+        # every input + selection is indicated in the log pane (operator:
+        # "changing the return electrode, there was not new text … make sure
+        # that all input and selection are indicated").
+        self.setup_tab.settingChanged.connect(self._log_setup_change)
         self.setup_tab.potentialLimitsChanged.connect(self._on_limits_changed)
         self.setup_tab.autoExportXlsxChanged.connect(self._on_auto_export_xlsx_changed)
         self.setup_tab.autoSavePlotsChanged.connect(self._on_auto_save_plots_changed)
@@ -595,6 +674,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_email_notifications_changed)
         self.setup_tab.userIdentityChanged.connect(
             self._on_user_identity_changed)
+        self.setup_tab.smsRecipientChanged.connect(
+            self._on_sms_recipient_changed)
         self.setup_tab.sessionSubjectChanged.connect(
             self._on_session_subject_changed)
         # Environment combo → forward to every experiment tab so
@@ -618,6 +699,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # experiment tab so the runner-side setup applies what the
         # user picked.
         self.setup_tab.acquisitionChanged.connect(self._on_acq_changed)
+        self.setup_tab.horizontalScalingChanged.connect(
+            self._on_horiz_scaling_changed)
         self.setup_tab.triggerSourceChanged.connect(self._on_trigger_source_changed)
         self.setup_tab.digitalTriggerChanged.connect(self._on_digital_trigger_changed)
         # The operator-facing trigger-edge selector was removed; the
@@ -701,7 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self._on_auto_save_plots_changed(
             self.setup_tab.current_auto_save_plots(),
-            self.setup_tab.current_auto_save_plots_format())
+            self.setup_tab.current_auto_save_plots_format(),
+            self.setup_tab.current_auto_save_plots_dpi())
         # Discover and load any installed ``stimtest_*`` extension
         # packages.  Extensions register additional login profiles
         # (and the restricted shapes those profiles unlock) by
@@ -724,6 +808,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_pane.log(
                 f"Extension discovery failed: "
                 f"{type(_e).__name__}: {_e}")
+        # Re-register profiles imported via Admin → Import Profile… in
+        # a prior session.  AFTER ``_load_extensions`` so a pip-
+        # installed extension of the same name wins a hash collision
+        # (the persisted copy is then a redundant no-op).
+        try:
+            self._load_imported_profiles()
+        except Exception as _e:
+            self.log_pane.log(
+                f"Imported-profile reload failed: "
+                f"{type(_e).__name__}: {_e}")
         # All prefs restored + downstream tabs primed.  From here on,
         # every Setup-tab / PatternPanel change reflects a user-driven
         # input event the operator should see in the log.  Flip the
@@ -731,15 +825,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_setup_changes = True
         # Wire pattern-panel changes from every experiment tab through
         # a single debounced log slot so the operator gets a "Pattern:
-        # …" line whenever they finish editing a parameter.  Debounce
-        # collapses spinbox-tick bursts into one final line.
+        # …" line whenever they finish editing a parameter.  The log
+        # listens to ``patternCommitted`` (Enter / focus-out / discrete
+        # change) — NOT ``patternChanged`` (per keystroke) — so typing a
+        # value doesn't spam a line per key (operator: "only print after
+        # return/enter is pressed or clicked out of the input").  The
+        # debounce still collapses any commit cascade into one line.
         for _tab in self._experiment_tabs():
             _pp = getattr(_tab, "pattern_panel", None)
             if _pp is not None:
                 try:
-                    _pp.patternChanged.connect(self._on_pattern_changed_log)
+                    _sig = getattr(_pp, "patternCommitted", None)
+                    if _sig is not None:
+                        _sig.connect(self._on_pattern_changed_log)
+                    else:                       # back-compat for older panels
+                        _pp.patternChanged.connect(self._on_pattern_changed_log)
                 except Exception:
                     pass
+                # Inline average-count edit (beside the acquisition-time
+                # readout) → push into the Setup tab's spin, the single
+                # source of truth.  Its acquisitionChanged signal then
+                # re-broadcasts the value to EVERY tab's readout + logs
+                # the change like any other Setup input.  Connected
+                # post-restore so the construction burst can't fire it.
+                try:
+                    _pp.acqNavgEdited.connect(self._on_inline_navg_edited)
+                except Exception:
+                    pass
+            # Test-parameters inputs (channel/combo selection + de-selection,
+            # duration, ramp mode, stop conditions, camera capture, …) carry
+            # their own ready-to-log string via ``paramChanged`` (mirrors
+            # SetupTab.settingChanged).  Connected HERE — after prefs
+            # restore — so the construction/restore burst never logs; the
+            # ``_log_setup_change`` gate is a second guard.
+            try:
+                _tab.paramChanged.connect(self._log_setup_change)
+            except Exception:
+                pass
         # Also: now that prefs are restored, log the resolved initial
         # setup state once so the session log starts with a complete
         # snapshot the operator can refer back to later.  Without this
@@ -748,6 +870,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # effect at run start.
         try:
             self._log_initial_setup_snapshot()
+        except Exception:
+            pass
+        # Apply the saved colour theme (View → Theme: system / light / dark)
+        # + set the menu radio + auto-follow the OS scheme in "system" mode.
+        try:
+            self._apply_saved_theme()
         except Exception:
             pass
         # Also save prefs whenever the user clicks Start on any experiment
@@ -783,7 +911,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pb.toggled.connect(self._on_pause_btn_toggled)
 
     def _experiment_tabs(self):
-        return [self.vt_tab, self.sp_tab, self.lp_tab, self.ps_tab]
+        return [self.vt_tab, self.sp_tab, self.cp_tab, self.lp_tab,
+                self.ps_tab, self.eis_tab]
 
     # ----------------------------------------------------------- auto-discharge
     def _auto_discharge_seed_pref(self) -> None:
@@ -820,6 +949,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_connected(self, stim, scope):
         for tab in self._experiment_tabs():
             tab.set_hardware(stim, scope)
+        # Re-arm the Test-parameters entry sync: the scope settings
+        # (record length / acquisition / trigger) couldn't have been
+        # pre-applied while disconnected, so the next entry into Test
+        # parameters must run the sync + hardware pre-apply even if
+        # Setup itself hasn't changed since.
+        self._setup_dirty_for_test = True
         # Embedded Calibration tab tracks the live handles too — only if
         # it has actually been instantiated (it's created lazily on first
         # "Run Calibration" press).
@@ -874,7 +1009,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # user can jump to the Calibration tab.
         self._act_calibrate.setEnabled(True)
         self._act_calibrate.setToolTip(
-            "Switch to the Calibration tab to run the PlexStim test-board "
+            "Switch to the Verification tab to run the PlexStim test-board "
             "stimulator verification sweep.")
 
     def _on_disconnected(self):
@@ -933,8 +1068,98 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not getattr(self, "_log_setup_changes", False):
             return
+        # A Setup parameter changed → the active experiment tab's cached
+        # view of Setup is now stale; re-pull it the next time the
+        # operator opens the Test parameters page.
+        self._setup_dirty_for_test = True
         try:
             self.log_pane.log(f"Setup: {msg}")
+        except Exception:
+            pass
+
+    def _on_top_tab_changed(self, *_):
+        """Top-level tab navigation hook.
+
+        Keeps the Start/Pause/Stop row anchored to the focused tab AND,
+        when the operator opens the Test parameters page, pulls the
+        current Setup parameters into the active experiment tab if they
+        haven't been synced since the last Setup change (the dirty
+        flag).  This guarantees the Test parameters page always reflects
+        Setup on entry.
+        """
+        self._refresh_button_row_placement()
+        try:
+            if (self.tabs.currentWidget() is self._test_params_tab
+                    and getattr(self, "_setup_dirty_for_test", False)):
+                self._sync_setup_into_active_tab()
+                self._setup_dirty_for_test = False
+        except Exception:
+            pass
+
+    def _sync_setup_into_active_tab(self) -> None:
+        """Pull the current Setup-tab parameters into the ACTIVE
+        experiment tab so the Test parameters page reflects Setup on
+        entry — covering params whose widgets don't re-fire their change
+        signal on prefs restore (aliases / limits) and so never reached
+        the tab via the normal forwarder path.
+
+        The ARRAY is deliberately NOT re-applied here: ``set_array``
+        rebuilds the channel grid and CLEARS the operator's channel
+        selections (``channel_selector._GridCanvas.set_array`` →
+        ``_actives.clear()``), and genuine array changes already
+        propagate via the ``arrayChanged`` forwarder.  Everything synced
+        here is cache-only — no operator-input is clobbered.
+        """
+        if self._current_exp_code is None:
+            return
+        entry = self._exp_tab_by_code.get(self._current_exp_code)
+        if not entry:
+            return
+        tab = entry[0]
+        st = self.setup_tab
+        for _fn in (
+            lambda: tab.set_environment(
+                st.current_environment_short(),
+                st.current_environment_custom_text()),
+            lambda: tab.set_aliases(st.current_aliases()),
+            lambda: tab.set_potential_limits(
+                *st.current_potential_limits()),
+            lambda: tab.set_user_identity(
+                st.current_user_name(), st.current_user_email()),
+            lambda: tab.set_sms_recipient(
+                st.current_user_phone(), st.current_user_carrier()),
+            lambda: tab.set_session_subject(
+                st.current_session_subject()),
+            # OSCILLOSCOPE settings (operator: "setup settings, including
+            # oscilloscope, was not set when I moved to Test parameters").
+            # The acquisition mode/NUMAVg + trigger source/type are pushed
+            # by the forwarders on interactive change, but — like aliases
+            # / limits — they don't reliably re-fire on prefs restore or
+            # scope-connect auto-mapping, so pull them here too.  Trigger
+            # source + digital flag go together (coherent (source, type)
+            # pair, mirroring the forwarders).
+            lambda: tab.set_acquisition(*st.current_acquisition()),
+            lambda: tab.set_trigger_source(st.current_trigger_source()),
+            lambda: tab.set_digital_trigger(st.is_digital_trigger()),
+            lambda: tab.set_session_identity(st.current_notebook(),
+                                             st.current_session_stem()),
+        ):
+            try:
+                _fn()
+            except Exception:
+                # Best-effort per param — a stale tab/Setup API (e.g. a
+                # test stub) must not break tab navigation.
+                pass
+        # HARDWARE pre-apply (operator: "set all necessary oscilloscope
+        # settings when entering the Test parameters tab, including
+        # record length").  Runs AFTER the cache pulls above so the
+        # just-synced acquisition / trigger state is what lands on the
+        # scope.  Applies record length + acquisition + trigger; the
+        # driver setters are idempotent so unchanged settings cost
+        # nothing, and the method itself no-ops without a connected
+        # scope or while a run is starting / in flight.
+        try:
+            tab.apply_scope_settings_on_entry()
         except Exception:
             pass
 
@@ -1013,32 +1238,78 @@ class MainWindow(QtWidgets.QMainWindow):
         if pat is None:
             return
         try:
-            self._log_setup_change(f"pattern = {self._describe_pattern(pat)}")
+            # Multi-line tabbed body (one line per phase / delay / rate);
+            # the "pattern =" header sits on its own line, the tabbed body
+            # follows (operator: separated tabbed lines).
+            desc = self._describe_pattern(pat)
+            # De-dupe: a COMMIT (Enter / focus-out) on an input that leaves the
+            # pattern UNCHANGED — e.g. a focus-out with no edit, or the inline
+            # acq-average spinbox (not a pattern parameter) — must not log a
+            # duplicate line (operator dislikes redundant log lines).
+            if desc == getattr(self, "_last_logged_pattern_desc", None):
+                return
+            self._last_logged_pattern_desc = desc
+            self._log_setup_change(f"pattern =\n{desc}")
         except Exception:
             pass
 
     def _describe_pattern(self, pat) -> str:
-        """One-line summary of a PulsePattern for the log pane.
+        r"""Multi-line, tab-indented summary of a PulsePattern for the log.
 
-        Lists phase widths + amplitudes + rate.  Best-effort: any
-        attribute lookup error degrades to repr(pat).
+        ONE tabbed line per component — each phase (signed amplitude ×
+        width + shape), each following delay (interphase between phases,
+        discharge after the LAST phase — ``Phase.delay_after_us``), and
+        the rate — so a multi-phase / shaped pattern is readable at a
+        glance (operator: "separated lines (tabbed) for each phase,
+        interphase delay, and discharge delay").  The caller prepends the
+        ``pattern =`` header line, so this returns just the tabbed BODY
+        (each line begins with a literal TAB).
+
+        The SHAPE is shown per phase (``rectangular`` / ``sinusoidal`` /
+        ``exp-decay`` / ``linear-increasing`` / …) so otherwise-identical
+        phases are distinguishable (a raw shape id's underscore renders as
+        a hyphen).  A zero delay is omitted (that phase has no following
+        gap).  Rate is "pps" (operator), never "Hz".  Best-effort: any
+        attribute lookup error degrades to a tabbed repr(pat).
+
+        Example (biphasic sinusoidal, 20 µs interphase + discharge)::
+
+            \tPhase 1: -50.0 µA × 200 µs, sinusoidal
+            \tInterphase delay: 20 µs
+            \tPhase 2: +50.0 µA × 200 µs, sinusoidal
+            \tDischarge delay: 20 µs
+            \tRate: 50 pps
         """
         if pat is None:
-            return "(none)"
+            return "\t(none)"
         try:
             phases = getattr(pat, "phases", []) or []
-            phase_parts: List[str] = []
-            for p in phases:
+            n = len(phases)
+            lines: List[str] = []
+            for i, p in enumerate(phases):
                 w = float(getattr(p, "width_us", 0.0) or 0.0)
                 a = float(getattr(p, "amplitude_ua", 0.0) or 0.0)
-                phase_parts.append(f"{a:+.1f} µA × {w:.0f} µs")
+                shape = str(getattr(p, "shape", None)
+                            or "rectangular").replace("_", "-")
+                lines.append(
+                    f"\tPhase {i + 1}: {a:+.1f} µA × {w:.0f} µs, {shape}")
+                # The delay FOLLOWING this phase: interphase between
+                # phases, discharge after the last one (the last phase
+                # always carries the discharge delay — even a monophasic
+                # pulse, per pattern_panel.pattern()).
+                d = float(getattr(p, "delay_after_us", 0.0) or 0.0)
+                if d > 0.0:
+                    kind = "Discharge" if i == n - 1 else "Interphase"
+                    lines.append(f"\t{kind} delay: {d:.0f} µs")
+            if not lines:
+                return "\t(no phases)"
             rate = float(getattr(pat, "rate_hz", 0.0) or 0.0)
-            txt = " → ".join(phase_parts) if phase_parts else "(no phases)"
             if rate > 0:
-                txt += f" @ {rate:g} Hz"
-            return txt
+                # "pps" (pulses per second), NOT "Hz" (operator).
+                lines.append(f"\tRate: {rate:g} pps")
+            return "\n".join(lines)
         except Exception:
-            return repr(pat)
+            return f"\t{pat!r}"
 
     def _log_initial_setup_snapshot(self) -> None:
         """Emit a one-time multi-line snapshot of the resolved setup at
@@ -1103,7 +1374,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log_setup_changes = original
 
     def _on_array_changed(self, array):
-        self._log_setup_change(f"array = {self._describe_array(array)}")
+        # Many electrode sub-inputs (return / reference electrode, geometry,
+        # connector) re-emit ``arrayChanged`` for their downstream metadata but
+        # DON'T change this generic device/coating/area description — those get
+        # their own explicit `settingChanged` log line instead.  De-dupe here so
+        # a return-electrode tweak doesn't ALSO spam an identical `array = …`
+        # line (operator dislikes redundant log spam).  Only log when the
+        # description actually changed from the last one we logged.
+        desc = self._describe_array(array)
+        if desc != getattr(self, "_last_array_desc", None):
+            self._last_array_desc = desc
+            self._log_setup_change(f"array = {desc}")
         for tab in self._experiment_tabs():
             tab.set_array(array)
 
@@ -1118,15 +1399,16 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in self._experiment_tabs():
             tab.set_auto_export_xlsx(on)
 
-    def _on_auto_save_plots_changed(self, on: bool, fmt: str):
-        """Setup-tab plots-auto-save toggle (or format combo) changed —
-        broadcast to every experiment tab so the next ``RunnerWorker``
-        picks up the new (on, fmt) pair."""
+    def _on_auto_save_plots_changed(self, on: bool, fmt: str,
+                                    dpi: int = 600):
+        """Setup-tab plots-auto-save toggle (format combo or DPI spinbox)
+        changed — broadcast to every experiment tab so the next
+        ``RunnerWorker`` picks up the new (on, fmt, dpi) tuple."""
         self._log_setup_change(
             f"auto-save plots = {'ON' if on else 'OFF'}"
-            + (f" (format = {fmt})" if on else ""))
+            + (f" (format = {fmt}, {int(dpi)} DPI)" if on else ""))
         for tab in self._experiment_tabs():
-            tab.set_auto_save_plots(on, fmt)
+            tab.set_auto_save_plots(on, fmt, dpi)
 
     def _on_email_notifications_changed(self, on: bool):
         """Same forwarding shape as auto-export — every experiment tab
@@ -1146,12 +1428,30 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in self._experiment_tabs():
             tab.set_user_identity(name, email)
 
+    def _on_sms_recipient_changed(self, phone: str, carrier: str):
+        """Forward the run-end text-alert recipient (phone + carrier) from
+        the Setup tab into every experiment tab."""
+        self._log_setup_change(
+            f"text alerts = {phone + ' (' + carrier + ')' if (phone and carrier) else '(off)'}")
+        for tab in self._experiment_tabs():
+            tab.set_sms_recipient(phone, carrier)
+
     def _on_session_subject_changed(self, subject: str):
         """Forward the raw Session text into every experiment tab so
         the email subject line matches what the user typed."""
         self._log_setup_change(f"session subject = {subject!r}")
+        st = self.setup_tab
         for tab in self._experiment_tabs():
             tab.set_session_subject(subject)
+            # Session identity for file naming + plot titles —
+            # [notebook]_[session] stem and the notebook part (see
+            # set_session_identity).  Pushed together with the subject
+            # so the .npz / .xlsx / TIFF stems always track the fields.
+            try:
+                tab.set_session_identity(st.current_notebook(),
+                                         st.current_session_stem())
+            except Exception:
+                pass
 
     def _on_environment_changed(self, short_code: str, custom_text: str):
         """Forward the Setup-tab Environment selection to every
@@ -1204,6 +1504,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.setup_tab.apply_scope_capabilities(self.conn.scope)
             except Exception as e:
                 self.statusBar().showMessage(f"Could not query scope caps: {e}")
+            # Apply the current Wide/Tight horizontal-window selection to the
+            # freshly-connected scope (it reads it at run start).
+            self._apply_horiz_scaling_to_scope(
+                self.setup_tab.current_horizontal_scaling())
         else:
             self.setup_tab.clear_scope_mapping()
             # Reset the acq widget to its sane no-scope defaults.
@@ -1216,6 +1520,48 @@ class MainWindow(QtWidgets.QMainWindow):
             f"acquisition = {mode}, n_avg = {n_avg}")
         for tab in self._experiment_tabs():
             tab.set_acquisition(mode, n_avg)
+
+    def _on_inline_navg_edited(self, n_avg: int) -> None:
+        """A pattern panel's INLINE average-count spinbox (beside the
+        acquisition-time readout) was edited.
+
+        Push the value into the Setup tab's ``acq_navg_spin`` — the
+        single source of truth for the scope average count.  Setting it
+        fires SetupTab's ``acquisitionChanged`` → :meth:`_on_acq_changed`
+        → every tab's ``set_acquisition`` → each pattern panel's
+        ``set_acquisition_info`` (which no-ops on the already-matching
+        value), so all readouts stay in lockstep and the change is
+        logged like any other Setup input.  A same-value ``setValue`` is
+        a Qt no-op, so there is no signal loop.
+        """
+        try:
+            self.setup_tab.acq_navg_spin.setValue(int(n_avg))
+            # ``acq_navg_spin`` now commits on ``editingFinished`` (not
+            # ``valueChanged``), so a programmatic ``setValue`` no longer
+            # auto-fires the ``acquisitionChanged`` broadcast — trigger it
+            # explicitly so an inline edit still reaches every tab + arms the
+            # scope confirm (the no-op guard in ``_on_acq_changed`` keeps a
+            # same-value push quiet).
+            self.setup_tab._on_acq_changed()
+        except Exception:
+            pass
+
+    def _on_horiz_scaling_changed(self, mode: str):
+        """Apply the Setup-tab horizontal-window (Wide/Tight) selection to the
+        shared scope — ``auto_layout_for_pulse`` reads it at the next run.  The
+        scope is shared across every experiment tab, so setting it once here is
+        enough; a scope that lacks the setter (simulator / legacy) is a no-op."""
+        self._log_setup_change(f"horizontal window = {mode}")
+        self._apply_horiz_scaling_to_scope(mode)
+
+    def _apply_horiz_scaling_to_scope(self, mode: str) -> None:
+        scope = getattr(self.conn, "scope", None)
+        fn = getattr(scope, "set_horizontal_fit_mode", None)
+        if callable(fn):
+            try:
+                fn(mode)
+            except Exception:
+                pass
 
     def _on_trigger_source_changed(self, source: str):
         """Forward the trigger-source toggle to each experiment tab."""
@@ -1267,7 +1613,16 @@ class MainWindow(QtWidgets.QMainWindow):
         running mean. Refreshing here is the cheapest way to surface
         that without wiring a per-capture signal into the Setup tab.
         """
-        self.setup_tab.setEnabled(not running)
+        # View-only lock on Setup: disable the INPUTS (incl. the Hardware
+        # panel) but keep the tab + its scroll area live so the operator can
+        # scroll/read settings during a run (operator: "allow for scrolling
+        # through … Setup and Test Parameters").  Falls back to the old
+        # whole-widget disable if the tab lacks the method (test stubs).
+        _setup_lock = getattr(self.setup_tab, "set_run_locked", None)
+        if callable(_setup_lock):
+            _setup_lock(running)
+        else:
+            self.setup_tab.setEnabled(not running)
         self.res_tab.setEnabled(not running)
         self._refresh_run_menu_enabled(running)
         if not running:
@@ -1315,16 +1670,123 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._act_pause.setText("&Resume" if paused else "&Pause")
 
+    @staticmethod
+    def _save_path_prompts_suppressed() -> bool:
+        """Headless / first-launch bypass for the missing-folder choice
+        dialog — same env vars as the run-start prompts
+        (``_start_prompts_suppressed``)."""
+        return bool(os.environ.get("PULSAR_SKIP_OVERWRITE_PROMPT")
+                    or os.environ.get("PULSAR_SKIP_FIRST_LAUNCH_SETUP"))
+
+    def _set_setup_save_path_text(self, text: str) -> None:
+        """Set the Setup tab's save-path field WITHOUT re-emitting
+        ``savePathChanged`` (the QLineEdit only emits on ``editingFinished``,
+        so ``setText`` won't recurse — but block signals defensively), then
+        re-evaluate the save-options enable state for the new path.  Best-
+        effort; never raises."""
+        try:
+            sp = self.setup_tab.save_path
+            blocked = sp.blockSignals(True)
+            sp.setText(text)
+            sp.blockSignals(blocked)
+        except Exception:
+            pass
+        try:
+            self.setup_tab._refresh_save_options()
+        except Exception:
+            pass
+
+    def _resolve_missing_save_dir(self, p: Path) -> "Optional[Path]":
+        """The INPUTTED save folder does not exist → modal with CHOICES.
+
+        Operator: "I want a pop up with choices for the user to choose when an
+        inputted directory does not exist."  Returns the folder to USE (always
+        existing on return — created or chosen), or ``None`` to cancel and keep
+        the previous save location.
+          * **Create** → ``mkdir`` the entered path and use it;
+          * **Choose a different folder…** → a folder browser (existing dirs
+            only); reflects the pick back into the Setup field;
+          * **Cancel** → ``None`` (caller reverts the field)."""
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Save folder does not exist")
+        box.setText("The save folder you entered does <b>not exist</b>.")
+        box.setInformativeText(
+            f"<b>Folder:</b> {p}<br><br>"
+            "Choose <b>Create</b> to make it now, <b>Choose a different "
+            "folder…</b> to pick an existing one, or <b>Cancel</b> to keep "
+            "your previous save location.")
+        create = box.addButton("Create",
+                               QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        choose = box.addButton("Choose a different folder…",
+                               QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(create)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is create:
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self.statusBar().showMessage(f"Could not create folder: {e}")
+                return None
+            self._set_setup_save_path_text(str(p))   # normalize + re-enable
+            return p
+        if clicked is choose:
+            start = str(p.parent) if p.parent.exists() else str(Path.home())
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose folder for saved sessions", start)
+            if chosen:
+                cp = Path(chosen)
+                self._set_setup_save_path_text(str(cp))
+                return cp
+            return None                              # browser cancelled
+        return None                                  # Cancel
+
     def _on_save_path_changed(self, path: str):
         """Forward a save-path change from the Setup tab to every
-        experiment tab so freshly-saved sessions land in the new folder."""
+        experiment tab so freshly-saved sessions land in the new folder.
+
+        When the INPUTTED folder does not exist, a genuine USER change (not
+        the startup prefs-restore burst) pops a choice dialog — Create /
+        Choose a different folder… / Cancel — via ``_resolve_missing_save_dir``
+        (operator: "I want a pop up with choices … when an inputted directory
+        does not exist") INSTEAD of silently creating a possibly-mistyped
+        path.  On Cancel the previous save location is kept and the field is
+        reverted.  During restore / headless the path is accepted as-is with
+        NO modal and NO silent ``mkdir`` — the run-start directory guard
+        (``_confirm_directory_before_start``) is the backstop, and the
+        save-options stay disabled until the folder exists (gotcha #147)."""
         self._log_setup_change(f"save path = {path}")
         try:
             p = Path(path).expanduser()
-            p.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.statusBar().showMessage(f"Save path not usable: {e}")
             return
+        if not p.exists():
+            interactive = (getattr(self, "_log_setup_changes", False)
+                           and not self._save_path_prompts_suppressed())
+            if interactive:
+                # Genuine post-startup USER input of a non-existent folder →
+                # ask with choices instead of silently creating it.
+                resolved = self._resolve_missing_save_dir(p)
+                if resolved is None:
+                    # Cancel → keep the previous save dir; revert the field so
+                    # it doesn't linger on the non-existent typed path.
+                    self._set_setup_save_path_text(str(self.save_dir))
+                    self.statusBar().showMessage(
+                        "Save path unchanged (folder does not exist).")
+                    return
+                p = resolved
+            else:
+                # Restore / startup / headless — NOT a fresh user "input" (a
+                # remembered or default location).  Preserve the historical
+                # best-effort create; never block launch on it.
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    self.statusBar().showMessage(f"Save path not usable: {e}")
+                    return
         self.save_dir = p
         for tab in self._experiment_tabs():
             tab.set_save_dir(p)
@@ -1359,6 +1821,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._log_setup_change(f"log filename = {filename}")
         self.log_pane.set_log_file(self.save_dir / filename)
+        # The notebook field contributes to the session identity too —
+        # keep the tabs' [notebook]_[session] stem in lock-step with
+        # the log filename (same composition source).
+        try:
+            st = self.setup_tab
+            for tab in self._experiment_tabs():
+                tab.set_session_identity(st.current_notebook(),
+                                         st.current_session_stem())
+        except Exception:
+            pass
 
     def _on_experiment_requested(self, code: str):
         """Setup tab's Experiment dropdown changed (or a startup-prefs
@@ -1449,6 +1921,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if old_widget is not None:
                 old_widget.setParent(None)
         self._test_params_layout.addWidget(target_tab.params_page, stretch=1)
+        # Prime the pattern preview now that this experiment's
+        # params_page (which HOSTS the preview) is the active Test-
+        # parameters content.  The preview's other render trigger is
+        # the experiment-VIEW showEvent, which never fires for a user
+        # who stays on Setup / Test parameters at launch — so without
+        # this the preview is stuck on "No pulse pattern set." with
+        # every field populated.  Idempotent; on the launch path this
+        # runs AFTER restore_prefs, so it renders the restored values.
+        try:
+            target_tab.ensure_preview_rendered()
+        except Exception:
+            pass
         self._current_exp_code = code
         # Re-anchor the Start / Pause / Stop button row to the
         # currently-focused top-level tab — the swap might have
@@ -1583,6 +2067,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # from __init__).
             self._admin_setup_completed = False
 
+        # Plugin-host profiles the operator imported in a prior
+        # session (top-level prefs key, not under "admin").  Stash the
+        # raw list now; ``_load_imported_profiles`` re-registers them
+        # AFTER ``_load_extensions`` so a pip-installed extension of
+        # the same name wins any hash collision.
+        _imported = prefs.get("imported_profiles", [])
+        if isinstance(_imported, list):
+            self._imported_profiles = [
+                p for p in _imported if isinstance(p, dict)]
+
         # First-launch setup prompt: shown exactly once when the
         # operator hasn't been through it AND the password is still
         # the factory default.  Modal — blocks the rest of the
@@ -1596,6 +2090,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Setup prefs ignored: {e}")
         for key, tab in (
             (PREF_KEY_VT, self.vt_tab), (PREF_KEY_SP, self.sp_tab),
+            (PREF_KEY_CP, self.cp_tab),
             (PREF_KEY_LP, self.lp_tab), (PREF_KEY_PS, self.ps_tab),
         ):
             try:
@@ -1842,6 +2337,7 @@ class MainWindow(QtWidgets.QMainWindow):
             PREF_KEY_SETUP: self.setup_tab.current_prefs(),
             PREF_KEY_VT: self.vt_tab.current_prefs(),
             PREF_KEY_SP: self.sp_tab.current_prefs(),
+            PREF_KEY_CP: self.cp_tab.current_prefs(),
             PREF_KEY_LP: self.lp_tab.current_prefs(),
             PREF_KEY_PS: self.ps_tab.current_prefs(),
             PREF_KEY_RESULTS: res_prefs,
@@ -1865,6 +2361,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 # nag).
                 "setup_completed": bool(self._admin_setup_completed),
             },
+            # Plugin-host profiles imported via Admin → Import Profile…
+            # Re-registered at launch by ``_load_imported_profiles`` so
+            # an imported profile (e.g. CWRU) survives restarts without
+            # the pip package installed.  Each entry is
+            # ``{name, display_name, password_hash, shapes}``.
+            "imported_profiles": list(self._imported_profiles),
         }
 
     def _apply_prefs_payload(self, payload: dict) -> None:
@@ -1875,6 +2377,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Setup prefs ignored: {e}")
         for key, tab in (
             (PREF_KEY_VT, self.vt_tab), (PREF_KEY_SP, self.sp_tab),
+            (PREF_KEY_CP, self.cp_tab),
             (PREF_KEY_LP, self.lp_tab), (PREF_KEY_PS, self.ps_tab),
         ):
             try:
@@ -2196,7 +2699,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Setup → Calibration → Test parameters → … even if other
             # tabs were re-ordered earlier.
             insert_idx = self.tabs.indexOf(self.setup_tab) + 1
-            self.tabs.insertTab(insert_idx, self.cal_tab, "Calibration")
+            self.tabs.insertTab(insert_idx, self.cal_tab, "Verification")
             self.cal_tab.doneRequested.connect(self._on_calibration_done)
         else:
             # Tab already exists — just refresh the handles in case the
@@ -2339,6 +2842,84 @@ class MainWindow(QtWidgets.QMainWindow):
                         # rendering hiccup escape into the menu
                         # action handler.
                         pass
+
+    def _on_theme_selected(self, mode: str) -> None:
+        """Apply + persist a View → Theme choice (system / light / dark)."""
+        from .theme import apply_theme, THEME_MODES
+        mode = mode if mode in THEME_MODES else "system"
+        self._theme_mode = mode
+        apply_theme(QtWidgets.QApplication.instance(), mode)
+        # Keep the menu radio in sync (also covers a programmatic set).
+        for m, act in getattr(self, "_theme_actions", {}).items():
+            act.setChecked(m == mode)
+        # Persist for next launch.  Prefs sections must be DICTS (load_prefs
+        # drops non-dict top-level keys), so store under ``theme.mode``.
+        try:
+            from .prefs import load_prefs, save_prefs
+            prefs = load_prefs() or {}
+            prefs["theme"] = {"mode": mode}
+            save_prefs(prefs)
+        except Exception:
+            pass
+        # The rotated axis-title widgets cache a rendered pixmap; nudge them to
+        # repaint in the new palette colour.
+        try:
+            self._refresh_axis_titles_for_theme()
+        except Exception:
+            pass
+
+    def _apply_saved_theme(self) -> None:
+        """Read the saved theme pref, apply it, set the menu radio, and (for
+        ``system``) auto-follow later OS scheme changes.  Called once at the
+        end of ``__init__``."""
+        from .theme import (apply_palette_only, connect_system_scheme,
+                            THEME_MODES)
+        mode = "system"
+        try:
+            from .prefs import load_prefs
+            mode = ((load_prefs() or {}).get("theme") or {}).get("mode", "system")
+        except Exception:
+            pass
+        if mode not in THEME_MODES:
+            mode = "system"
+        self._theme_mode = mode
+        # PALETTE ONLY — no setStyle.  launch() already installed Fusion before
+        # the window (so the tree was built under it); a setStyle here would
+        # force a GLOBAL widget re-polish, which is pointless (Fusion already
+        # set) and a segfault hazard when stale widgets exist.
+        apply_palette_only(QtWidgets.QApplication.instance(), mode)
+        for m, act in getattr(self, "_theme_actions", {}).items():
+            act.setChecked(m == mode)
+        # While in "system" mode, re-apply when the OS toggles light/dark.
+        # Hold the window via a WEAKREF in the callback — the signal lives on
+        # the app's styleHints (process-lifetime), so a strong ``self`` capture
+        # would keep every MainWindow alive forever.  That leaked each test's
+        # window (hardware sims / timers / file handles) and crashed the suite
+        # at teardown.  The weakref lets the window GC normally; the tiny
+        # closure that stays connected is harmless.
+        import weakref as _weakref
+        _self_ref = _weakref.ref(self)
+
+        def _follow_os_scheme():
+            _w = _self_ref()
+            if _w is not None and getattr(_w, "_theme_mode", "system") == "system":
+                # Palette-only re-apply (Fusion already installed) + a repaint.
+                apply_palette_only(QtWidgets.QApplication.instance(), "system")
+                try:
+                    _w._refresh_axis_titles_for_theme()
+                except Exception:
+                    pass
+        connect_system_scheme(QtWidgets.QApplication.instance(),
+                              _follow_os_scheme)
+
+    def _refresh_axis_titles_for_theme(self) -> None:
+        """Force every rotated ``_AxisTitle`` to repaint after a palette change
+        so the plot-margin axis labels pick up the new theme text colour.
+        (Its ``paintEvent`` reads ``palette().windowText()`` live, so an
+        explicit ``update()`` is enough — no cache to invalidate.)"""
+        from .widgets import _AxisTitle
+        for w in self.findChildren(_AxisTitle):
+            w.update()
 
     def _set_base_font_pt(self, pt: float) -> None:
         """Pick a new base font size from the Font Size submenu.
@@ -2573,6 +3154,75 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(
             self, "Bug report sent",
             "Thanks — the report has been emailed to the maintainer.")
+
+    def _on_help_reset_potentials(self):
+        """Help → Reset learned electrode potentials… — wipe the
+        per-coating learned-OCP store.
+
+        The store (:mod:`stimtest.electrode_potential_history`)
+        accumulates E_ret rest potentials per coating and, once enough
+        samples land, uses the running mean as the live OCP for that
+        coating.  Early PULSAR builds recorded WRONG values (the
+        baseline-subtraction bugs, since fixed), so the Pt bin in
+        particular is contaminated — the operator turned the reference
+        toggle OFF to avoid it.  This clears the store so future
+        captures re-learn cleanly.  Offers ALL or Pt-only.
+        """
+        try:
+            from ..electrode_potential_history import summary, reset
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Reset learned potentials",
+                f"Could not access the learned-potential store:\n\n{e}")
+            return
+        try:
+            bins = summary()   # [(coating_key, n, ocp_or_None), …]
+        except Exception:
+            bins = []
+        if bins:
+            lines = "\n".join(
+                f"  • {k}: {n} sample(s)"
+                + (f", learned OCP {ocp:+.3f} V" if ocp is not None else "")
+                for k, n, ocp in bins)
+        else:
+            lines = "  (the store is already empty)"
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reset learned electrode potentials")
+        box.setText(
+            "Clear the open-circuit potentials PULSAR has learned per "
+            "coating?\n\nCurrent store:\n" + lines
+            + "\n\nThis cannot be undone. Future captures re-learn from "
+              "scratch.")
+        b_all = box.addButton(
+            "Reset ALL", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        b_pt = box.addButton(
+            "Reset Pt only", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(b_all)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is None or clicked not in (b_all, b_pt):
+            return
+        try:
+            if clicked is b_pt:
+                reset("Pt")
+                what = "Pt"
+            else:
+                reset(None)
+                what = "all coatings"
+            QtWidgets.QMessageBox.information(
+                self, "Reset learned potentials",
+                f"Cleared the learned electrode potentials for {what}.")
+            try:
+                self.log_pane.log(
+                    f"Learned electrode potentials reset ({what}).")
+            except Exception:
+                pass
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Reset learned potentials",
+                f"Reset failed:\n\n{e}")
 
     def _on_help_contribute_data(self):
         """Help → Contribute electrode data… — open the contribution
@@ -3257,6 +3907,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_admin_login.setVisible(not logged_in)
         self._act_admin_logout.setVisible(logged_in)
         self._act_admin_catalog.setEnabled(is_admin(name))
+        # Export Profile is admin-gated (distributing a profile is
+        # privileged); Import stays open to all so a collaborator can
+        # load a profile file they were given without admin rights.
+        if hasattr(self, "_act_export_profile"):
+            self._act_export_profile.setEnabled(is_admin(name))
         # Broadcast to every PatternPanel in every experiment tab so
         # the asymmetric / symmetric shape dropdowns add / remove the
         # restricted entries.  Best-effort: a stale tab that doesn't
@@ -3272,6 +3927,181 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log_pane.log(
                     f"Profile broadcast to {type(tab).__name__} failed: "
                     f"{type(_e).__name__}: {_e}")
+
+    # ------------------------------------------- profile import / export
+    def _register_profile_payload(self, data, *, source="(payload)"):
+        """Validate a profile dict and register it via the plugin host.
+
+        Returns ``(ok: bool, message: str)``.  Shared by the Import
+        action and the startup re-load of persisted profiles.  Pure
+        DATA — no code execution — so importing a profile file is safe:
+        it only registers ``{name, password_hash, shapes}`` against the
+        shape primitives already built into ``stimtest.waveforms``.
+        """
+        from ..waveforms import PHASE_SHAPES
+        if not isinstance(data, dict):
+            return False, f"Profile {source} is not a JSON object."
+        name = str(data.get("name", "")).strip().lower()
+        phash = str(data.get("password_hash", "")).strip().lower()
+        display = data.get("display_name") or None
+        raw_shapes = data.get("shapes") or []
+        if isinstance(raw_shapes, str):
+            return False, "Profile 'shapes' must be a list, not a string."
+        if not name:
+            return False, "Profile is missing a 'name'."
+        # SHA-256 hex digest is exactly 64 lowercase hex chars.
+        if len(phash) != 64 or any(c not in "0123456789abcdef" for c in phash):
+            return False, (
+                f"Profile {name!r} has an invalid password_hash "
+                f"(expected a 64-char SHA-256 hex digest).")
+        shapes = [str(s).strip() for s in raw_shapes if str(s).strip()]
+        known = [s for s in shapes if s in PHASE_SHAPES]
+        unknown = [s for s in shapes if s not in PHASE_SHAPES]
+        try:
+            register_extension_profile(
+                name=name, password_hash=phash,
+                shapes=set(known), display_name=display)
+        except ValueError as e:
+            return False, f"Could not register profile {name!r}: {e}"
+        label = display or name.upper()
+        msg = f"{label} ({len(known)} shape(s))"
+        if unknown:
+            msg += (f" — ignored {len(unknown)} unknown shape(s): "
+                    f"{', '.join(unknown)}")
+        return True, msg
+
+    def _persist_imported_profile(self, data) -> None:
+        """Add/replace a profile in the persisted ``imported_profiles``
+        list (de-duped by name) and save prefs so it re-registers on
+        the next launch."""
+        name = str(data.get("name", "")).strip().lower()
+        if not name:
+            return
+        record = {
+            "name": name,
+            "display_name": data.get("display_name") or name.upper(),
+            "password_hash": str(
+                data.get("password_hash", "")).strip().lower(),
+            "shapes": [str(s) for s in (data.get("shapes") or [])],
+        }
+        self._imported_profiles = [
+            p for p in self._imported_profiles
+            if str(p.get("name", "")).strip().lower() != name]
+        self._imported_profiles.append(record)
+        try:
+            self._save_prefs_from_tabs()
+        except Exception as e:
+            self.log_pane.log(f"Could not persist imported profile: {e}")
+
+    def _load_imported_profiles(self) -> None:
+        """Re-register profiles the operator imported in a prior session
+        (persisted under prefs ``imported_profiles``).  Best-effort per
+        profile; a collision with a same-name pip extension is logged
+        and skipped (the extension already won)."""
+        for rec in list(self._imported_profiles):
+            ok, msg = self._register_profile_payload(rec, source="prefs")
+            if ok:
+                self.log_pane.log(f"Re-registered imported profile: {msg}")
+            else:
+                self.log_pane.log(f"Imported profile skipped: {msg}")
+
+    def _on_import_profile(self) -> None:
+        """Admin → Import Profile — load a ``.json`` profile file and
+        register it.  OPEN to all users (logging in to USE the profile
+        still needs the password).  Persists so it survives restarts."""
+        import json
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import profile", str(self.save_dir),
+            "PULSAR profile (*.json *.pulsarprofile);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Import profile",
+                f"Could not read profile file:\n{e}")
+            return
+        ok, msg = self._register_profile_payload(data, source=path)
+        if not ok:
+            QMessageBox.warning(self, "Import profile", msg)
+            return
+        self._persist_imported_profile(data)
+        # Re-broadcast the current profile so every PatternPanel + the
+        # login dialog pick up the newly-registered profile / shapes.
+        self._set_profile(self._current_profile)
+        self.log_pane.log(f"Imported profile: {msg}")
+        self.statusBar().showMessage(f"Imported profile: {msg}")
+        QMessageBox.information(
+            self, "Import profile",
+            f"Imported {msg}.\n\nLog in with this profile's password "
+            f"(Admin → Log In…) to use its shapes.")
+
+    def _on_export_profile(self) -> None:
+        """Admin → Export Profile — write a registered profile to a
+        ``.json`` file for distribution.  Admin-gated."""
+        import json
+        from PyQt6.QtWidgets import (
+            QFileDialog, QMessageBox, QInputDialog)
+        if not is_admin(self._current_profile):
+            QMessageBox.information(
+                self, "Export profile",
+                "Exporting a profile requires admin login "
+                "(Admin → Log In…).")
+            return
+        names = list_extension_profiles()
+        if not names:
+            QMessageBox.information(
+                self, "Export profile",
+                "No profiles are registered to export.\n\nInstall or "
+                "import a profile (e.g. CWRU) first.")
+            return
+        if len(names) == 1:
+            chosen = names[0]
+        else:
+            chosen, ok = QInputDialog.getItem(
+                self, "Export profile", "Profile to export:",
+                names, 0, False)
+            if not ok or not chosen:
+                return
+        prof = get_extension_profile(chosen)
+        if prof is None:
+            QMessageBox.warning(
+                self, "Export profile", f"Profile {chosen!r} not found.")
+            return
+        payload = {
+            "format": "pulsar-profile",
+            "format_version": 1,
+            "name": prof["name"],
+            "display_name": prof["display_name"],
+            "password_hash": prof["password_hash"],
+            "shapes": prof["shapes"],
+        }
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export profile",
+            str(self.save_dir / f"{prof['name']}.pulsarprofile.json"),
+            "PULSAR profile (*.json *.pulsarprofile)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export profile",
+                f"Could not write profile file:\n{e}")
+            return
+        self.log_pane.log(
+            f"Exported profile {prof['name']!r} → {path}")
+        self.statusBar().showMessage(f"Exported profile → {path}")
+        QMessageBox.information(
+            self, "Export profile",
+            f"Exported {prof['display_name']} to:\n{path}\n\nShare this "
+            f"file with collaborators and tell them the password "
+            f"separately — the file contains only the hash, so it "
+            f"can't be used to log in on its own.")
 
     # ---------------------------------------------------- extensions
     def _load_extensions(self) -> None:
@@ -3540,17 +4370,140 @@ def _wrap_tooltips_for_wrapping(root: QtWidgets.QWidget) -> None:
             continue
 
 
+def _single_instance_server_name() -> str:
+    """Per-user QLocalServer name for the single-instance guard.
+
+    Keyed on the login name so two different users on the same box
+    (rare for a bench rig, but possible via fast-user-switching) don't
+    block each other, while a second launch by the SAME user is caught.
+    """
+    try:
+        import getpass
+        user = getpass.getuser()
+    except Exception:
+        user = "user"
+    safe = "".join(c for c in user if c.isalnum()) or "user"
+    return f"PULSAR-stimtest-single-instance-{safe}"
+
+
+def _acquire_single_instance(server_name: Optional[str] = None):
+    """Single-instance guard.  The PlexStim 2.0 allows only ONE client
+    (exclusive USB lock; the DLL is single-producer), so a second PULSAR
+    window can't Initialize the stimulator ("No Plexon Stimulator is
+    detected") and two PULSAR processes touching the DLL risk a heap-
+    corruption race.  So at most one PULSAR window per user.
+
+    Returns ``(status, server)``:
+      * ``("primary", QLocalServer)`` — this is the first/only instance;
+        keep the server alive for the process lifetime and listen on it.
+      * ``("secondary", None)``       — another PULSAR is already running;
+        it has been pinged to raise its window, so the caller must exit
+        WITHOUT creating a second window.
+      * ``("disabled", None)``        — the guard is bypassed
+        (``PULSAR_ALLOW_MULTIPLE`` set, e.g. dev/test) or QtNetwork is
+        unavailable; proceed normally with no server.
+
+    Requires a live ``QApplication`` (QLocalSocket/Server need the Qt
+    event machinery), so call it AFTER the app is constructed.
+    """
+    if os.environ.get("PULSAR_ALLOW_MULTIPLE"):
+        return "disabled", None
+    try:
+        from PyQt6 import QtNetwork
+    except Exception:
+        return "disabled", None
+    name = server_name or _single_instance_server_name()
+    # Probe: can we reach an already-running instance's server?
+    sock = QtNetwork.QLocalSocket()
+    sock.connectToServer(name)
+    if sock.waitForConnected(300):
+        try:
+            sock.write(b"raise")
+            sock.flush()
+            sock.waitForBytesWritten(300)
+        except Exception:
+            pass
+        sock.disconnectFromServer()
+        return "secondary", None
+    sock.abort()
+    # No live instance.  Clear any stale socket left by a crashed
+    # instance, then claim the name.
+    QtNetwork.QLocalServer.removeServer(name)
+    server = QtNetwork.QLocalServer()
+    if not server.listen(name):
+        # Couldn't listen (unusual) — fail OPEN so launch still works.
+        return "disabled", None
+    return "primary", server
+
+
+def _bring_to_front(win) -> None:
+    """Un-minimise, show, and try to steal foreground for ``win`` (used
+    when a second launch pings the running instance)."""
+    try:
+        if win.isMinimized():
+            win.showNormal()
+        else:
+            win.show()
+        win.raise_()
+        win.activateWindow()
+    except Exception:
+        pass
+
+
+def _close_startup_splash() -> None:
+    """Dismiss the PyInstaller boot splash once the main window is up.
+
+    ``pyi_splash`` is injected ONLY into the frozen app when a ``Splash()``
+    was bundled (see installer/StimulationTesting.spec).  In a normal
+    ``python run_gui.py`` run the import fails — swallowed, so this is a
+    no-op outside the frozen build.
+    """
+    try:
+        import pyi_splash  # type: ignore  # present only in the frozen app
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def launch(simulate: bool = False, save_dir: Optional[str] = None,
            skip_prereq_check: bool = False) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     # Block accidental wheel-scroll edits on combos / spinboxes.
     app._no_wheel_filter = _NoWheelInputs(app)
     app.installEventFilter(app._no_wheel_filter)
+    # ---- Single-instance guard (before any dialog / window) ----------
+    # If a PULSAR is already running for this user, raise its window and
+    # bow out — don't open a duplicate that would fight over the
+    # stimulator's exclusive USB lock (operator: "prevent PULSAR from
+    # opening another window").  Set PULSAR_ALLOW_MULTIPLE=1 to bypass.
+    _si_status, _si_server = _acquire_single_instance()
+    if _si_status == "secondary":
+        try:
+            sys.stderr.write(
+                "PULSAR is already running — focusing the existing "
+                "window instead of opening a second one.\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return 0
     if not skip_prereq_check and not simulate:
         # On real-hardware launches, give the user a heads-up if the
         # PlexStim SDK isn't installed. We do this *before* showing the
         # main window so the dialog can't get buried behind it.
         _check_plexstim_prereq(app)
+    # Apply the saved colour theme (View → Theme: system / light / dark) BEFORE
+    # building the window so the first paint is already the right palette — a
+    # palette applied AFTER the widget tree is built leaves cached widget
+    # palettes stale (dark-mode-still-looks-light).  MainWindow._apply_saved_theme
+    # re-applies + wires the menu radio + OS-scheme auto-follow.
+    try:
+        from .theme import apply_theme
+        from .prefs import load_prefs
+        apply_theme(app, ((load_prefs() or {}).get("theme") or {}).get("mode",
+                                                                       "system"),
+                    repolish=False)      # before the window — nothing to repaint
+    except Exception:
+        pass
     # Pass the caller's ``simulate`` value through verbatim. The
     # earlier form ``simulate or True`` always collapsed to ``True``
     # (the ``or`` short-circuits on the truthy literal), so the
@@ -3559,6 +4512,7 @@ def launch(simulate: bool = False, save_dir: Optional[str] = None,
     # came up in simulator mode until the user manually unticked.
     win = MainWindow(simulate_default=simulate, save_dir=save_dir)
     win.show()
+    _close_startup_splash()   # dismiss the PyInstaller boot splash (frozen app)
     # Force every static tooltip to render as wrapped HTML rather
     # than a single screen-spanning line. Run AFTER ``win.show()`` so
     # the entire widget tree is realized.
@@ -3578,6 +4532,26 @@ def launch(simulate: bool = False, save_dir: Optional[str] = None,
         # Hot-plug refresh is a nicety; don't fail launch if the
         # filter can't install (e.g. unusual Qt build, sandboxing).
         pass
+    # Now that the window exists, wire the single-instance server so a
+    # SECOND launch ping (someone double-clicks PULSAR again) raises THIS
+    # window instead of opening a duplicate.  Keep the server pinned on
+    # the app so it lives for the whole process.
+    if _si_server is not None:
+        app._single_instance_server = _si_server
+
+        def _on_second_launch():
+            try:
+                conn = _si_server.nextPendingConnection()
+                if conn is not None:
+                    conn.disconnectFromServer()
+            except Exception:
+                pass
+            _bring_to_front(win)
+
+        try:
+            _si_server.newConnection.connect(_on_second_launch)
+        except Exception:
+            pass
     return app.exec()
 
 

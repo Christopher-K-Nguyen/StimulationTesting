@@ -137,7 +137,7 @@ def test_symmetric_shape_combo_icons_flip_with_polarity(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(SYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     # Compare icons across the combo for both polarities. Use a
     # non-rectangular shape entry where the flip is visible
     # (rectangular icons look identical with sign flipped since
@@ -145,7 +145,7 @@ def test_symmetric_shape_combo_icons_flip_with_polarity(qapp):
     from stimtest.waveforms import SHAPE_LINEAR_INCREASING
     idx = panel.shape_combo.findData(SHAPE_LINEAR_INCREASING)
     cath_pm = panel.shape_combo.itemIcon(idx).pixmap(80, 28).toImage()
-    panel.polarity.setCurrentText("Anodic-first")
+    panel.polarity.setCurrentText("Anodal-first")
     anod_pm = panel.shape_combo.itemIcon(idx).pixmap(80, 28).toImage()
     assert cath_pm != anod_pm
 
@@ -160,11 +160,11 @@ def test_asymmetric_shape_combo_icons_flip_with_polarity(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_MIX_MATCH)
     cath_pm = panel.asym_shape_combo.itemIcon(idx).pixmap(
         80, 28).toImage()
-    panel.polarity.setCurrentText("Anodic-first")
+    panel.polarity.setCurrentText("Anodal-first")
     anod_pm = panel.asym_shape_combo.itemIcon(idx).pixmap(
         80, 28).toImage()
     assert cath_pm != anod_pm

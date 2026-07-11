@@ -1,12 +1,16 @@
-"""Tests for Task #47: BiasFeedbackPanel visibility gate based on
-queued configuration mix.
+"""BiasFeedbackPanel visibility gate — two conditions, in order.
 
-The STM32 bias module only makes sense for monopolar (``id == "MP"``)
-configs — every other configuration kind uses an array electrode as
-the return path, so the bias module would have nothing to do.  The
-panel hides itself when no MP configs are queued so operators on
-bipolar / common-ground / tripolar sessions aren't tempted to flip
-the closed-loop checkbox.
+The per-tab INTERSTELLAR closed-loop config panel is shown only when
+BOTH are true (see ``_BaseExperimentTab._refresh_bias_visibility``):
+
+1. **INTERSTELLAR is connected** (operator: "If INTERSTELLAR is not
+   connected, then the interpulse bias option is hidden in the test
+   parameters").  The tab tracks this in ``_bias_connected``, driven by
+   the ConnectionPanel's biasConnected / biasDisconnected signals.
+2. **At least one MONOPOLAR (``id == "MP"``) config is queued** — the
+   bias module drives a dedicated counter electrode, so it has nothing
+   to do for BP / TP / CG configs (which return current through array
+   electrodes).
 
 Tests use the concrete VoltageTransientTab (multi-config) and
 ShortPulsingTab (single-config) so the gate is exercised on both
@@ -52,124 +56,161 @@ class _ComboStub:
         return list(self._configs)
 
 
-def _bare_tab_with_combo_and_panel(qapp, configs):
+def _bare_tab_with_combo_and_panel(qapp, configs, *, connected):
     """Build just enough of the _BaseExperimentTab surface to
     exercise the visibility gate without spinning up the full
     Test-Parameters page (and its 1000-line construction chain).
 
-    We use a plain stub class instead of ``_BaseExperimentTab.__new__``
-    because QWidget's metaclass needs ``super().__init__()`` to have
-    run before any attribute access via ``getattr(self, ...)`` works
-    — and the gate method only touches ``self._bias_feedback_panel``
-    + ``self.combo_panel``, both of which we can stamp on a plain
-    object."""
+    ``connected`` stamps the ``_bias_connected`` flag the gate reads —
+    it stands in for "the operator has connected INTERSTELLAR from the
+    Setup tab."
+    """
+    import types
+
     from stimtest.gui.bias_feedback_panel import BiasFeedbackPanel
+    from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     class _Stub:
         pass
 
     tab = _Stub()
-    tab._bias_feedback_panel = BiasFeedbackPanel()
+    # The tabs build the panel WITHOUT the embedded connector (connection
+    # lives in Setup); mirror that here.
+    tab._bias_feedback_panel = BiasFeedbackPanel(include_connector=False)
     tab.combo_panel = _ComboStub(configs)
+    tab._bias_connected = connected
+    # Bind the real gate + connect/disconnect handlers onto the stub so
+    # calling _on_bias_connected(tab) (which internally does
+    # self._refresh_bias_visibility()) resolves against the stub.
+    for name in ("_refresh_bias_visibility",
+                 "_on_bias_connected", "_on_bias_disconnected"):
+        setattr(tab, name,
+                types.MethodType(getattr(_BaseExperimentTab, name), tab))
     return tab
 
 
 # ---------------------------------------------------------------------------
-# Decision matrix
+# Gate 1 — connection
 # ---------------------------------------------------------------------------
-def test_visible_when_at_least_one_mp_config(qapp):
-    """At least one MP config queued → panel VISIBLE.  Operator can
-    pre-configure setpoint / tolerance even before that MP iteration
-    is reached."""
+def test_hidden_when_not_connected_even_with_mp(qapp):
+    """Not connected → HIDDEN even with a monopolar config queued.  This
+    is the operator's core requirement."""
+    from stimtest.gui.experiment_tabs import _BaseExperimentTab
+
+    configs = [Configuration.monopolar(1)]
+    tab = _bare_tab_with_combo_and_panel(qapp, configs, connected=False)
+    _BaseExperimentTab._refresh_bias_visibility(tab)
+    assert not tab._bias_feedback_panel.isVisibleTo(
+        tab._bias_feedback_panel)
+
+
+# ---------------------------------------------------------------------------
+# Gate 2 — config mix (evaluated only once connected)
+# ---------------------------------------------------------------------------
+def test_visible_when_connected_and_mp(qapp):
+    """Connected + at least one MP config → VISIBLE."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     configs = [Configuration.monopolar(1), Configuration.bipolar(2, 6)]
-    tab = _bare_tab_with_combo_and_panel(qapp, configs)
+    tab = _bare_tab_with_combo_and_panel(qapp, configs, connected=True)
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert tab._bias_feedback_panel.isVisibleTo(tab._bias_feedback_panel)
 
 
-def test_hidden_when_only_bipolar(qapp):
-    """BP-only mix → panel HIDDEN.  Bias module has nothing to do
+def test_hidden_when_connected_but_only_bipolar(qapp):
+    """Connected but BP-only → HIDDEN.  Bias module has nothing to do
     because the return current goes through an array electrode."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     configs = [Configuration.bipolar(1, 5), Configuration.bipolar(2, 6)]
-    tab = _bare_tab_with_combo_and_panel(qapp, configs)
+    tab = _bare_tab_with_combo_and_panel(qapp, configs, connected=True)
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert not tab._bias_feedback_panel.isVisibleTo(
         tab._bias_feedback_panel)
 
 
-def test_hidden_when_only_tripolar(qapp):
-    """TP-only mix → panel HIDDEN.  Same rationale as bipolar."""
+def test_hidden_when_connected_but_only_tripolar(qapp):
+    """Connected but TP-only → HIDDEN.  Same rationale as bipolar."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     configs = [Configuration.tripolar(6, 5, 7),
                Configuration.tripolar(10, 9, 11)]
-    tab = _bare_tab_with_combo_and_panel(qapp, configs)
+    tab = _bare_tab_with_combo_and_panel(qapp, configs, connected=True)
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert not tab._bias_feedback_panel.isVisibleTo(
         tab._bias_feedback_panel)
 
 
-def test_hidden_when_no_configs(qapp):
-    """Empty combo list → panel HIDDEN.  Symmetric with the
+def test_hidden_when_connected_but_no_configs(qapp):
+    """Connected but empty combo list → HIDDEN.  Symmetric with the
     Start-button disabled state."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
-    tab = _bare_tab_with_combo_and_panel(qapp, [])
+    tab = _bare_tab_with_combo_and_panel(qapp, [], connected=True)
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert not tab._bias_feedback_panel.isVisibleTo(
         tab._bias_feedback_panel)
 
 
-def test_visible_when_mixed_mp_and_bp(qapp):
-    """Mixed MP + BP queue → VISIBLE (the MP iteration uses the
-    bias module).  At least one MP is enough."""
+def test_visible_when_connected_and_mixed_mp_and_bp(qapp):
+    """Connected + mixed MP + BP queue → VISIBLE (the MP iteration uses
+    the bias module).  At least one MP is enough."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     configs = [Configuration.bipolar(1, 5),
                Configuration.monopolar(7),       # the MP iteration
                Configuration.tripolar(10, 9, 11)]
-    tab = _bare_tab_with_combo_and_panel(qapp, configs)
+    tab = _bare_tab_with_combo_and_panel(qapp, configs, connected=True)
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert tab._bias_feedback_panel.isVisibleTo(
         tab._bias_feedback_panel)
 
 
 # ---------------------------------------------------------------------------
+# Connect / disconnect handlers flip the gate live
+# ---------------------------------------------------------------------------
+def test_connect_disconnect_handlers_toggle_visibility(qapp):
+    """``_on_bias_connected`` / ``_on_bias_disconnected`` flip
+    ``_bias_connected`` and re-run the gate — so connecting INTERSTELLAR
+    reveals the panel (for an MP config) and disconnecting hides it."""
+    from stimtest.gui.experiment_tabs import _BaseExperimentTab
+
+    tab = _bare_tab_with_combo_and_panel(
+        qapp, [Configuration.monopolar(1)], connected=False)
+    _BaseExperimentTab._refresh_bias_visibility(tab)
+    assert not tab._bias_feedback_panel.isVisibleTo(tab._bias_feedback_panel)
+
+    _BaseExperimentTab._on_bias_connected(tab)
+    assert tab._bias_connected is True
+    assert tab._bias_feedback_panel.isVisibleTo(tab._bias_feedback_panel)
+
+    _BaseExperimentTab._on_bias_disconnected(tab)
+    assert tab._bias_connected is False
+    assert not tab._bias_feedback_panel.isVisibleTo(tab._bias_feedback_panel)
+
+
+# ---------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------
 def test_no_op_when_panel_missing(qapp):
-    """Construction-order guard: the visibility-refresh slot is
-    wired to combinationsChanged BEFORE the panel exists (signal
-    fires during initial combo_panel.set_array).  Method must no-op
-    safely on missing attribute rather than AttributeError.
-
-    Uses a plain object stub instead of ``_BaseExperimentTab.__new__``
-    because the QWidget metaclass requires ``super().__init__()`` to
-    have run before any attribute access via ``getattr(self, ...)``
-    works — and the whole point of this test is the missing-
-    attribute path, which we can exercise on any callable target.
-    """
+    """Construction-order guard: the visibility-refresh slot is wired to
+    combinationsChanged BEFORE the panel exists (signal fires during
+    initial combo_panel.set_array).  Method must no-op safely on a
+    missing attribute rather than AttributeError."""
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
     class _BareStub:
         """No Qt parentage, no _bias_feedback_panel attribute."""
         combo_panel = _ComboStub([Configuration.monopolar(1)])
 
-    # Calling the unbound method on the stub exercises the
-    # getattr(self, "_bias_feedback_panel", None) early-out path
-    # without the QWidget construction.
     _BaseExperimentTab._refresh_bias_visibility(_BareStub())
 
 
 def test_no_op_when_combo_panel_raises(qapp):
     """If the combo panel raises during selected_configurations()
-    (transient state during teardown / partial construction), treat
-    as 'no configs' and hide the panel rather than letting the
-    exception escape."""
+    (transient state during teardown / partial construction), treat as
+    'no configs' and hide the panel rather than letting the exception
+    escape."""
     from stimtest.gui.bias_feedback_panel import BiasFeedbackPanel
     from stimtest.gui.experiment_tabs import _BaseExperimentTab
 
@@ -181,9 +222,9 @@ def test_no_op_when_combo_panel_raises(qapp):
         pass
 
     tab = _Stub()
-    tab._bias_feedback_panel = BiasFeedbackPanel()
+    tab._bias_feedback_panel = BiasFeedbackPanel(include_connector=False)
     tab.combo_panel = _ExplodingCombo()
-    # Must not raise — falls back to no-configs path.
+    tab._bias_connected = True   # get past gate 1 to exercise gate 2
     _BaseExperimentTab._refresh_bias_visibility(tab)
     assert not tab._bias_feedback_panel.isVisibleTo(
         tab._bias_feedback_panel)
@@ -199,17 +240,15 @@ def test_no_op_when_combo_panel_raises(qapp):
     "ProgressiveStressTab",
 ])
 def test_full_tab_construction_starts_hidden(qapp, array_4x4, TabCls):
-    """Fresh tab with no configs queued → bias panel hidden.  Smoke
-    test that the wiring (combinationsChanged → _refresh_bias_visibility
-    + initial call after panel construction) actually works in a real
-    tab, not just a bare stub."""
+    """Fresh tab (INTERSTELLAR not connected) → bias panel hidden.  Smoke
+    test that the wiring actually works in a real tab, not just a bare
+    stub."""
     import stimtest.gui.experiment_tabs as et
     cls = getattr(et, TabCls)
     tab = cls(array_4x4)
-    # No configs selected by default at construction.
+    # The panel is built (feature enabled from source) but hidden — no
+    # INTERSTELLAR connection yet.
     panel = getattr(tab, "_bias_feedback_panel", None)
     assert panel is not None, (
         f"{TabCls} should expose _bias_feedback_panel after construction")
-    # Visibility on a widget that's not yet shown is determined by
-    # isVisibleTo(itself).  Initial state: hidden (no MP configs).
     assert not panel.isVisibleTo(panel)

@@ -81,6 +81,29 @@ from .base import fmt_elapsed as _fmt_elapsed  # noqa: E402,F401
 # :mod:`stimtest.hardware.base`.
 
 
+def _frange_incl(start: float, stop: float, step: float) -> list:
+    """Inclusive float range — MATLAB ``start:step:stop`` semantics.
+
+    Used to build the vertical-scale grid the same way the MATLAB
+    ``getWaveform3.m`` ``vertScale_partN = start:diff:end`` ranges do.
+    """
+    n = int(round((stop - start) / step)) + 1
+    return [round(start + i * step, 9) for i in range(max(n, 0))]
+
+
+# --------------------------------------------------------------------------
+# Serial / RS232 transport tuning + per-command robustness.  Applied ONLY
+# when the scope is on an ASRL / COM resource (e.g. a TPS2014B over an
+# RS232-to-USB bridge), where bytes can drop or garble despite a matched
+# baud rate (flow-control / bridge-timing / buffer-overrun).  USB-TMC is
+# fast + reliable, so it skips all of this — the hot per-capture loop keeps
+# its latency.  Operator confirmed serial is rare/legacy, so this is a
+# safety net, not the common path.
+# --------------------------------------------------------------------------
+_SERIAL_MIN_TIMEOUT_MS = 5000        # floor the VISA timeout (serial is slow)
+_SERIAL_QUERY_DELAY_S = 0.10         # write→read turnaround gap for the bridge
+_SERIAL_QUERY_RETRIES = 3            # re-query on empty / garbled / timeout
+_SERIAL_QUERY_RETRY_BACKOFF_S = 0.15  # × attempt# between retries
 
 
 def channel_count_from_model(model: str) -> Optional[int]:
@@ -147,25 +170,58 @@ class TektronixOscilloscope(Oscilloscope):
             # libusbK (Zadig), visa32/64 sees nothing while @py finds the
             # scope via libusbK — so we probe rather than assume.
             self._rm = None
+            # Prefer the backend that actually finds a SCOPE-shaped USB
+            # resource, not merely the first backend that returns ANY
+            # resource. The @py (pyvisa-py) backend may enumerate only a
+            # serial COM port (e.g. ASRL3::INSTR) while NI-VISA (the default
+            # backend) is the one that sees the USB-TMC scope; breaking on
+            # "any resource" would lock onto @py's COM port and never reach
+            # NI-VISA. Vendor-ID prefixes cover the hex form (NI-VISA) and
+            # the decimal form (pyvisa-py) for Tek / Keysight / R&S.
+            _scope_vids = ("0x0699", "1689", "0x0957", "2391",
+                           "0x0AAD", "2733")
+            _fallback_rm = None
+            _fallback_res = ()
             for backend in ("@py", "C:\\Windows\\System32\\visa64.dll", ""):
                 try:
                     rm = pyvisa.ResourceManager(backend) if backend else pyvisa.ResourceManager()
                     resources = tuple(rm.list_resources())
-                    if resources:
-                        self._rm = rm
-                        self._cached_resources = resources
-                        break
-                    # Keep as fallback if no better option found
-                    if self._rm is None:
-                        self._rm = rm
                 except Exception:
-                    pass
+                    continue
+                if resources and any(
+                        vid in r for r in resources for vid in _scope_vids):
+                    self._rm = rm
+                    self._cached_resources = resources
+                    break
+                # Remember the first usable RM (even one with no scope-shaped
+                # resource) as a fallback for libusbK / no-VISA setups.
+                if _fallback_rm is None:
+                    _fallback_rm = rm
+                    _fallback_res = resources
             if self._rm is None:
-                self._rm = pyvisa.ResourceManager("@py")
+                if _fallback_rm is not None:
+                    self._rm = _fallback_rm
+                    self._cached_resources = _fallback_res or None
+                else:
+                    self._rm = pyvisa.ResourceManager("@py")
         self._inst = None
         self._resource_hint = resource
         self._prefer_usb = prefer_usb
         self._timeout_ms = timeout_ms
+        # Transport awareness — recomputed in open() from the resource
+        # string.  True for an ASRL / COM (serial / RS232-to-USB) link,
+        # where open() tunes the transport AND _w / _q add per-command
+        # robustness (error-queue drain + query retry).  False for USB-TMC,
+        # which stays on the plain fast path.
+        self._is_serial: bool = False
+        # Operator-tunable serial settings, applied in open() when serial
+        # (set them BEFORE open() if comm is flaky despite a correct baud).
+        # ``serial_flow_control``: None = leave the VISA default; else one of
+        # "none" / "rts_cts" / "xon_xoff" / "dtr_dsr" (or a
+        # ``pyvisa.constants.ControlFlow`` value).  ``serial_baud_rate``:
+        # None = leave default; match the scope's RS232 menu.
+        self.serial_flow_control = None
+        self.serial_baud_rate: Optional[int] = None
         self._cmds: TekCommandSet = MODERN_CMDS
         self.info = ScopeInfo()
         self.channel_aliases: Dict[str, str] = {
@@ -193,7 +249,22 @@ class TektronixOscilloscope(Oscilloscope):
         # no-op.
         self._expected_acq_mode: Optional[str] = None
         self._expected_acq_navg: Optional[int] = None
+        # Confirmed-applied (mode, n_avg) from the LAST successful
+        # set_acquisition_mode read-back.  Makes the setter idempotent:
+        # re-sending ACQuire:MODe on a long record forces a multi-second
+        # internal reconfiguration, so we skip the write when the scope
+        # is already confirmed in this state.  Set only AFTER a
+        # successful confirmation; reset to None at open() so a
+        # reconnect re-initialises.
+        self._applied_acq: Optional[Tuple[str, Optional[int]]] = None
         self._expected_trigger_source: Optional[str] = None
+        # Non-None (the source channel, e.g. "CH2") while a PULSE-WIDTH
+        # trigger is active (``set_trigger_pulse_width``) — the pulse-width
+        # trigger's threshold lives in a DIFFERENT register than the edge
+        # level (``TRIGger:A:LOWerthreshold:CHx`` vs ``TRIGger:A:LEVel``),
+        # so ``set_trigger_level`` routes on this.  Reset to None by
+        # ``set_trigger`` (edge) and at ``open()``.
+        self._trig_pulse_source: Optional[str] = None
         # True when the configured trigger source is a TTL digital sync
         # line — either the EXT BNC or a scope channel the operator
         # tagged with Role=Trigger (typically CH3/CH4 wired to the
@@ -269,6 +340,12 @@ class TektronixOscilloscope(Oscilloscope):
         # cached state.
         self._expected_horiz_scale_s: Optional[float] = None
         self._expected_horiz_position_pct: Optional[float] = None
+        #: Last REQUESTED SEC/DIV (pre-rounding).  A VT sweep re-applies the
+        #: SAME pattern-derived timebase per channel (apply_default_scope_view
+        #: → auto_layout_for_pulse); this lets set_horizontal_scale skip the
+        #: redundant write + readback + (X-side) preamble invalidation when the
+        #: request is unchanged.
+        self._last_horiz_scale_req: Optional[float] = None
         # Last reported X / Y units from the preamble (e.g. "s" and "V").
         # Refreshed every time :meth:`_read_preamble` parses a batch
         # ``WFMOutpre?`` response.  Defaults chosen so the time-axis
@@ -320,7 +397,13 @@ class TektronixOscilloscope(Oscilloscope):
 
     # ----- discovery -----
     def list_resources(self) -> List[str]:
-        return list(self._rm.list_resources())
+        # Suppress pyvisa-py's TCPIP discovery UserWarnings ("limited to
+        # the default interface" / "requires the zeroconf package") — they
+        # fire during enumeration and are pure noise on a USB/serial bench.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return list(self._rm.list_resources())
 
     def _pick_resource(self) -> str:
         if self._resource_hint:
@@ -334,7 +417,10 @@ class TektronixOscilloscope(Oscilloscope):
             candidates = list(self._cached_resources)
             self._cached_resources = None
         else:
-            candidates = list(self._rm.list_resources())
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # pyvisa-py TCPIP noise
+                candidates = list(self._rm.list_resources())
         if not candidates:
             raise RuntimeError("No VISA resources found. Is NI-VISA installed and the scope on?")
         if self._prefer_usb:
@@ -416,6 +502,18 @@ class TektronixOscilloscope(Oscilloscope):
         self._log("[scope] === Initializing oscilloscope ===")
         if resource:
             self._resource_hint = resource
+        # Re-arm the once-per-session XZEro-disagree diagnostic so a
+        # reconnect logs it once again (see _read_channel Method P).
+        self._xzero_disagree_logged = False
+        # Clear the SELect cache — a reconnect/reset may default the device's
+        # channel selection, so a stale "already selected" entry could make
+        # _read_channel skip a needed SELect ON → CURVe? error 2244.
+        # configure_channels re-seeds it authoritatively at run setup.
+        self._selected_channels = set()
+        # A reconnect resets the scope's timebase — clear the SEC/DIV request
+        # cache so the first set_horizontal_scale after reconnect actually
+        # writes instead of trusting a stale "already applied" value.
+        self._last_horiz_scale_req = None
         # Reset per-session USB-stall stats so the count + worst-offender
         # tracking starts fresh every connect.  Without this, the
         # session-end summary in close() would aggregate stats from
@@ -466,6 +564,17 @@ class TektronixOscilloscope(Oscilloscope):
                     f"[scope] VISA session config: "
                     f"timeout={self._timeout_ms} ms, "
                     f"write_term='\\n', read_term='\\n'")
+                # ---- Transport-aware serial tuning ----------------
+                # An ASRL / COM resource is RS232(-to-USB).  Flip the
+                # transport flag so _w / _q add robustness, and tune the
+                # serial link (longer timeout, write→read delay, flow
+                # control) so the TPS2014B-style "poor comms despite a
+                # matched baud" symptom is mitigated.  USB-TMC skips this.
+                self._is_serial = self._resource_is_serial(rsrc)
+                if self._is_serial:
+                    self._log("[scope] transport: SERIAL (ASRL/RS232) "
+                              "— enabling per-command robustness")
+                    self._configure_serial_transport()
                 # ---- Step 2: identify device (*IDN?) --------------
                 self._log("[scope] Step 2/6: Identify device (*IDN?)")
                 idn = self._q("*IDN?")
@@ -668,6 +777,10 @@ class TektronixOscilloscope(Oscilloscope):
         if _spec is not None:
             self._n_vert_divs = float(_spec.n_vert_divs)
             self._half_vert_divs = self._n_vert_divs / 2.0
+            # Smallest V/div the hardware accepts — TBS2000B goes to 1 mV,
+            # legacy 8-div families to 2 mV (verified live).  Drives the
+            # model-aware ``_vertical_grid_vpd``.
+            self._min_vdiv_v = float(getattr(_spec, "min_vdiv_v", 2e-3))
             # If the per-series spec disagrees with the queried
             # horizontal count, prefer the SCPI answer (the scope
             # itself is the source of truth for horiz; the spec is
@@ -682,7 +795,8 @@ class TektronixOscilloscope(Oscilloscope):
             f"[scope] display grid: "
             f"{self._n_horiz_divs:.0f} horizontal × "
             f"{self._n_vert_divs:.0f} vertical divs "
-            f"(±{self._half_vert_divs:.1f} from screen centre)")
+            f"(±{self._half_vert_divs:.1f} from screen centre); "
+            f"min V/div = {self._min_vdiv_v * 1e3:g} mV")
         # Binary transfer: signed int8, MSB-first.
         # DATa:ENCdg RIBinary — R=MSB-first, I=signed integer, Binary=raw bytes.
         # DATa:WIDth is fixed at 1 (int8) for ALL acquisition modes, matching
@@ -705,11 +819,23 @@ class TektronixOscilloscope(Oscilloscope):
         self._w(self._cmds.data_encoding_cmd)
         self._w("DATa:WIDth 1")
         self._data_width = 1
-        # DATa:STARt/STOP define the slice of the record to transfer. They
-        # don't change between captures (we always want the full record),
-        # so set once at open and let set_record_length() refresh on demand.
+        # DATa:STARt = 1 (read from the first sample) — but DO NOT pin
+        # DATa:STOP.  MATLAB PARITY (operator: "I do not want DATa:STOP …
+        # acquire waveforms similar to my MATLAB code"): getCurve.m only
+        # sets DATa:SOUrce + reads CURVe?, never DATa:STOP / record length.
+        # Pinning DATa:STOP = record length is what transferred the
+        # off-screen record tail (the CWRU end-of-record burst).  We read
+        # CURVe? at the scope's natural front-panel window; the time axis
+        # tracks the actual returned points (Method P uses raw.size).
         self._w("DATa:STARt 1")
         self._record_length = None
+        # Force the next set_acquisition_mode to actually write — we
+        # don't reliably know the front panel's current acq mode at
+        # connect, so the idempotent skip must not fire on first use.
+        self._applied_acq = None
+        # Reconnect may land on any front-panel trigger state — assume
+        # edge until set_trigger_pulse_width() re-arms pulse-width mode.
+        self._trig_pulse_source = None
         # NOTE: record length is intentionally NOT set here — the
         # Setup/Experiment/Calibration tabs each call
         # ``set_record_length`` with the value appropriate for that
@@ -720,10 +846,21 @@ class TektronixOscilloscope(Oscilloscope):
         # matches whatever the front panel last had — without it the
         # very first downstream query sees ``None`` and round-trips
         # the scope.
+        #
+        # CHECK + LOG the record length at connect (operator: "when
+        # connecting the oscilloscope, you need to check what is the
+        # record length").  PULSAR no longer pins DATa:STOP (MATLAB
+        # parity), so CURVe? reads the scope's natural front-panel
+        # window — but the operator still wants the record length on
+        # record per session, so surface it here.
         try:
-            self._refresh_record_length()
-        except Exception:
-            pass
+            _rl = self._refresh_record_length()
+            self._log(f"[scope] Step 6/6: front-panel record length = "
+                      f"{_rl:,} samples (CURVe? reads the natural window; "
+                      f"DATa:STOP NOT pinned — MATLAB parity)")
+        except Exception as e:
+            self._log(f"[scope] Step 6/6: record-length query failed "
+                      f"({type(e).__name__}: {e})")
         # ---- Probe survey: log gain + type for every channel, warn
         # ---- if a real probe (not BNC) is reported anywhere.
         # ---- Hardware state — NOT overwritten by Setup / Experiment
@@ -891,6 +1028,147 @@ class TektronixOscilloscope(Oscilloscope):
                 f"if the rate climbs persistently, check the USB cable "
                 f"and downstream hubs.")
 
+    # ----- transport detection + serial tuning -------------------------
+    @staticmethod
+    def _resource_is_serial(rsrc: str) -> bool:
+        """True for a serial / RS232(-to-USB) VISA resource string."""
+        u = str(rsrc or "").upper()
+        return u.startswith("ASRL") or u.startswith("COM")
+
+    def _resolve_flow_control(self, value):
+        """Map a flow-control name to pyvisa's ``ControlFlow`` enum."""
+        try:
+            from pyvisa import constants as _vc
+        except Exception:
+            return value
+        if isinstance(value, str):
+            return {
+                "none": _vc.ControlFlow.none,
+                "rts_cts": _vc.ControlFlow.rts_cts,
+                "xon_xoff": _vc.ControlFlow.xon_xoff,
+                "dtr_dsr": getattr(_vc.ControlFlow, "dtr_dsr",
+                                   _vc.ControlFlow.none),
+            }.get(value.strip().lower(), _vc.ControlFlow.none)
+        return value
+
+    def _configure_serial_transport(self) -> None:
+        """Tune a serial / RS232(-to-USB) VISA session for reliability.
+
+        Serial links drop / garble bytes far more readily than USB-TMC.
+        The legacy Tek programmer manual (TBS1000/B · TDS2000/B/C ·
+        TDS1000/B/C · TDS200 · TPS2000/B) documents the exact failure the
+        operator hit on a TPS2014B: *"If no flow control (flagging) is
+        used, commands may be received faster than the oscilloscope can
+        process them"* — input-buffer overrun DESPITE a matched baud rate.
+
+        Defaults applied (operator-overridable via ``serial_flow_control``
+        / ``serial_baud_rate`` BEFORE ``open()``):
+
+        * longer timeout + write→read turnaround delay + ``send_end``;
+        * **hard flagging (RTS/CTS) on BOTH ends** — host VISA
+          ``flow_control`` AND scope-side ``RS232:HARDFlagging ON``.
+          Hard, never soft: the manual warns soft flagging (XON/XOFF)
+          **locks up on binary transfers whose payload contains the
+          XON/XOFF bytes** — and ``CURVe?`` int8 waveform data can contain
+          any byte value, so soft flagging would wedge mid-capture.
+
+        Every write is DEFENSIVE: backends differ in which serial
+        attributes they expose, and a missing one must NOT abort the
+        connect.
+        """
+        inst = self._inst
+        if inst is None:
+            return
+
+        def _try(label, fn):
+            try:
+                fn()
+                self._log(f"[scope]   serial: {label}")
+            except Exception as e:
+                self._log(f"[scope]   serial: {label} — skipped "
+                          f"({type(e).__name__})")
+        _floor = max(self._timeout_ms, _SERIAL_MIN_TIMEOUT_MS)
+        _try(f"timeout={_floor} ms",
+             lambda: setattr(inst, "timeout", _floor))
+        _try(f"query_delay={_SERIAL_QUERY_DELAY_S} s",
+             lambda: setattr(inst, "query_delay", _SERIAL_QUERY_DELAY_S))
+        _try("send_end=True", lambda: setattr(inst, "send_end", True))
+        if self.serial_baud_rate is not None:
+            _try(f"baud_rate={self.serial_baud_rate}",
+                 lambda: setattr(inst, "baud_rate",
+                                 int(self.serial_baud_rate)))
+            # Manual: "if another command is sent immediately after
+            # [RS232:BAUd], the first couple of characters may be lost."
+            # Same caution applies to a host-side rate change mid-session.
+            time.sleep(0.2)
+        # Host-side flow control: operator override wins; default RTS/CTS
+        # (hard flagging) per the manual's overrun warning.
+        _fc = (self.serial_flow_control
+               if self.serial_flow_control is not None else "rts_cts")
+        _try(f"flow_control={_fc}",
+             lambda: setattr(inst, "flow_control",
+                             self._resolve_flow_control(_fc)))
+        # Scope-side: assert hard flagging so BOTH ends agree (host-only
+        # RTS/CTS does nothing if the scope ignores the lines).  Applies
+        # to the TDS2000/TDS1000/TDS200/TPS2000(B) families per the
+        # manual; harmless best-effort elsewhere.  Skipped when the
+        # operator explicitly chose a non-RTS/CTS scheme.
+        if _fc == "rts_cts":
+            _try("RS232:HARDFlagging ON (scope side)",
+                 lambda: inst.write("RS232:HARDFlagging ON"))
+
+    def _check_error_queue(self, after_cmd: str = "") -> None:
+        """Detect a SCPI error via the IEEE-488.2 Standard Event Status
+        Register (``*ESR?``) and raise if one is flagged.
+
+        ``*ESR?`` is PORTABLE across every Tek scope — the legacy serial
+        TPS / TDS families AND the modern TBS2000 — whereas
+        ``SYSTem:ERRor?`` isn't reliably implemented on the older serial
+        scopes this matters for (a TPS2014B over RS232).  Error bits:
+        CME(32) | EXE(16) | DDE(8) | QYE(4) = ``0x3C``.  When one is set we
+        pull a human-readable detail from whichever message query the
+        scope supports (``ALLEv?`` / ``SYSTem:ERRor?`` / ``EVMsg?``).
+
+        Silent SCPI rejections — a misspelled mnemonic, an out-of-range
+        numeric, a command in the wrong acquisition state, or a byte
+        garbled on a serial link — leave the scope in a state that doesn't
+        match the host's idea of it; you'd only find out when the captured
+        trace looks wrong.  Used by ``_w_checked`` (explicit critical
+        writes, any transport) and by ``_w`` after EVERY write on a serial
+        link.  Best-effort: a garbled / unreadable status read is swallowed
+        rather than turned into a false failure.
+        """
+        if self._inst is None:
+            raise RuntimeError("Scope not open")
+        try:
+            t0 = time.perf_counter()
+            esr_raw = self._inst.query("*ESR?").strip()
+            esr = int(float(esr_raw))
+            self._log(f"[scope] > *ESR?   < {esr_raw}   "
+                      f"({_fmt_elapsed(time.perf_counter() - t0)})")
+        except Exception:
+            return  # never let the error-check itself become the failure
+        if not (esr & 0x3C):
+            return  # no command / execution / device / query error
+        # Error flagged — best-effort detail via the documented Tek event
+        # sequence: ALLEv? / EVMsg? dequeue the event codes for "the last
+        # *ESR? read" (programmer manual, Status & Events).  These exist on
+        # EVERY Tek family, legacy + modern.  ``SYSTem:ERRor?`` is last-
+        # resort ONLY — the legacy TPS/TDS/TBS1000 families don't implement
+        # it (querying it there queues ANOTHER error), so it must never be
+        # tried before the event-queue queries.
+        detail = ""
+        for _mq in ("ALLEv?", "EVMsg?", "SYSTem:ERRor?"):
+            try:
+                d = self._inst.query(_mq).strip()
+            except Exception:
+                continue
+            if d and not d.lstrip().startswith(("0,", "0;", "0 ")):
+                detail = f" [{_mq} → {d}]"
+            break
+        raise RuntimeError(
+            f"Tek SCPI error (ESR=0x{esr:02X}) after {after_cmd!r}{detail}")
+
     def _w(self, cmd: str) -> None:
         if self._inst is None: raise RuntimeError("Scope not open")
         t0 = time.perf_counter()
@@ -898,49 +1176,70 @@ class TektronixOscilloscope(Oscilloscope):
         dt = time.perf_counter() - t0
         self._log(f"[scope] > {cmd}   ({_fmt_elapsed(dt)})")
         self._track_query_latency(cmd, dt)
+        # Serial only: drain the error queue after EVERY write so a
+        # silently-corrupted command surfaces at its source.  USB-TMC skips
+        # this — the link is reliable and the hot loop self-validates.
+        if self._is_serial:
+            self._check_error_queue(cmd)
 
     def _q(self, cmd: str) -> str:
         if self._inst is None: raise RuntimeError("Scope not open")
-        t0 = time.perf_counter()
-        resp = self._inst.query(cmd).strip()
-        dt = time.perf_counter() - t0
-        self._log(f"[scope] > {cmd}   < {resp}   "
-                  f"({_fmt_elapsed(dt)})")
-        self._track_query_latency(cmd, dt)
-        return resp
+        if not self._is_serial:
+            # USB-TMC fast path — one query, no retry.
+            t0 = time.perf_counter()
+            resp = self._inst.query(cmd).strip()
+            dt = time.perf_counter() - t0
+            self._log(f"[scope] > {cmd}   < {resp}   ({_fmt_elapsed(dt)})")
+            self._track_query_latency(cmd, dt)
+            return resp
+        # Serial path — validate + retry on empty / garbled / timeout.  An
+        # RS232-to-USB bridge can return a truncated or empty read; a single
+        # garbled NUMACq? / preamble shouldn't kill the run.  Clear the
+        # parser (*CLS) and back off between attempts.
+        _last_exc = None
+        for _attempt in range(_SERIAL_QUERY_RETRIES):
+            try:
+                t0 = time.perf_counter()
+                resp = self._inst.query(cmd).strip()
+                dt = time.perf_counter() - t0
+                if resp:
+                    _suffix = (f", attempt {_attempt + 1}/"
+                               f"{_SERIAL_QUERY_RETRIES}" if _attempt else "")
+                    self._log(f"[scope] > {cmd}   < {resp}   "
+                              f"({_fmt_elapsed(dt)}{_suffix})")
+                    self._track_query_latency(cmd, dt)
+                    return resp
+                self._log(f"[scope] > {cmd}   < <empty>   (serial, attempt "
+                          f"{_attempt + 1}/{_SERIAL_QUERY_RETRIES})")
+            except Exception as e:
+                _last_exc = e
+                self._log(f"[scope] > {cmd}   < <{type(e).__name__}>   "
+                          f"(serial, attempt {_attempt + 1}/"
+                          f"{_SERIAL_QUERY_RETRIES})")
+            try:
+                self._inst.write("*CLS")
+            except Exception:
+                pass
+            time.sleep(_SERIAL_QUERY_RETRY_BACKOFF_S * (_attempt + 1))
+        if _last_exc is not None:
+            raise _last_exc
+        raise RuntimeError(
+            f"Scope returned an empty response to {cmd!r} after "
+            f"{_SERIAL_QUERY_RETRIES} serial retries.")
 
     def _w_checked(self, cmd: str) -> None:
         """Send a SCPI command and immediately drain the error queue.
 
-        IEEE-488.2 / SCPI: ``SYSTem:ERRor?`` returns ``0,"No error"`` when
-        the queue is empty. The MATLAB code wrapped every Tek write with
-        an error-queue read for this reason — silent SCPI rejections (a
-        misspelled mnemonic, an out-of-range numeric, a command issued
-        in the wrong acquisition state) leave the scope in a state that
-        doesn't match the host's idea of it, and you only find out when
-        the captured trace looks weird. We surface the SCPI error code
-        here so the failure points at the actual offending command.
+        Explicit error-checked write for critical state changes on ANY
+        transport (the serial path ALSO auto-checks via ``_w``).  See
+        ``_check_error_queue`` for the rationale.
         """
         if self._inst is None: raise RuntimeError("Scope not open")
         t0 = time.perf_counter()
         self._inst.write(cmd)
-        self._log(f"[scope] > {cmd}   ({_fmt_elapsed(time.perf_counter() - t0)})")
-        try:
-            t0 = time.perf_counter()
-            err = self._inst.query("SYSTem:ERRor?").strip()
-            self._log(f"[scope] > SYSTem:ERRor?   < {err}   "
-                      f"({_fmt_elapsed(time.perf_counter() - t0)})")
-        except Exception:
-            return  # never let the error-check itself become the failure
-        # Format is ``code,"description"``; code 0 = no error.
-        head = err.split(",", 1)[0].strip()
-        try:
-            code = int(head)
-        except ValueError:
-            return
-        if code != 0:
-            raise RuntimeError(
-                f"Tek SCPI error after {cmd!r}: {err}")
+        self._log(f"[scope] > {cmd}   "
+                  f"({_fmt_elapsed(time.perf_counter() - t0)})")
+        self._check_error_queue(cmd)
 
     # ----- capability probing ------------------------------------------
     def _probe_commands(self, *, spec=None,
@@ -1124,9 +1423,11 @@ class TektronixOscilloscope(Oscilloscope):
         """Detect whether the scope has an EXT trigger BNC input.
 
         TBS2000B / TBS2000C / MSO / MDO / DPO scopes have an external
-        trigger input on the rear BNC; TBS1000C and TBS1000B-EDU
-        (the 2-channel basic scopes) do *not* — their valid trigger
-        sources are CH1, CH2, and AC LINE only.
+        trigger input on the rear BNC, and the TBS1000C has a front-panel
+        "Aux In" (SCPI source ``AUX``, per the TBS1000C user manual) — all
+        carry ``has_ext_trigger = True`` in the spec DB, so this LIVE probe
+        only runs for UNKNOWN models.  (The legacy TBS1000B-EDU has no
+        external trigger.)
 
         Probe technique: save the current ``TRIGger:A:EDGE:SOUrce``,
         try setting it to ``EXT``, read back. If the scope accepted
@@ -1229,13 +1530,22 @@ class TektronixOscilloscope(Oscilloscope):
         return {
             "shrink_count": 0,
             "last_scale": None,
+            "last_pos": None,       # last CHx:POSition (divs) we WROTE
             "history": [],          # list of scales we've picked
             "settled_count": 0,     # consecutive no-op returns
-            "locked": False,        # True after repeat / max-tries
+            "locked": False,        # True after repeat / grid-limit accept
         }
 
     def set_channel_scale(self, channel: str, volts_per_div: float) -> None:
-        self._w(f"{channel}:SCAle {volts_per_div:g}")
+        # Write the V/div in 3-significant-figure SCIENTIFIC notation
+        # (e.g. ``7.50E-02``) — the format the MATLAB used and the one the
+        # TBS firmware honors at FINE resolution.  The old ``:g`` decimal
+        # form worked for the 1-2-5 grid but the fine grid (gotcha — port
+        # of getWaveform3.m) needs the scope to apply arbitrary 3-sig-fig
+        # values; scientific notation guarantees the scope doesn't quantize
+        # back to a coarse cell.  ``%.2e`` = 2 mantissa decimals = 3 sig
+        # figs.
+        self._w(f"{channel}:SCAle {volts_per_div:.2e}")
         if hasattr(self, "_adapt_state"):
             # Use the canonical default (see _new_adapt_state) so
             # ``adapt_channel_scale`` finds the full schema if it
@@ -1243,10 +1553,17 @@ class TektronixOscilloscope(Oscilloscope):
             self._adapt_state.setdefault(
                 channel, self._new_adapt_state()
             )["last_scale"] = float(volts_per_div)
-        # Y-side change → channel's preamble (YMUlt) is now stale.
-        # See LOG_ANALYSIS.md finding #4 and ``_read_channel``'s
-        # preamble-cache section.
-        self._invalidate_preamble_cache(channel)
+        # Y-side change → channel's preamble YMULT is now stale (YOFF tracks
+        # POSition, YZERO=0, X-side untouched).  PATCH ymult in place from the
+        # scope's learned codes-per-div instead of forcing a full WFMOutpre?
+        # re-query on the next CURVe? (~100 ms saved per scale write; the
+        # rescale loop does thousands per run).  Falls back to a full
+        # invalidate when codes-per-div isn't learned yet (first read per
+        # channel) or there's no cache entry — correctness preserved.
+        _cpd = getattr(self, "_y_codes_per_div", {}).get(channel)
+        if not (_cpd and self._patch_preamble_y(
+                channel, ymult=float(volts_per_div) / _cpd)):
+            self._invalidate_preamble_cache(channel)
 
     def set_channel_scale_for_peak(self, channel: str,
                                    peak_v: float, *,
@@ -1284,8 +1601,8 @@ class TektronixOscilloscope(Oscilloscope):
         # a scale narrower than the scope can deliver.
         ideal = self._snap_to_grid(
             max(peak_abs / max(float(divs), 1.0),
-                self._TEK_VERTICAL_GRID_VPD[0]),
-            self._TEK_VERTICAL_GRID_VPD, direction="ceil")
+                self._vertical_grid_vpd[0]),
+            self._vertical_grid_vpd, direction="ceil")
         # Use the cached value when available; otherwise read once.
         current = None
         if hasattr(self, "_adapt_state"):
@@ -1329,10 +1646,8 @@ class TektronixOscilloscope(Oscilloscope):
         Returns ``True`` / ``False`` / ``None`` (last on SCPI error
         or malformed reply).
         """
-        try:
-            vpd = float(self._q(f"{channel}:SCAle?"))
-            pos_divs = float(self._q(f"{channel}:POSition?"))
-        except Exception:
+        vpd, pos_divs = self._cached_scale_pos(channel)
+        if vpd is None or pos_divs is None:
             return None
         if not (np.isfinite(vpd) and np.isfinite(pos_divs)) or vpd <= 0.0:
             return None
@@ -1359,7 +1674,7 @@ class TektronixOscilloscope(Oscilloscope):
 
     def channel_in_view(self, channel: str,
                         v_min: float, v_max: float,
-                        *, margin_divs: float = 3.9) -> Optional[bool]:
+                        *, margin_divs: float = 3.95) -> Optional[bool]:
         """SCPI in-view check — port of MATLAB ``getWaveform2.m`` lines
         307-362.
 
@@ -1390,10 +1705,8 @@ class TektronixOscilloscope(Oscilloscope):
             instead the convention is "can't tell" — the runner falls
             back to a single-pass fit-the-range write without iterating.
         """
-        try:
-            vpd = float(self._q(f"{channel}:SCAle?"))
-            pos_divs = float(self._q(f"{channel}:POSition?"))
-        except Exception:
+        vpd, pos_divs = self._cached_scale_pos(channel)
+        if vpd is None or pos_divs is None:
             return None
         if not (np.isfinite(vpd) and np.isfinite(pos_divs)) or vpd <= 0.0:
             return None
@@ -1422,7 +1735,7 @@ class TektronixOscilloscope(Oscilloscope):
 
     def channel_clip_sides(self, channel: str,
                            v_min: float, v_max: float,
-                           *, margin_divs: float = 3.9
+                           *, margin_divs: float = 3.95
                            ) -> Optional[Tuple[bool, bool, float, float, float]]:
         """Directional companion to :meth:`channel_in_view`.
 
@@ -1465,10 +1778,8 @@ class TektronixOscilloscope(Oscilloscope):
         just exposes the directional inputs that the original
         collapses to a boolean.
         """
-        try:
-            vpd = float(self._q(f"{channel}:SCAle?"))
-            pos_divs = float(self._q(f"{channel}:POSition?"))
-        except Exception:
+        vpd, pos_divs = self._cached_scale_pos(channel)
+        if vpd is None or pos_divs is None:
             return None
         if not (np.isfinite(vpd) and np.isfinite(pos_divs)) or vpd <= 0.0:
             return None
@@ -1672,7 +1983,7 @@ class TektronixOscilloscope(Oscilloscope):
         targets = self.compute_scale_position_targets(
             v_min, v_max,
             divs=divs,
-            grid=self._TEK_VERTICAL_GRID_VPD,
+            grid=self._vertical_grid_vpd,
             position_limit_divs=5.0,
         )
         if targets is None:
@@ -1695,8 +2006,13 @@ class TektronixOscilloscope(Oscilloscope):
     # sees a clean signal that comfortably exceeds the MATLAB
     # ``setTriggerLevel.m`` threshold (which is sized for a low-noise
     # input, not a full-bandwidth one).
+    # NOTE: COUPling is NOT in this list — it's role-dependent (see
+    # ``_coupling_for`` + ``apply_channel_defaults``).  V_mon / I_mon are
+    # AC-coupled (operator + MATLAB ``setOscilloscope.m`` line 507:
+    # volt/curr → AC), so the scope strips the stimulator's DC offset at
+    # the hardware (fixes the −24…−107 mV testboard offsets); E_ret / E_act
+    # stay DC so their absolute rest potential is preserved.
     _CHANNEL_DEFAULT_COMMANDS = (
-        ("{ch}:COUPling DC",      "DC coupling (no AC blocking cap)"),
         ("{ch}:INVert OFF",       "no waveform inversion"),
         ("{ch}:POSition 0",       "vertical position 0 div"),
         ('{ch}:YUNit "V"',        "report data in volts"),
@@ -1755,9 +2071,74 @@ class TektronixOscilloscope(Oscilloscope):
             info["is_probe"] = True
         return info
 
+    def _coupling_for(self, channel: str) -> str:
+        """Default input coupling at scope-setup time, per ROLE (resolved from
+        ``channel_aliases``):
+
+        * **I_mon** → **DC** (operator: "Change Imon to DC coupled" — REVERSED
+          from the earlier AC default).  The I_mon monitor sits at ~0 anyway and
+          the I_mon trigger levels (``imon_trigger_level``) were designed
+          against the DC-coupled signal, so DC keeps the trigger comparator and
+          the current read consistent with the original design.
+        * the **Trigger** channel (a distinct DIGITAL sync channel) → **AC** —
+          a large low-duty-cycle TTL edge still crosses the 1.4 V level, and AC
+          strips any DC pedestal from the sync line.  I_mon WINS when it IS the
+          trigger (the I_mon-edge fallback), since a DC-coupled edge is what the
+          comparator wants.
+        * **V_mon / E_ret / E_act** → **DC** — they carry a MEANINGFUL DC level
+          (the electrode rest potential / driving voltage) that must be kept.
+
+        The imon / trigger channels come from ``channel_aliases`` (keys
+        ``"imon"`` / ``"trigger"``), which the GUI populates per run
+        (``SetupTab.current_aliases`` → ``configure_channels``) BEFORE
+        ``apply_channel_defaults`` runs, so they're reliably known here.  Small-
+        swing DC-dominated electrode channels (monopolar E_ret / E_act) are
+        still switched DC→AC at RUN time by the runner's DC→AC helper (gotcha
+        #85), independent of this default."""
+        ch = str(channel).upper()
+        # Per-channel operator OVERRIDE (Setup tab coupling dropdown) wins over
+        # the role-based default.  Only a concrete "DC"/"AC" is stored; "Auto"
+        # leaves no entry so the role logic below applies.
+        ov = (getattr(self, "_channel_coupling_override", None) or {}).get(ch)
+        if ov in ("DC", "AC"):
+            return ov
+        aliases = getattr(self, "channel_aliases", None) or {}
+        imon_ch = str(aliases.get("imon", "")).upper()
+        trig_ch = str(aliases.get("trigger", "")).upper()
+        # I_mon → DC (takes priority when it's also the trigger).
+        if imon_ch and ch == imon_ch:
+            return "DC"
+        # A distinct digital-sync Trigger channel → AC.
+        if trig_ch and ch == trig_ch:
+            return "AC"
+        return "DC"
+
+    def set_channel_coupling_overrides(self, mapping) -> None:
+        """Store per-channel coupling OVERRIDES from the Setup tab (``{CHx:
+        "DC"|"AC"}``; "Auto" channels are omitted so the role default applies).
+        Consulted by :meth:`_coupling_for` at ``apply_channel_defaults`` time."""
+        out = {}
+        for ch, mode in (mapping or {}).items():
+            m = str(mode).upper()
+            if m in ("DC", "AC"):
+                out[str(ch).upper()] = m
+        self._channel_coupling_override = out
+
+    def set_channel_bandwidth_overrides(self, mapping) -> None:
+        """Store per-channel bandwidth OVERRIDES from the Setup tab (``{CHx:
+        "full"|"20mhz"}``; "Auto" channels are omitted so the automatic
+        trigger/data split applies).  Consulted by
+        ``experiment_tabs._apply_channel_bandwidths``."""
+        out = {}
+        for ch, mode in (mapping or {}).items():
+            m = str(mode).strip().lower().replace(" ", "")
+            if m in ("full", "20mhz"):
+                out[str(ch).upper()] = m
+        self._channel_bandwidth_override = out
+
     def apply_channel_defaults(self, channel: str,
                                *, probe_warning: bool = True) -> None:
-        """Force DC / 1X / no-invert / 0-pos / V-units on one channel.
+        """Force role-coupling / 1X / no-invert / 0-pos / V-units on one channel.
 
         Does NOT touch bandwidth — see :meth:`set_channel_bandwidth`
         and :meth:`set_channel_bandwidth_for_purpose`.
@@ -1792,11 +2173,35 @@ class TektronixOscilloscope(Oscilloscope):
                 self._w(tmpl.format(ch=channel))
             except Exception:
                 pass
+        # Input coupling: per-role via ``_coupling_for`` — AC for the I_mon +
+        # Trigger channels (operator: "set Imon and Trigger as AC coupled"),
+        # DC for V_mon / E_ret / E_act (they carry a meaningful DC level).
+        # Small-swing DC-dominated electrode channels (monopolar E_ret / E_act)
+        # are additionally switched DC→AC at RUN time by the runner's
+        # ``measure_electrode_dc_offsets_and_switch_to_ac`` (gotcha #85).  See
+        # ``_coupling_for`` for the trigger caveat (AC is fine for a digital
+        # sync Trigger; it would break a small-signal I_mon-edge fallback).
+        try:
+            self._w(f"{channel}:COUPling {self._coupling_for(channel)}")
+        except Exception:
+            pass
         # Probe attenuation — dialect-specific command from the command set.
         try:
             self._w(self._cmds.probe_cmd_tmpl.format(ch=channel))
         except Exception:
             pass
+        # CRITICAL: this writes ``CHx:POSition 0`` (and COUPling / YUNit),
+        # all of which change the channel's preamble (YOFf / YZEro).  The
+        # preamble cache MUST be invalidated or a later CURVe? is decoded
+        # with a stale YOFf from a DIFFERENT position → a constant
+        # per-channel DC offset in the saved/plotted trace (preamble-
+        # cache safety contract, see _read_channel).  This was the one
+        # vertical-state write site that skipped invalidation.
+        self._invalidate_preamble_cache(channel)
+        # The default command list set CHx:POSition 0 — keep the cached
+        # position coherent so the in-view / clip checks don't query a
+        # value they already know (Opt #3).
+        self._cache_channel_pos(channel, 0.0)
 
     def set_channel_bandwidth(self, channel: str,
                               option) -> Optional[float]:
@@ -1864,6 +2269,39 @@ class TektronixOscilloscope(Oscilloscope):
         _ = purpose
         return self.set_channel_bandwidth(channel, opt)
 
+    def set_channel_bandwidth_full(self, channel: str) -> Optional[float]:
+        """Set FULL analog bandwidth on ``channel`` (dialect-correct).
+
+        Sends the series' "full bandwidth" token — ``FULl`` on modern
+        TBS/TDS, ``OFF`` on legacy families — which is the FIRST entry
+        of ``bandwidth_options`` (ordered full -> most-limited).
+
+        This INTENTIONALLY overrides the former lab convention of a
+        20 MHz limit (see :meth:`set_channel_bandwidth_for_purpose`).
+        Per operator request, ALL channels — INCLUDING I_mon — run at
+        full bandwidth.  CAUTION: at full BW the I_mon trigger
+        comparator sees broadband noise, and the MATLAB-derived
+        trigger-level formula was tuned for the 20 MHz-limited peak, so
+        triggering can be less reliable on the real stimulator.
+
+        Returns the applied cutoff in MHz (the model's analog max for a
+        true full-BW setting, or ``inf`` when the max is unknown), or
+        ``None`` when the series has no bandwidth options / the scope
+        rejected the write.
+        """
+        from .tektronix_models import get_series_spec as _get_series
+        series_spec = _get_series(getattr(self.info, "model", "") or "")
+        if series_spec is None or not series_spec.bandwidth_options:
+            # No series spec — best-effort generic full-BW token.
+            try:
+                self._w(f"{channel}:BANdwidth FULl")
+            except Exception:
+                return None
+            return None
+        # ``bandwidth_options`` is ordered full -> most-limited, so the
+        # first entry is the full-bandwidth option for this dialect.
+        return self.set_channel_bandwidth(channel, series_spec.bandwidth_options[0])
+
     def set_horizontal_scale(self, seconds_per_div: float) -> float:
         """Write the SEC/DIV setting and return what the scope actually applied.
 
@@ -1883,6 +2321,18 @@ class TektronixOscilloscope(Oscilloscope):
         fails for any reason, returns the requested value as a
         best-effort fallback and logs a warning.
         """
+        # Skip when the SAME SEC/DIV was already requested + applied — a VT
+        # sweep re-applies the identical pattern-derived timebase per channel
+        # (apply_default_scope_view → auto_layout_for_pulse), so re-writing it
+        # (plus the readback AND the X-side preamble invalidation, which would
+        # force a WFMOutpre re-read on every channel's first capture) is pure
+        # redundant traffic.
+        _prev_req = getattr(self, "_last_horiz_scale_req", None)
+        _prev_app = getattr(self, "_expected_horiz_scale_s", None)
+        if (_prev_req is not None and seconds_per_div == _prev_req
+                and _prev_app is not None):
+            return float(_prev_app)
+        self._last_horiz_scale_req = float(seconds_per_div)
         self._w(f"{self._cmds.horiz_scale} {seconds_per_div:g}")
         try:
             applied = float(self._q(f"{self._cmds.horiz_scale}?"))
@@ -1944,14 +2394,15 @@ class TektronixOscilloscope(Oscilloscope):
         # Clamp on the host so a programmer error doesn't put the
         # scope into a state where the trigger is off-screen.
         pct = max(0.0, min(100.0, float(percent)))
-        # Snap DOWN to the nearest 10 % step — matches the MATLAB
-        # convention of parking the trigger on a grid division so the
-        # user sees clean alignment, and the floor (vs. round-to-
-        # nearest) keeps more leading pre-trigger samples than the
-        # caller asked for rather than fewer.  Avoids odd values
-        # like 47.3 % that the scope would otherwise honour to
-        # several decimals.
-        pct = int(pct / 10.0) * 10.0
+        # The trigger position is applied at FULL precision — no snap to a
+        # 10 % grid (operator: "forget about my requirement of trigger
+        # percentage rounded").  The earlier floor-to-nearest-10 % defeated
+        # the asymmetric pre/post framing: a wide pulse needs only a few-%
+        # leading offset (e.g. 7.5 %), which the floor collapsed to 0 % and
+        # jammed the leading edge against the trigger marker.  The TBS
+        # firmware honours the percentage to several decimals, and the
+        # cached ``_expected_horiz_position_pct`` (used by ``_read_channel``
+        # Method P to derive t=0) now matches the exact value applied.
 
         # Force the scope OUT of delay mode before writing the position.
         # When ``HORizontal:DELay:MODe`` is ON, the scope uses
@@ -1991,8 +2442,82 @@ class TektronixOscilloscope(Oscilloscope):
     def set_channel_position(self, channel: str, divisions: float) -> None:
         """Set the per-channel vertical position (in divisions, +/- ~5)."""
         self._w(f"{channel}:POSition {divisions:g}")
-        # Y-side change → channel's preamble (YOFf / YZEro) is stale.
+        self._cache_channel_pos(channel, divisions)
+        # Y-side change → only YOFF is stale (= pos_divs × codes-per-div;
+        # YMULT tracks V/div, YZERO=0).  PATCH it in place from the learned
+        # codes-per-div; fall back to a full invalidate when unlearned / no
+        # cache entry.  Saves the WFMOutpre? re-query on the next CURVe?.
+        _cpd = getattr(self, "_y_codes_per_div", {}).get(channel)
+        if not (_cpd and self._patch_preamble_y(
+                channel, yoff=float(divisions) * _cpd)):
+            self._invalidate_preamble_cache(channel)
+
+    def set_channel_coupling(self, channel: str, coupling: str) -> None:
+        """Set AC / DC input coupling on ``channel`` (``CHx:COUPling``).
+
+        Used by the electrode-offset capture (measure the DC rest
+        potential DC-coupled, then AC-couple so the small pulse swing
+        can be fine-scaled — a DC-biased E_ret/E_act can't be fine-scaled
+        while DC-coupled because the ±5-div POSition limit forces a coarse
+        V/div).  Coupling is a Y-side change, so the channel's preamble
+        (YMULT / YOFf / YZERO) must be re-queried on the next read."""
+        c = "AC" if str(coupling).strip().upper().startswith("A") else "DC"
+        self._w(f"{channel}:COUPling {c}")
         self._invalidate_preamble_cache(channel)
+
+    def _cache_channel_pos(self, channel: str, divisions: float) -> None:
+        """Record the CHx:POSition (divisions) we just WROTE so the
+        in-view / clip / screen-window checks can skip the
+        ``CHx:POSition?`` round-trip (operator: efficiency — the rescale
+        loop re-read position ~45×/capture).  MUST be called from EVERY
+        vertical-position write path (``set_channel_position`` and the
+        ``apply_channel_defaults`` POSition-0 default); a missed writer
+        would leave a stale value, so the readers verify finiteness and
+        fall back to a fresh query whenever the cache is absent."""
+        if not hasattr(self, "_adapt_state"):
+            return
+        try:
+            self._adapt_state.setdefault(
+                channel, self._new_adapt_state())["last_pos"] = float(divisions)
+        except Exception:
+            pass
+
+    def _cached_scale_pos(self, channel: str):
+        """Return ``(vpd, pos_divs)`` for ``channel`` from the confirmed-
+        value caches (``last_scale`` / ``last_pos`` — what we most
+        recently WROTE), querying the scope ONLY for whichever value the
+        cache is missing.  Returns ``(None, None)`` on total failure so
+        callers can bail.  This is the SAME cached-scale reference
+        ``_channel_screen_window_v`` already trusts for stale-frame
+        detection, now extended to position and shared by the in-view /
+        clip checks so a converged rescale iteration costs zero vertical-
+        state round-trips."""
+        vpd = None
+        pos = None
+        st = getattr(self, "_adapt_state", {}).get(channel) \
+            if hasattr(self, "_adapt_state") else None
+        if st is not None:
+            _s = st.get("last_scale")
+            if _s is not None and np.isfinite(_s) and float(_s) > 0.0:
+                vpd = float(_s)
+            _p = st.get("last_pos")
+            if _p is not None and np.isfinite(_p):
+                pos = float(_p)
+        if vpd is None:
+            try:
+                vpd = float(self._q(f"{channel}:SCAle?"))
+            except Exception:
+                return (None, None)
+        if pos is None:
+            try:
+                pos = float(self._q(f"{channel}:POSition?"))
+            except Exception:
+                pos = 0.0
+        if not (np.isfinite(vpd) and vpd > 0.0):
+            return (None, None)
+        if not np.isfinite(pos):
+            pos = 0.0
+        return (vpd, pos)
 
     def set_trigger_level(self, level_v: float) -> None:
         # Hard rule: when the digital sync (EXT) is the trigger source, the
@@ -2002,6 +2527,16 @@ class TektronixOscilloscope(Oscilloscope):
         src = (self._expected_trigger_source or "").upper()
         if src.startswith("EXT"):
             return
+        # PULSE-WIDTH trigger active → its threshold lives in the
+        # per-channel LOWerthreshold register, NOT TRIGger:A:LEVel (the
+        # EDGE level).  Route so the runners' per-step level updates
+        # (``update_imon_trigger_level``) land where the trigger reads.
+        if self._trig_pulse_source:
+            fmt = getattr(self._cmds, "trig_pulse_threshold_fmt", "")
+            if fmt:
+                self._w(fmt.format(ch=self._trig_pulse_source)
+                        + f" {level_v:g}")
+                return
         self._w(f"{self._cmds.trig_level} {level_v:g}")
 
     def set_cursors(self, phase1_us: float, interphase_us: float = 0.0,
@@ -2106,6 +2641,100 @@ class TektronixOscilloscope(Oscilloscope):
                       f"{type(e).__name__}: {e}")
             return float("nan")
 
+    def _channel_screen_window_v(
+            self, channel: str) -> Optional[Tuple[float, float]]:
+        """Return ``(vert_pos_v, half_window_v)`` — the volts-space
+        centre and half-height of ``channel``'s current on-screen
+        window — or ``None`` if the scale can't be resolved.
+
+        Prefers the cached :meth:`adapt_channel_scale` ``last_scale``
+        (the V/div we most recently *wrote*) so the check usually costs
+        at most one ``CHx:POSition?`` round-trip.  The cached scale is
+        exactly the right reference for stale-frame detection: a frame
+        still at the OLD scale reads far outside the window the NEW
+        scale implies.  Falls back to ``CHx:SCAle?`` when no cache
+        exists yet.
+        """
+        vpd, pos_divs = self._cached_scale_pos(channel)
+        if vpd is None or not (np.isfinite(vpd) and vpd > 0.0):
+            return None
+        _hvd = getattr(self, "_half_vert_divs", None)
+        if _hvd is None or not np.isfinite(_hvd) or _hvd <= 0.0:
+            return None
+        if pos_divs is None or not np.isfinite(pos_divs):
+            pos_divs = 0.0
+        vert_pos_v = -pos_divs * vpd
+        half_window = float(_hvd) * vpd
+        return (vert_pos_v, half_window)
+
+    def settle_one_acquisition(
+            self, *, timeout_s: Optional[float] = None) -> None:
+        """Arm + wait for one fresh averaged acquisition WITHOUT reading
+        the waveform (no ``CURVe?``).
+
+        Fast-scaling mode calls this between rescale iterations: after a
+        V/div change the scope must re-acquire before
+        ``MEASUrement:IMMed`` reflects the new (possibly now-unclipped)
+        signal.  Mirrors the arm + ``ACQuire:NUMACq?`` poll inside
+        :meth:`single_capture` but skips the per-channel transfer.
+        Never raises on timeout (reads whatever the averager has,
+        matching MATLAB ``getWaveform.m``).
+        """
+        try:
+            self._w("ACQuire:STAte RUN")
+            n_avg_target = int(self._expected_acq_navg or 0)
+            is_average = ((self._expected_acq_mode or "").upper() == "AVERAGE"
+                          and n_avg_target > 0)
+            _budget = (self._timeout_ms / 1000.0
+                       if timeout_s is None else float(timeout_s))
+            deadline = time.time() + _budget
+            if is_average:
+                # Wait for n_avg FRESH frames since this settle began —
+                # NOT merely ``NUMACq >= n_avg``.  A V/div change made
+                # just before this call may NOT reset the averager's
+                # NUMACq to 0 (TBS firmware varies), so a plain
+                # ``>= n_avg`` test passes IMMEDIATELY on the stale,
+                # pre-change count and MEASUrement then reads a frame
+                # still at the OLD scale — the fast-scaling stale-frame
+                # bug (V_mon → 1000 mV/div, see CLAUDE.md §12).  Anchor
+                # the target to the count at entry so the rolling-average
+                # window is fully repopulated with post-change frames
+                # regardless of whether the scope reset or kept rolling.
+                try:
+                    _entry = int(float(self._inst.query(
+                        "ACQuire:NUMACq?").strip()))
+                except Exception:
+                    _entry = 0
+                _target = _entry + n_avg_target
+                while time.time() < deadline:
+                    if self._should_abort():
+                        break
+                    try:
+                        _now = int(float(self._inst.query(
+                            "ACQuire:NUMACq?").strip()))
+                        # Reset detected (count dropped) → the averager
+                        # restarted from 0 on the scale change; retarget
+                        # to a plain n_avg so we don't wait forever for
+                        # an unreachable entry+n_avg.
+                        if _now < _entry:
+                            _entry = 0
+                            _target = n_avg_target
+                        if _now >= _target:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+            else:
+                while time.time() < deadline:
+                    if self._should_abort():
+                        break
+                    if self._check_triggered():
+                        break
+                    time.sleep(0.010)
+        except Exception as e:
+            self._log(f"[scope] settle_one_acquisition: "
+                      f"{type(e).__name__}: {e}")
+
     # ----- adaptive scaling / layout (ported from MATLAB setDefaultScopeView3
     #       and adjustScale + improvements) ----------------------------------
     #: Horizontal-timebase quantisation — built dynamically from the
@@ -2158,15 +2787,72 @@ class TektronixOscilloscope(Oscilloscope):
         grid = grid + tuple(m * 10.0 for m in mantissas)
         return grid
 
-    #: Vertical scale grid. Tek scopes use a 1-2-5 sequence in volts/div
-    #: from 1 mV up to 5 V. Mirrors MATLAB ``adjustScale.m`` VERT_SCALE
-    #: but extends the high end to 5 V/div (TBS2204B accepts up to that).
-    _TEK_VERTICAL_GRID_VPD = (
-        1e-3, 2e-3, 5e-3,
-        1e-2, 2e-2, 5e-2,
-        1e-1, 2e-1, 5e-1,
-        1.0, 2.0, 5.0,
+    #: Vertical-scale grid — FINE-GRAINED, port of MATLAB
+    #: ``getWaveform3.m`` (the operator's actual coarse-scaling list), NOT
+    #: the coarse 1-2-5 sequence of the older ``adjustScale.m``.  The Tek
+    #: scope ACCEPTS arbitrary fine V/div over SCPI (``CHx:SCAle`` as
+    #: 3-sig-fig scientific notation — see ``set_channel_scale``), so the
+    #: fit loop can land on a scale that fills the screen far better than
+    #: 1-2-5 (operator: "minimize coarse scaling so the waveform best fits
+    #: in the screen").  A ±73 mV trace snaps to 75 mV/div here (~97 %
+    #: fill) instead of 100 mV/div on the old grid (~73 %).
+    #:
+    #: getWaveform3.m's 6 parts (mV/div, converted to V/div):
+    #:   2 – 4.5   step 0.5
+    #:   5 – 19    step 1
+    #:   20 – 95   step 5
+    #:   100 – 280 step 20
+    #:   300 – 950 step 50
+    #:   1000 – 5000 step 100
+    #: ``DIVS`` (fit budget) is NOT baked into the grid — it lives in the
+    #: per-role ``divs`` and the per-scope ``MAX_FACTOR`` (the operator's
+    #: MATLAB targeted the 8-div TBS1104B; the Python computes the budget
+    #: from the connected scope's vertical-div count).
+    _TEK_VERTICAL_GRID_VPD = tuple(
+        round(v * 1e-3, 9) for v in (
+            _frange_incl(2.0, 4.5, 0.5)
+            + _frange_incl(5.0, 19.0, 1.0)
+            + _frange_incl(20.0, 95.0, 5.0)
+            + _frange_incl(100.0, 280.0, 20.0)
+            + _frange_incl(300.0, 950.0, 50.0)
+            + _frange_incl(1000.0, 5000.0, 100.0)
+        )
     )
+
+    #: Smallest legal V/div this scope accepts (hardware floor).  Class
+    #: default is the conservative 2 mV (the getWaveform3.m / TBS1104B floor)
+    #: so a pre-``open()`` or unknown model never asks for a finer scale than
+    #: the hardware allows.  ``open()`` overwrites it from the connected
+    #: model's ``TekSeriesSpec.min_vdiv_v`` (TBS2000B → 1 mV, verified live).
+    _min_vdiv_v: float = 2e-3
+
+    @property
+    def _vertical_grid_vpd(self) -> tuple:
+        """Model-aware V/div grid: the base getWaveform3.m grid (2 mV floor)
+        EXTENDED DOWN to ``self._min_vdiv_v`` in the same 0.5 mV steps as its
+        first segment, for a scope whose hardware goes finer than 2 mV/div.
+
+        * TBS2000B (``_min_vdiv_v = 1e-3``) → prepends 1.0 & 1.5 mV/div, so
+          a small NIL-preset I_mon or a low-swing E_ret can fine-fit to
+          1 mV/div (~5× finer screen fill than the old 2 mV floor).
+        * Legacy 2 mV scopes (``_min_vdiv_v = 2e-3``) → base grid unchanged.
+
+        All grid consumers (``adapt_channel_scale``, the snap helpers,
+        ``compute_scale_position_targets``) read THIS, not the raw class
+        constant, so the finer floor never leaks onto a scope that would
+        clamp it."""
+        base = self._TEK_VERTICAL_GRID_VPD
+        vmin = float(getattr(self, "_min_vdiv_v", base[0]) or base[0])
+        if vmin >= base[0] - 1e-12:
+            # Floor at/above the base start — filter (usually a no-op).
+            return tuple(v for v in base if v >= vmin - 1e-12)
+        # Hardware goes finer: prepend 0.5 mV/div steps down to vmin.
+        fine = []
+        v = base[0] - 0.5e-3
+        while v >= vmin - 1e-12:
+            fine.append(round(v, 9))
+            v -= 0.5e-3
+        return tuple(sorted(fine)) + base
 
     @staticmethod
     def _snap_to_grid(value: float, grid: tuple, *,
@@ -2214,6 +2900,47 @@ class TektronixOscilloscope(Oscilloscope):
         )
     )
 
+    #: Minimum fraction of the (real) screen the pulse must fill for
+    #: ``auto_layout_for_pulse`` to accept a candidate timebase.  MATLAB
+    #: ``setOscillocopeView.m`` used 0.30 on a 10-division TBS1104B; the
+    #: bench TBS2204B is a 15-division / 1-2-4-grid scope whose coarse SEC/DIV
+    #: grid can't land near MATLAB's windows (achievable spans on 15 divs are
+    #: …600, 1500, 3000 µs — nothing between).  At 0.30 a 400 µs pulse falls
+    #: just under the wider 100 µs/div step (27 % fill) and drops to the tight
+    #: 40 µs/div → 600 µs window; the operator wants the WIDER MATLAB-like
+    #: window (more post-pulse recovery), so the floor is 0.25 — it lets the
+    #: 400 µs pulse take the 1500 µs step, yet still rejects the near-empty
+    #: 3000 µs step for a 700 µs pulse (fill 0.233 < 0.25).  Don't raise this
+    #: back to 0.30 without re-checking the 400 µs case, and don't drop it to
+    #: 0.20 (that over-widens the 700 µs pattern to 3000 µs).  See
+    #: ``tests/test_auto_layout_window.py``.  This is the DEFAULT (= WIDE); the
+    #: operator can pick WIDE vs TIGHT from the Setup tab, which calls
+    #: :meth:`set_horizontal_fit_mode` to override the per-instance value below.
+    _AUTO_FIT_MIN_FILL: float = 0.25
+    #: Fill floors for the operator-selectable horizontal-scaling modes
+    #: (Setup → Oscilloscope → "Horizontal window").  LOWER fill = WIDER window
+    #: (more post-pulse recovery); HIGHER fill = TIGHTER (the pulse fills more
+    #: of the screen).
+    _HORIZ_FIT_WIDE: float = 0.25
+    _HORIZ_FIT_TIGHT: float = 0.45
+
+    def set_horizontal_fit_mode(self, mode: str) -> None:
+        """Select the auto-fit horizontal-window preference used by
+        :meth:`auto_layout_for_pulse`: ``"wide"`` (default — more post-pulse
+        recovery, MATLAB-like) or ``"tight"`` (the pulse fills more of the
+        screen).  Stored per-instance and read back by ``auto_layout_for_pulse``
+        via ``_auto_fit_min_fill`` (falls back to the ``_AUTO_FIT_MIN_FILL``
+        class default when never set)."""
+        m = str(mode or "").strip().lower()
+        self._auto_fit_min_fill = (self._HORIZ_FIT_TIGHT
+                                   if m.startswith("tight")
+                                   else self._HORIZ_FIT_WIDE)
+        try:
+            self._log(f"[scope] horizontal window: {'tight' if m.startswith('tight') else 'wide'} "
+                      f"(fill floor {self._auto_fit_min_fill:.2f})")
+        except Exception:
+            pass
+
     @property
     def _horiz_scale_candidates_s(self) -> tuple:
         """Auto-fit candidate timebases for the connected scope family.
@@ -2254,9 +2981,26 @@ class TektronixOscilloscope(Oscilloscope):
 
           1. Pulse width = phase1 + interphase + phase2 + discharge
              (the full active window, matching MATLAB's ``totalPulse``).
-          2. Iterate the candidate timebases largest→smallest; choose the
-             smallest entry where ``totalPulse / (10 × scale) ≥ 0.3``,
-             i.e. the pulse fills at least 30 % of the 10-division window.
+          2. Iterate the candidate timebases largest→smallest; pick the
+             WIDEST entry where the pulse still fills at least
+             ``_AUTO_FIT_MIN_FILL`` (0.25) of the actual screen
+             (``totalPulse / (n_horiz_divs × scale) ≥ 0.25``).  30 % was
+             the MATLAB ``setOscillocopeView.m`` value, but MATLAB ran on a
+             10-division / 1-2.5-5-grid TBS1104B; the bench TBS2204B is a
+             15-division / 1-2-4-grid scope, and on that coarser grid a
+             pulse that fills just under 30 % of the wider step (e.g. a
+             400 µs pulse at 100 µs/div ≈ 27 %) would drop to the tight
+             next-finer step (40 µs/div → 600 µs window) instead of taking
+             the wider MATLAB-like window (100 µs/div → 1500 µs).  The
+             operator chose the WIDER window (more post-pulse recovery), so
+             the floor is 0.25 — enough to let a 400 µs pulse take the
+             1500 µs step, while still rejecting the near-empty 3000 µs step
+             for a 700 µs pulse (which the literal 10-div rule would have
+             wrongly selected).  The window can only be a grid span (the
+             scope FLOORS off-grid SEC/DIV writes to its 1-2-4 grid —
+             verified live), so the achievable windows are coarse
+             (…, 600, 1500, 3000 µs on 15 divs); this rule picks the widest
+             acceptable one.
           3. Pre-trigger offset:
                * fill ≥ 0.4 → 3 divisions before the pulse start
                * fill <  0.4 → 4 divisions (more leading baseline so a
@@ -2293,33 +3037,46 @@ class TektronixOscilloscope(Oscilloscope):
         )
 
         # --- 1. Pick timebase -------------------------------------------
-        # Iterate from widest (1000 µs/div) to narrowest (1 µs/div on
-        # 1-2-4 modern, 2.5 µs/div on 1-2.5-5 legacy), stopping at the
-        # smallest scale where fill ≥ 0.3.  Candidate list is dialect-
-        # specific (see ``_horiz_scale_candidates_s`` property) — the
-        # TBS2204B knob is 1-2-4, the TBS1000B knob is 1-2.5-5, and
-        # each would round the other's grid silently.  If the pulse is
-        # so narrow that even the narrowest candidate can't reach 30 %
-        # fill the loop exhausts and we stay at the narrowest entry.
+        # Iterate widest→narrowest, pick the WIDEST scale where the pulse
+        # still fills ≥ _AUTO_FIT_MIN_FILL of the actual screen.  Candidate
+        # list is dialect-specific (see ``_horiz_scale_candidates_s``) — the
+        # TBS2204B knob is 1-2-4, the TBS1000B knob is 1-2.5-5, and each
+        # would round the other's grid silently.  If the pulse is so narrow
+        # that even the narrowest candidate can't reach the fill floor the
+        # loop exhausts and we stay at the narrowest entry.  (The scope
+        # FLOORS off-grid SEC/DIV to its native grid — verified live — so
+        # the achievable windows are coarse, e.g. …600/1500/3000 µs on
+        # 15 divs; this picks the widest acceptable one.)
         candidates = self._horiz_scale_candidates_s
         scale_s = candidates[0]
         fract = 0.0
         for cand_s in candidates:
             scale_us = cand_s * 1e6
             fract = pulse_width_us / (scale_us * float(self._n_horiz_divs))
-            if fract >= 0.3:
+            if fract >= getattr(self, "_auto_fit_min_fill",
+                                self._AUTO_FIT_MIN_FILL):
                 scale_s = cand_s
                 break
 
         # --- 2. Pre-trigger offset (divisions) --------------------------
-        # MATLAB convention: tighter fill → less leading baseline (3 divs);
-        # looser fill → more leading baseline (4 divs) so the pulse doesn't
-        # sit jammed against the trigger marker.
+        # SHORT pre-pulse interpulse, LONGER post-pulse interpulse
+        # (operator: "the trigger position is … not setting the interpulse
+        # durations before and after the pulse properly … interpulse before
+        # the pulse shorter than after").  Allocate the NON-pulse part of
+        # the window ~1/4 to the leading (pre-trigger) baseline and ~3/4 to
+        # the post-pulse tail.  The MATLAB original (setOscillocopeView.m)
+        # used a flat 3-4 divs of leading baseline, which for a WIDE pulse
+        # (filling most of the window) left LESS room after the pulse than
+        # before — the captured trace then ran out before the framed
+        # post-pulse region, showing "missing data" past the last sample.
+        # Floor at 1 div so the leading edge isn't jammed against the
+        # trigger marker.
         scale_us = scale_s * 1e6
         if left_offset_divs is not None:
-            offset_divs = int(left_offset_divs)
+            offset_divs = float(left_offset_divs)
         else:
-            offset_divs = 3 if fract >= 0.4 else 4
+            free_divs = max(float(self._n_horiz_divs) * (1.0 - fract), 0.0)
+            offset_divs = max(1.0, free_divs * 0.25)
         shift_us = float(offset_divs) * scale_us
         if is_ext:
             shift_us += float(digital_delay_us)
@@ -2332,6 +3089,19 @@ class TektronixOscilloscope(Oscilloscope):
         position_pct = max(0.0, min(100.0,
                             shift_us / (scale_us * float(self._n_horiz_divs))
                             * 100.0))
+        # Round the trigger position to the NEAREST 10% (operator request:
+        # "I want it rounded to the nearest 10%").  This is NEAREST (round-half)
+        # — NOT the old FLOOR (``int(pct/10)*10``) that was removed for
+        # collapsing a small few-% offset DOWN to 0% and jamming the leading
+        # edge against the trigger.  Nearest rounds a small offset UP instead,
+        # and ``auto_layout`` floors the offset at 1 division (≥ 6.7% on a
+        # 15-div scope, 10% on a 10-div), so the minimum rounds to 10%, never
+        # 0%.  The guard makes that explicit: a genuine (non-zero) pre-trigger
+        # offset can never collapse to 0% (which would re-jam the leading edge).
+        _raw_pos_pct = position_pct
+        position_pct = round(position_pct / 10.0) * 10.0
+        if _raw_pos_pct > 0.5 and position_pct <= 0.0:
+            position_pct = 10.0
         self.set_horizontal_position(position_pct)
         self.set_horizontal_scale(scale_s)
 
@@ -2382,7 +3152,7 @@ class TektronixOscilloscope(Oscilloscope):
         imon_peak_v = abs(amp_ua) * float(imon_v_per_ua)
         imon_scale = self._snap_to_grid(
             max(imon_peak_v / max(headroom_divs, 1.0), 1e-3),
-            self._TEK_VERTICAL_GRID_VPD, direction="ceil",
+            self._vertical_grid_vpd, direction="ceil",
         )
 
         # V_mon: size the scale on I·R (the edge-step the calibration
@@ -2414,7 +3184,7 @@ class TektronixOscilloscope(Oscilloscope):
             vmon_peak_v = (v_r + v_c) * float(vmon_v_per_v)
             vmon_scale = self._snap_to_grid(
                 max(vmon_peak_v / max(headroom_divs, 1.0), 1e-3),
-                self._TEK_VERTICAL_GRID_VPD, direction="ceil",
+                self._vertical_grid_vpd, direction="ceil",
             )
         else:
             # Unknown load — start at 1 V/div on V_mon. Adaptive scaling
@@ -2430,13 +3200,36 @@ class TektronixOscilloscope(Oscilloscope):
     #: so legitimate hunting (coarse → fine → re-check) can run its
     #: course without being mistaken for oscillation.
     _ADAPT_REPEAT_LIMIT: int = 3
-    #: Hard cap on the number of distinct scales tried per channel
-    #: before we give up adapting.  MATLAB ``getWaveform.m`` allows
-    #: ``fineScale_count > 4`` *after* any number of coarse hops, so the
-    #: total can easily reach 8-10.  Set high enough that legitimate
-    #: coarse-then-fine convergence is never cut short, but pathological
-    #: oscillation eventually hits the cap.
-    _ADAPT_MAX_TRIES: int = 10
+    # NOTE: there is NO PERSISTENT LOCK in this adapt — never re-add one.
+    # (operator, twice: "remove the N/10 counter" … "never should have a
+    # cap".)  History of what was tried and rejected:
+    #
+    #   * The old ``_ADAPT_MAX_TRIES`` ("try N/10") hard cap counted DISTINCT
+    #     scales tried over the CHANNEL'S LIFETIME, but ``history`` accumulates
+    #     across EVERY capture in a run — so a long VT ramp exhausted the cap
+    #     (try 10/10), set ``locked=True``, and FROZE the V/div for the
+    #     remaining higher-amplitude captures.  REMOVED first.
+    #   * A ``st["locked"] = True`` flag then survived on THREE other paths —
+    #     adjacent-cell oscillation, grid-max clip-accept, grid-min shrink-
+    #     accept — and the top-of-method ``if st["locked"]: return None``
+    #     short-circuited EVERY later call, even a ``force_grow`` clipped /
+    #     out-of-view capture.  So a channel that briefly oscillated (or a
+    #     tiny start-of-ramp capture that hit grid min) was stranded at a
+    #     too-small V/div and RAILED the ADC exactly like the N/10 cap did
+    #     (exp_vt_max CH14: locked at 200 mV/div on cap#4, then cap#5-7 pinned
+    #     at [-1156,+876] mV — 11-13 % of samples at the rail — while the
+    #     current climbed 632→978 µA).  REMOVED second: all three now just
+    #     ``return None`` for the current call and RE-EVALUATE on the next, so
+    #     a signal that later overflows always gets to upscale.
+    #
+    # The per-capture rescale loop is bounded by ``MAX_RECAPTURE`` (so there
+    # is no within-capture hang), and the adjacent-cell repeat guard still
+    # DAMPS cosmetic two-cell churn (skips one write) WITHOUT freezing — a
+    # genuine grow is a larger, non-adjacent cell the guard never matches.
+    # The ``locked`` field is kept in the state dict (always False) only for
+    # back-compat with external readers / tests.  Don't re-add a lock; if a
+    # per-CAPTURE bound is ever needed, put it in the rescale loop, not the
+    # cross-capture adapt state.
     #: After this many *consecutive* "no change needed" returns we
     #: consider the channel converged and clear the history, so a later
     #: change in signal magnitude can adapt again without tripping the
@@ -2447,8 +3240,20 @@ class TektronixOscilloscope(Oscilloscope):
                             v_min: float, v_max: float,
                             divs: float = 4.0,
                             shrink_threshold: float = 0.30,
-                            shrink_stable_count: int = 2) -> Optional[float]:
+                            shrink_stable_count: int = 2,
+                            force_grow: bool = False) -> Optional[float]:
         """Post-capture autorange: snap CH<n>:SCAle to fit (v_min, v_max).
+
+        ``force_grow=True`` bypasses the fits-now no-coarsen veto: the
+        caller is asserting its (v_min, v_max) is NOT a faithful
+        on-screen range — e.g. the rescale loop's ×2 extrapolation after
+        a clip / out-of-view detection, where the true extent is unknown
+        and the trace may be railing off ONE side (offset-driven clip)
+        while the offset-blind ``half_range`` still "fits".  Without the
+        bypass, the doubling-escape contract breaks for DC-biased roles
+        at the position-0 default (adversarial finding: E_act at a
+        ~800 mV rest railing at 0.2 V/div settled instead of growing).
+        The veto only ever applies to FAITHFUL in-view observations.
 
         Loop-safe coarse scaling that mirrors MATLAB ``getWaveform.m``:
 
@@ -2458,17 +3263,21 @@ class TektronixOscilloscope(Oscilloscope):
           * **Shrink → hysteresis.**  Signal small for current scale →
             need ``shrink_stable_count`` consecutive votes before
             tightening, so a noisy capture doesn't flicker the scale.
-          * **Repeat detection.**  Track the full sequence of picked
-            scales; if a candidate has come up ``_ADAPT_REPEAT_LIMIT``
-            times we lock in (signal is oscillating between two grid
-            cells, neither perfect — accept).
-          * **Grid-boundary clamps.**  At the min or max of the
-            vertical-scale grid: accept current rather than try to go
-            further.  Otherwise we'd loop forever asking for a scale
-            the scope can't reach.
-          * **Hard try cap.**  After ``_ADAPT_MAX_TRIES`` distinct
-            scales have been written, lock in — prevents pathological
-            signals from wedging the sweep in an endless adjust loop.
+          * **Repeat detection (no lock).**  Track the full sequence of
+            picked scales; if a candidate re-appears ``_ADAPT_REPEAT_LIMIT``
+            times AND it's an ADJACENT grid cell (two-cell oscillation on a
+            noisy stationary signal), SKIP that one write to damp the churn
+            — but do NOT lock.  The next call re-evaluates, so a genuine
+            grow (a larger, non-adjacent cell) is never suppressed.
+          * **Grid-boundary accepts.**  At the min or max of the
+            vertical-scale grid: return None (can't go further) rather than
+            loop asking for an unreachable scale — again WITHOUT locking, so
+            a signal that later moves off the boundary re-adapts freely.
+
+        (There is deliberately NO PERSISTENT LOCK and NO lifetime "try N/10"
+        cap — see the NOTE at ``_ADAPT_REPEAT_LIMIT``.  Both froze the V/div
+        mid-ramp and railed later captures; the per-capture rescale loop
+        bounds the within-capture iterations instead.)
 
         Returns the new scale if one was applied, or ``None`` if the
         current scale was kept (either because it's already correct,
@@ -2502,26 +3311,66 @@ class TektronixOscilloscope(Oscilloscope):
                 current_scale = 1.0
             st["last_scale"] = current_scale
 
-        # If we already decided to lock in on a previous call, stay put.
+        # NO PERSISTENT LOCK — see the NOTE by ``_ADAPT_REPEAT_LIMIT``.
+        # Every call re-evaluates from the cached scale, so a signal that
+        # later overflows the current V/div is NEVER stranded (the CH14
+        # railing bug).  ``st["locked"]`` is kept only for back-compat and
+        # is always False; the defensive check below costs nothing and
+        # documents the invariant, but nothing sets it True anymore.
         if st["locked"]:
             return None
 
         # Mirror MATLAB ``setFineScalePos2.m``: scale = abs(range) / 2 / 4
         # = half the signal range divided by 4 divs.
         half_range = abs(v_max - v_min) / 2.0
-        grid_min = self._TEK_VERTICAL_GRID_VPD[0]
-        grid_max = self._TEK_VERTICAL_GRID_VPD[-1]
+        grid_min = self._vertical_grid_vpd[0]
+        grid_max = self._vertical_grid_vpd[-1]
         ideal_scale = self._snap_to_grid(
             max(half_range / max(divs, 1.0), grid_min),
-            self._TEK_VERTICAL_GRID_VPD, direction="ceil")
+            self._vertical_grid_vpd, direction="ceil")
+
+        # Fit budget: the visible half-screen minus the 0.05-div safety
+        # margin (same MAX_FACTOR derivation the runners use).  ``divs``
+        # stays the SIZING target when an adjustment is genuinely needed
+        # (MATLAB getWaveform3.m ``scale_check = max_abs/SCREEN_FACTOR``);
+        # the fit budget decides WHETHER a grow is needed at all.
+        fit_divs = max(float(divs),
+                       float(getattr(self, "_half_vert_divs", 4.0)) - 0.05)
+        # ``force_grow`` invalidates the fits-now veto: the caller's range
+        # is an extrapolation (clip / out-of-view ×2 doubling), not a
+        # faithful observation, and the offset-blind half_range can
+        # "fit" while the real trace rails off one side of the screen.
+        fits_now = (not force_grow) and (
+            half_range <= fit_divs * current_scale)
 
         # ---- Loop-protection gates ----------------------------------
-        # 1) No change needed — already on the right grid cell.
+        # 1) No change needed — already on the right grid cell, OR the
+        #    sizing target is coarser than current but the signal already
+        #    FITS the visible budget at the current (finer) scale.  A
+        #    fitting waveform must NEVER be coarsened just to land the
+        #    ``divs`` fill target (operator: "the third waveform has
+        #    larger vertical scaling despite that the second fits the
+        #    screen" — minimize coarse scaling for best fit).  MATLAB
+        #    getWaveform3.m accepts on ``isInView && ~isTooTight``; it
+        #    never coarsens past an in-view scale either.
         #    This is the GOOD path: count consecutive settles and, once
         #    we've seen a couple in a row, clear the history so a future
         #    signal-magnitude change can adapt again without tripping the
         #    repeat-detector on stale entries.  This is NOT a lock.
-        if ideal_scale == current_scale:
+        if ideal_scale == current_scale or (
+                ideal_scale > current_scale and fits_now):
+            if (ideal_scale > current_scale
+                    and int(st.get("settled_count", 0)) == 0):
+                # Logged once per settle streak — near a grid boundary
+                # this branch can fire on every LP/PS snapshot
+                # indefinitely, and per-snapshot repeats are pure noise.
+                self._log(
+                    f"[scope]   adapt {channel}: signal range "
+                    f"[{v_min*1000:+.1f}..{v_max*1000:+.1f}] mV fits the "
+                    f"±{fit_divs:.2f}-div budget at current "
+                    f"{current_scale*1000:.2f} mV/div — keeping the finer "
+                    f"scale (best fit; not coarsening to the "
+                    f"{ideal_scale*1000:.2f} mV/div fill target).")
             st["shrink_count"] = 0
             st["settled_count"] = int(st.get("settled_count", 0)) + 1
             if st["settled_count"] >= self._ADAPT_SETTLED_COUNT and history:
@@ -2531,24 +3380,13 @@ class TektronixOscilloscope(Oscilloscope):
         # Any non-settled call resets the settled counter.
         st["settled_count"] = 0
 
-        # 2) Hard cap on distinct scales tried.  Set high enough that
-        #    legitimate coarse-then-fine convergence (MATLAB allows
-        #    fineScale_count>4 plus any number of coarse hops) is never
-        #    cut short.
-        if len(history) >= self._ADAPT_MAX_TRIES:
-            self._log(
-                f"[scope]   adapt {channel}: try-count cap reached "
-                f"({len(history)} ≥ {self._ADAPT_MAX_TRIES}) — keeping "
-                f"current {current_scale*1000:.2f} mV/div (locking).")
-            st["locked"] = True
-            return None
-        # 3) Repeat detection — only treat as oscillation when the
+        # 2) Repeat detection — only treat as oscillation when the
         #    candidate has come up ``_ADAPT_REPEAT_LIMIT`` times AND the
         #    last write was an adjacent grid cell (i.e. we're flipping
         #    between two neighbours, not still hunting coarsely).
         if history.count(ideal_scale) >= self._ADAPT_REPEAT_LIMIT:
             try:
-                grid = self._TEK_VERTICAL_GRID_VPD
+                grid = self._vertical_grid_vpd
                 # Closest grid index to BOTH the current_scale (which
                 # may be off-grid because we cache the requested value,
                 # not the snapped one the scope actually applied) and
@@ -2570,34 +3408,40 @@ class TektronixOscilloscope(Oscilloscope):
                 # making progress.
                 adjacent = False
             if adjacent:
+                # Two-cell cosmetic flip on a ~stationary noisy signal:
+                # SKIP this one write to damp the churn, but do NOT lock.
+                # The next call re-evaluates, so a genuine grow — a larger,
+                # NON-adjacent cell with history count 0 — is never
+                # suppressed by this guard (it only ever matches the same
+                # adjacent cell).
                 self._log(
                     f"[scope]   adapt {channel}: candidate "
-                    f"{ideal_scale*1000:.2f} mV/div would be re-pick #"
+                    f"{ideal_scale*1000:.2f} mV/div is re-pick #"
                     f"{history.count(ideal_scale)+1} (adjacent to current "
-                    f"{current_scale*1000:.2f} mV/div) — oscillation between "
-                    f"neighbouring grid cells, locking.")
-                st["locked"] = True
+                    f"{current_scale*1000:.2f} mV/div) — damping a two-cell "
+                    f"oscillation for this capture (no lock).")
                 return None
             # Non-adjacent re-pick is legitimate coarse hunting; allow it.
 
         # ---- Direction-specific paths -------------------------------
         if ideal_scale > current_scale:
             # Clip: grow scale.  But if we're already at the grid max,
-            # accept (can't grow further; clipping is unavoidable here).
+            # accept — can't grow further; clipping is unavoidable here.
+            # No lock: each call re-checks, so if the signal later DROPS
+            # the shrink branch can still recover a finer scale.
             if current_scale >= grid_max:
                 self._log(
                     f"[scope]   adapt {channel}: signal range "
                     f"[{v_min*1000:+.1f}..{v_max*1000:+.1f}] mV exceeds "
                     f"grid max {grid_max*1000:.0f} mV/div — accepting clip "
-                    f"(locking).")
-                st["locked"] = True
+                    f"(at ceiling).")
                 return None
             self._log(
                 f"[scope]   adapt {channel}: signal range "
-                f"[{v_min*1000:+.1f}..{v_max*1000:+.1f}] mV exceeds current "
-                f"scale {current_scale*1000:.2f} mV/div → upscale to "
-                f"{ideal_scale*1000:.2f} mV/div (immediate, to avoid clip; "
-                f"try {len(history)+1}/{self._ADAPT_MAX_TRIES})")
+                f"[{v_min*1000:+.1f}..{v_max*1000:+.1f}] mV exceeds the "
+                f"±{fit_divs:.2f}-div budget at "
+                f"{current_scale*1000:.2f} mV/div → upscale to "
+                f"{ideal_scale*1000:.2f} mV/div (immediate, to avoid clip)")
             self.set_channel_scale(channel, ideal_scale)
             st["shrink_count"] = 0
             st["last_scale"] = ideal_scale
@@ -2605,13 +3449,15 @@ class TektronixOscilloscope(Oscilloscope):
             return ideal_scale
 
         # ideal_scale < current_scale  — Shrink with hysteresis.
-        # If we're already at the grid min, accept; can't go finer.
+        # If we're already at the grid min, accept; can't go finer.  No
+        # lock: if the signal later GROWS, the grow branch above fires on
+        # the next call and upscales — a tiny start-of-ramp capture must
+        # never strand the channel at grid min for the rest of the ramp.
         if current_scale <= grid_min:
             self._log(
                 f"[scope]   adapt {channel}: at grid min "
-                f"{grid_min*1000:.1f} mV/div — can't downscale further, "
-                f"locking.")
-            st["locked"] = True
+                f"{grid_min*1000:.1f} mV/div — can't downscale further "
+                f"(finest grid cell).")
             return None
         st["shrink_count"] += 1
         if st["shrink_count"] >= shrink_stable_count:
@@ -2620,8 +3466,7 @@ class TektronixOscilloscope(Oscilloscope):
                 f"[{v_min*1000:+.1f}..{v_max*1000:+.1f}] mV is small for "
                 f"scale {current_scale*1000:.2f} mV/div "
                 f"({st['shrink_count']} consecutive votes) → downscale to "
-                f"{ideal_scale*1000:.2f} mV/div  (try "
-                f"{len(history)+1}/{self._ADAPT_MAX_TRIES})")
+                f"{ideal_scale*1000:.2f} mV/div")
             self.set_channel_scale(channel, ideal_scale)
             st["shrink_count"] = 0
             st["last_scale"] = ideal_scale
@@ -2639,9 +3484,11 @@ class TektronixOscilloscope(Oscilloscope):
         """Forget the adapt history so the autorange loop can run fresh.
 
         Call this between sweeps (or between configurations) — otherwise
-        the ``locked`` flag and history would carry over from the prior
-        run, blocking adaptation when the new run's signal magnitude
-        differs.  Pass ``channel=None`` to reset ALL channels at once.
+        the ``history`` (and cached ``last_scale``) would carry over from
+        the prior run, so the repeat-detector could mistake the new run's
+        first picks for oscillation.  (There is no persistent lock to
+        carry over any more — see the NOTE by ``_ADAPT_REPEAT_LIMIT``.)
+        Pass ``channel=None`` to reset ALL channels at once.
         """
         if not hasattr(self, "_adapt_state"):
             return
@@ -2651,6 +3498,36 @@ class TektronixOscilloscope(Oscilloscope):
             self._adapt_state.pop(channel, None)
 
     # ----- preamble cache (LOG_ANALYSIS.md finding #4) ---------------
+    def _patch_preamble_y(self, channel: str, *, ymult: Optional[float] = None,
+                          yoff: Optional[float] = None) -> bool:
+        """PATCH the cached preamble's Y-side fields IN PLACE instead of
+        dropping the entry (which forces a full ``WFMOutpre?`` re-query,
+        ~100 ms, on the next ``CURVe?``).
+
+        A vertical ``CHx:SCAle`` write changes ONLY ``YMULT`` (= vpd / codes-
+        per-div); a ``CHx:POSition`` write changes ONLY ``YOFF`` (= pos_divs ×
+        codes-per-div); ``YZERO`` is always 0 and the X-side fields are
+        untouched by a vertical write.  Verified against 1337 real TBS2204B
+        preamble rows (``YMULT/vpd = 0.04`` exactly, ``YOFF/25 = pos_divs``,
+        ``YZERO = 0``, zero exceptions).  The caller supplies the new value(s)
+        from the scope's OWN learned codes-per-div (``_y_codes_per_div``, see
+        ``_read_channel``) so this is family-agnostic — no hardcoded 25.
+
+        Returns True if the entry existed and was patched; False if there was
+        no cache entry (caller then falls back to a plain invalidate).  Never
+        touches ``YZERO`` / X-fields / signedness."""
+        if not hasattr(self, "_preamble_cache"):
+            return False
+        entry = self._preamble_cache.get(channel)
+        if entry is None:
+            return False
+        (o_ym, o_yo, o_yz, xi, xz, pto, sgn, be) = entry
+        self._preamble_cache[channel] = (
+            o_ym if ymult is None else float(ymult),
+            o_yo if yoff is None else float(yoff),
+            o_yz, xi, xz, pto, sgn, be)
+        return True
+
     def _invalidate_preamble_cache(self, channel: Optional[str] = None) -> None:
         """Drop cached ``WFMOutpre?`` results.
 
@@ -2673,47 +3550,78 @@ class TektronixOscilloscope(Oscilloscope):
             self._preamble_cache.pop(channel, None)
 
     def set_record_length(self, n: int) -> None:
+        # MODEL-AWARE record length (operator: "know model series record
+        # length choices so that the appropriate record length is used") —
+        # snap the request to the MODEL'S valid choices, then SET
+        # ``HORizontal:RECOrdlength``.  ``snap_record_length`` encodes the
+        # operator's rule exactly: a 20 000 request → **20 000** on the
+        # deep-memory families (TBS2000B / TBS1000C: 1k/2k/20k/…, e.g.
+        # TBS2204B + CWRU's TBS1072C) and → **2500** on the fixed-record
+        # families (TBS1000/B, TDS, TPS — the TBS1104 / 2500-point class).
+        # We do
+        # NOT pin ``DATa:STOP`` (operator: "I do not want DATa:STOP") — the
+        # ``CURVe?`` reads the record's natural window and the time axis
+        # tracks the ACTUAL returned points (``raw.size`` → Method P in
+        # ``_read_channel``).  Calibration passes the SAME requested length
+        # as experiments (operator: "the calibration record length should
+        # match the experimental record length"), so both snap to the same
+        # model-appropriate value.
         n = snap_record_length(int(n), getattr(self.info, "model", ""))
         if n <= 0:
             raise ValueError(f"record_length must be positive, got {n}.")
-        # TBS2000-series scopes reallocate their internal capture buffer
-        # when ``HORizontal:RECOrdlength`` changes; on a TBS2204B with
-        # 20k records this internal step takes 10-30 seconds AFTER the
-        # SCPI write returns its OPC.  Log a "this is going to take a
-        # while" notice up front so the operator sees activity in the
-        # log pane and on-disk session log during the otherwise-silent
-        # gap.  Without this the user sees ``[scope] >
-        # HORizontal:RECOrdlength 20000`` then nothing for 20+ s and
-        # assumes the GUI has hung / crashed.
+        # Idempotent: skip the (slow) write if the scope is confirmed here.
+        if getattr(self, "_record_length", None) == n:
+            self._log(f"[scope] set_record_length({n}): already set — "
+                      f"skipping (no buffer reallocation).")
+            return
+        # FIXED-record families (always 2500 points): HORizontal:RECOrdlength
+        # is QUERY-ONLY (a SET queues a CME error), so skip the write and
+        # confirm by query.  No DATa:STOP.
+        _series = get_model_spec(getattr(self.info, "model", "") or "")
+        _fixed_lengths = getattr(_series, "record_lengths", None)
+        if _fixed_lengths is not None and len(_fixed_lengths) == 1:
+            try:
+                actual = int(float(self._q(f"{self._cmds.horiz_record}?")))
+            except Exception:
+                actual = n
+            self._record_length = actual
+            self._log(
+                f"[scope] set_record_length({n}): fixed-record family "
+                f"({getattr(self.info, 'model', '?')} is always "
+                f"{_fixed_lengths[0]} points; HORizontal:RECOrdlength is "
+                f"query-only) — write skipped, scope confirmed {actual}.")
+            self._invalidate_preamble_cache()
+            return
+        # TBS2000-series reallocate their capture buffer when
+        # HORizontal:RECOrdlength changes (10-30 s on a TBS2204B with 20k) —
+        # log a heads-up so the silent gap doesn't read as a hang.
         _t0 = time.perf_counter()
         self._log(
             f"[scope] set_record_length({n}): writing — scope will "
-            f"internally re-allocate the capture buffer; this can "
-            f"take 10-30 s on TBS2000-series with large records.")
+            f"internally re-allocate the capture buffer; this can take "
+            f"10-30 s on TBS2000-series with large records.")
         self._w_checked(f"{self._cmds.horiz_record} {n}")
-        self._w_checked(f"DATa:STOP {n}")
         try:
             actual = int(float(self._q(f"{self._cmds.horiz_record}?")))
         except Exception:
             actual = n
         self._record_length = actual
-        _dt = time.perf_counter() - _t0
         self._log(
             f"[scope] set_record_length({n}): OK, scope confirmed "
-            f"{actual} points  (total {_fmt_elapsed(_dt)})")
-        # Record-length change → ALL channels' preambles (NR_Pt /
-        # XINcr) are stale.
+            f"{actual} points (total {_fmt_elapsed(time.perf_counter() - _t0)}); "
+            f"DATa:STOP NOT pinned (CURVe? reads the natural window).")
+        # Record-length change → ALL channels' preambles (NR_Pt / XINcr) stale.
         self._invalidate_preamble_cache()
 
     def _refresh_record_length(self) -> int:
-        """Query the scope for the record length and cache it.
+        """Query + cache the scope's record length (NO ``DATa:STOP`` pin).
 
-        The record length doesn't change unless someone calls
-        :meth:`set_record_length` explicitly, so we read it once at open
-        and re-use the cached value for every subsequent capture.
+        We do NOT pin ``DATa:STOP`` (operator: "I do not want DATa:STOP" —
+        that pulled in the off-screen record tail); ``CURVe?`` reads the
+        natural window and the time axis tracks the actual returned points.
+        Cached for the connect-time log + diagnostics.
         """
         n = int(float(self._q(f"{self._cmds.horiz_record}?")))
-        self._w(f"DATa:STOP {n}")
         self._record_length = n
         return n
 
@@ -2723,12 +3631,37 @@ class TektronixOscilloscope(Oscilloscope):
             mode_u = "SAMPLE"
         # Tek uses 'AVE' / 'SAM' / 'PEA' as accepted abbreviations
         m = {"SAMPLE": "SAMPLE", "AVERAGE": "AVERAGE", "PEAK": "PEAKDETECT"}[mode_u]
+        # Snap the requested NUMAVg onto a legal power-of-two NOW so the
+        # idempotent check below compares against what we'd ACTUALLY
+        # apply (NUMAVg is restricted to 2..512 on the TBS-series).
+        target_navg = None
+        if mode_u == "AVERAGE" and self._cmds.has_acq_numavg:
+            choices = self.average_count_choices() or []
+            target_navg = (min(choices, key=lambda v: abs(v - int(n_avg)))
+                           if choices else int(n_avg))
         # Remember what we asked for so the periodic check can
         # compare device state against intent.
         self._expected_acq_mode = m
-        self._expected_acq_navg = (int(n_avg) if mode_u == "AVERAGE"
-                                   and self._cmds.has_acq_numavg
-                                   else None)
+        self._expected_acq_navg = target_navg
+        # Idempotent: if the LAST call confirmed the scope is already in
+        # this exact (mode, n_avg) state, skip the mode/NUMAVg writes —
+        # switching ACQuire:MODe on a long record triggers another
+        # multi-second internal reconfiguration, so starting another
+        # experiment with unchanged acquisition shouldn't pay it again.
+        # ``_applied_acq`` is set ONLY after a successful read-back (and
+        # reset at open()), so a failed prior attempt won't make us
+        # wrongly skip.  We still re-assert the cheap data-transfer
+        # format so a stale front-panel encoding can't corrupt a capture.
+        if getattr(self, "_applied_acq", None) == (m, target_navg):
+            self._w(self._cmds.data_encoding_cmd)
+            self._data_width = 1
+            self._w("DATa:WIDth 1")
+            self._log(
+                f"[scope] set_acquisition_mode({mode_u}, "
+                f"n_avg={target_navg if target_navg is not None else n_avg}):"
+                f" already set — skipping mode/NUMAVg writes (no "
+                f"reconfiguration).")
+            return
         # Switching to AVERAGE mode on a long-record-length capture
         # triggers another internal scope reconfiguration that the
         # SCPI write itself doesn't wait for.  Log a heartbeat at the
@@ -2748,13 +3681,8 @@ class TektronixOscilloscope(Oscilloscope):
 
         self._w_checked(f"ACQuire:MODe {m}")
         if mode_u == "AVERAGE" and self._cmds.has_acq_numavg:
-            # NUMAVg is restricted to powers of two on the TBS-series
-            # (programmer manual ACQuire:NUMAVg, 2..512). Snap the
-            # request onto the nearest legal value so the SCPI write
-            # never errors out.
-            choices = self.average_count_choices() or []
-            if choices:
-                n_avg = min(choices, key=lambda v: abs(v - int(n_avg)))
+            # Use the legal power-of-two NUMAVg snapped above.
+            n_avg = target_navg if target_navg is not None else int(n_avg)
             self._w_checked(f"ACQuire:NUMAVg {int(n_avg)}")
         # Read-back: confirm the scope is actually in the requested mode.
         # On some firmware the mode write is ignored when the scope is
@@ -2789,6 +3717,10 @@ class TektronixOscilloscope(Oscilloscope):
         # firmware reformats the preamble for AVERAGE vs SAMPLE).
         # Invalidate all to be safe.
         self._invalidate_preamble_cache()
+        # Record the confirmed state so a subsequent identical
+        # set_acquisition_mode (next experiment, unchanged settings) is
+        # a no-op rather than another multi-second reconfiguration.
+        self._applied_acq = (m, target_navg)
 
     def acquisition_modes(self):
         modes = ["SAMPLE", "AVERAGE"]
@@ -2802,6 +3734,34 @@ class TektronixOscilloscope(Oscilloscope):
     def max_average_count(self) -> int:
         vals = self._cmds.acq_numavg_values
         return vals[-1] if vals else 16
+
+    def set_average_count(self, n_avg: int) -> int:
+        """Write ``ACQuire:NUMAVg`` + read it back; return the DEVICE value.
+
+        Snaps the request to the model's supported grid first (Tektronix
+        NUMAVg is a fixed power-of-two list), writes it, then re-queries
+        ``ACQuire:NUMAVg?`` and returns whatever the SCOPE reports — the
+        ground truth the GUI reflects to the operator (gotcha #84 confirm).
+        Touches ONLY NUMAVg (never ``ACQuire:MODe``), so it can't trigger
+        the multi-second SAMPLE↔AVERAGE reconfiguration and is safe to run
+        interactively.  Firmware without NUMAVg (oldest TDS) echoes the
+        request unchanged.  ``_expected_acq_navg`` is updated so the
+        periodic drift check + averager-settle sizing stay in sync.
+        """
+        if not self._cmds.has_acq_numavg:
+            return int(n_avg)
+        choices = self.average_count_choices() or []
+        target = (min(choices, key=lambda v: abs(int(v) - int(n_avg)))
+                  if choices else int(n_avg))
+        self._w_checked(f"ACQuire:NUMAVg {int(target)}")
+        try:
+            got = int(float(self._q("ACQuire:NUMAVg?")))
+        except Exception:
+            got = int(target)
+        self._expected_acq_navg = got
+        self._log(f"[scope] average count set to {got} (requested "
+                  f"{n_avg}) — confirmed by ACQuire:NUMAVg?")
+        return got
 
     def set_trigger(self, source: str = "EXT", level_v: float = 1.0,
                     slope: str = "RISE", mode: str = "NORMAL",
@@ -2832,7 +3792,19 @@ class TektronixOscilloscope(Oscilloscope):
                 source = fallback
         if self._cmds.trig_type_edge_cmd:
             self._w(self._cmds.trig_type_edge_cmd)
-        self._w(f"{self._cmds.trig_edge_source} {source}")
+        # An EDGE trigger is now active — clear the pulse-width flag so
+        # ``set_trigger_level`` routes to the edge level register again.
+        self._trig_pulse_source = None
+        # Translate the LOGICAL "EXT" source to the dialect's SCPI name for the
+        # external-trigger BNC — modern (TBS1000C / TBS2000B/C) names it "AUX"
+        # (the front-panel "Aux In"), legacy names it "EXT".  The EXT-vs-channel
+        # logic elsewhere in this method still keys on the logical ``source``
+        # ("EXT"); only the wire value changes here.
+        scpi_source = source
+        if src_check.startswith("EXT"):
+            scpi_source = (getattr(self._cmds, "ext_trigger_scpi_source", "EXT")
+                           or "EXT")
+        self._w(f"{self._cmds.trig_edge_source} {scpi_source}")
         # ---- Verify the scope accepted what we just sent ----
         # Read back immediately and compare.  Tek firmware
         # substitutes AUX for any source it doesn't recognise without
@@ -2842,7 +3814,7 @@ class TektronixOscilloscope(Oscilloscope):
         try:
             readback = self._q(
                 f"{self._cmds.trig_edge_source}?").strip().upper()
-            req = source.upper().strip()
+            req = scpi_source.upper().strip()
             if req and req not in readback and readback not in req:
                 self._log(
                     f"[scope]   ⚠ trigger source readback mismatch: "
@@ -2879,20 +3851,26 @@ class TektronixOscilloscope(Oscilloscope):
             self._w(f"{self._cmds.acq_state} RUN")
         except Exception:
             pass
-        # If the trigger source is one of the input channels, force the
-        # same bench defaults on that channel that we apply to mapped
-        # data channels — otherwise a 10X probe attenuation or AC
-        # coupling on the trigger channel will quietly make us miss
-        # edges from a 3.3 V digital sync line.
+        # If the trigger source is one of the input channels, apply the same
+        # bench defaults (probe gain, bandwidth, coupling) we give mapped data
+        # channels.  Coupling now comes from ``_coupling_for``, which returns
+        # AC for the Trigger channel (operator: "set Imon and Trigger as AC
+        # coupled") — safe for a large low-duty digital sync edge (it still
+        # crosses the 1.4 V level after the DC is stripped), though NOT for a
+        # small-signal I_mon-edge fallback trigger (see the _coupling_for
+        # caveat).  The dedicated trigger-comparator coupling
+        # (TRIGger:A:EDGE:COUPling) stays DC regardless.
         src_u = source.upper()
         if src_u.startswith("CH") and src_u[2:].isdigit():
             self.apply_channel_defaults(src_u)
             # When a channel is the trigger source it's effectively the
-            # I_mon path (current monitor) — apply the same low-pass BW
-            # limit the rest of the I_mon setup uses so the trigger
-            # comparator sees the clean filtered signal.
+            # I_mon path (current monitor).  Per operator request we run
+            # ALL channels at FULL bandwidth, so the trigger channel is
+            # set to full BW too — matching the rest of the I_mon setup.
+            # (Former behaviour applied a 20 MHz limit here for a cleaner
+            # trigger comparator; full BW trades that for more noise.)
             try:
-                self.set_channel_bandwidth_for_purpose(src_u, "imon")
+                self.set_channel_bandwidth_full(src_u)
             except Exception:
                 pass
         # Stash the requested settings so a periodic sanity check
@@ -2911,6 +3889,75 @@ class TektronixOscilloscope(Oscilloscope):
             self._expected_trigger_is_digital = bool(digital)
         else:
             self._expected_trigger_is_digital = src_check.startswith("EXT")
+
+    def set_trigger_pulse_width(self, source: str, level_v: float,
+                                polarity: str, width_s: float,
+                                when: str = "MOREthan") -> bool:
+        """Switch to a PULSE-WIDTH trigger; return True when applied.
+
+        Used for CONTINUOUS (no-interpulse-delay) shaped waveforms: the
+        half-peak EDGE trigger can fire on NARROW noise crossings at low
+        currents, while the real phase lobe stays beyond the level for a
+        long, predictable dwell — qualifying on that width (``when
+        MOREthan`` a fraction of the dwell) rejects the noise (operator:
+        "Are you going to implement the pulse width trigger type for
+        certain waveform shapes?").
+
+        Call AFTER :meth:`set_trigger` — this method only switches the
+        TYPE + pulse-width parameters; the edge call did the shared setup
+        (mode NORMAL, acq RUN, channel defaults, source stash).  The
+        trigger fires when the pulse beyond ``level_v`` lasts longer than
+        ``width_s`` — t=0 then lands mid-phase rather than at the leading
+        edge, which the pipeline already tolerates (phase-time chains
+        anchor at the DETECTED onset, gotcha #44).
+
+        Returns False (leaving the edge trigger in place) on a family
+        without pulse-width support (legacy dialect) or any write error —
+        the caller logs the fallback.  Read-back confirms the applied
+        width per the operator's confirm-everything rule.
+        """
+        cmds = self._cmds
+        if not getattr(cmds, "has_pulse_width_trigger", False):
+            return False
+        src = str(source).upper().strip()
+        # Same EXT→dialect translation as set_trigger: the external-trigger BNC
+        # is "AUX" on modern (TBS1000C / TBS2000), "EXT" on legacy.  (Best-effort
+        # for pulse-width-on-AUX; the try/except below falls back to the edge
+        # trigger if the firmware rejects the AUX LOWerthreshold register.)
+        if src.startswith("EXT"):
+            src = (getattr(cmds, "ext_trigger_scpi_source", "EXT")
+                   or "EXT").upper()
+        pol = ("NEGative" if str(polarity).upper().startswith("NEG")
+               else "POSitive")
+        try:
+            self._w(cmds.trig_type_pulse_cmd)
+            self._w(f"{cmds.trig_pulse_source} {src}")
+            self._w(f"{cmds.trig_pulse_polarity} {pol}")
+            self._w(f"{cmds.trig_pulse_when} {when}")
+            self._w(f"{cmds.trig_pulse_width} {float(width_s):.6e}")
+            # The pulse-width threshold is per-channel LOWerthreshold —
+            # NOT the edge TRIGger:A:LEVel.
+            self._w(cmds.trig_pulse_threshold_fmt.format(ch=src)
+                    + f" {float(level_v):g}")
+        except Exception as exc:
+            self._log(f"[scope] ⚠ pulse-width trigger setup failed "
+                      f"({exc}) — keeping the edge trigger.")
+            return False
+        # Read-back confirm (operator: always confirm settings by reading
+        # back what the device applied).
+        try:
+            got_w = float(self._q(f"{cmds.trig_pulse_width}?"))
+            if not (abs(got_w - float(width_s))
+                    <= max(1e-7, 0.02 * float(width_s))):
+                self._log(f"[scope] ⚠ pulse-width read-back = {got_w:.3e} s, "
+                          f"requested {float(width_s):.3e} s")
+        except Exception:
+            pass
+        self._trig_pulse_source = src
+        self._log(f"[scope] pulse-width trigger: source={src}, "
+                  f"polarity={pol}, when={when} {float(width_s)*1e6:.1f} µs, "
+                  f"threshold={float(level_v)*1e3:+.2f} mV")
+        return True
 
     # ----- acquisition -----
     def auto_scale(self) -> None:
@@ -2954,20 +4001,44 @@ class TektronixOscilloscope(Oscilloscope):
         # Trigger source.
         if self._expected_trigger_source is not None:
             try:
-                got_src = self._q(f"{self._cmds.trig_edge_source}?").upper()
+                got_src = self._q(
+                    f"{self._cmds.trig_edge_source}?").upper().strip()
             except Exception:
                 got_src = ""
+            exp = self._expected_trigger_source.upper().strip()
             # Some dialects echo the source with a "CH" prefix or an
-            # equivalent abbreviation; check loosely.
-            if (self._expected_trigger_source not in got_src and
-                    got_src not in self._expected_trigger_source):
+            # equivalent abbreviation; check loosely.  Also: the external-
+            # trigger BNC is named "EXT" on legacy scopes but "AUX" on modern
+            # (TBS1000C / TBS2000), and an EXT-logical trigger is WRITTEN as
+            # AUX there (set_trigger), so treat EXT/AUX as equivalent to avoid
+            # a false "trigger source drifted" warning.
+            _ext_equiv = {"EXT", "AUX"}
+            match = ((exp in got_src or got_src in exp)
+                     or (exp in _ext_equiv and got_src in _ext_equiv))
+            if not match:
                 problems.append(
-                    f"trigger source drifted: expected "
-                    f"{self._expected_trigger_source}, device reports "
-                    f"{got_src!r}")
+                    f"trigger source drifted: expected {exp}, device "
+                    f"reports {got_src!r}")
         if not problems:
             return None
         return "; ".join(problems)
+
+    def _data_channels(self) -> list:
+        """Scope channels to TRANSFER per capture — every mapped role EXCEPT a
+        standalone Trigger channel.
+
+        A digital-sync Trigger channel carries no signal any metric reads:
+        ``make_capture`` extracts only vmon/imon/eret/eact and
+        ``check_trigger_alignment`` reads imon — nothing reads the trigger
+        trace.  So a ``CURVe?`` of that channel every capture is pure waste
+        (~212 ms on a 20k record).  Dropping the ``trigger`` role from the
+        read set removes it, while a trigger that COINCIDES with a data role
+        (the I_mon-edge trigger fallback, ``trigger == imon``) is still
+        transferred via that data role (the set-comprehension keeps the
+        channel because ``imon`` also maps to it).  Used by all three capture
+        paths so VT / PS / SP / LP / calibration all benefit."""
+        aliases = getattr(self, "channel_aliases", {}) or {}
+        return sorted({v for k, v in aliases.items() if k != "trigger" and v})
 
     def single_capture(self, *,
                        timeout_s: Optional[float] = None) -> ScopeAcquisition:
@@ -3064,6 +4135,12 @@ class TektronixOscilloscope(Oscilloscope):
                 f"[scope]   waiting for {n_avg_target} acquisitions "
                 f"(AVERAGE mode, timeout {timeout_s:.1f} s)…")
             while time.time() < deadline:
+                if self._should_abort():
+                    # STOP pressed — read whatever's averaged so far and
+                    # bail instead of waiting out the full window.
+                    self._log("[scope]   abort — stopping NUMACq poll "
+                              f"early at {count}/{n_avg_target}.")
+                    break
                 try:
                     raw = self._inst.query("ACQuire:NUMACq?").strip()
                     n_polls += 1
@@ -3088,20 +4165,24 @@ class TektronixOscilloscope(Oscilloscope):
         else:
             # SAMPLE / PEAK / unknown mode — single-trigger semantics.
             triggered = False
+            aborted = False
             while time.time() < deadline:
+                if self._should_abort():
+                    aborted = True   # STOP pressed — bail without raising
+                    break
                 if self._check_triggered():
                     triggered = True
                     break
                 # 10 ms inter-poll keeps the loop responsive without
                 # saturating the USB-TMC bus.
                 time.sleep(0.010)
-            if not triggered:
+            if not triggered and not aborted:
                 raise TimeoutError(
                     "Scope was not triggered within the timeout. "
                     "Check trigger source, level, and cable connections.")
 
         # Determine which channels to fetch
-        wanted_channels = sorted(set(self.channel_aliases.values()))
+        wanted_channels = self._data_channels()
         out_channels: Dict[str, np.ndarray] = {}
         # Reusable time axis across the per-channel loop. The horizontal
         # scaling (XINCr / XZEro) is identical across all channels in
@@ -3200,7 +4281,7 @@ class TektronixOscilloscope(Oscilloscope):
                 tick_fn()
 
         # Step 5 — read channels (scope still running; data is stable after wait)
-        wanted_channels = sorted(set(self.channel_aliases.values()))
+        wanted_channels = self._data_channels()
         out_channels: Dict[str, np.ndarray] = {}
         time_us = np.empty(0)
         sample_period_us = 0.0
@@ -3338,7 +4419,7 @@ class TektronixOscilloscope(Oscilloscope):
                 + f"— reading the latest frame anyway.")
 
         # Step 4 — read all wanted channels.
-        wanted_channels = sorted(set(self.channel_aliases.values()))
+        wanted_channels = self._data_channels()
         out_channels: Dict[str, np.ndarray] = {}
         time_us = np.empty(0)
         sample_period_us = 0.0
@@ -3397,7 +4478,16 @@ class TektronixOscilloscope(Oscilloscope):
         # Ensure the channel is displayed on screen.  CURVe? returns
         # error 2244 ("waveform not activated") for a channel that is
         # turned off (SELect:CH<x> OFF), even if DATa:SOUrce points to it.
-        self._w(f"SELect:{ch} ON")
+        # CACHED: nothing deselects a USED channel mid-run — only
+        # ``configure_channels`` flips SELect (at setup) — so re-sending
+        # ``SELect:CH ON`` before EVERY CURVe? (~8×/capture, ~1300×/run) was
+        # pure redundant SCPI traffic.  Send it once per channel, then skip.
+        _sel = getattr(self, "_selected_channels", None)
+        if _sel is None:
+            _sel = self._selected_channels = set()
+        if ch not in _sel:
+            self._w(f"SELect:{ch} ON")
+            _sel.add(ch)
 
         # Pick which channel CURVe? will read from. DATa:STARt / STOP and
         # the binary-encoding settings are already established at open()
@@ -3430,6 +4520,24 @@ class TektronixOscilloscope(Oscilloscope):
                 self._preamble_cache[ch] = (
                     ymult, yoff, yzero, xinc, xzero, pt_off,
                     is_signed, is_big_endian)
+                # Learn this channel's Y codes-per-division from the scope's
+                # OWN reported ymult + the last written scale (ymult = vpd /
+                # codes_per_div), so set_channel_scale/position can PATCH the
+                # cache in place instead of re-querying WFMOutpre? every time.
+                # Family-agnostic (no hardcoded 25); sanity-gated [10,60] so a
+                # stale/None last_scale can never poison the conversion — if
+                # unlearned, the setters fall back to a full invalidate.
+                try:
+                    _ls = (self._adapt_state.get(ch, {}).get("last_scale")
+                           if hasattr(self, "_adapt_state") else None)
+                    if _ls and ymult > 0:
+                        _cpd = float(_ls) / float(ymult)
+                        if 10.0 <= _cpd <= 60.0:
+                            if not hasattr(self, "_y_codes_per_div"):
+                                self._y_codes_per_div: Dict[str, float] = {}
+                            self._y_codes_per_div[ch] = _cpd
+                except Exception:
+                    pass
 
         # ----- Curve as a binary stream ----------------------------------
         # dtype and byte-order are derived from WFMOutpre:BN_Fmt? / BYT_Or?
@@ -3532,7 +4640,63 @@ class TektronixOscilloscope(Oscilloscope):
         # cross-check was originally added for).
         used_method = "A (XZEro)"
         xz_used = xzero
-        if abs(xzero) < 0.5 * xinc:
+        # ---- Method P: POSITION-derived zero (operator-authoritative
+        # on percent-position models).  Operator: "The trigger location
+        # is where zero is.  You need to account where zero is based on
+        # trigger percentage on [record] length or trigger horizontal
+        # position time...  if the model uses percentage, then use the
+        # record length to know where to shift."
+        #
+        # On the legacy TIME-position families (TBS1104B etc., record =
+        # screen) the XZEro readback IS the horizontal position
+        # expressed as time, so Method A already implements the rule —
+        # exactly what the operator's MATLAB (getSettings.m 'time' case)
+        # relied on.  On the PERCENT-position families (TBS2000*) the
+        # firmware reports XZEro = −record/2 (trigger-symmetric)
+        # REGARDLESS of the programmed position — but the TRUE trigger
+        # placement follows position% × record length.  Confirmed by
+        # arithmetic on the operator's session: position 20 % of a
+        # 20k × 32 ns record → true zero −128 µs; with the firmware's
+        # −320 µs the pulse onset displayed at −210 µs even though it
+        # sits at the trigger on the scope screen (sync ≈ onset).
+        # Derive zero from the position and OVERRIDE the readback,
+        # with a loud cross-check so a firmware that honestly reports
+        # XZEro is visible in the session log.
+        if (getattr(self._cmds, "horiz_position_unit", "") == "percent"
+                and xinc > 0 and npts):
+            _pct = self._expected_horiz_position_pct
+            if _pct is None:
+                try:
+                    _pct = float(self._q(
+                        f"{self._cmds.horiz_position}?"))
+                except Exception:
+                    _pct = None
+            if _pct is not None and 0.0 <= float(_pct) <= 100.0:
+                _xz_pos = -(float(_pct) / 100.0) * float(npts) * float(xinc)
+                # On the percent-position families (TBS2000*) this
+                # disagreement is EXPECTED on every capture — the
+                # firmware always reports XZEro = −record/2 while the
+                # true zero follows the position %.  Logging it per
+                # capture spammed the session log (operator: "Stop with
+                # the XZero disagree, especially since … you are going to
+                # keep doing that with the TBS2000B series").  Log it
+                # ONCE per scope session so the diagnostic is still on
+                # record, then go silent.
+                if (abs(_xz_pos - xzero) > max(float(xinc), 1e-9)
+                        and not getattr(self, "_xzero_disagree_logged",
+                                        False)):
+                    self._log(
+                        f"[scope-time] XZEro readback "
+                        f"({xzero*1e6:+.1f} µs) differs from the "
+                        f"position-derived zero ({_xz_pos*1e6:+.1f} µs "
+                        f"= {float(_pct):.0f}% × {npts} pts × "
+                        f"{xinc*1e9:.1f} ns) — using position-derived "
+                        f"(TBS2000 reports −record/2 regardless of "
+                        f"position; expected, logged once per session).")
+                    self._xzero_disagree_logged = True
+                xz_used = _xz_pos
+                used_method = f"P (position {float(_pct):.0f}% × record)"
+        elif abs(xzero) < 0.5 * xinc:
             # XZEro is effectively zero — either no pre-trigger
             # configured OR the legacy firmware quirk where XZEro=0
             # is reported even with non-zero horizontal position.
@@ -3793,12 +4957,19 @@ class TektronixOscilloscope(Oscilloscope):
         # Turn OFF every channel first so only the mapped ones are active.
         # Unused enabled channels produce CURVe? errors and add noise.
         n_ch = int(getattr(self.info, "n_channels", 4) or 4)
+        _sel = set()
         for i in range(1, n_ch + 1):
             ch = f"CH{i}"
+            on = ch in used
             try:
-                self._w(f"SELect:{ch} {'ON' if ch in used else 'OFF'}")
+                self._w(f"SELect:{ch} {'ON' if on else 'OFF'}")
+                if on:
+                    _sel.add(ch)
             except Exception:
                 pass
+        # Seed the SELect cache (read by _read_channel to skip the redundant
+        # per-capture SELect ON).  This is the authoritative select state.
+        self._selected_channels = _sel
         # Apply canonical bench defaults to each active channel.
         # Suppress per-channel probe warnings — we collect them
         # below and emit ONE summary line so the LogPane doesn't

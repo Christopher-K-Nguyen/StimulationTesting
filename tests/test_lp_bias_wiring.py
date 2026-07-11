@@ -39,8 +39,10 @@ def test_lp_arms_after_scope_view_before_main_loop():
     assert "arm_bias_feedback" in src
     asv_pos = src.index("apply_default_scope_view")
     arm_pos = src.index("self.arm_bias_feedback(")
-    main_while_pos = src.index(
-        "while not self.aborted and (time.time() - t_start)")
+    # Main pulsing loop header (precise-sampling refactor: the elapsed
+    # check moved inside the loop, so the header is now the bare
+    # ``while not self.aborted:``).
+    main_while_pos = src.index("while not self.aborted:")
     assert asv_pos < arm_pos < main_while_pos
 
 
@@ -84,14 +86,25 @@ def test_lp_rearms_after_post_recharacterization_restore():
 
 
 def test_lp_calls_bias_step_after_snapshot_capture():
-    """bias_step_if_armed should follow the snapshot capture event
-    so the GUI's status badge update lands AFTER the just-emitted
-    metrics row."""
+    """bias_step_if_armed should follow the snapshot capture event so the
+    GUI's status badge update lands AFTER the just-emitted metrics row.
+
+    The per-channel snapshot capture+emit now lives in the
+    ``_capture_and_emit_snapshot`` helper (called once per monitored channel —
+    multichannel monopolar plots each channel, CLAUDE.md gotcha #105); the
+    bias step fires ONCE per snapshot round AFTER that channel loop, so the
+    runtime order (capture emit → bias step) is preserved even though the
+    ``kind="capture"`` string now sits in the helper defined below run()."""
     src = _read_lp_source()
     assert "bias_step_if_armed" in src
-    capture_emit = src.index('kind="capture"')
-    bias_step = src.index("bias_step_if_armed")
-    assert capture_emit < bias_step
+    # In run()'s snapshot round, the capture-emitting helper is CALLED before
+    # the bias step (the call precedes the helper's own def in the source).
+    snap_call = src.index("self._capture_and_emit_snapshot(")
+    bias_step = src.index("self.bias_step_if_armed(")
+    assert snap_call < bias_step
+    # …and the helper actually emits the capture event.
+    helper_def = src.index("def _capture_and_emit_snapshot")
+    assert src.index('kind="capture"', helper_def) > helper_def
 
 
 def test_lp_disarms_in_outer_finally_before_stop_all():

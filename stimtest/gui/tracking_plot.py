@@ -286,11 +286,18 @@ class TrackingPlot(QtWidgets.QWidget):
         keys_w = QtWidgets.QWidget()
         keys_w.setLayout(self._keys_row)
 
-        # Per-metric axis combo. ``self._metric_combos[short]`` =
-        # QComboBox with three entries (Off / Left / Right). User
-        # change triggers a full curve rebuild via
-        # :meth:`_on_axis_changed`.
-        self._metric_combos: Dict[str, QtWidgets.QComboBox] = {}
+        # Per-metric axis selector — TWO checkboxes (Left / Right) that are
+        # MUTUALLY EXCLUSIVE but both DESELECTABLE (operator: "two checkboxes
+        # for left or right axes plotting for each metric.  Only one of the
+        # two can be selected, selecting the other will immediately deselect
+        # the other").  Three states per metric: neither checked = Off
+        # (hidden), Left checked = left axis, Right checked = right axis.
+        # ``self._metric_axes[short]`` stays the single source of truth; the
+        # checkbox pair is the view.  ``_axis_check_updating`` guards the
+        # programmatic sibling-uncheck from re-entering the handler.
+        self._metric_left_chk: Dict[str, QtWidgets.QCheckBox] = {}
+        self._metric_right_chk: Dict[str, QtWidgets.QCheckBox] = {}
+        self._axis_check_updating = False
         # Per-row metric label widgets — stashed so the I_stim
         # row can update its label text when the unit toggle
         # flips between "µA" and "A/cm²".
@@ -300,8 +307,16 @@ class TrackingPlot(QtWidgets.QWidget):
         metrics_grid.setHorizontalSpacing(6)
         metrics_grid.setVerticalSpacing(2)
         metrics_grid.addWidget(QtWidgets.QLabel("Metric"), 0, 0)
-        metrics_grid.addWidget(QtWidgets.QLabel("Axis"), 0, 1)
-        metrics_grid.addWidget(QtWidgets.QLabel("Unit"), 0, 2)
+        metrics_grid.addWidget(QtWidgets.QLabel("L"), 0, 1)
+        metrics_grid.addWidget(QtWidgets.QLabel("R"), 0, 2)
+        metrics_grid.addWidget(QtWidgets.QLabel("Unit"), 0, 3)
+        _axis_tip = (
+            "Plot this metric on the <b>L</b>eft or <b>R</b>ight y-axis. "
+            "The two are mutually exclusive — ticking one unticks the "
+            "other; untick both to HIDE the metric. Multiple metrics can "
+            "share an axis (axis-label units are deduplicated). Hiding "
+            "keeps the data recorded (it still streams in from new "
+            "captures) so you can re-show it later without re-running.")
         for row, (label, short, _accessor, unit) in enumerate(
                 TRACKED_METRICS, start=1):
             # Display label appends the unit so the operator can
@@ -310,24 +325,23 @@ class TrackingPlot(QtWidgets.QWidget):
             lbl_widget = QtWidgets.QLabel(f"{label} [{unit}]")
             metrics_grid.addWidget(lbl_widget, row, 0)
             self._metric_labels[short] = lbl_widget
-            cb = QtWidgets.QComboBox()
-            cb.addItem("Off", userData=AXIS_NA)
-            cb.addItem("Left", userData=AXIS_LEFT)
-            cb.addItem("Right", userData=AXIS_RIGHT)
-            default = self._metric_axes.get(short, AXIS_NA)
-            cb.setCurrentIndex({AXIS_NA: 0, AXIS_LEFT: 1, AXIS_RIGHT: 2}[default])
-            cb.currentIndexChanged.connect(
-                lambda _i, s=short: self._on_axis_changed(s))
-            self._metric_combos[short] = cb
-            cb.setToolTip(
-                f"Plot this metric on the <b>Off</b> (hidden), "
-                f"<b>Left</b>, or <b>Right</b> y-axis. Multiple "
-                f"metrics can share an axis — units in the axis "
-                f"label are deduplicated. Off keeps the data "
-                f"recorded (the metric still streams in from new "
-                f"captures) so you can toggle it back on later "
-                f"without re-running the experiment.")
-            metrics_grid.addWidget(cb, row, 1)
+            l_chk = QtWidgets.QCheckBox()
+            r_chk = QtWidgets.QCheckBox()
+            l_chk.setToolTip(_axis_tip)
+            r_chk.setToolTip(_axis_tip)
+            l_chk.toggled.connect(
+                lambda on, s=short: self._on_axis_check(s, AXIS_LEFT, on))
+            r_chk.toggled.connect(
+                lambda on, s=short: self._on_axis_check(s, AXIS_RIGHT, on))
+            self._metric_left_chk[short] = l_chk
+            self._metric_right_chk[short] = r_chk
+            metrics_grid.addWidget(l_chk, row, 1,
+                                   QtCore.Qt.AlignmentFlag.AlignCenter)
+            metrics_grid.addWidget(r_chk, row, 2,
+                                   QtCore.Qt.AlignmentFlag.AlignCenter)
+            # Reflect the default axis onto the pair (signal-guarded).
+            self._apply_axis_to_checks(short, self._metric_axes.get(short,
+                                                                    AXIS_NA))
             # I_stim gets a unit-toggle button (µA ↔ A/cm²).
             # Other metrics have a static unit shown alongside
             # the label, so the unit column is empty for them.
@@ -341,7 +355,7 @@ class TrackingPlot(QtWidgets.QWidget):
                 self._i_stim_unit_btn.clicked.connect(
                     self._toggle_i_stim_unit)
                 metrics_grid.addWidget(
-                    self._i_stim_unit_btn, row, 2)
+                    self._i_stim_unit_btn, row, 3)
         # Wrap the grid in a VBox with a trailing stretch so the metric
         # rows pack at the TOP of the GroupBox instead of getting
         # spread out across the full available height. Without this,
@@ -367,6 +381,9 @@ class TrackingPlot(QtWidgets.QWidget):
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("w")
+        # Mouse wheel must NOT zoom (operator request).
+        from .widgets import disable_plot_wheel_zoom
+        disable_plot_wheel_zoom(self.plot)
         # Gridlines default OFF on experiment plots so subtle
         # trace features aren't obscured. The main window's View
         # → Gridlines action toggles them on/off for every
@@ -560,10 +577,47 @@ class TrackingPlot(QtWidgets.QWidget):
     def _on_key_toggled(self, *_):
         self._rebuild_curves()
 
-    def _on_axis_changed(self, short: str):
-        cb = self._metric_combos.get(short)
-        if cb is None: return
-        self._metric_axes[short] = cb.currentData() or AXIS_NA
+    def _apply_axis_to_checks(self, short: str, axis: str) -> None:
+        """Reflect an axis choice onto the L/R checkbox pair without
+        re-firing the handler (used for defaults + prefs restore)."""
+        l = self._metric_left_chk.get(short)
+        r = self._metric_right_chk.get(short)
+        if l is None or r is None:
+            return
+        self._axis_check_updating = True
+        try:
+            l.setChecked(axis == AXIS_LEFT)
+            r.setChecked(axis == AXIS_RIGHT)
+        finally:
+            self._axis_check_updating = False
+
+    def _on_axis_check(self, short: str, side: str, checked: bool) -> None:
+        """One handler for both L/R checkboxes.
+
+        MUTUAL EXCLUSION: ticking a side unticks its sibling (operator:
+        "only one of the two checkboxes can be selected, selecting the
+        other will immediately deselect the other").  Unticking a side
+        with the sibling also off = Off (metric hidden).  The
+        ``_axis_check_updating`` guard makes the programmatic sibling
+        untick a no-op so the rebuild runs exactly once per user click.
+        """
+        if self._axis_check_updating:
+            return
+        l = self._metric_left_chk.get(short)
+        r = self._metric_right_chk.get(short)
+        if l is None or r is None:
+            return
+        if checked:
+            self._axis_check_updating = True
+            try:
+                (r if side == AXIS_LEFT else l).setChecked(False)
+            finally:
+                self._axis_check_updating = False
+            self._metric_axes[short] = side
+        else:
+            # This side was just unticked; if neither is now on → hidden.
+            if not l.isChecked() and not r.isChecked():
+                self._metric_axes[short] = AXIS_NA
         self._rebuild_curves()
         self._refresh_y_axis_labels()
 
@@ -771,10 +825,7 @@ class TrackingPlot(QtWidgets.QWidget):
             for short, axis in axes.items():
                 if axis not in (AXIS_NA, AXIS_LEFT, AXIS_RIGHT): continue
                 self._metric_axes[short] = axis
-                cb = self._metric_combos.get(short)
-                if cb is not None:
-                    cb.setCurrentIndex({AXIS_NA: 0, AXIS_LEFT: 1,
-                                        AXIS_RIGHT: 2}[axis])
+                self._apply_axis_to_checks(short, axis)
         # Re-render y-axis labels so they reflect the restored
         # metric/axis assignment.
         self._refresh_y_axis_labels()

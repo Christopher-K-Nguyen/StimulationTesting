@@ -4,10 +4,13 @@ Operator: "I want an output next to the pulse rate to indicate what is the
 approximate acquisition time based on the average count and the pulse rate —
 right of the pulse rate unit drop down."
 
-The readout lives on ``PatternControlPanel`` as ``acq_time_label`` (added to
-the rate row immediately after ``rate_unit_combo``).  Its estimate is
-``sweeps / rate`` where ``sweeps`` = the average count in AVERAGE mode and 1
-in SAMPLE mode — the same formula the runner uses to size its capture timeout.
+The readout lives on ``PatternControlPanel`` as ``acq_time_label`` on its own
+"Average count" row just below the pulse-rate row, to the right of the inline
+average-count editor (moved off the rate row so its verbose calculation stops
+widening the panel).  Its estimate is ``sweeps / rate`` where ``sweeps`` = the
+average count in AVERAGE mode and 1 in SAMPLE mode — the same formula the
+runner uses to size its capture timeout.  In period (ms) mode the DISPLAYED
+calculation flips to ``sweeps × period`` to match the selected unit.
 The average count + mode come from the Setup tab, routed through
 ``_BaseExperimentTab.set_acquisition`` → ``pattern_panel.set_acquisition_info``.
 """
@@ -36,23 +39,47 @@ def _panel():
 
 
 # ------------------------------------------------------------------- layout
-def test_label_exists_and_is_right_of_unit_combo(_app):
+def test_label_on_its_own_row_below_rate(_app):
     p = _panel()
     assert isinstance(p.acq_time_label, QtWidgets.QLabel)
-    # Same container widget as the unit combo (they share the rate row).
-    assert p.acq_time_label.parent() is p.rate_unit_combo.parent()
-    # A non-empty default readout (default 16 avg @ default rate).
-    assert p.acq_time_label.text().startswith("≈")
+    # The acq-time readout + inline average-count editor were MOVED off the
+    # rate row onto their own "Average count" row (operator: "the
+    # calculation of time per capture is making the panel too wide … Move
+    # the Average count to below the pulse rate with the calculation on its
+    # right").  So they share a container with each other, but NOT with the
+    # rate-unit combo any more.
+    assert p.acq_time_label.parent() is p.acq_navg_inline.parent()
+    assert p.acq_time_label.parent() is not p.rate_unit_combo.parent()
+    # A non-empty default readout (default 16 avg @ default rate),
+    # showing the calculation (operator: "show the calculation").
+    assert "≈" in p.acq_time_label.text()
+    assert "÷" in p.acq_time_label.text()
     assert "/ capture" in p.acq_time_label.text()
     p.deleteLater()
 
 
+def test_period_mode_calc_uses_multiplication(_app):
+    """Operator: "If the pulse rate is set to pulse period, then have the
+    calculation change accordingly."  In period (ms) mode the readout shows
+    ``sweeps × period`` instead of ``sweeps ÷ rate`` — same result, mirrored
+    to the unit the operator dialled in."""
+    p = _panel()
+    p.set_acquisition_info("AVERAGE", 64)
+    p.rate_pps.setValue(100.0)                    # 100 pps
+    p.rate_unit_combo.setCurrentText(p.UNIT_MS)   # → 10 ms period
+    txt = p.acq_time_label.text()
+    assert "×" in txt and "10 ms" in txt
+    assert "÷" not in txt
+    assert txt == "64 × 10 ms ≈ 0.64 s / capture"
+    p.deleteLater()
+
+
 # ------------------------------------------------------- AVERAGE-mode formula
-def test_average_mode_uses_navg_over_rate(_app):
+def test_average_mode_shows_calc_navg_over_rate(_app):
     p = _panel()
     p.rate_pps.setValue(100.0)               # 100 pps (default unit = pps)
     p.set_acquisition_info("AVERAGE", 64)    # 64 / 100 = 0.64 s
-    assert p.acq_time_label.text() == "≈ 0.64 s / capture"
+    assert p.acq_time_label.text() == "64 ÷ 100 pps ≈ 0.64 s / capture"
     p.deleteLater()
 
 
@@ -60,7 +87,11 @@ def test_sample_mode_is_single_sweep(_app):
     p = _panel()
     p.rate_pps.setValue(100.0)
     p.set_acquisition_info("SAMPLE", 64)     # 1 / 100 = 0.01 s → 10 ms
-    assert p.acq_time_label.text() == "≈ 10 ms / capture"
+    assert p.acq_time_label.text() == "1 sweep ÷ 100 pps ≈ 10 ms / capture"
+    # SAMPLE mode ignores the average count → inline editor greyed out.
+    assert p.acq_navg_inline.isEnabled() is False
+    p.set_acquisition_info("AVERAGE", 64)
+    assert p.acq_navg_inline.isEnabled() is True
     p.deleteLater()
 
 
@@ -69,9 +100,38 @@ def test_label_updates_when_rate_changes(_app):
     p = _panel()
     p.set_acquisition_info("AVERAGE", 64)
     p.rate_pps.setValue(100.0)               # 0.64 s
-    assert p.acq_time_label.text() == "≈ 0.64 s / capture"
+    assert p.acq_time_label.text() == "64 ÷ 100 pps ≈ 0.64 s / capture"
     p.rate_pps.setValue(10.0)                # 64 / 10 = 6.4 s
-    assert p.acq_time_label.text() == "≈ 6.40 s / capture"
+    assert p.acq_time_label.text() == "64 ÷ 10 pps ≈ 6.40 s / capture"
+    p.deleteLater()
+
+
+# ------------------------------------------- inline average-count editor
+def test_inline_navg_edit_updates_readout_and_emits(_app):
+    """Editing the inline spin recomputes the estimate immediately and
+    publishes the new count via ``acqNavgEdited`` (MainWindow forwards
+    it into the Setup tab's spin)."""
+    p = _panel()
+    p.rate_pps.setValue(100.0)
+    p.set_acquisition_info("AVERAGE", 64)
+    got = []
+    p.acqNavgEdited.connect(got.append)
+    p.acq_navg_inline.setValue(128)          # type…
+    p.acq_navg_inline.editingFinished.emit()  # …then commit (Enter/click-out)
+    assert got == [128]
+    assert p.acq_time_label.text() == "128 ÷ 100 pps ≈ 1.28 s / capture"
+    p.deleteLater()
+
+
+def test_set_acquisition_info_syncs_inline_spin_without_emitting(_app):
+    """A Setup-tab push must sync the inline spin SILENTLY — re-emitting
+    acqNavgEdited would bounce the value straight back at the Setup tab."""
+    p = _panel()
+    got = []
+    p.acqNavgEdited.connect(got.append)
+    p.set_acquisition_info("AVERAGE", 32)
+    assert p.acq_navg_inline.value() == 32
+    assert got == [], "sync from Setup must not re-emit acqNavgEdited"
     p.deleteLater()
 
 
@@ -119,4 +179,28 @@ def test_set_acquisition_routes_into_pattern_panel(_app):
     assert vt.pattern_panel._acq_n_avg == 32
     assert vt.pattern_panel._acq_mode == "AVERAGE"
     assert "/ capture" in vt.pattern_panel.acq_time_label.text()
+    w.close()
+
+
+def test_inline_navg_round_trips_through_setup_to_all_tabs(_app):
+    """The full loop: editing VT's inline average-count spin pushes the
+    value into the Setup tab's acq_navg_spin (source of truth), whose
+    acquisitionChanged broadcast lands on EVERY tab's readout."""
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.setApplicationName("pulsar-pytest")
+    from stimtest.gui.main_window import MainWindow
+    w = MainWindow(simulate_default=True)
+    QtWidgets.QApplication.processEvents()
+    # Pick a target guaranteed != the current value (delta-robust per
+    # the prefs-sandbox rule — a fixed literal could no-op on re-runs).
+    cur = int(w.setup_tab.acq_navg_spin.value())
+    target = 128 if cur != 128 else 256
+    w.vt_tab.pattern_panel.acq_navg_inline.setValue(target)
+    w.vt_tab.pattern_panel.acq_navg_inline.editingFinished.emit()  # commit
+    QtWidgets.QApplication.processEvents()
+    assert int(w.setup_tab.acq_navg_spin.value()) == target
+    # Broadcast reached a DIFFERENT tab's panel too.
+    assert w.sp_tab.pattern_panel._acq_n_avg == target
+    assert w.sp_tab.pattern_panel.acq_navg_inline.value() == target
     w.close()

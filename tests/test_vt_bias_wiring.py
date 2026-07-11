@@ -66,11 +66,17 @@ def test_vt_arms_before_amplitude_while_loop():
 
 
 def test_vt_calls_bias_step_after_capture_emit():
-    """bias_step_if_armed should land AFTER the per-amplitude
-    capture event so the GUI status badge update lands alongside
-    the just-emitted metrics row."""
+    """bias_step_if_armed should land AFTER the per-amplitude capture
+    event so the GUI status badge update lands alongside the just-emitted
+    metrics row.
+
+    The per-capture sequence (append, dose, limit flags, emit, bias step)
+    was factored into the shared ``_capture_and_flag`` helper so the main
+    ramp loop AND the bidirectional back-off search treat a capture
+    identically — so the ordering now lives in that helper.
+    """
     src = _read_vt_source()
-    method_pos = src.index("def _run_one_configuration")
+    method_pos = src.index("def _capture_and_flag")
     body_end = src.find("\n    def ", method_pos + 1)
     body = src[method_pos:body_end if body_end != -1 else len(src)]
     assert "self.bias_step_if_armed()" in body

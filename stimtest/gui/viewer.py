@@ -10,8 +10,11 @@ Standalone window for visually inspecting saved sessions. Layout:
     │                          │  Parameter / metric inspector      │
     └──────────────────────────┴────────────────────────────────────┘
 
-* **File → Open .npz**         : load any saved session
-* **File → Open folder…**      : index a folder of sessions in the tree
+* **File → Open…**             : load a PULSAR ``.npz`` session OR scope
+                                 data (PicoScope-style ``.csv`` / ``.tsv`` /
+                                 ``.xls`` / ``.xlsx``)
+* **File → Open folder…**      : index a folder of sessions + scope-data
+                                 files in the tree
 * **Export → This plot…**      : save current capture to .tif/.png/.pdf
 * **Export → All plots…**      : write a per-channel folder of .tif files
 * **Export → Summary plots**   : Q_inj vs I_stim and V_d vs Q_inj overlays
@@ -22,6 +25,7 @@ metadata page.
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,9 +47,12 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.figure import Figure
 
-from ..persistence import load_session_meta, load_session_npz
+from ..persistence import (load_session_meta, load_session_npz,
+                           load_picoscope, PICO_EXTENSIONS,
+                           is_pulsar_session_xlsx)
 from ..plotting import (
-    plot_capture, plot_overlay, plot_qinj_vs_amplitude, plot_vd_vs_qinj,
+    plot_capture, plot_charge_transfer, plot_overlay, plot_picoscope,
+    plot_qinj_vs_amplitude, plot_vd_vs_qinj,
     export_capture_plot, export_session_plots, export_session_summary_plots,
     SCREEN_DPI, WAVE_TYPES, _figsize_in,
 )
@@ -64,6 +71,15 @@ KIND_FOLDER = "folder"
 KIND_SESSION = "session"
 KIND_RUN = "run"
 KIND_CAPTURE = "capture"
+KIND_PICO = "pico"          # a PicoScope CSV (raw external-scope capture)
+
+# Line-style choices for the per-trace Styles… dialog.  MODULE-LEVEL (not a
+# ViewerWindow class attr) because the ViewerWindow→ViewerPanel transplant
+# loop copies only METHODS — a class DATA attr like this would be missing on
+# ViewerPanel and _open_style_dialog would AttributeError (silently, via Qt's
+# click handler → "Styles… does nothing").
+_LINESTYLE_CHOICES = (("Solid", "-"), ("Dashed", "--"),
+                      ("Dotted", ":"), ("Dash-dot", "-."))
 
 
 class ChannelTraceToggleBar(QtWidgets.QWidget):
@@ -101,35 +117,57 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
         self._axis_map: Dict[str, str] = dict(DEFAULT_TRACE_AXIS)
         self._available_traces: set = set(WAVE_TYPES)
 
-        # Channel row — populated dynamically by ``set_available_channels``.
-        self.channel_row = QtWidgets.QHBoxLayout()
-        self.channel_row.setContentsMargins(0, 0, 0, 0)
-        self.channel_row.setSpacing(4)
-        self.channel_row.addWidget(QtWidgets.QLabel("Channels:"))
+        # Channel COLUMN (operator: "[the CH01-CH16 row] needs to be a
+        # column").  A vertical, scrollable checkbox list — Gamry Echem
+        # Analyst-style left control panel.  Populated dynamically by
+        # ``set_available_entries`` / ``set_available_channels``.
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        header.addWidget(QtWidgets.QLabel("Channels:"))
         self._channel_all = QtWidgets.QPushButton("All")
         self._channel_none = QtWidgets.QPushButton("None")
-        self._channel_all.setFixedWidth(48)
-        self._channel_none.setFixedWidth(54)
+        self._channel_all.setFixedWidth(40)
+        self._channel_none.setFixedWidth(46)
         self._channel_all.clicked.connect(lambda: self._set_all_channels(True))
         self._channel_none.clicked.connect(lambda: self._set_all_channels(False))
-        self.channel_row.addWidget(self._channel_all)
-        self.channel_row.addWidget(self._channel_none)
-        self._channel_row_stretch_index = self.channel_row.count()
+        header.addWidget(self._channel_all)
+        header.addWidget(self._channel_none)
+        header.addStretch(1)
+        # The vertical layout that actually holds the per-channel checkboxes.
+        # Kept named ``channel_row`` for back-compat with the insertion code;
+        # it is now a QVBoxLayout (a column).  A trailing stretch keeps the
+        # checkboxes top-aligned; new boxes insert just before it.
+        self.channel_row = QtWidgets.QVBoxLayout()
+        self.channel_row.setContentsMargins(0, 0, 0, 0)
+        self.channel_row.setSpacing(2)
         self.channel_row.addStretch(1)
+        _chan_container = QtWidgets.QWidget()
+        _chan_container.setLayout(self.channel_row)
+        self._channel_scroll = QtWidgets.QScrollArea()
+        self._channel_scroll.setWidgetResizable(True)
+        self._channel_scroll.setWidget(_chan_container)
+        self._channel_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._channel_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
 
-        # Waveform-type row — per-trace axis dropdown (replaces the old
-        # checkbox grid). Order matches WAVE_TYPES so layout is stable.
-        self.wave_row = QtWidgets.QHBoxLayout()
+        # Waveform-type controls — per-trace axis dropdown.  Now stacked
+        # VERTICALLY (the bar lives in a left column, not a top row).
+        self.wave_row = QtWidgets.QVBoxLayout()
         self.wave_row.setContentsMargins(0, 0, 0, 0)
-        self.wave_row.setSpacing(8)
+        self.wave_row.setSpacing(4)
         self.wave_row.addWidget(QtWidgets.QLabel("Waveforms:"))
         for wname in WAVE_TYPES:
+            pair = QtWidgets.QHBoxLayout()
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(4)
             lbl = QtWidgets.QLabel(wname)
             lbl.setStyleSheet(
                 f"color: {TRACE_COLOURS.get(wname, '#000')}; "
                 f"font-weight: bold;")
+            lbl.setFixedWidth(46)
             self.axis_labels[wname] = lbl
-            self.wave_row.addWidget(lbl)
+            pair.addWidget(lbl)
             combo = QtWidgets.QComboBox()
             combo.addItem("N/A",          userData=AXIS_NA)
             combo.addItem("Left y-axis",  userData=AXIS_LEFT)
@@ -146,8 +184,9 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
             combo.currentIndexChanged.connect(
                 lambda _idx, t=wname: self._on_axis_changed(t))
             self.axis_combos[wname] = combo
-            self.wave_row.addWidget(combo)
-        self.wave_row.addSpacing(12)
+            pair.addWidget(combo, 1)
+            self.wave_row.addLayout(pair)
+        self.wave_row.addSpacing(8)
 
         # Inset controls — same QToolButton + QMenu pattern as
         # MultiChannelScope, so users see identical UX in both places.
@@ -174,13 +213,20 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
         self.inset_btn.setMenu(self._inset_menu)
         self.inset_btn.setEnabled(False)
         self.wave_row.addWidget(self.inset_btn)
-        self.wave_row.addStretch(1)
 
+        # Assemble the left control column: channels header → scrollable
+        # channel checkbox column (takes the slack) → separator → waveform
+        # controls.  A modest max width keeps it from eating the plot.
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 0)
-        outer.setSpacing(2)
-        outer.addLayout(self.channel_row)
+        outer.setSpacing(4)
+        outer.addLayout(header)
+        outer.addWidget(self._channel_scroll, 1)
+        _sep = QtWidgets.QFrame()
+        _sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        outer.addWidget(_sep)
         outer.addLayout(self.wave_row)
+        self.setMaximumWidth(220)
 
     # ----------------------------------------------------------- API
     def set_available_entries(self, entries) -> None:
@@ -395,6 +441,298 @@ class ChannelTraceToggleBar(QtWidgets.QWidget):
         self._emit()
 
 
+class _PicoRoleBar(QtWidgets.QWidget):
+    """Per-channel role selector for a PicoScope CSV capture.
+
+    Hidden unless a PicoScope node is selected.  Lets the operator map each
+    channel (A/B/C/D, which vary per file) to a role so POLARIS can compute
+    metrics; default = all unmapped → raw display.  The current-monitor
+    channel is a VOLTAGE, so a scale (mV/µA) converts it to current.
+    """
+    changed = QtCore.pyqtSignal()
+    _ROLE_LABELS = [("—", "none"), ("V_mon", "v_mon"),
+                    ("I_mon (current)", "i_mon"),
+                    ("E_act", "e_act"), ("E_ret", "e_ret")]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(8)
+        lay.addWidget(QtWidgets.QLabel("Channel roles:"))
+        self._combo_row = QtWidgets.QHBoxLayout()
+        self._combo_row.setSpacing(8)
+        lay.addLayout(self._combo_row)
+        self._combos: Dict[str, QtWidgets.QComboBox] = {}
+        self._saved_roles: Dict[str, str] = {}   # remembered across files
+        lay.addStretch(1)
+        lay.addWidget(QtWidgets.QLabel("Current scale:"))
+        self.scale_spin = QtWidgets.QDoubleSpinBox()
+        self.scale_spin.setRange(0.001, 1000.0)
+        self.scale_spin.setDecimals(3)
+        self.scale_spin.setValue(2.5)
+        self.scale_spin.setSuffix(" mV/µA")
+        self.scale_spin.setToolTip(
+            "Current-monitor scaling — converts the channel mapped to I_mon "
+            "(volts) into µA.  Affects charge / R_a only; the voltage metrics "
+            "(V_a / V_d / E_pol) are scale-independent.")
+        lay.addWidget(self.scale_spin)
+        self.metrics_chk = QtWidgets.QCheckBox("Compute metrics")
+        self.metrics_chk.setToolTip(
+            "Infer the pulse pattern from the current channel and show the "
+            "V_a / V_d / E_pol markers + metrics.  Needs V_mon assigned.")
+        lay.addWidget(self.metrics_chk)
+        self.scale_spin.valueChanged.connect(lambda *_: self.changed.emit())
+        self.metrics_chk.toggled.connect(lambda *_: self.changed.emit())
+
+    def set_channels(self, names) -> None:
+        """Rebuild the per-channel combos for ``names`` (restoring any
+        remembered role per channel name)."""
+        while self._combo_row.count():
+            it = self._combo_row.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        self._combos = {}
+        for nm in names:
+            box = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(2)
+            h.addWidget(QtWidgets.QLabel(nm.replace("Channel ", "Ch ") + ":"))
+            combo = QtWidgets.QComboBox()
+            for lbl, tok in self._ROLE_LABELS:
+                combo.addItem(lbl, tok)
+            idx = combo.findData(self._saved_roles.get(nm, "none"))
+            combo.setCurrentIndex(max(idx, 0))
+            combo.currentIndexChanged.connect(self._on_combo)
+            self._combos[nm] = combo
+            h.addWidget(combo)
+            self._combo_row.addWidget(box)
+
+    def _on_combo(self, *_):
+        for nm, c in self._combos.items():
+            self._saved_roles[nm] = c.currentData()
+        self.changed.emit()
+
+    def roles(self) -> Dict[str, str]:
+        return {nm: c.currentData() for nm, c in self._combos.items()}
+
+    def current_scale(self) -> float:
+        return float(self.scale_spin.value())
+
+    def metrics_enabled(self) -> bool:
+        return self.metrics_chk.isChecked()
+
+    def has_vmon(self) -> bool:
+        return any(c.currentData() == "v_mon" for c in self._combos.values())
+
+    def prefs(self) -> dict:
+        return {"roles": dict(self._saved_roles),
+                "scale": self.current_scale(),
+                "metrics": self.metrics_enabled()}
+
+    def restore(self, p: dict) -> None:
+        if not isinstance(p, dict):
+            return
+        self._saved_roles.update(p.get("roles") or {})
+        try:
+            self.scale_spin.setValue(float(p.get("scale", 2.5)))
+        except Exception:
+            pass
+        self.metrics_chk.setChecked(bool(p.get("metrics", False)))
+
+
+class _PlotViewBar(QtWidgets.QWidget):
+    """Plot-view controls: user-settable X / Y axis ranges + the
+    current-vs-current-density right-axis toggle.
+
+    Operator requests (POLARIS review): "allow the user to set the axis
+    range" (item 2) and a current-vs-current-density toggle defaulting to
+    current (extra).  All controls default to Auto / Current so a freshly
+    opened file renders exactly as before until the user overrides.
+    """
+
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        def _spin():
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(-1e9, 1e9)
+            s.setDecimals(3)
+            s.setMaximumWidth(90)
+            s.setKeyboardTracking(False)
+            s.valueChanged.connect(lambda *_: self._emit())
+            return s
+
+        # X range
+        self.x_auto = QtWidgets.QCheckBox("X auto")
+        self.x_auto.setChecked(True)
+        self.x_auto.toggled.connect(self._on_auto)
+        self.x_min = _spin(); self.x_max = _spin()
+        lay.addWidget(self.x_auto)
+        lay.addWidget(QtWidgets.QLabel("min")); lay.addWidget(self.x_min)
+        lay.addWidget(QtWidgets.QLabel("max")); lay.addWidget(self.x_max)
+
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        lay.addWidget(sep)
+
+        # Y range — LEFT (voltage) axis.
+        self.y_auto = QtWidgets.QCheckBox("Left Y auto")
+        self.y_auto.setChecked(True)
+        self.y_auto.toggled.connect(self._on_auto)
+        self.y_min = _spin(); self.y_max = _spin()
+        lay.addWidget(self.y_auto)
+        lay.addWidget(QtWidgets.QLabel("min")); lay.addWidget(self.y_min)
+        lay.addWidget(QtWidgets.QLabel("max")); lay.addWidget(self.y_max)
+
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        lay.addWidget(sep2)
+
+        # Y range — RIGHT (current / density) axis (operator: "Allow for
+        # changing the right axis range").
+        self.ry_auto = QtWidgets.QCheckBox("Right Y auto")
+        self.ry_auto.setChecked(True)
+        self.ry_auto.toggled.connect(self._on_auto)
+        self.ry_min = _spin(); self.ry_max = _spin()
+        lay.addWidget(self.ry_auto)
+        lay.addWidget(QtWidgets.QLabel("min")); lay.addWidget(self.ry_min)
+        lay.addWidget(QtWidgets.QLabel("max")); lay.addWidget(self.ry_max)
+
+        sep3 = QtWidgets.QFrame()
+        sep3.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        lay.addWidget(sep3)
+
+        # Current vs current density (right axis); default = current.
+        lay.addWidget(QtWidgets.QLabel("Right axis:"))
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.addItem("Current (µA)", "current")
+        self.unit_combo.addItem("Current density (A/cm²)", "density")
+        self.unit_combo.setCurrentIndex(0)            # default current
+        self.unit_combo.currentIndexChanged.connect(lambda *_: self._emit())
+        lay.addWidget(self.unit_combo)
+
+        sep4 = QtWidgets.QFrame()
+        sep4.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        lay.addWidget(sep4)
+
+        # Charge-transfer (dE/dt) decomposition view — Harris 2019
+        # chronopotentiometry (capacitive vs Faradaic).  Swaps the normal
+        # capture plot for the 3-panel dE/dt / reciprocal-derivative view.
+        self.ct_check = QtWidgets.QCheckBox("Charge transfer (dE/dt)")
+        self.ct_check.setToolTip(
+            "Show the capacitive/Faradaic decomposition (dE/dt, 1/(dE/dt)) "
+            "for the selected capture — Harris 2019 chronopotentiometry.")
+        self.ct_check.toggled.connect(lambda *_: self._emit())
+        lay.addWidget(self.ct_check)
+        # dV/dt + 1/(dV/dt) as NORMALIZED-overlay option traces on the capture
+        # plot (operator: "derivative and reciprocal of derivative as option
+        # traces … normalized overlay").  Independent of the 3-panel view above.
+        self.dvdt_check = QtWidgets.QCheckBox("dV/dt")
+        self.dvdt_check.setToolTip("Overlay the derivative dV/dt (normalized, "
+                                   "dashed) on the capture plot.")
+        self.dvdt_check.toggled.connect(lambda *_: self._emit())
+        lay.addWidget(self.dvdt_check)
+        self.recip_check = QtWidgets.QCheckBox("1/(dV/dt)")
+        self.recip_check.setToolTip("Overlay the reciprocal derivative "
+                                    "1/(dV/dt) (normalized, dotted).")
+        self.recip_check.toggled.connect(lambda *_: self._emit())
+        lay.addWidget(self.recip_check)
+
+        # The left-axis label ("Voltage [V]" vs "Potential vs <ref> [V]" vs
+        # "Voltage vs <return> [V]") is AUTOMATIC (operator: "It should be
+        # automatic") — decided per render from the axis content by the shared
+        # ``plotting._voltage_axis_label`` helper, matching the live PULSAR
+        # plot.  The old "Potential axis" / "Voltage vs return" checkboxes are
+        # gone.
+        lay.addStretch(1)
+        self._on_auto()
+
+    # -- state queries --------------------------------------------------
+    def _on_auto(self, *_):
+        self.x_min.setEnabled(not self.x_auto.isChecked())
+        self.x_max.setEnabled(not self.x_auto.isChecked())
+        self.y_min.setEnabled(not self.y_auto.isChecked())
+        self.y_max.setEnabled(not self.y_auto.isChecked())
+        self.ry_min.setEnabled(not self.ry_auto.isChecked())
+        self.ry_max.setEnabled(not self.ry_auto.isChecked())
+        self._emit()
+
+    def _emit(self, *_):
+        self.changed.emit()
+
+    def xrange(self):
+        if self.x_auto.isChecked():
+            return None
+        lo, hi = self.x_min.value(), self.x_max.value()
+        return (lo, hi) if hi > lo else None
+
+    def yrange(self):
+        if self.y_auto.isChecked():
+            return None
+        lo, hi = self.y_min.value(), self.y_max.value()
+        return (lo, hi) if hi > lo else None
+
+    def yrange_right(self):
+        if self.ry_auto.isChecked():
+            return None
+        lo, hi = self.ry_min.value(), self.ry_max.value()
+        return (lo, hi) if hi > lo else None
+
+    def density(self) -> bool:
+        return self.unit_combo.currentData() == "density"
+
+    def charge_transfer(self) -> bool:
+        return self.ct_check.isChecked()
+
+    def deriv_overlays(self) -> set:
+        s = set()
+        if self.dvdt_check.isChecked():
+            s.add("dvdt")
+        if self.recip_check.isChecked():
+            s.add("recip")
+        return s
+
+    def prefs(self) -> dict:
+        return {"x_auto": self.x_auto.isChecked(),
+                "x_min": self.x_min.value(), "x_max": self.x_max.value(),
+                "y_auto": self.y_auto.isChecked(),
+                "y_min": self.y_min.value(), "y_max": self.y_max.value(),
+                "ry_auto": self.ry_auto.isChecked(),
+                "ry_min": self.ry_min.value(), "ry_max": self.ry_max.value(),
+                "density": self.density(),
+                "charge_transfer": self.charge_transfer(),
+                "dvdt": self.dvdt_check.isChecked(),
+                "recip": self.recip_check.isChecked()}
+
+    def restore(self, p: dict) -> None:
+        if not isinstance(p, dict):
+            return
+        try:
+            self.x_auto.setChecked(bool(p.get("x_auto", True)))
+            self.x_min.setValue(float(p.get("x_min", 0.0)))
+            self.x_max.setValue(float(p.get("x_max", 0.0)))
+            self.y_auto.setChecked(bool(p.get("y_auto", True)))
+            self.y_min.setValue(float(p.get("y_min", 0.0)))
+            self.y_max.setValue(float(p.get("y_max", 0.0)))
+            self.ry_auto.setChecked(bool(p.get("ry_auto", True)))
+            self.ry_min.setValue(float(p.get("ry_min", 0.0)))
+            self.ry_max.setValue(float(p.get("ry_max", 0.0)))
+            self.unit_combo.setCurrentIndex(1 if p.get("density") else 0)
+            self.ct_check.setChecked(bool(p.get("charge_transfer", False)))
+            self.dvdt_check.setChecked(bool(p.get("dvdt", False)))
+            self.recip_check.setChecked(bool(p.get("recip", False)))
+        except Exception:
+            pass
+
+
 class ViewerPanel(QtWidgets.QWidget):
     """Embeddable viewer body.
 
@@ -418,6 +756,7 @@ class ViewerPanel(QtWidgets.QWidget):
                  parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self._sessions: Dict[str, Session] = {}   # path-string -> Session
+        self._pico: Dict[str, object] = {}        # path-string -> PicoScopeRecording
         # Cached overlay context for the trace-toggle re-render.
         # The original ``_overlay_captures_by_channel`` /
         # ``_overlay_title`` were declared as CLASS attributes on
@@ -446,15 +785,26 @@ class ViewerPanel(QtWidgets.QWidget):
         left_layout.setContentsMargins(4, 4, 4, 4)
 
         btn_row = QtWidgets.QHBoxLayout()
-        self.open_file_btn = QtWidgets.QPushButton("Open .npz…")
+        self.open_file_btn = QtWidgets.QPushButton("Open…")
         self.open_folder_btn = QtWidgets.QPushButton("Open folder…")
+        # Remove the selected file/folder from the view (operator: "Allow for
+        # add or remove files from view").  Open ADDS without clearing, so the
+        # tree accumulates files (Gamry Echem Analyst-style); Remove (button,
+        # right-click, or Delete key) drops one back out.
+        self.remove_btn = QtWidgets.QPushButton("Remove")
+        self.remove_btn.setToolTip(
+            "Remove the selected file or folder from the view (Delete key).")
         btn_row.addWidget(self.open_file_btn)
         btn_row.addWidget(self.open_folder_btn)
+        btn_row.addWidget(self.remove_btn)
         left_layout.addLayout(btn_row)
 
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderLabels(["Session / Run / Capture", "Info"])
         self.tree.setColumnWidth(0, 320)
+        self.tree.setContextMenuPolicy(
+            QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         left_layout.addWidget(self.tree)
         splitter.addWidget(left)
 
@@ -473,6 +823,9 @@ class ViewerPanel(QtWidgets.QWidget):
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.trace_toggles = ChannelTraceToggleBar(self)
         self.trace_toggles.selectionChanged.connect(self._refresh_overlay)
+        # Hidden until a session/run overlay is selected (set per node kind
+        # in _on_tree_item).
+        self.trace_toggles.setVisible(False)
         # Viewer-side gridlines toggle. Independent from the
         # main window's View → Gridlines action — the Viewer
         # uses matplotlib (different rendering pipeline from the
@@ -499,11 +852,45 @@ class ViewerPanel(QtWidgets.QWidget):
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
         top_row.addWidget(self.toolbar, stretch=1)
+        # Per-trace line-style + color picker (operator: "Allow the choice
+        # of choosing the plot line style and color after opening").  Opens
+        # a dialog listing every trace currently on the plot.  Overrides are
+        # stored by trace label and re-applied on every render in
+        # _finish_render, so they survive capture/overlay re-renders.
+        self._trace_styles: Dict[str, dict] = {}
+        self.style_btn = QtWidgets.QPushButton("Styles…")
+        self.style_btn.setToolTip(
+            "Choose the line style and color of each trace on the plot.")
+        self.style_btn.clicked.connect(self._open_style_dialog)
+        top_row.addWidget(self.style_btn, stretch=0)
         top_row.addWidget(self.grid_toggle, stretch=0)
         top_row_w = QtWidgets.QWidget(); top_row_w.setLayout(top_row)
         pl.addWidget(top_row_w)
-        pl.addWidget(self.trace_toggles)
-        pl.addWidget(self.canvas)
+        # Axis-range + current/density controls (operator: "allow the user
+        # to set the axis range" + current-vs-density toggle, default
+        # current).  Re-renders the current view on any change.
+        self.view_bar = _PlotViewBar(self)
+        self.view_bar.changed.connect(self._on_view_changed)
+        pl.addWidget(self.view_bar)
+        # PicoScope per-channel role selector — hidden unless a PicoScope
+        # CSV node is selected (raw display by default; assign roles +
+        # "Compute metrics" to overlay V_a / V_d / E_pol).
+        self.pico_role_bar = _PicoRoleBar(self)
+        self.pico_role_bar.setVisible(False)
+        self.pico_role_bar.changed.connect(self._on_pico_roles_changed)
+        pl.addWidget(self.pico_role_bar)
+        # Plot region: channel COLUMN on the LEFT, canvas on the right
+        # (Gamry Echem Analyst-style control panel beside the plot).  The
+        # trace toggles are shown ONLY for the multi-channel overlay
+        # (session / run) view — hidden for single captures and PicoScope
+        # data, where they don't apply (operator: "the channel toggle
+        # messed up my viewing of the CSV").
+        mid = QtWidgets.QHBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(4)
+        mid.addWidget(self.trace_toggles, 0)
+        mid.addWidget(self.canvas, 1)
+        pl.addLayout(mid, 1)
 
         # Channel-map view — second tab on the right side. Renders the
         # device geometry (one disk per electrode in the array's
@@ -538,8 +925,43 @@ class ViewerPanel(QtWidgets.QWidget):
         self.param_table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
 
-        ipl.addWidget(self.metric_table)
+        # File-info table (operator: "Have another table for file info:
+        # notebook, subject, total runs, total captures, created").  Separate
+        # from the experiment Parameters table.
+        self.file_table = QtWidgets.QTableWidget(0, 2)
+        self.file_table.setHorizontalHeaderLabels(["File", "Value"])
+        self.file_table.horizontalHeader().setStretchLastSection(True)
+        self.file_table.verticalHeader().setVisible(False)
+        self.file_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        # Order: File → Parameter → Metric (operator request).
+        ipl.addWidget(self.file_table)
         ipl.addWidget(self.param_table)
+        # Metric column: an edit bar (response-class override + hand-edit +
+        # save) above the metric table (operator: "save changes to the metrics
+        # when adjusting the values … set the channel/combo as Good/Broken/
+        # Open").  The bar is hidden until an experiment capture/run is
+        # selected (not for PicoScope / folder / session-metadata nodes).
+        self._metric_edit_enabled = False
+        self._dirty_paths: set = set()   # .npz paths with unsaved metric edits
+        # Snapshot of each capture's metrics taken the FIRST time it's adjusted
+        # (class override or hand-edit), keyed by id(cap), so the metric table
+        # can show the ORIGINAL value alongside the new one (operator: "when
+        # adjusting values, keep the original values alongside the new one").
+        self._original_metrics: dict = {}
+        _metric_col = QtWidgets.QWidget()
+        _mcl = QtWidgets.QVBoxLayout(_metric_col)
+        _mcl.setContentsMargins(0, 0, 0, 0)
+        _mcl.setSpacing(2)
+        self.metric_edit_bar = _MetricEditBar(self)
+        self.metric_edit_bar.classChosen.connect(self._on_response_class_chosen)
+        self.metric_edit_bar.editToggled.connect(self._on_metric_edit_toggled)
+        self.metric_edit_bar.saveRequested.connect(self._on_save_metric_changes)
+        self.metric_edit_bar.setVisible(False)
+        _mcl.addWidget(self.metric_edit_bar)
+        _mcl.addWidget(self.metric_table)
+        ipl.addWidget(_metric_col)
         right_split.addWidget(info_panel)
 
         right_split.setStretchFactor(0, 4)
@@ -550,7 +972,13 @@ class ViewerPanel(QtWidgets.QWidget):
         # ---- Wiring --------------------------------------------------
         self.open_file_btn.clicked.connect(self.on_open_file)
         self.open_folder_btn.clicked.connect(self.on_open_folder)
+        self.remove_btn.clicked.connect(self._remove_selected_item)
         self.tree.currentItemChanged.connect(self._on_tree_item)
+        # Delete key removes the selected file/folder from the view.
+        _del = QtGui.QShortcut(QtGui.QKeySequence(
+            QtCore.Qt.Key.Key_Delete), self.tree)
+        _del.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        _del.activated.connect(self._remove_selected_item)
 
         # Held so :meth:`current_prefs` can serialise the splitter
         # sizes the user dragged. Two splitters: the outer (tree | plot)
@@ -575,6 +1003,26 @@ class ViewerPanel(QtWidgets.QWidget):
                 self.load_folder(p)
             elif p.exists():
                 self.load_session_file(p)
+
+    # -----------------------------------------------------------------
+    def _on_view_changed(self) -> None:
+        """Axis-range or current/density control changed — re-render the
+        current view.  Density is read by the ``_show_*`` methods at render
+        time; axis-range overrides are applied in :meth:`_finish_render`.
+        Mirrors :meth:`_on_grid_toggled`'s re-render dispatch."""
+        if self._overlay_captures_by_channel:
+            try:
+                self._refresh_overlay()
+                return
+            except Exception:
+                pass
+        selected = (self.tree.currentItem()
+                    if hasattr(self, "tree") else None)
+        if selected is not None:
+            try:
+                self._on_tree_item(selected, None)
+            except Exception:
+                pass
 
     # -----------------------------------------------------------------
     def _on_grid_toggled(self, checked: bool) -> None:
@@ -746,7 +1194,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _build_menus(self) -> None:
         p = self._panel
         m_file = self.menuBar().addMenu("&File")
-        a_open = m_file.addAction("Open &.npz…")
+        a_open = m_file.addAction("&Open…")
         a_open.triggered.connect(p.on_open_file)
         a_folder = m_file.addAction("Open &folder…")
         a_folder.triggered.connect(p.on_open_folder)
@@ -774,7 +1222,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def on_open_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open session", "", "Session files (*.npz);;All files (*)")
+            self, "Open", "",
+            "Sessions & scope data (*.npz *.csv *.tsv *.xls *.xlsx *.xlsm);;"
+            "PULSAR session (*.npz);;"
+            "Scope data — CSV / TSV / Excel "
+            "(*.csv *.tsv *.xls *.xlsx *.xlsm);;"
+            "All files (*)")
         if path:
             self.load_session_file(Path(path))
 
@@ -782,10 +1235,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def on_open_folder(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Open folder")
         if path:
-            self.load_folder(Path(path))
+            # Additive — accumulate folders/files in the view (Gamry-style).
+            self.load_folder(Path(path), clear=False)
 
-    def load_folder(self, folder: Path) -> None:
-        """Index every ``.npz`` file in ``folder`` (one tree branch each)."""
+    def load_folder(self, folder: Path, *, clear: bool = True) -> None:
+        """Index every ``.npz`` file in ``folder`` (one tree branch each).
+
+        ``clear=True`` (default) replaces the view — used by the embedded
+        Results tab, which re-points at the save directory.  ``clear=False``
+        ADDS the folder as another branch so the standalone POLARIS can
+        accumulate multiple folders / files (operator: "Allow for add or
+        remove files from view").
+        """
         # Stash the resolved folder path for ``current_prefs`` so a
         # re-launch can restore the same context. Stored even when
         # the folder turns out to be empty — opening it once still
@@ -794,37 +1255,178 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._last_open_path = str(Path(folder).resolve())
         except Exception:
             pass
-        self.tree.clear()
-        self._sessions.clear()
+        if clear:
+            self.tree.clear()
+            self._sessions.clear()
+            self._pico.clear()
+        else:
+            # Additive open: if this folder is already a branch, just
+            # re-select it instead of duplicating.
+            existing = self._find_top_level_item_for_path(str(folder))
+            if existing is not None:
+                self.tree.setCurrentItem(existing)
+                self.status_message.emit(f"{folder.name} already open")
+                return
         npzs = sorted(folder.glob("*.npz"))
-        if not npzs:
+        # Scope-data files in any supported format (CSV / TSV / Excel) —
+        # but ONLY genuine external captures, not PULSAR's own session
+        # EXPORTS (operator: "only show what is opened/imported").  PULSAR
+        # writes `<stem>.npz` + `<stem>.xlsx` (+ .tif/.txt) per session; the
+        # .xlsx is a DERIVED export, not a scope capture, so skip any scope
+        # file whose stem matches a sibling .npz, plus any .xlsx detected as
+        # a PULSAR export by its sheet structure.
+        _npz_stems = {p.stem for p in npzs}
+        picos = sorted(
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in PICO_EXTENSIONS
+            and p.stem not in _npz_stems
+            and not is_pulsar_session_xlsx(p))
+        if not npzs and not picos:
             # Empty folder: report via the status bar instead of a
             # modal popup. ``ResultsTab.refresh`` calls ``load_folder``
             # whenever the save directory is repointed (or just
             # selected, on a fresh install with no saved sessions),
             # and a blocking dialog there made the GUI feel broken.
-            self.status_message.emit(f"No .npz sessions in {folder}")
+            self.status_message.emit(f"No .npz / scope-data files in {folder}")
             return
         root = QtWidgets.QTreeWidgetItem(self.tree, [folder.name, ""])
         root.setData(0, ROLE_KIND, KIND_FOLDER)
         root.setData(0, ROLE_PATH, str(folder))
         for p in npzs:
             self._add_session_to_tree(p, parent=root)
+        for p in picos:              # scope captures (CSV / TSV / Excel)
+            self._add_pico_to_tree(p, parent=root)
         root.setExpanded(True)
-        self.status_message.emit(f"Indexed {len(npzs)} session(s) in {folder}")
+        n = len(npzs) + len(picos)
+        self.status_message.emit(f"Indexed {n} file(s) in {folder}")
 
     def load_session_file(self, path: Path) -> None:
-        if path.suffix.lower() != ".npz":
+        suffix = path.suffix.lower()
+        if suffix != ".npz" and suffix not in PICO_EXTENSIONS:
             QtWidgets.QMessageBox.warning(
-                self, "Unsupported", "Viewer expects a .npz session file.")
+                self, "Unsupported",
+                "POLARIS opens PULSAR .npz sessions and scope data "
+                "(.csv / .tsv / .xls / .xlsx).")
+            return
+        # A PULSAR session .xlsx is an EXPORT of a .npz, not a scope
+        # capture — opening it on the PicoScope path would misparse the
+        # metadata sheets.  Redirect to the sibling .npz if it's there.
+        if suffix in (".xlsx", ".xlsm") and is_pulsar_session_xlsx(path):
+            sib = path.with_suffix(".npz")
+            if sib.exists():
+                self.status_message.emit(
+                    f"{path.name} is a PULSAR export — opening {sib.name}")
+                self.load_session_file(sib)
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, "PULSAR export",
+                    f"{path.name} is a PULSAR session export (.xlsx), not a "
+                    f"scope capture.\n\nOpen the matching .npz session "
+                    f"instead.")
             return
         try:
             self._last_open_path = str(Path(path).resolve())
         except Exception:
             pass
-        self._add_session_to_tree(path, parent=self.tree.invisibleRootItem(),
-                                  expand=True, eager=True)
+        # Dedupe — opening an already-loaded file just re-selects it
+        # (Open ADDS, so without this a repeat open would duplicate the
+        # branch).
+        existing = self._find_top_level_item_for_path(str(path))
+        if existing is not None:
+            self.tree.setCurrentItem(existing)
+            self.status_message.emit(f"{path.name} already open")
+            return
+        if suffix in PICO_EXTENSIONS:
+            self._add_pico_to_tree(path, parent=self.tree.invisibleRootItem(),
+                                   select=True)
+        else:
+            self._add_session_to_tree(path,
+                                      parent=self.tree.invisibleRootItem(),
+                                      expand=True, eager=True)
         self.status_message.emit(f"Loaded {path.name}")
+
+    # -----------------------------------------------------------------
+    # Add / remove files from the view (operator: "Allow for add or
+    # remove files from view").
+    # -----------------------------------------------------------------
+    def _find_top_level_item_for_path(self, path: str):
+        """Return the top-level tree item whose ROLE_PATH matches ``path``
+        (a session, PicoScope, or folder root), or None."""
+        try:
+            want = str(Path(path).resolve())
+        except Exception:
+            want = str(path)
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            it = root.child(i)
+            p = it.data(0, ROLE_PATH)
+            if not p:
+                continue
+            try:
+                same = str(Path(p).resolve()) == want
+            except Exception:
+                same = str(p) == str(path)
+            if same:
+                return it
+        return None
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        menu = QtWidgets.QMenu(self.tree)
+        act_remove = menu.addAction("Remove from view")
+        act_remove.setEnabled(item is not None)
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen is act_remove and item is not None:
+            self._remove_tree_item(item)
+
+    def _remove_selected_item(self) -> None:
+        self._remove_tree_item(self.tree.currentItem())
+
+    def _remove_tree_item(self, item) -> None:
+        """Remove ``item``'s owning top-level file/folder branch from the
+        view and drop its cached data.  Removing a Run/Capture removes the
+        whole owning session (the unit the user opened)."""
+        if item is None:
+            return
+        # Walk up to the top-level branch (folder root, session, or pico).
+        top = item
+        while top.parent() is not None:
+            top = top.parent()
+        # Drop cached payloads for the branch + any descendants.
+        def _drop(node):
+            p = node.data(0, ROLE_PATH)
+            if p:
+                self._sessions.pop(p, None)
+                self._pico.pop(p, None)
+            for i in range(node.childCount()):
+                _drop(node.child(i))
+        _drop(top)
+        label = top.text(0)
+        idx = self.tree.indexOfTopLevelItem(top)
+        if idx >= 0:
+            self.tree.takeTopLevelItem(idx)
+        # Clear the plot/tables if nothing is selected anymore.
+        if self.tree.currentItem() is None:
+            self.figure.clear()
+            self._finish_render()
+            self._set_metric_table([])
+            self._set_param_table([])
+            self._set_file_table([])
+            if hasattr(self, "trace_toggles"):
+                self.trace_toggles.setVisible(False)
+            if hasattr(self, "pico_role_bar"):
+                self.pico_role_bar.setVisible(False)
+        self.status_message.emit(f"Removed {label} from view")
+
+    def _add_pico_to_tree(self, path: Path, *, parent, select: bool = False):
+        """Add a leaf tree node for a scope-data capture (CSV/TSV/Excel)."""
+        item = QtWidgets.QTreeWidgetItem(
+            parent, [path.name, f"Scope data ({path.suffix.lstrip('.').upper()})"])
+        item.setData(0, ROLE_KIND, KIND_PICO)
+        item.setData(0, ROLE_PATH, str(path))
+        if select:
+            self.tree.setCurrentItem(item)
+        return item
 
     def _add_session_to_tree(self, path: Path, *, parent,
                              expand: bool = False, eager: bool = False) -> None:
@@ -869,7 +1471,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             for cap_idx, cap in enumerate(run.captures):
                 amp = cap.pattern.excitation_phase.amplitude_ua
                 qinj = cap.metrics.charge_injection_mc_per_cm2
-                cap_label = f"#{cap.index:03d}  {amp:+.1f} µA"
+                # 1-BASED display number (operator: "stop counting start at
+                # 0") — cap.index stays the 0-based array index everywhere it
+                # indexes data; only the human label adds 1.
+                cap_label = f"#{cap.index + 1:03d}  {amp:+.1f} µA"
                 summary = f"Q_inj = {qinj:.3f} mC/cm²" if np.isfinite(qinj) else ""
                 if cap.status.reached_potential_limit:
                     summary += "  [LIMIT]"
@@ -889,6 +1494,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if current is None:
             return
         kind = current.data(0, ROLE_KIND)
+        # The PicoScope role selector is only relevant for a PicoScope node.
+        if hasattr(self, "pico_role_bar"):
+            self.pico_role_bar.setVisible(kind == KIND_PICO)
+        # The channel/waveform toggle column applies ONLY to the
+        # multi-channel OVERLAY (session / run).  Hide it for single
+        # captures and PicoScope data (operator: "the channel toggle messed
+        # up my viewing of the CSV … only have such toggles for multiple
+        # sheets in an Excel file").
+        if hasattr(self, "trace_toggles"):
+            self.trace_toggles.setVisible(kind in (KIND_SESSION, KIND_RUN))
         if kind == KIND_SESSION:
             # Lazy-load the session into the tree if not done
             if current.childCount() == 1 and current.child(0).text(0) == "…loading":
@@ -898,15 +1513,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._show_run_overlay(current)
         elif kind == KIND_CAPTURE:
             self._show_capture(current)
+        elif kind == KIND_PICO:
+            self._show_picoscope(current)
         elif kind == KIND_FOLDER:
             self.figure.clear()
-            self.canvas.draw_idle()
+            self._finish_render()
             self._set_metric_table([])
-            self._set_param_table([("Folder", current.data(0, ROLE_PATH))])
+            self._set_param_table([])
+            self._set_file_table([("Folder", current.data(0, ROLE_PATH))])
         # Always refresh the channel-map view so it reflects the
         # session that owns the current selection. ``_current_session``
         # walks the tree item up to its session root.
         self.map_panel.set_session(self._current_session())
+        # Show/hide the metric-edit bar (response-class override + save) for
+        # this node + sync its Response combo to the current class.
+        self._update_metric_edit_bar()
 
     # -----------------------------------------------------------------
     # Show a single capture
@@ -920,11 +1541,99 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         run = session.runs[run_idx]
         cap = run.captures[cap_idx]
-        plot_capture(cap, run, session, fig=self.figure,
-                     show_grid=self._show_grid)
-        self.canvas.draw_idle()
-        self._set_metric_table(_capture_metric_rows(cap, run))
+        if self.view_bar.charge_transfer():
+            # Harris 2019 capacitive/Faradaic decomposition (dE/dt) view — the
+            # electrode surface area (for C_dl) comes from the run.
+            plot_charge_transfer(
+                cap, area_um2=getattr(run, "surface_area_um2", None),
+                fig=self.figure, show_grid=self._show_grid)
+        else:
+            plot_capture(cap, run, session, fig=self.figure,
+                         show_grid=self._show_grid,
+                         density=self.view_bar.density(),
+                         deriv_overlays=self.view_bar.deriv_overlays(),
+                         potential_axis=True, return_axis=True)
+        self._finish_render()
+        self._set_metric_table(_capture_metric_rows(cap, run),
+                               originals=self._metric_originals(cap, run))
         self._set_param_table(_session_param_rows(session, run, cap))
+        self._set_file_table(_session_file_rows(session))
+
+    def _show_picoscope(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        """Render a PicoScope CSV's raw channels (role-free)."""
+        path = item.data(0, ROLE_PATH)
+        rec = self._pico.get(path)
+        if rec is None:
+            try:
+                rec = load_picoscope(Path(path))
+            except Exception as e:
+                self.figure.clear()
+                ax = self.figure.add_subplot(111)
+                ax.text(0.5, 0.5, f"Could not load\n{Path(path).name}\n\n{e}",
+                        ha="center", va="center", wrap=True)
+                ax.axis("off")
+                self._finish_render()
+                self._set_metric_table([])
+                self._set_param_table([])
+                self._set_file_table([("File", Path(path).name),
+                                      ("Error", str(e))])
+                return
+            self._pico[path] = rec
+        # Populate the role-selector combos for THIS file's channels (only
+        # rebuild when the channel set changes, to keep the user's picks).
+        names = list(rec.channels)
+        if getattr(self, "_pico_role_channels", None) != names:
+            self.pico_role_bar.set_channels(names)
+            self._pico_role_channels = names
+        self.pico_role_bar.setVisible(True)
+        # FILE-info table: the CSV path + per-channel source units + range.
+        frows = [("File", Path(path).name),
+                 ("Source", "PicoScope CSV"),
+                 ("Samples", str(rec.time_us.size)),
+                 ("Time span [µs]",
+                  f"{float(rec.time_us.min()):.1f} … {float(rec.time_us.max()):.1f}"
+                  if rec.time_us.size else "—")]
+        for nm, arr in rec.channels.items():
+            u = rec.source_units.get(nm, "V")
+            rng = (f"[{float(np.nanmin(arr)):+.3f}, {float(np.nanmax(arr)):+.3f}] V"
+                   if arr.size else "—")
+            frows.append((f"{nm} ({u})", rng))
+        self._set_file_table(frows)
+        # METRICS path: roles assigned + "Compute metrics" on + a V_mon
+        # channel → infer the pattern, compute metrics, render the full
+        # capture plot.  Otherwise show the raw channels.
+        if (self.pico_role_bar.metrics_enabled()
+                and self.pico_role_bar.has_vmon()):
+            try:
+                from ..persistence import picoscope_to_session
+                sess = picoscope_to_session(
+                    rec, self.pico_role_bar.roles(),
+                    current_scale_mv_per_ua=self.pico_role_bar.current_scale())
+                run = sess.runs[0]
+                cap = run.captures[0]
+                plot_capture(cap, run, sess, fig=self.figure,
+                             show_grid=self._show_grid,
+                             density=self.view_bar.density(),
+                             potential_axis=True, return_axis=True)
+                self._finish_render()
+                self._set_metric_table(_capture_metric_rows(cap, run))
+                self._set_param_table(_session_param_rows(sess, run, cap))
+                return
+            except Exception as e:
+                # Fall back to the raw view on any inference/metric error.
+                self.status_message.emit(f"PicoScope metrics failed: {e}")
+        plot_picoscope(rec, fig=self.figure, show_grid=self._show_grid)
+        self._finish_render()
+        self._set_metric_table([
+            ("Assign channel roles + tick", "Compute metrics, above")])
+        self._set_param_table([])
+
+    def _on_pico_roles_changed(self) -> None:
+        """Re-render the current PicoScope node when the role map / scale /
+        metrics toggle changes."""
+        item = self.tree.currentItem()
+        if item is not None and item.data(0, ROLE_KIND) == KIND_PICO:
+            self._show_picoscope(item)
 
     def _show_run_overlay(self, item: QtWidgets.QTreeWidgetItem) -> None:
         """Show all captures of a single run as a waveform overlay.
@@ -944,15 +1653,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # Audit #25 — guard against NaN ``max_q_inj`` (all-aborted runs)
         # and non-finite ``surface_area_um2`` (legacy archives missing
         # the field).
-        self._set_metric_table([
-            ("Channel", run.configuration.display_name()),
-            ("Surface area", _fmt_or_dash(
-                run.surface_area_um2, ".0f", "µm²")),
+        # Metric table for a channel/combo: the run summary (incl.
+        # ACCUMULATED charge — operator: "for each channel/combo tab,
+        # include accumulated charge") followed by the WAVEFORM metrics of
+        # the representative (max-amplitude good) capture — NOT just the file
+        # setup + max Q_inj (operator: "Metric table is all wrong … no
+        # waveform metrics besides maximum Q_inj").
+        rep = self._representative_capture(run)
+        rows = [
+            ("Channel/combo", run.configuration.display_name()),
             ("Captures", str(len(run.captures))),
-            ("Max Q_inj", _fmt_or_dash(
-                run.max_q_inj, ".3f", "mC/cm²")),
-        ])
-        self._set_param_table(_session_param_rows(session, run, None))
+            ("Max Q_inj [mC/cm²]", _fmt_or_dash(run.max_q_inj, ".3f")),
+            ("Cumulative N_pulse", _fmt_pulses_or_dash(
+                _run_cumulative_n_pulses(run))),
+            ("Cumulative Q",
+             _fmt_charge_nc(_run_accumulated_charge_nc(run))),
+            ("Time to complete", _fmt_duration_s(run.duration_s)),
+        ]
+        if rep is not None:
+            rows.append(("———  representative capture  ———", ""))
+            rows.extend(_capture_metric_rows(rep, run))
+        self._set_metric_table(
+            rows, originals=(self._metric_originals(rep, run)
+                             if rep is not None else None))
+        self._set_param_table(_session_param_rows(session, run, rep))
+        self._set_file_table(_session_file_rows(session))
 
     # --------- multi-channel waveform overlay ----------------------
     # Cached most-recent overlay context so the toggle bar can re-render
@@ -985,6 +1710,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """
         captures: Dict[str, "Capture"] = {}
         labels: Dict[str, str] = {}
+        areas: Dict[str, float] = {}
         for run in session.runs:
             cap = self._representative_capture(run)
             if cap is None:
@@ -997,7 +1723,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 key = f"{key} #{session.runs.index(run)}"
             captures[key] = cap
             labels[key] = key
+            areas[key] = getattr(run, "surface_area_um2", float("nan"))
         self._overlay_captures_by_channel = captures
+        self._overlay_areas_by_key = areas
+        self._overlay_reference_label = getattr(
+            getattr(session, "test", None),
+            "reference_electrode_label", "Ag|AgCl")
+        self._overlay_return_label = getattr(
+            getattr(session, "test", None),
+            "counter_electrode_label", "Pt")
+        # No electrodes (Plexon Test Board) → keep the axis plain "Voltage [V]".
+        self._overlay_reference_aware = bool(
+            ((getattr(getattr(session, "test", None), "extras", None) or {})
+             .get("setup_snapshot") or {}).get("has_electrodes", True))
         self._overlay_title = (f"{session.subject or session.notebook} — "
                                f"channel waveform overlay")
         self.trace_toggles.set_available_entries(labels)
@@ -1016,17 +1754,34 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """
         captures: Dict[str, "Capture"] = {}
         labels: Dict[str, str] = {}
+        areas: Dict[str, float] = {}
+        _area = getattr(run, "surface_area_um2", float("nan"))
         for cap in run.captures:
             try:
                 amp = cap.pattern.excitation_phase.amplitude_ua
-                amp_label = f"{amp:+.0f} µA"
+                amp_label = f"{amp:+.1f} µA"   # always one decimal (operator)
             except Exception:
                 amp_label = ""
-            key = f"#{cap.index:03d}"
+            # 1-BASED entry key/label (operator: "stop counting start at 0")
+            # — the key is also the legend prefix in plot_overlay, so this
+            # makes the channel list, checkbox labels, AND legend 1-based.
+            key = f"#{cap.index + 1:03d}"
             labels[key] = (f"{key} {amp_label}".strip()
                            if amp_label else key)
             captures[key] = cap
+            areas[key] = _area
         self._overlay_captures_by_channel = captures
+        self._overlay_areas_by_key = areas
+        self._overlay_reference_label = getattr(
+            getattr(session, "test", None),
+            "reference_electrode_label", "Ag|AgCl")
+        self._overlay_return_label = getattr(
+            getattr(session, "test", None),
+            "counter_electrode_label", "Pt")
+        # No electrodes (Plexon Test Board) → keep the axis plain "Voltage [V]".
+        self._overlay_reference_aware = bool(
+            ((getattr(getattr(session, "test", None), "extras", None) or {})
+             .get("setup_snapshot") or {}).get("has_electrodes", True))
         self._overlay_title = (
             f"{run.configuration.display_name()} — ramp overlay "
             f"({len(captures)} captures)")
@@ -1054,6 +1809,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 inset_traces=set(self.trace_toggles.inset_traces()),
                 show_grid=self._show_grid,
                 title=self._overlay_title or "Channel waveform overlay",
+                density=self.view_bar.density(),
+                areas_by_key=getattr(self, "_overlay_areas_by_key", None),
+                potential_axis=getattr(self, "_overlay_reference_aware", True),
+                reference_label=getattr(
+                    self, "_overlay_reference_label", "Ag|AgCl"),
+                return_axis=getattr(self, "_overlay_reference_aware", True),
+                return_label=getattr(
+                    self, "_overlay_return_label", "Pt"),
             )
         except Exception as e:
             # Surface a clean message in the figure rather than crashing
@@ -1064,7 +1827,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     ha="center", va="center", color="#a00",
                     transform=ax.transAxes)
             ax.axis("off")
-        self.canvas.draw_idle()
+        self._finish_render()
 
     def _show_session_metadata(self, item: QtWidgets.QTreeWidgetItem) -> None:
         path = item.data(0, ROLE_PATH)
@@ -1075,14 +1838,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
                 return
+            # Metadata-only (not yet loaded): no waveform metrics; file info
+            # in the File table, experiment in Parameters.
             self._set_metric_table([
+                ("Select a channel/combo or capture", "for waveform metrics")])
+            self._set_param_table([
+                ("Experiment", str(meta.get("test", {}).get("experiment", "")))])
+            self._set_file_table([
                 ("Notebook", str(meta.get("notebook", ""))),
                 ("Subject", str(meta.get("subject", ""))),
+                ("Total runs", str(len(meta.get("runs", [])))),
                 ("Created", str(meta.get("created_at", ""))),
-                ("Runs", str(len(meta.get("runs", [])))),
-            ])
-            self._set_param_table([
-                ("Experiment", str(meta.get("test", {}).get("experiment", ""))),
                 ("Path", str(path)),
             ])
             return
@@ -1093,24 +1859,258 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # Results-tab variant).
         if session.runs:
             self._set_overlay_for_session(session)
+        # Session level → no single-capture waveform metrics; file metadata
+        # lives in the File table now (operator: separate file-info table).
         self._set_metric_table([
-            ("Notebook", session.notebook),
-            ("Subject", session.subject),
-            ("Total runs", str(len(session.runs))),
-            ("Total captures", str(session.total_captures)),
-            ("Created", session.created_at.isoformat()),
-        ])
+            ("Select a channel/combo or capture", "for waveform metrics")])
         self._set_param_table(_session_param_rows(session, None, None))
+        self._set_file_table(_session_file_rows(session))
 
     # -----------------------------------------------------------------
     # Misc helpers (info-panel rendering)
     # -----------------------------------------------------------------
-    def _set_metric_table(self, rows: List[tuple]) -> None:
+    def _finish_render(self) -> None:
+        """Make the current figure's legend entries CLICKABLE to toggle their
+        traces (operator: "Let the legend have checkbox per entry to toggle
+        for viewing on the plot"), then redraw.  Used in place of a bare
+        ``canvas.draw_idle()`` after every plot.  Clicking a legend entry
+        hides/shows the matching trace(s) and dims the entry."""
+        fig = self.figure
+        # Apply user axis-range overrides (operator: "allow the user to set
+        # the axis range").  X is shared across all axes; the Y override
+        # applies to the primary (left / voltage) axis.  None = Auto = leave
+        # the plotter's MATLAB-faithful range untouched.
+        vb = getattr(self, "view_bar", None)
+        if vb is not None and fig.axes:
+            xr = vb.xrange()
+            if xr is not None:
+                for ax in fig.axes:
+                    ax.set_xlim(*xr)
+            yr = vb.yrange()
+            if yr is not None:
+                fig.axes[0].set_ylim(*yr)
+            # Right (current / density) axis range — the twin axes, found
+            # by its right-side y-label position (robust to inset axes).
+            yr_r = vb.yrange_right()
+            if yr_r is not None:
+                for ax in fig.axes[1:]:
+                    try:
+                        if ax.yaxis.get_label_position() == "right":
+                            ax.set_ylim(*yr_r)
+                            break
+                    except Exception:
+                        pass
+        # Apply per-trace style overrides (operator: line style + color
+        # picker).  Match by label against the data lines on every axis.
+        styles = getattr(self, "_trace_styles", {})
+        if styles:
+            for ax in fig.axes:
+                for ln in ax.get_lines():
+                    st = styles.get(ln.get_label())
+                    if not st:
+                        continue
+                    if st.get("color"):
+                        ln.set_color(st["color"])
+                    if st.get("linestyle"):
+                        ln.set_linestyle(st["linestyle"])
+        legend = None
+        if getattr(fig, "legends", None):
+            legend = fig.legends[0]
+        else:
+            for ax in fig.axes:
+                lg = ax.get_legend()
+                if lg is not None:
+                    legend = lg
+                    break
+        self._legend_map = {}
+        if legend is not None:
+            lines_by_label: Dict[str, list] = {}
+            for ax in fig.axes:
+                for ln in ax.get_lines():
+                    lbl = ln.get_label()
+                    if lbl and not lbl.startswith("_"):
+                        lines_by_label.setdefault(lbl, []).append(ln)
+            for legline, legtext in zip(legend.get_lines(),
+                                        legend.get_texts()):
+                origs = lines_by_label.get(legtext.get_text())
+                if not origs:
+                    continue
+                # Sync the legend proxy to the (possibly restyled) data line
+                # so the swatch reflects the chosen color / dash.
+                legline.set_color(origs[0].get_color())
+                legline.set_linestyle(origs[0].get_linestyle())
+                legline.set_picker(6)
+                legtext.set_picker(6)
+                self._legend_map[legline] = origs
+                self._legend_map[legtext] = origs
+            if not getattr(self, "_legend_pick_connected", False):
+                self.canvas.mpl_connect("pick_event", self._on_legend_pick)
+                self._legend_pick_connected = True
+        self.canvas.draw_idle()
+
+    def _on_legend_pick(self, event) -> None:
+        origs = getattr(self, "_legend_map", {}).get(event.artist)
+        if not origs:
+            return
+        visible = not origs[0].get_visible()
+        for ln in origs:
+            ln.set_visible(visible)
+        # Dim the legend entry (both its proxy line + text) when hidden.
+        for art, mapped in self._legend_map.items():
+            if mapped is origs:
+                art.set_alpha(1.0 if visible else 0.3)
+        self.canvas.draw_idle()
+
+    # -- per-trace line style + color --------------------------------
+    def set_trace_style(self, label: str, *, color: Optional[str] = None,
+                        linestyle: Optional[str] = None,
+                        rerender: bool = True) -> None:
+        """Override a trace's color and/or line style by its legend label.
+
+        Stored in ``self._trace_styles`` and re-applied on every render via
+        :meth:`_finish_render`, so it survives capture / overlay switches.
+        ``rerender`` re-applies immediately to the current figure."""
+        st = self._trace_styles.setdefault(label, {})
+        if color is not None:
+            st["color"] = color
+        if linestyle is not None:
+            st["linestyle"] = linestyle
+        if rerender:
+            self._finish_render()
+
+    def _current_trace_labels(self) -> List[str]:
+        """Distinct legend labels of every data trace currently plotted."""
+        seen: List[str] = []
+        for ax in self.figure.axes:
+            for ln in ax.get_lines():
+                lbl = ln.get_label()
+                if lbl and not lbl.startswith("_") and lbl not in seen:
+                    seen.append(lbl)
+        return seen
+
+    def _open_style_dialog(self) -> None:
+        """Dialog: pick each visible trace's line style + color (operator:
+        "Allow the choice of choosing the plot line style and color after
+        opening")."""
+        labels = self._current_trace_labels()
+        if not labels:
+            QtWidgets.QMessageBox.information(
+                self, "Trace styles",
+                "No traces are plotted yet. Open a file and select a "
+                "capture, channel/combo, or PicoScope node first.")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Trace styles")
+        form = QtWidgets.QGridLayout(dlg)
+        form.addWidget(QtWidgets.QLabel("<b>Trace</b>"), 0, 0)
+        form.addWidget(QtWidgets.QLabel("<b>Line style</b>"), 0, 1)
+        form.addWidget(QtWidgets.QLabel("<b>Color</b>"), 0, 2)
+        # Find the current color/style of each label from the live lines.
+        cur = {}
+        for ax in self.figure.axes:
+            for ln in ax.get_lines():
+                lbl = ln.get_label()
+                if lbl in labels and lbl not in cur:
+                    cur[lbl] = (ln.get_color(), ln.get_linestyle())
+        rows = {}
+        from matplotlib.colors import to_hex
+        for i, lbl in enumerate(labels, start=1):
+            form.addWidget(QtWidgets.QLabel(lbl), i, 0)
+            combo = QtWidgets.QComboBox()
+            for name, code in _LINESTYLE_CHOICES:
+                combo.addItem(name, code)
+            cur_ls = self._trace_styles.get(lbl, {}).get(
+                "linestyle", cur.get(lbl, ("", "-"))[1])
+            idx = combo.findData(cur_ls)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            form.addWidget(combo, i, 1)
+            try:
+                cur_col = to_hex(self._trace_styles.get(lbl, {}).get(
+                    "color", cur.get(lbl, ("#1f77b4", ""))[0]))
+            except Exception:
+                cur_col = "#1f77b4"
+            btn = QtWidgets.QPushButton(cur_col)
+            btn.setStyleSheet(
+                f"background-color:{cur_col}; color:#000;")
+
+            def _pick(_=None, b=btn):
+                c = QtWidgets.QColorDialog.getColor(
+                    QtGui.QColor(b.text()), dlg, "Pick trace color")
+                if c.isValid():
+                    b.setText(c.name())
+                    b.setStyleSheet(
+                        f"background-color:{c.name()}; color:#000;")
+
+            btn.clicked.connect(_pick)
+            form.addWidget(btn, i, 2)
+            rows[lbl] = (combo, btn)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addWidget(bb, len(labels) + 1, 0, 1, 3)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            for lbl, (combo, btn) in rows.items():
+                self.set_trace_style(lbl, color=btn.text(),
+                                     linestyle=combo.currentData(),
+                                     rerender=False)
+            self._finish_render()
+
+    def _set_metric_table(self, rows: List[tuple], originals=None) -> None:
+        # ``originals`` (dict: row-label → original value string) turns on a
+        # third "Original" column that shows the pre-adjustment value alongside
+        # the new one for any CHANGED row (operator: "when adjusting values,
+        # keep the original values alongside the new one").  When absent the
+        # table stays the historic 2 columns.
+        _have_orig = bool(originals)
+        self.metric_table.setColumnCount(3 if _have_orig else 2)
+        self.metric_table.setHorizontalHeaderLabels(
+            ["Metric", "Value", "Original"] if _have_orig
+            else ["Metric", "Value"])
         self.metric_table.setRowCount(len(rows))
-        for i, (k, v) in enumerate(rows):
-            self.metric_table.setItem(i, 0, QtWidgets.QTableWidgetItem(str(k)))
-            self.metric_table.setItem(i, 1, QtWidgets.QTableWidgetItem(str(v)))
+        # Whether the Value column is currently hand-editable (the edit bar's
+        # "Edit values" checkbox).  Only rows tagged with a field name (a
+        # 3-tuple) become editable, and only while the toggle is on.
+        _editing = bool(getattr(self, "_metric_edit_enabled", False))
+        _RO = (QtCore.Qt.ItemFlag.ItemIsEnabled
+               | QtCore.Qt.ItemFlag.ItemIsSelectable)
+        for i, row in enumerate(rows):
+            k, v = row[0], row[1]
+            field = row[2] if len(row) > 2 else None
+            key_item = QtWidgets.QTableWidgetItem(str(k))
+            key_item.setFlags(_RO)
+            self.metric_table.setItem(i, 0, key_item)
+            val_item = QtWidgets.QTableWidgetItem(str(v))
+            if field:
+                # Stash the CaptureMetrics field name so a hand-edit round-trips
+                # (see ``_collect_metric_edits``).  Editable only when toggled.
+                val_item.setData(QtCore.Qt.ItemDataRole.UserRole, field)
+                flags = _RO
+                if _editing:
+                    flags |= QtCore.Qt.ItemFlag.ItemIsEditable
+                val_item.setFlags(flags)
+            else:
+                val_item.setFlags(_RO)
+            self.metric_table.setItem(i, 1, val_item)
+            if _have_orig:
+                # Original value — shown only when it differs from the new one
+                # (an unchanged row leaves the cell blank).  Always read-only.
+                ov = originals.get(str(k))
+                cell = (str(ov) if (ov is not None and str(ov) != str(v))
+                        else "")
+                orig_item = QtWidgets.QTableWidgetItem(cell)
+                orig_item.setFlags(_RO)
+                try:                        # dim it (secondary reference)
+                    orig_item.setForeground(self.palette().brush(
+                        QtGui.QPalette.ColorRole.PlaceholderText))
+                except Exception:
+                    pass
+                self.metric_table.setItem(i, 2, orig_item)
         self.metric_table.resizeColumnToContents(0)
+        if _have_orig:
+            self.metric_table.resizeColumnToContents(1)
 
     def _set_param_table(self, rows: List[tuple]) -> None:
         self.param_table.setRowCount(len(rows))
@@ -1118,6 +2118,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.param_table.setItem(i, 0, QtWidgets.QTableWidgetItem(str(k)))
             self.param_table.setItem(i, 1, QtWidgets.QTableWidgetItem(str(v)))
         self.param_table.resizeColumnToContents(0)
+
+    def _set_file_table(self, rows: List[tuple]) -> None:
+        self.file_table.setRowCount(len(rows))
+        for i, (k, v) in enumerate(rows):
+            self.file_table.setItem(i, 0, QtWidgets.QTableWidgetItem(str(k)))
+            self.file_table.setItem(i, 1, QtWidgets.QTableWidgetItem(str(v)))
+        self.file_table.resizeColumnToContents(0)
 
     # -----------------------------------------------------------------
     # Export menu actions
@@ -1130,6 +2137,170 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if not path:
             return None
         return self._sessions.get(path)
+
+    # -----------------------------------------------------------------
+    # Metric editing — response-class override (Good/Broken/Open),
+    # hand-edit metric values, save back to the .npz (operator request).
+    # -----------------------------------------------------------------
+    def _edit_target(self):
+        """Resolve the current tree selection to a dict describing what the
+        metric-edit bar acts on: ``session`` / ``run`` / ``path`` / ``cap_idx``
+        (None for a channel/combo RUN node).  Returns None for any non-editable
+        node (PicoScope / folder / session-metadata / nothing selected) — the
+        class override + save apply to the CHANNEL/COMBO (all captures of the
+        run), so a single-capture selection still targets its whole run."""
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        kind = item.data(0, ROLE_KIND)
+        if kind not in (KIND_CAPTURE, KIND_RUN):
+            return None
+        path = item.data(0, ROLE_PATH)
+        run_idx = item.data(0, ROLE_RUN)
+        session = self._sessions.get(path)
+        if session is None or run_idx is None or run_idx >= len(session.runs):
+            return None
+        return dict(session=session, run=session.runs[run_idx], path=path,
+                    run_idx=run_idx, cap_idx=item.data(0, ROLE_CAP), kind=kind)
+
+    def _run_area_um2(self, session, run) -> float:
+        """Surface area (µm²) for a run's ACTIVE electrode — needed to recompute
+        the (area-normalised) metrics.  Falls back to the first site / a neutral
+        default so a recompute never divides by a missing area."""
+        try:
+            active = int(run.configuration.active)
+            for s in session.test.array.sites:
+                if int(getattr(s, "number", -1)) == active:
+                    return float(getattr(s, "surface_area_um2", 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            return float(session.test.array.sites[0].surface_area_um2)
+        except Exception:
+            return 5000.0
+
+    def _ensure_original_metrics(self, cap) -> None:
+        """Snapshot ``cap.metrics`` the FIRST time this capture is adjusted, so
+        the metric table can show the original value alongside the new one
+        (operator: "keep the original values alongside the new one").  Keyed by
+        id(cap); the captures live in the loaded session so the id is stable."""
+        import copy
+        key = id(cap)
+        if key not in self._original_metrics:
+            try:
+                self._original_metrics[key] = copy.deepcopy(cap.metrics)
+            except Exception:
+                pass
+
+    def _metric_originals(self, cap, run):
+        """Return {row-label: original value string} for a capture that has been
+        adjusted (a snapshot exists), else None.  Built by re-running the row
+        builder on the snapshot so the labels/formatting match the live rows
+        exactly (so only genuinely-changed rows show an Original value)."""
+        snap = self._original_metrics.get(id(cap))
+        if snap is None:
+            return None
+        try:
+            orig_rows = _capture_metric_rows(cap, run, m_override=snap)
+        except Exception:
+            return None
+        return {str(r[0]): str(r[1]) for r in orig_rows}
+
+    def _update_metric_edit_bar(self) -> None:
+        """Show/hide the metric-edit bar for the current selection + sync the
+        Response combo to the (representative) capture's current class."""
+        bar = getattr(self, "metric_edit_bar", None)
+        if bar is None:
+            return
+        tgt = self._edit_target()
+        if tgt is None:
+            bar.setVisible(False)
+            return
+        bar.setVisible(True)
+        caps = tgt["run"].captures
+        cls = "normal"
+        if caps:
+            _c = tgt["cap_idx"]
+            cap = caps[_c] if (_c is not None and _c < len(caps)) else caps[0]
+            cls = getattr(cap.metrics, "response_class", "normal") or "normal"
+        bar.set_class(cls)
+
+    @QtCore.pyqtSlot(str)
+    def _on_response_class_chosen(self, cls: str) -> None:
+        """Recompute EVERY capture of the selected channel/combo with the forced
+        class, mark the session dirty, and re-render."""
+        from ..metrics import recompute_capture_metrics
+        tgt = self._edit_target()
+        if tgt is None:
+            return
+        area = self._run_area_um2(tgt["session"], tgt["run"])
+        for cap in tgt["run"].captures:
+            self._ensure_original_metrics(cap)   # keep pre-override values
+            try:
+                recompute_capture_metrics(cap, area, class_override=cls)
+            except Exception:
+                pass
+        self._dirty_paths.add(tgt["path"])
+        self._on_tree_item(self.tree.currentItem(), None)   # re-render
+
+    @QtCore.pyqtSlot(bool)
+    def _on_metric_edit_toggled(self, on: bool) -> None:
+        self._metric_edit_enabled = bool(on)
+        self.metric_table.setEditTriggers(
+            (QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked) if on
+            else QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._on_tree_item(self.tree.currentItem(), None)   # re-tag rows
+
+    def _collect_metric_edits(self, cap) -> int:
+        """Apply hand-edited Value cells (tagged with a CaptureMetrics field)
+        to ``cap.metrics``.  Returns the number of fields changed."""
+        self._ensure_original_metrics(cap)       # keep pre-edit values
+        n = 0
+        tbl = self.metric_table
+        for r in range(tbl.rowCount()):
+            it = tbl.item(r, 1)
+            if it is None:
+                continue
+            field = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if field not in _EDITABLE_METRIC_FIELDS:
+                continue
+            val = _parse_metric_value(it.text())
+            if val is not None and hasattr(cap.metrics, field):
+                setattr(cap.metrics, field, val)
+                n += 1
+        return n
+
+    @QtCore.pyqtSlot()
+    def _on_save_metric_changes(self) -> None:
+        """Apply hand-edits to the displayed capture + save the session back to
+        its source .npz (after a confirmation — it overwrites the file)."""
+        from ..persistence import save_session_npz
+        tgt = self._edit_target()
+        if tgt is None:
+            return
+        session, path = tgt["session"], tgt["path"]
+        caps = tgt["run"].captures
+        if caps and self._metric_edit_enabled:
+            _c = tgt["cap_idx"]
+            cap = caps[_c] if (_c is not None and _c < len(caps)) else caps[0]
+            self._collect_metric_edits(cap)
+        resp = QtWidgets.QMessageBox.question(
+            self, "Save changes",
+            f"Overwrite\n{path}\nwith the edited metrics?\n\n(The raw waveforms "
+            "are preserved — only the metrics + response class change.)")
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            save_session_npz(session, path)
+            self._dirty_paths.discard(path)
+            try:
+                self.status_message.emit(f"Saved metrics → {Path(path).name}")
+            except Exception:
+                pass
+            self._on_tree_item(self.tree.currentItem(), None)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save failed", str(e))
 
     @QtCore.pyqtSlot()
     def on_export_this_plot(self) -> None:
@@ -1187,7 +2358,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         plot_qinj_vs_amplitude(s, fig=self.figure,
                                show_grid=self._show_grid)
-        self.canvas.draw_idle()
+        self._finish_render()
 
     @QtCore.pyqtSlot()
     def _show_vd_overlay(self) -> None:
@@ -1196,7 +2367,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         plot_vd_vs_qinj(s, fig=self.figure,
                         show_grid=self._show_grid)
-        self.canvas.draw_idle()
+        self._finish_render()
 
     # -----------------------------------------------------------------
     # Persistence
@@ -1211,6 +2382,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         out: dict = {
             "trace_toggles": self.trace_toggles.current_prefs(),
         }
+        try:
+            out["view_bar"] = self.view_bar.prefs()
+        except Exception:
+            pass
+        try:
+            out["pico_role_bar"] = self.pico_role_bar.prefs()
+        except Exception:
+            pass
         if getattr(self, "_last_open_path", None):
             out["last_open"] = self._last_open_path
         try:
@@ -1245,6 +2424,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         toggles = p.get("trace_toggles")
         if isinstance(toggles, dict):
             self.trace_toggles.restore_prefs(toggles)
+        vb = p.get("view_bar")
+        if isinstance(vb, dict):
+            self.view_bar.restore(vb)
+        prb = p.get("pico_role_bar")
+        if isinstance(prb, dict):
+            self.pico_role_bar.restore(prb)
         # Splitter sizes — guard against zero-collapse so a stored
         # "everything in the left pane" state can't render the plot
         # canvas invisible on next launch.
@@ -1300,9 +2485,16 @@ for _name in ("on_open_file", "on_open_folder",
               "load_folder", "load_session_file",
               "_add_session_to_tree", "_load_session_into_tree",
               "_on_tree_item",
+              "_on_tree_context_menu", "_remove_selected_item",
+              "_remove_tree_item", "_find_top_level_item_for_path",
               "_show_capture", "_show_run_overlay",
               "_show_session_metadata",
-              "_set_metric_table", "_set_param_table",
+              # PicoScope CSV import (raw external-scope captures)
+              "_add_pico_to_tree", "_show_picoscope",
+              "_on_pico_roles_changed",
+              "_set_metric_table", "_set_param_table", "_set_file_table",
+              "_finish_render", "_on_legend_pick",
+              "set_trace_style", "_current_trace_labels", "_open_style_dialog",
               "_current_session",
               "on_export_this_plot", "on_export_all_plots",
               "on_export_summary_plots",
@@ -1318,7 +2510,12 @@ for _name in ("on_open_file", "on_open_folder",
               # Persistence — added so the embedded Results-tab
               # variant and the standalone ViewerWindow share one
               # snapshot/restore implementation.
-              "current_prefs", "restore_prefs"):
+              "current_prefs", "restore_prefs",
+              # Metric editing — response-class override + hand-edit + save.
+              "_edit_target", "_run_area_um2", "_update_metric_edit_bar",
+              "_on_response_class_chosen", "_on_metric_edit_toggled",
+              "_collect_metric_edits", "_on_save_metric_changes",
+              "_ensure_original_metrics", "_metric_originals"):
     setattr(ViewerPanel, _name, getattr(ViewerWindow, _name))
 del _name
 
@@ -1326,6 +2523,25 @@ del _name
 # ---------------------------------------------------------------------------
 # Side-panel info builders
 # ---------------------------------------------------------------------------
+def _fmt_duration_s(t_s: float) -> str:
+    """Human-readable elapsed duration (``"45s"`` / ``"1m 23s"`` /
+    ``"1h 05m 03s"``) or ``"—"`` for NaN / negative.  Used for the
+    per-channel/combo "Time to complete" metric row."""
+    try:
+        if t_s is None or not np.isfinite(t_s) or t_s < 0:
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    t = int(round(float(t_s)))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def _fmt_or_dash(value: float, spec: str, unit: str = "") -> str:
     """Format ``value`` with ``spec`` or return ``"—"`` for NaN /
     non-finite. Audit finding #25 — every Viewer metric cell that
@@ -1349,46 +2565,207 @@ def _fmt_or_dash(value: float, spec: str, unit: str = "") -> str:
     return format(v, spec) + suffix
 
 
-def _capture_metric_rows(cap: Capture, run: ChannelRun) -> List[tuple]:
-    m = cap.metrics
+# Response-class display ↔ internal string (operator: Good/Broken/Open).
+# MODULE-level (not a class attr) so the ViewerWindow→ViewerPanel method-copy
+# loop's methods can reference them (gotcha #70b — class data attrs aren't
+# transplanted).
+_CLASS_DISPLAY = {"normal": "Good", "broken": "Broken",
+                  "open": "Open", "capacitive": "Capacitive"}
+_CLASS_FROM_DISPLAY = {v: k for k, v in _CLASS_DISPLAY.items()}
+# Editable metric Value cells → CaptureMetrics field + parse unit-suffix.  The
+# metric-row builder tags these rows with the field name (3-tuple) so a
+# hand-edit round-trips to the right scalar field.
+_EDITABLE_METRIC_FIELDS = (
+    "driving_voltage_v", "effective_capacitance_nf",
+    "rc_fit_resistance_kohm", "rc_fit_tau_us",
+)
+
+
+def _class_display(cls) -> str:
+    return _CLASS_DISPLAY.get(cls or "normal", "Good")
+
+
+def _parse_metric_value(text):
+    """Parse the leading number out of a metric Value cell (e.g. ``35.65 nF``,
+    ``1.403 V``, ``−0.80``) → float, ignoring the unit suffix.  Returns None
+    when there's no parseable number."""
+    import re
+    s = str(text).strip().replace("−", "-")   # unicode minus → ASCII
+    m = re.match(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+class _MetricEditBar(QtWidgets.QWidget):
+    """POLARIS bar to OVERRIDE a channel/combo's response class
+    (Good / Broken / Open / Capacitive), hand-EDIT metric values, and SAVE the
+    changes back to the .npz (operator: "Allow the user to save changes to the
+    metrics when adjusting the values … setting the channel/combo as
+    Good/Broken/Open — the appropriate metrics are to be computed as well").
+
+    Signals: ``classChosen(str)`` (internal class string), ``editToggled(bool)``,
+    ``saveRequested()``."""
+
+    classChosen = QtCore.pyqtSignal(str)
+    editToggled = QtCore.pyqtSignal(bool)
+    saveRequested = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(6)
+        lay.addWidget(QtWidgets.QLabel("Response:"))
+        self.class_combo = QtWidgets.QComboBox()
+        for disp in ("Good", "Broken", "Open", "Capacitive"):
+            self.class_combo.addItem(disp)
+        self.class_combo.setToolTip(
+            "Set this channel/combo's response class.  The appropriate metrics "
+            "are recomputed for ALL its captures:\n"
+            "  • Good → access V/R + electrode polarization (no C_eff)\n"
+            "  • Broken → parallel R‖C fit (R, C, τ)\n"
+            "  • Open / Capacitive → effective capacitance C_eff.")
+        self.class_combo.currentTextChanged.connect(self._on_class)
+        lay.addWidget(self.class_combo)
+        self.edit_chk = QtWidgets.QCheckBox("Edit values")
+        self.edit_chk.setToolTip("Hand-edit the metric Value column "
+                                 "(C_eff / R / τ / V_d); applied on Save.")
+        self.edit_chk.toggled.connect(self.editToggled)
+        lay.addWidget(self.edit_chk)
+        lay.addStretch(1)
+        self.save_btn = QtWidgets.QPushButton("Save to file")
+        self.save_btn.setToolTip("Write the edited metrics back to the source "
+                                 ".npz (overwrites it after a confirmation).")
+        self.save_btn.clicked.connect(self.saveRequested)
+        lay.addWidget(self.save_btn)
+        self._guard = False
+
+    def _on_class(self, disp):
+        if not self._guard:
+            self.classChosen.emit(_CLASS_FROM_DISPLAY.get(disp, "normal"))
+
+    def set_class(self, cls):
+        self._guard = True
+        try:
+            self.class_combo.setCurrentText(_class_display(cls))
+        finally:
+            self._guard = False
+
+
+def _capture_metric_rows(cap: Capture, run: ChannelRun,
+                         m_override=None) -> List[tuple]:
+    # ``m_override`` lets the caller build rows from a SNAPSHOT of the metrics
+    # (the pre-adjustment "original") instead of the live ``cap.metrics`` — used
+    # to fill the metric table's Original column alongside the new values.
+    m = m_override if m_override is not None else cap.metrics
     L = rich.plain_label
+    # Units live in the FIRST column (the label), matching the live PULSAR
+    # metric table (operator: "Have the units in the metrics table in the first
+    # column").  ``_fmt_or_dash`` is called with no unit so the value cell holds
+    # just the number (or an em-dash for NaN).
     rows = [
-        ("Capture #", cap.index),
+        # 1-BASED for the operator (operator: "stop counting start at 0").
+        ("Capture #", cap.index + 1),
         ("Status", _status_text(cap)),
-        ("Amplitude", _fmt_or_dash(
-            cap.pattern.excitation_phase.amplitude_ua, "+.2f", "µA")),
-        (L('Q','ph'),  _fmt_or_dash(m.charge_per_phase_nc, ".3f", "nC")),
-        (L('Q','inj'), _fmt_or_dash(m.charge_injection_mc_per_cm2,
-                                    ".3f", "mC/cm²")),
-        (L('E','ip'),  _fmt_or_dash(m.interpulse_potential_v, ".3f", "V")),
-        (L('C','eff'), _fmt_or_dash(m.effective_capacitance_nf,
-                                    ".3f", "nF")),
-        (L('C','d'),   _fmt_or_dash(m.driving_capacitance_mf_per_cm2,
-                                    ".3f", "mF/cm²")),
+        ("Amplitude [µA]", _fmt_or_dash(
+            cap.pattern.excitation_phase.amplitude_ua, "+.2f")),
+        (f"{L('Q','ph')} [nC]",  _fmt_or_dash(m.charge_per_phase_nc, ".3f")),
+        (f"{L('Q','inj')} [mC/cm²]", _fmt_or_dash(m.charge_injection_mc_per_cm2,
+                                                  ".3f")),
+        (f"{L('E','ip')} [V]",  _fmt_or_dash(m.interpulse_potential_v, ".3f")),
+        (f"{L('C','d')} [mF/cm²]",   _fmt_or_dash(m.driving_capacitance_mf_per_cm2,
+                                                  ".3f")),
     ]
+    # Response class + capacitance / R‖C fit (editable in POLARIS — the Response
+    # combo overrides the class + recomputes; these mirror the result).  Rows
+    # tagged with a 3rd element (field name) are hand-editable Value cells.
+    _cls = getattr(m, "response_class", "normal") or "normal"
+    rows.append(("Response", _class_display(_cls)))
+    rows.append((f"{L('V','d')} [V]", _fmt_or_dash(m.driving_voltage_v, ".3f"),
+                 "driving_voltage_v"))
+    if _cls != "normal" or math.isfinite(
+            getattr(m, "effective_capacitance_nf", float("nan"))):
+        # broken → R‖C FIT capacitance, labelled bare ``C`` (operator: "for
+        # broken, do not call it Ceff"); open / capacitive → ``C_eff``.
+        _c_lbl = "C" if _cls == "broken" else "C_eff"
+        rows.append((f"{_c_lbl} [nF]", _fmt_or_dash(m.effective_capacitance_nf,
+                                                    ".3g"),
+                     "effective_capacitance_nf"))
+        if math.isfinite(getattr(m, "rc_fit_resistance_kohm", float("nan"))):
+            rows.append(("R (R‖C) [kΩ]",
+                         _fmt_or_dash(m.rc_fit_resistance_kohm, ".1f"),
+                         "rc_fit_resistance_kohm"))
+        if math.isfinite(getattr(m, "rc_fit_tau_us", float("nan"))):
+            rows.append(("τ (R‖C) [µs]",
+                         _fmt_or_dash(m.rc_fit_tau_us, ".1f"),
+                         "rc_fit_tau_us"))
+        # Per-phase bad-response values for the OTHER phases (operator:
+        # "for broken and open channels, compute the same metrics for
+        # other phases") — the scalars above ARE phase 1.  Read-only rows.
+        _cpp = list(getattr(m, "effective_capacitance_per_phase_nf", []) or [])
+        _rpp = list(getattr(m, "rc_fit_resistance_per_phase_kohm", []) or [])
+        _tpp = list(getattr(m, "rc_fit_tau_per_phase_us", []) or [])
+        for _k in range(1, max(len(_cpp), len(_rpp), len(_tpp))):
+            _rv = _rpp[_k] if _k < len(_rpp) else float("nan")
+            _cv = _cpp[_k] if _k < len(_cpp) else float("nan")
+            _tv = _tpp[_k] if _k < len(_tpp) else float("nan")
+            if math.isfinite(_rv):
+                rows.append((f"R (R‖C) ph{_k + 1} [kΩ]",
+                             _fmt_or_dash(_rv, ".1f")))
+            if math.isfinite(_cv):
+                rows.append((f"{_c_lbl} ph{_k + 1} [nF]",
+                             _fmt_or_dash(_cv, ".3g")))
+            if math.isfinite(_tv):
+                rows.append((f"τ (R‖C) ph{_k + 1} [µs]",
+                             _fmt_or_dash(_tv, ".1f")))
+    # Driving impedance Z_d = V_d/I_stim and driving energy (∫V·I over the
+    # pulse) — operator request.  Shown when finite.
+    if math.isfinite(getattr(m, "driving_impedance_kohm", float("nan"))):
+        rows.append((f"{L('Z','d')} [kΩ]",
+                     _fmt_or_dash(m.driving_impedance_kohm, ".3f")))
+    if math.isfinite(getattr(m, "driving_energy_uj", float("nan"))):
+        from .widgets import _fmt_energy
+        rows.append(("Driving energy", _fmt_energy(m.driving_energy_uj)))
+    # Harris 2019 chronopotentiometry capacitive/Faradaic decomposition
+    # (normal captures only) — C_dl + approximate Faradaic split.
+    if math.isfinite(getattr(m, "c_dl_mf_per_cm2", float("nan"))):
+        rows.append((f"{L('C', 'dl')} [mF/cm²]",
+                     _fmt_or_dash(m.c_dl_mf_per_cm2, ".3f")))
+    if math.isfinite(getattr(m, "faradaic_fraction", float("nan"))):
+        rows.append(("Faradaic charge fraction",
+                     f"{m.faradaic_fraction * 100:.0f}%"))
+    if math.isfinite(getattr(m, "faradaic_onset_us", float("nan"))):
+        _fo = f"{m.faradaic_onset_us:.0f} µs"
+        if math.isfinite(getattr(m, "faradaic_onset_v", float("nan"))):
+            _fo += f"  ({m.faradaic_onset_v:+.3f} V)"
+        rows.append(("Faradaic onset", _fo))
     if m.active_driving_voltage_per_phase_v:
-        rows.append((f"{L('V','d')} active per phase",
+        rows.append((f"{L('V','d')} active per phase [V]",
                      ", ".join(f"{v:.3f}" for v in m.active_driving_voltage_per_phase_v)))
     if m.return_driving_voltage_per_phase_v:
-        rows.append((f"{L('V','d')} return per phase",
+        rows.append((f"{L('V','d')} return per phase [V]",
                      ", ".join(f"{v:.3f}" for v in m.return_driving_voltage_per_phase_v)))
     if m.access_voltage_per_phase_v:
-        rows.append((f"{L('V','a')} active",
+        rows.append((f"{L('V','a')} active [V]",
                      ", ".join(f"{v:.3f}" for v in m.access_voltage_per_phase_v)))
     if m.access_resistance_per_phase_kohm:
-        rows.append((f"{L('R','a')} active (kΩ)",
+        rows.append((f"{L('R','a')} active [kΩ]",
                      ", ".join(f"{r:.2f}" for r in m.access_resistance_per_phase_kohm)))
     if m.return_access_voltage_per_phase_v:
-        rows.append((f"{L('V','a')} return",
+        rows.append((f"{L('V','a')} return [V]",
                      ", ".join(f"{v:.3f}" for v in m.return_access_voltage_per_phase_v)))
     if m.return_access_resistance_per_phase_kohm:
-        rows.append((f"{L('R','a')} return (kΩ)",
+        rows.append((f"{L('R','a')} return [kΩ]",
                      ", ".join(f"{r:.2f}" for r in m.return_access_resistance_per_phase_kohm)))
     if m.polarization_per_phase_v:
-        rows.append((f"{L('E','pol')} active",
+        rows.append((f"{L('E','pol')} active [V]",
                      ", ".join(f"{e:.3f}" for e in m.polarization_per_phase_v)))
     if m.return_polarization_per_phase_v:
-        rows.append((f"{L('E','pol')} return",
+        rows.append((f"{L('E','pol')} return [V]",
                      ", ".join(f"{e:.3f}" for e in m.return_polarization_per_phase_v)))
     # Tissue-damage screening (Shannon + modified Shannon). Only
     # surface when the metrics layer actually computed something —
@@ -1399,7 +2776,6 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun) -> List[tuple]:
     # :mod:`stimtest.damage_models` for the full reference list and
     # the rationale for surfacing this as guidance rather than a
     # hard interlock.
-    import math
     if math.isfinite(getattr(m, "shannon_k_value", float("nan"))):
         try:
             from ..damage_models import (
@@ -1508,21 +2884,82 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun) -> List[tuple]:
     return rows
 
 
+def _run_accumulated_charge_nc(run: ChannelRun) -> float:
+    """Total cathodic charge delivered across a channel/combo's captures.
+    Prefers the per-capture running ``cumulative_charge_nc`` (VT/PS stamp
+    it); else sums each capture's |charge_per_phase_nc|."""
+    import math
+    cums = [c.metrics.cumulative_charge_nc for c in run.captures
+            if math.isfinite(getattr(c.metrics, "cumulative_charge_nc",
+                                     float("nan")))]
+    if cums:
+        return max(cums)
+    s = sum(abs(c.metrics.charge_per_phase_nc) for c in run.captures
+            if math.isfinite(getattr(c.metrics, "charge_per_phase_nc",
+                                     float("nan"))))
+    return s if s > 0 else float("nan")
+
+
+def _run_cumulative_n_pulses(run: ChannelRun) -> float:
+    """Total pulses delivered across a channel/combo's captures.  Prefers the
+    per-capture running ``cumulative_n_pulses`` (VT/PS stamp it); else sums
+    each capture's ``n_pulses``."""
+    import math
+    cums = [c.metrics.cumulative_n_pulses for c in run.captures
+            if math.isfinite(getattr(c.metrics, "cumulative_n_pulses",
+                                     float("nan")))]
+    if cums:
+        return max(cums)
+    s = sum(c.metrics.n_pulses for c in run.captures
+            if math.isfinite(getattr(c.metrics, "n_pulses", float("nan"))))
+    return s if s > 0 else float("nan")
+
+
+def _fmt_pulses_or_dash(n: float) -> str:
+    """Comma-group a pulse count, or an em-dash when not recorded."""
+    import math
+    return f"{n:,.0f}" if math.isfinite(n) else "—"
+
+
+def _fmt_charge_nc(q_nc: float) -> str:
+    """Auto-scale a charge in nC to nC / µC / mC."""
+    import math
+    if not math.isfinite(q_nc):
+        return "—"
+    a = abs(q_nc)
+    if a >= 1e6:
+        return f"{q_nc / 1e6:.3f} mC"
+    if a >= 1e3:
+        return f"{q_nc / 1e3:.3f} µC"
+    return f"{q_nc:.2f} nC"
+
+
+def _session_uses_reference(session: Session) -> bool:
+    """True iff ANY capture recorded a separate active/return potential
+    (instrumentation amp) — i.e. an Ag|AgCl reference was actually used.
+    When false the reference label should read N/A rather than the default
+    'Ag|AgCl' (operator: "reference electrode says Ag|AgCl despite not
+    used")."""
+    for run in session.runs:
+        for cap in run.captures:
+            if ((cap.e_act_v is not None and len(cap.e_act_v))
+                    or (cap.e_ret_v is not None and len(cap.e_ret_v))):
+                return True
+    return False
+
+
 def _session_param_rows(session: Session, run: Optional[ChannelRun],
                         cap: Optional[Capture]) -> List[tuple]:
+    """EXPERIMENT parameters only — file metadata (notebook/subject/…) lives
+    in the separate File-info table (``_session_file_rows``)."""
     p = session.test.pattern
     rows: List[tuple] = []
-    rows.append(("Notebook", session.notebook))
-    rows.append(("Subject", session.subject))
     rows.append(("Experiment", session.test.experiment))
     rows.append(("Pattern",
                  "Triphasic" if p.is_triphasic else
                  ("Monophasic" if p.num_phases == 1 else "Biphasic")))
     rows.append(("Polarity",
-                 "Cathodic-first" if p.polarity == -1 else "Anodic-first"))
-    rows.append(("Rate", f"{p.rate_hz} pps"))
-    rows.append(("Reference", session.test.reference_electrode_label))
-    rows.append(("Counter", session.test.counter_electrode_label))
+                 "Cathodal-first" if p.polarity == -1 else "Anodal-first"))
     for k, ph in enumerate(p.phases, start=1):
         rows.append((f"Phase {k} amp", f"{ph.amplitude_ua:+.2f} µA"))
         rows.append((f"Phase {k} width", f"{ph.width_us:.0f} µs"))
@@ -1550,6 +2987,35 @@ def _session_param_rows(session: Session, run: Optional[ChannelRun],
     if stim:
         rows.append(("Stimulator",
                      stim.get("description", "Plexon PlexStim")))
+    # Electrodes — counter is the RETURN electrode; the reference reads N/A
+    # when no Ag|AgCl was actually used (no E_act/E_ret recorded).
+    rows.append(("Return electrode", session.test.counter_electrode_label))
+    rows.append(("Reference electrode",
+                 session.test.reference_electrode_label
+                 if _session_uses_reference(session) else "N/A (not used)"))
+    # Rate LAST (operator: "Move Rate at the bottom of the parameters").
+    rows.append(("Rate", f"{p.rate_hz} pps"))
+    return rows
+
+
+def _session_file_rows(session: Session) -> List[tuple]:
+    """File / session metadata for the File-info table."""
+    rows: List[tuple] = [
+        ("Notebook", session.notebook or "—"),
+        ("Subject", session.subject or "—"),
+        ("Total runs", str(len(session.runs))),
+        ("Total captures", str(session.total_captures)),
+    ]
+    created = getattr(session, "created_at", None)
+    if created is not None:
+        try:
+            rows.append(("Created", created.strftime("%Y-%m-%d %H:%M")))
+        except Exception:
+            rows.append(("Created", str(created)))
+    if getattr(session, "user_name", ""):
+        rows.append(("Operator", session.user_name))
+    if getattr(session, "save_dir", None):
+        rows.append(("Save dir", str(session.save_dir)))
     return rows
 
 
@@ -1558,6 +3024,8 @@ def _status_text(cap: Capture) -> str:
         return "Aborted"
     if cap.status.voltage_compliance:
         return "Voltage compliance"
+    if getattr(cap.status, "exceeded_potential_limit", False):
+        return "Limit exceeded"
     if cap.status.reached_potential_limit:
         return "Limit reached"
     if not cap.status.good:
@@ -1742,7 +3210,12 @@ class ChannelMapPanel(QtWidgets.QWidget):
         parent = self.parent()
         if parent is not None and hasattr(parent, "_show_grid"):
             show_grid = bool(parent._show_grid)
-        ax.grid(show_grid, linestyle=":", color="#cccccc", linewidth=0.5)
+        # Pass line props ONLY when enabling — ``grid(False, linestyle=…)``
+        # re-enables the grid (matplotlib gotcha), defeating the toggle.
+        if show_grid:
+            ax.grid(True, linestyle=":", color="#cccccc", linewidth=0.5)
+        else:
+            ax.grid(False)
         ax.set_xlabel("column")
         ax.set_ylabel("row")
         title = (f"{array.name} — {label}" if reducer is not None
@@ -1810,11 +3283,26 @@ def _readable_text_color(rgba) -> str:
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
+def _close_startup_splash() -> None:
+    """Dismiss the PyInstaller boot splash once the window is up.
+
+    ``pyi_splash`` exists only in the frozen POLARIS build when a
+    ``Splash()`` was bundled; the import fails (swallowed) in a normal
+    ``python run_viewer.py`` run.
+    """
+    try:
+        import pyi_splash  # type: ignore  # present only in the frozen app
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def launch(initial_path: Optional[Path] = None) -> int:
     """Open the viewer as a standalone application."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = ViewerWindow(initial_path=initial_path)
     win.show()
+    _close_startup_splash()   # dismiss the PyInstaller boot splash (frozen app)
     return app.exec()
 
 

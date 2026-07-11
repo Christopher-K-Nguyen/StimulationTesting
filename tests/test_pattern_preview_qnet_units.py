@@ -104,7 +104,7 @@ def test_saturated_cap_coupled_collapses_two_anodic_subphases_in_qph(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.phase_amp[0].setValue(-1000.0)
@@ -125,12 +125,22 @@ def test_saturated_cap_coupled_collapses_two_anodic_subphases_in_qph(qapp):
     assert len(nc_values) == 2, (
         f"expected 2 logical Q_ph values, got {len(nc_values)}: "
         f"{nc_values} from header {hdr!r}")
-    # Cathodic (first) is negative, combined anodic (second) is
-    # positive, and their magnitudes match within the
-    # discrete-balance precision (~ sub-pC).
+    # Cathodic (first) is negative, combined anodic (second) is positive.
+    # The DISPLAYED per-phase Q_ph are now the IDEAL charges (operator:
+    # "charge metrics use the ideal pattern"); the cap-coupled solver
+    # balances the DEVICE charge, so the IDEAL magnitudes match only within
+    # the device-vs-ideal (staircase + quantization) difference (~0.2 %), not
+    # to sub-pC.  The realistic DELIVERED residual is the separately-shown
+    # Q_net (device) — asserted below.
     assert nc_values[0] < 0
     assert nc_values[1] > 0
-    assert abs(nc_values[0] + nc_values[1]) < 0.01   # < 10 pC
+    _mag = max(abs(nc_values[0]), abs(nc_values[1]))
+    assert abs(nc_values[0] + nc_values[1]) < 0.01 * _mag, nc_values  # < 1 %
+    # The Q_net line reports the DEVICE-delivered residual (the realistic
+    # error), which the solver balanced to near zero (picocoulombs).
+    import re as _re
+    pc = _re.search(r"([+-]?\d+\.\d+)\s*pC", hdr)
+    assert pc is not None and abs(float(pc.group(1))) < 50.0, hdr  # < 50 pC delivered
 
 
 def test_unsaturated_cap_coupled_does_not_collapse_qph(qapp):
@@ -145,7 +155,7 @@ def test_unsaturated_cap_coupled_does_not_collapse_qph(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     # Modest cathodic that doesn't saturate.

@@ -231,8 +231,14 @@ class PatternPreview(QtWidgets.QWidget):
     # arbitrary table, etc.) get pushed off-screen. With a modest
     # ``sizeHint`` and a ``Preferred`` vertical policy the scroll area
     # provides a vertical bar exactly when the page overflows.
-    MIN_HEIGHT = 160
-    PREFERRED_HEIGHT = 200
+    MIN_HEIGHT = 120
+    PREFERRED_HEIGHT = 150
+    #: The PRIOR default height.  A saved view-state at exactly this value
+    #: means the user never resized the preview, so it's treated as "use the
+    #: current default" on restore (operator: "reduce the default height of
+    #: the test parameter plot") — without this, an old saved 200 would keep
+    #: overriding the smaller default.
+    _LEGACY_DEFAULT_HEIGHT = 200
     #: Hard upper bound on the user-stretched height — keeps the
     #: preview from running off the screen on small monitors when the
     #: user drags hard.
@@ -312,6 +318,10 @@ class PatternPreview(QtWidgets.QWidget):
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("w")
+        # Mouse wheel must NOT zoom (operator request) — pan via the
+        # scrollbars / drag and zoom via the X±/Y± buttons instead.
+        from .widgets import disable_plot_wheel_zoom
+        disable_plot_wheel_zoom(self.plot)
         # Gridlines default OFF on experiment plots so subtle trace
         # features aren't obscured. The main window's View →
         # Gridlines action toggles them on/off for every experiment
@@ -482,6 +492,22 @@ class PatternPreview(QtWidgets.QWidget):
         self.short_btn = _btn("−", "Decrease plot height (40 px)",
                               lambda: self._change_height(-40))
 
+        # Cadence-view button — frames several consecutive pulses so the
+        # user sees the pulse train: how close pulses are (interpulse
+        # spacing) and, when the interpulse delay is off, the back-to-back
+        # continuous pulsing.  The preview already draws N_PULSES_DRAWN
+        # tiled periods; this button just zooms out to a few of them in one
+        # click (vs ~9 X− presses) and the scrollbar then pans along the
+        # rest.  Operator: "continuous plotting … move along the x axis to
+        # find the next pulses … expand the x axis scale to see how close
+        # pulses are … see the pulsing with no interpulse delay".
+        self.cadence_btn = _btn(
+            "Cadence",
+            "Show several consecutive pulses (the pulse train + interpulse "
+            "spacing).  Drag / use the scrollbar to move along to the next "
+            "pulses; X+/X− to zoom.",
+            lambda: self.show_cadence_view())
+
         # Reset-view button — restores the default zoom (single pulse,
         # full y-amp range with header padding).
         self.reset_btn = QtWidgets.QToolButton()
@@ -519,6 +545,7 @@ class PatternPreview(QtWidgets.QWidget):
         controls_row.addWidget(QtWidgets.QLabel("Height:"))
         controls_row.addWidget(self.tall_btn)
         controls_row.addWidget(self.short_btn)
+        controls_row.addWidget(self.cadence_btn)
         controls_row.addStretch(1)
         controls_row.addWidget(self.reset_btn)
 
@@ -653,6 +680,11 @@ class PatternPreview(QtWidgets.QWidget):
         # outermost pulses so the user sees a clean baseline run-in.
         period_us = (1e6 / pattern.rate_hz) if pattern.rate_hz > 0 else 0.0
         interpulse_us = max(period_us - pattern.total_pulse_us, 0.0)
+        # Cache the cadence geometry for the "Cadence" view button (frames
+        # several consecutive pulses so pulse-to-pulse spacing / back-to-back
+        # no-interpulse-delay pulsing is visible in one click).
+        self._last_period_us = period_us
+        self._last_total_pulse_us = float(pattern.total_pulse_us)
         # ``tile_post_us`` MUST equal ``interpulse_us`` so each tile
         # spans exactly one period and adjacent tiles butt up cleanly.
         # Earlier this used ``max(interpulse_us, 24.0)`` to give a
@@ -1198,17 +1230,21 @@ class PatternPreview(QtWidgets.QWidget):
                 skip_arrow=ip_large,
             )
 
-        # ---- charge balance (computed on the ACTUAL waveform) ----
-        # Per user directive: charge balance is always evaluated on
-        # what the device will actually deliver — i.e. after 30 nA
-        # quantisation, integrated over the SAME breakpoint budget the
-        # .pat writer uses (PulsePattern.curved_sample_budget).
-        # Otherwise the preview header would report a balance computed
-        # on a coarser staircase than the device receives, and a
-        # cap-coupled solve refined to numerical precision could read
-        # as "imbalanced" here purely from the resolution mismatch.
-        q_phase_nc = pattern.actual_phase_charges_nc()
-        q_net_nc = float(sum(q_phase_nc))
+        # ---- per-phase Q_ph (IDEAL) + charge balance (realistic error) ----
+        # Operator: "For all charge metrics, use the ideal pattern.  Only use
+        # the realistic when comparing the error in the test parameters."  So
+        # the displayed per-phase Q_ph is the IDEAL continuous integral (the
+        # clean as-designed charge — matches the saved / reported metric
+        # ``PulsePattern.charge_per_phase_nc``), and the DEVICE staircase
+        # residual (30/100 nA quantisation, on the SAME breakpoint budget the
+        # .pat writer uses) is shown as Q_net = the realistic DELIVERED
+        # imbalance — the error the operator inspects here in the test-
+        # parameters panel.  A cap-coupled solve balances the DEVICE charge,
+        # so its device Q_net ≈ 0; the ideal per-phase values read cleanly.
+        q_phase_nc = pattern.ideal_phase_charges_nc()
+        q_phase_dev = pattern.actual_phase_charges_nc(
+            current_step_nA=pattern.device_current_step_nA())
+        q_net_nc = float(sum(q_phase_dev))     # DEVICE residual = delivered error
         q_max_nc = max(abs(q) for q in q_phase_nc) if q_phase_nc else 0.0
         ratio = abs(q_net_nc) / q_max_nc if q_max_nc > 0 else 0.0
 
@@ -1250,12 +1286,25 @@ class PatternPreview(QtWidgets.QWidget):
         # 0.001–0.1 % regime, and ``.1f`` would collapse all
         # well-balanced patterns to a featureless "0.0 %".
         imbalance_pct = 100.0 * ratio
+        # DEVICE-quantization error (operator: "use the realistic when
+        # comparing the error in the test parameters").  The per-phase Q_ph
+        # above is IDEAL; the device 30/100 nA staircase delivers slightly
+        # less on a shaped phase (a linear-increasing 100 nC → ~99.6 nC).
+        # Show the worst-case ideal-vs-delivered magnitude error so the
+        # operator sees the deviation here, without polluting the reported
+        # metric.  Omitted when negligible (rectangular / on-grid → ~0 %).
+        _dev_errs = [abs(abs(d) - abs(i)) / abs(i)
+                     for i, d in zip(q_phase_nc, q_phase_dev) if abs(i) > 1e-9]
+        _max_dev_err = max(_dev_errs) if _dev_errs else 0.0
+        _dev_note = (f" &nbsp;&nbsp; device Δ ≤ {_max_dev_err * 100:.2f}%"
+                     if _max_dev_err > 5e-4 else "")
         summary = (
             f"{rich.var('Q', 'ph')} = "
             + " | ".join(f"{q:+.1f} {rich.NC}" for q in q_phase_nc_logical)
             + f" &nbsp;&nbsp; <b>{rich.var('Q', 'net')}</b> = "
               f"{q_net_pc:+.2f} {rich.PC}"
               f" ({imbalance_pct:.3f}%)"
+            + _dev_note
             + f" &nbsp;&nbsp; rate = {pattern.rate_hz:g} {rich.PPS}"
             + f" &nbsp;&nbsp; period = {self._format_time(period_us)}"
             + f" &nbsp;&nbsp; pulse = {self._format_time(pattern.total_pulse_us)}"
@@ -1323,6 +1372,35 @@ class PatternPreview(QtWidgets.QWidget):
             self.plot.setYRange(*self._default_y_range, padding=0)
         self._update_scrollbar_from_view()
         self._update_scroll_y_from_view()
+
+    # -----------------------------------------------------------------
+    def show_cadence_view(self, n_pulses: float = 3.0):
+        """Frame ``~n_pulses`` consecutive pulses so the pulse-to-pulse
+        cadence is visible in one click — the interpulse spacing, or the
+        back-to-back run when there's no interpulse delay.
+
+        The preview already draws ``N_PULSES_DRAWN`` tiled periods (a
+        continuous train); this just zooms the x-view out to a few of them,
+        centred on the central pulse, clamped to the drawn extent.  The
+        scrollbar / drag-pan then moves along to the further pulses, and
+        X+/X− fine-tune the scale.  No-op until a pattern has been rendered.
+        """
+        period = getattr(self, "_last_period_us", 0.0)
+        if not (period > 0.0):
+            return
+        total = getattr(self, "_last_total_pulse_us", period)
+        centre = total / 2.0                    # centre of the central pulse
+        half = max(float(n_pulses), 1.0) * period / 2.0
+        d0, d1 = self._data_x_range
+        lo = max(d0, centre - half)
+        hi = min(d1, centre + half)
+        if hi - lo < 1e-6:                        # degenerate → whole train
+            lo, hi = d0, d1
+        vb = self.plot.getViewBox()
+        if vb is not None:
+            vb.enableAutoRange(x=False)
+        self.plot.setXRange(lo, hi, padding=0)
+        self._update_scrollbar_from_view()
 
     # ---- Actual-curve staircase from breakpoints --------------------
     @staticmethod
@@ -1615,11 +1693,19 @@ class PatternPreview(QtWidgets.QWidget):
         return {"height": int(self.height() or self.PREFERRED_HEIGHT)}
 
     def restore_view_state(self, view: dict) -> None:
-        """Apply a saved height (clamped to the legal range)."""
+        """Apply a saved height (clamped to the legal range).
+
+        A saved height equal to the PRIOR default is ignored, so reducing
+        ``PREFERRED_HEIGHT`` actually takes effect for existing users whose
+        prefs auto-saved the old default (operator: "reduce the default
+        height of the test parameter plot").  A genuinely user-resized
+        height (any other value) is still honored.
+        """
         if not isinstance(view, dict):
             return
         h = view.get("height")
-        if isinstance(h, (int, float)) and h > 0:
+        if (isinstance(h, (int, float)) and h > 0
+                and int(h) != self._LEGACY_DEFAULT_HEIGHT):
             self._set_height(int(h))
 
     # ---- zoom buttons -----------------------------------------------

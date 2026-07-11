@@ -299,11 +299,12 @@ def test_runner_worker_emits_progress_signal_on_progress_event():
 # VT rescale loop abort short-circuit (source-level check)
 # ---------------------------------------------------------------------------
 def test_vt_rescale_loop_checks_abort():
-    """The MAX_RECAPTURE rescale loop in voltage_transient.py should
-    check _abort_requested at the top of each iteration so Stop
+    """The MAX_RECAPTURE rescale loop — now the SHARED
+    ExperimentRunner.rescale_to_fit in base.py (used by VT/PS/SP/LP) —
+    should check _abort_requested at the top of each iteration so Stop
     breaks out promptly even when deep in scope rescaling."""
     src_path = Path(__file__).resolve().parent.parent / (
-        "stimtest/experiments/voltage_transient.py")
+        "stimtest/experiments/base.py")
     src = src_path.read_text(encoding="utf-8")
     # Find the rescale loop and verify the abort check is present
     # near the top.  Brittle string-match but adequate — the alternative

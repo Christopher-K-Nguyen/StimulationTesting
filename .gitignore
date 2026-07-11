@@ -107,3 +107,16 @@ LOG_ANALYSIS.md
 # own private repo, not this one.
 stimtest_cwru/
 stimtest_*/
+
+# Collaborator login profiles bundled into the installer.  These are
+# CWRU-specific data artifacts (login name + SHA-256 password hash +
+# unlocked shape IDs) — distributed out-of-band to collaborators, never
+# published in the public PULSAR repo (same confidentiality rule as the
+# stimtest_cwru extension above).  They live locally so the operator's
+# ``installer/build.py`` bundles them, but they're not committed; the
+# .iss entry uses ``skipifsourcedoesntexist`` so a public-repo build
+# still succeeds without them.
+installer/profiles/
+
+# Claude Code scratch/working files (never commit)
+.claude-tmp/

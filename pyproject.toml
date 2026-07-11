@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stimtest"
-version = "0.2.0"
+version = "0.2.195"
 description = "PULSAR — Python characterization suite for neural-stimulation electrodes (Plexon PlexStim + Tektronix scope), with the POLARIS companion session viewer."
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,6 +26,8 @@ dependencies = [
     "openpyxl>=3.1",    # Gamry-DTA-style .xlsx export
     "pandas>=2.0",      # tabular session export + ML weakness analyzer
     "scikit-learn>=1.3", # GBM-based Q_inj predictor + weakness analysis
+    "joblib>=1.3",      # ML model persistence (.pkl load/save); ships with
+                        # scikit-learn but the app imports it directly
 ]
 
 [project.optional-dependencies]

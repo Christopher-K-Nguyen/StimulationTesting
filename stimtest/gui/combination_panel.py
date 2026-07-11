@@ -109,7 +109,9 @@ class CombinationPanel(QtWidgets.QGroupBox):
     # spacing-shape constraint.
     SPACINGS = (0, 1, 2)
 
-    def __init__(self, single_mode: bool = False, parent=None):
+    def __init__(self, single_mode: bool = False, parent=None,
+                 multipolar_single: bool = False,
+                 multipolar_no_repeat: bool = False):
         super().__init__("Configurations to run", parent)
         # Static "single-mode" hint from the owning tab (True for the
         # pulsing experiments). The *effective* single mode is dynamic:
@@ -119,6 +121,25 @@ class CombinationPanel(QtWidgets.QGroupBox):
         # source. For other kinds (BP/TP/Partial-*/CG) only one combo
         # is run per session.
         self._static_single_mode = bool(single_mode)
+        # ``multipolar_single`` forces single-combo selection for the
+        # (partial) multipolar kinds (BP / TP / PBP / PTP) EVEN when the tab
+        # is not statically single-mode — Long-Term Pulsing wants exactly one
+        # multipolar combo per run (the return geometry is part of the test
+        # definition; you can't chronically pulse conflicting return sets),
+        # while keeping Monopolar multi-select for its simultaneous-channel
+        # pulsing.  Operator (0.2.152): "only allow for one selection of
+        # channel/combo under (partial) multipolar configuration."
+        self._multipolar_single = bool(multipolar_single)
+        # ``multipolar_no_repeat`` lets the (partial) multipolar kinds
+        # (BP/TP/PBP/PTP) be MULTI-select but enforces that no channel is
+        # reused as active OR return across the selected combos — Progressive
+        # Stress wants to stress several non-overlapping multipolar combos
+        # sequentially, without stressing any channel twice (operator, 0.2.152:
+        # "PS … tests the selected channel/combo sequentially.  For multipolar,
+        # a channel cannot be repeated as active or return").  Combos that
+        # would reuse an already-selected channel are greyed out.  Mutually
+        # exclusive with ``multipolar_single`` (no tab sets both).
+        self._multipolar_no_repeat = bool(multipolar_no_repeat)
         self._single_mode = self._static_single_mode
         self._array: ElectrodeArray | None = None
         self._actives: List[int] = []
@@ -523,10 +544,22 @@ class CombinationPanel(QtWidgets.QGroupBox):
         # is part of the test definition — running several at once
         # would just bury the user.
         prev_single = self._single_mode
-        self._single_mode = (
-            self._static_single_mode
-            and kind not in (KIND_MONO, KIND_CG, KIND_PCG)
-        )
+        _is_multipolar = kind in (KIND_BP, KIND_TP, KIND_PBP, KIND_PTP)
+        if _is_multipolar and self._multipolar_no_repeat:
+            # PS: multiple NON-OVERLAPPING multipolar combos (multi-select; the
+            # no-repeat constraint greys out any channel-sharing combo).
+            self._single_mode = False
+        elif _is_multipolar and self._multipolar_single:
+            # LP: exactly one multipolar combo (return geometry is the test).
+            self._single_mode = True
+        else:
+            # Static single-mode (SP/CP) → single for multipolar; the
+            # single-active kinds (Monopolar / Common Ground / Partial CG) are
+            # always multi (each combo exercises a different active).
+            self._single_mode = (
+                self._static_single_mode
+                and kind not in (KIND_MONO, KIND_CG, KIND_PCG)
+            )
         self.select_all.setVisible(not self._single_mode)
         # If the relaxation just toggled, force a rebuild to reset
         # the default check-state of the combo rows.
@@ -537,8 +570,11 @@ class CombinationPanel(QtWidgets.QGroupBox):
     def _rebuild(self):
         self._combos = self._compute_combos()
         # In single-combo mode only the first combo is enabled by default;
-        # the user explicitly picks which single combination to run.
-        if self._single_mode and self._combos:
+        # the user explicitly picks which single combination to run.  The
+        # no-repeat multipolar mode (PS) ALSO defaults to just the first combo
+        # — the rest would mostly conflict, and the user adds channel-disjoint
+        # combos one at a time (the greying guides them).
+        if (self._single_mode or self._no_repeat_active()) and self._combos:
             for i, c in enumerate(self._combos):
                 c.enabled = (i == 0)
         self.combos_list.blockSignals(True)
@@ -553,8 +589,57 @@ class CombinationPanel(QtWidgets.QGroupBox):
                 self.combos_list.addItem(item)
         finally:
             self.combos_list.blockSignals(False)
+        # Grey out channel-sharing combos for the PS no-repeat mode.
+        self._refresh_no_repeat_availability()
         self._update_summary()
         self.combinationsChanged.emit(self.selected_configurations())
+
+    def _no_repeat_active(self) -> bool:
+        """True when the PS no-repeat constraint applies — multipolar_no_repeat
+        set AND the current kind is a (partial) multipolar kind."""
+        return (self._multipolar_no_repeat
+                and self._kind() in (KIND_BP, KIND_TP, KIND_PBP, KIND_PTP))
+
+    @staticmethod
+    def _combo_channels(cfg) -> Set[int]:
+        """Every channel a combo touches — the active plus all returns."""
+        return {int(cfg.active)} | {int(r) for r in cfg.returns}
+
+    def _refresh_no_repeat_availability(self):
+        """PS no-repeat: grey out any UNSELECTED combo that shares a channel
+        (active OR return) with a SELECTED combo, so no channel is stressed
+        twice.  No-op unless ``_no_repeat_active()``.  Selected combos stay
+        enabled; a combo that no longer conflicts (because the user deselected
+        the combo it clashed with) is re-enabled."""
+        if not self._no_repeat_active():
+            return
+        used: Set[int] = set()
+        for c in self._combos:
+            if c.enabled:
+                used |= self._combo_channels(c.config)
+        self.combos_list.blockSignals(True)
+        try:
+            for i, c in enumerate(self._combos):
+                item = self.combos_list.item(i)
+                if item is None:
+                    continue
+                if c.enabled:
+                    item.setFlags(item.flags()
+                                  | QtCore.Qt.ItemFlag.ItemIsEnabled
+                                  | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    continue
+                conflict = bool(self._combo_channels(c.config) & used)
+                if conflict:
+                    if item.checkState() != QtCore.Qt.CheckState.Unchecked:
+                        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                    item.setFlags(item.flags()
+                                  & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    item.setFlags(item.flags()
+                                  | QtCore.Qt.ItemFlag.ItemIsEnabled
+                                  | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        finally:
+            self.combos_list.blockSignals(False)
 
     def _update_summary(self):
         n_total = len(self._combos)
@@ -759,6 +844,10 @@ class CombinationPanel(QtWidgets.QGroupBox):
                         self._combos[i].enabled = False
             finally:
                 self.combos_list.blockSignals(False)
+        # PS no-repeat: re-grey / re-enable combos after this change so the
+        # channel-disjoint invariant holds (checking one locks its channels;
+        # unchecking frees them).
+        self._refresh_no_repeat_availability()
         self._update_summary()
         self.combinationsChanged.emit(self.selected_configurations())
 
@@ -798,6 +887,30 @@ class CombinationPanel(QtWidgets.QGroupBox):
         return super().eventFilter(obj, ev)
 
     def _on_select_all_toggled(self, checked: bool):
+        if self._no_repeat_active():
+            # "Select all" can't mean literally every combo here (they'd share
+            # channels).  Checked → GREEDY maximal channel-disjoint set (take
+            # combos in list order, skipping any that reuse a channel already
+            # taken); unchecked → clear.
+            used: Set[int] = set()
+            self.combos_list.blockSignals(True)
+            try:
+                for i, c in enumerate(self._combos):
+                    item = self.combos_list.item(i)
+                    chans = self._combo_channels(c.config)
+                    take = checked and not (chans & used)
+                    c.enabled = take
+                    if item is not None:
+                        item.setCheckState(QtCore.Qt.CheckState.Checked if take
+                                           else QtCore.Qt.CheckState.Unchecked)
+                    if take:
+                        used |= chans
+            finally:
+                self.combos_list.blockSignals(False)
+            self._refresh_no_repeat_availability()
+            self._update_summary()
+            self.combinationsChanged.emit(self.selected_configurations())
+            return
         self.combos_list.blockSignals(True)
         try:
             state = (QtCore.Qt.CheckState.Checked if checked

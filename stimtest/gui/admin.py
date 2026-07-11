@@ -113,6 +113,15 @@ _extension_profiles: Dict[str, str] = {}
 #: populates this.
 _extension_display_names: Dict[str, str] = {}
 
+#: Map of extension profile name → the frozenset of shape IDs THAT
+#: profile unlocked.  :data:`RESTRICTED_SHAPES` is the global UNION
+#: across every registered profile and can't be decomposed back into
+#: per-profile sets, so this records each profile's own contribution —
+#: needed to EXPORT a single profile with exactly the shapes it owns.
+#: Same registration call populates this (last-write-wins, matching the
+#: display_name semantics).
+_extension_shapes: Dict[str, frozenset] = {}
+
 #: Dynamic set of restricted shape IDs.  Extensions union their
 #: shape IDs into this set when they register.  Empty in a default
 #: install → PatternPanel filter is a no-op and all shapes appear in
@@ -289,6 +298,12 @@ def register_extension_profile(
             _extension_display_names[name_lower] = display_name
         if shapes:
             RESTRICTED_SHAPES.update(str(s) for s in shapes)
+        # Record THIS profile's own shape set so it can be exported
+        # independently of the global union.  Last-write-wins, like
+        # display_name.  Empty frozenset for a profile that unlocks no
+        # shapes (e.g. a pure-login profile).
+        _extension_shapes[name_lower] = frozenset(
+            str(s) for s in (shapes or ()))
 
 
 def _any_extension_registered() -> bool:
@@ -299,6 +314,43 @@ def _any_extension_registered() -> bool:
     login UX).
     """
     return bool(_extension_profiles)
+
+
+def list_extension_profiles() -> List[str]:
+    """Return the registered extension-profile names, sorted.
+
+    Used by the GUI "Export Profile…" action to populate its picker.
+    Built-in profiles (``none`` / ``admin``) are NOT included — they
+    aren't exportable plugin profiles.
+    """
+    with _registry_lock:
+        return sorted(_extension_profiles)
+
+
+def get_extension_profile(name: str) -> Optional[Dict[str, object]]:
+    """Return a JSON-serializable snapshot of one registered extension
+    profile, or ``None`` if no such profile is registered.
+
+    The returned dict is the canonical import/export shape::
+
+        {"name", "display_name", "password_hash", "shapes"}
+
+    where ``shapes`` is a SORTED list of the shape IDs THIS profile
+    unlocked (from :data:`_extension_shapes`, not the global
+    :data:`RESTRICTED_SHAPES` union).  ``password_hash`` is the stored
+    SHA-256 hex digest — exporting it is safe because logging in still
+    requires the plaintext password, which is shared out-of-band.
+    """
+    key = (name or "").strip().lower()
+    with _registry_lock:
+        if key not in _extension_profiles:
+            return None
+        return {
+            "name": key,
+            "display_name": _extension_display_names.get(key, key.upper()),
+            "password_hash": _extension_profiles[key],
+            "shapes": sorted(_extension_shapes.get(key, frozenset())),
+        }
 
 
 def _profile_name(profile) -> str:

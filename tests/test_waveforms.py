@@ -367,8 +367,10 @@ def test_pat_load_arbitrary_uses_helper():
     stim._pat_content_signature = None
     stim._loaded_channels = set()
     stim._validated_channels = set()
-    # Override _check to just pass through.
-    stim._check = lambda res, ctx: None
+    # Override _check to just pass through.  Accept the ``since=`` kwarg
+    # that ``_invoke`` passes (the real _check signature gained it).
+    stim._check = lambda res, ctx, **kw: None
+    stim._channel_content_sig = {}
 
     p = PulsePattern.biphasic(amplitude_ua=100, phase_width_us=200,
                               polarity=-1, interphase_us=50,

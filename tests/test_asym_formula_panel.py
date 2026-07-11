@@ -72,7 +72,7 @@ def test_readout_for_rect_asym_charge_bal_amp_shows_t_a_floor(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_RECT)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.charge_mode.setCurrentText(CHARGE_BAL_AMP)
@@ -106,7 +106,7 @@ def test_readout_for_rect_asym_charge_bal_wid_shows_amp_floor(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_RECT)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.charge_mode.setCurrentText(CHARGE_BAL_WID)
@@ -136,7 +136,7 @@ def test_readout_for_rect_asym_charge_bal_off_shows_manual_message(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_RECT)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.charge_mode.setCurrentText(CHARGE_BAL_OFF)
@@ -166,7 +166,7 @@ def test_readout_for_pseudo_cap_lock_width_shows_feasibility_floor(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     lock_idx = panel.cap_lock_combo.findData(LOCK_WIDTH)
@@ -195,7 +195,7 @@ def test_readout_for_pseudo_cap_lock_amplitude_shows_amp_range(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     lock_idx = panel.cap_lock_combo.findData(LOCK_AMPLITUDE)
@@ -268,7 +268,7 @@ def test_readout_for_pseudo_cap_coupled_includes_pulse_rate_range(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.phase_amp[0].setValue(-200.0)
@@ -281,9 +281,11 @@ def test_readout_for_pseudo_cap_coupled_includes_pulse_rate_range(qapp):
     assert "Pulse period:" in txt
     # The interpulse-gap note (default ON → 5 µs).
     assert "5" in txt and "interpulse gap" in txt.lower()
-    # Hardware floor / ceiling mentioned for context.
+    # Hardware floor / ceiling mentioned for context.  The label shows
+    # the rate range in pulses-per-second (operator terminology), so the
+    # 100 kHz ceiling renders as "100.00 kpps" — NOT "kHz".
     assert "0.008" in txt   # RATE_HZ_MIN
-    assert "100" in txt and "kHz" in txt   # RATE_HZ_MAX = 100 kHz
+    assert "100" in txt and "kpps" in txt   # RATE_HZ_MAX = 100 kpps
 
 
 def test_readout_rate_range_drops_gap_when_interpulse_off(qapp):
@@ -297,7 +299,7 @@ def test_readout_rate_range_drops_gap_when_interpulse_off(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.phase_amp[0].setValue(-200.0)
@@ -328,7 +330,7 @@ def test_rate_range_in_readout_matches_spinbox_clamp(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.phase_amp[0].setValue(-1000.0)
@@ -361,7 +363,7 @@ def test_rate_range_omitted_outside_cap_coupled(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_RECT)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.charge_mode.setCurrentText(CHARGE_BAL_AMP)
@@ -391,7 +393,7 @@ def test_readout_floor_updates_when_first_phase_changes(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.asym_shape_combo.findData(ASYM_SHAPE_RECT)
     panel.asym_shape_combo.setCurrentIndex(idx)
     panel.charge_mode.setCurrentText(CHARGE_BAL_AMP)

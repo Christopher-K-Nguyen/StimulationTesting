@@ -51,7 +51,6 @@ def _fully_populated_metrics() -> CaptureMetrics:
         return_polarization_per_phase_v=[0.21, 0.22],
         charge_per_phase_nc=20.0,
         charge_injection_mc_per_cm2=0.4,
-        effective_capacitance_nf=1.5,
         driving_capacitance_mf_per_cm2=0.025,
         interpulse_potential_v=-0.05,
         return_pre_pulse_potential_v=-0.04,

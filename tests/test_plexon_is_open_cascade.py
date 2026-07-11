@@ -232,3 +232,72 @@ def test_init_failure_leaves_flag_false():
     stim._lib.ps_close_all_stim.reset_mock()
     stim.close()
     assert stim._lib.ps_close_all_stim.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Trigger mode — open() must assert PS_TRIG_SOFT for programmatic start/stop
+# ---------------------------------------------------------------------------
+# PULSAR drives start/stop PROGRAMMATICALLY via PS_StartStimAllChannels /
+# PS_StopStimAllChannels, both of which return error 4 ("wrong trigger
+# mode") unless the device is in PS_TRIG_SOFT (0).  PS_InitAllStim resets
+# the trigger mode and the power-on default is not guaranteed soft across
+# firmware revisions, so ``open()`` (re)asserts it on every connect.
+# Field symptom of a device left in PS_TRIG_PULSE/LEVEL: the stim "starts"
+# but waits for a hardware trigger that never arrives, so it never pulses.
+def test_open_sets_trigger_mode_soft():
+    """``open()`` explicitly sets the device to PS_TRIG_SOFT (0)."""
+    from stimtest.hardware.pyplexstim.pyplexstimlib import PS_TRIG_SOFT
+    stim = _build_stim()
+    stim._lib.ps_set_trigger_mode = MagicMock(return_value=0)
+    stim._lib.ps_get_trigger_mode = MagicMock(return_value=(PS_TRIG_SOFT, 0))
+
+    stim.open()
+
+    stim._lib.ps_set_trigger_mode.assert_called_once_with(
+        stim._stim_n, PS_TRIG_SOFT)
+    assert PS_TRIG_SOFT == 0  # the constant must stay 0 (SOFT)
+
+
+def test_open_forces_soft_even_when_device_came_up_in_pulse_mode():
+    """If the device powered up in PS_TRIG_PULSE (1), ``open()`` still
+    forces it back to PS_TRIG_SOFT (0)."""
+    from stimtest.hardware.pyplexstim.pyplexstimlib import PS_TRIG_SOFT
+    stim = _build_stim()
+    stim._lib.ps_set_trigger_mode = MagicMock(return_value=0)
+    # First get() = prior mode PULSE(1); second get() = post-set read-back SOFT.
+    stim._lib.ps_get_trigger_mode = MagicMock(
+        side_effect=[(1, 0), (PS_TRIG_SOFT, 0)])
+
+    stim.open()
+
+    stim._lib.ps_set_trigger_mode.assert_called_once_with(
+        stim._stim_n, PS_TRIG_SOFT)
+
+
+def test_open_survives_trigger_mode_set_failure():
+    """A trigger-mode set that returns non-OK must NOT abort ``open()``
+    — the first ``start_all`` surfaces the hard error 4 instead.  open()
+    still completes and flips ``_is_open`` True."""
+    stim = _build_stim()
+    stim._lib.ps_set_trigger_mode = MagicMock(return_value=-1)  # invalid arg
+    stim._lib.ps_get_trigger_mode = MagicMock(return_value=(1, 0))
+    stim._lib.ps_get_extended_error_info = MagicMock(
+        return_value=("bad mode", 0))
+
+    stim.open()  # must not raise
+    assert stim._is_open is True
+
+
+# ---------------------------------------------------------------------------
+# load_all_channels — the MONOPOLAR commit (PS_LoadAllChannels)
+# ---------------------------------------------------------------------------
+def test_load_all_channels_maps_to_ps_load_all_channels():
+    """``PlexonStimulator.load_all_channels()`` issues one
+    ``PS_LoadAllChannels`` (the commit the MATLAB used for monopolar
+    configs with no return channels)."""
+    stim = _build_stim()
+    stim._lib.ps_load_all_channels = MagicMock(return_value=0)
+
+    stim.load_all_channels()
+
+    stim._lib.ps_load_all_channels.assert_called_once_with(stim._stim_n)

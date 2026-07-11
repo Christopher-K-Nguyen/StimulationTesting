@@ -17,7 +17,11 @@ from typing import Dict
 # - PLX00078, PLX00089, PLX00161: original NIL list inherited from MATLAB.
 # - PLX00180: confirmed bench-tested 2026-05; outputs 1 V/V on V_mon and
 #   1 mV/µA on I_mon (matches the NIL constants below).
-NIL_SERIAL_NUMBERS = ("PLX00078", "PLX00089", "PLX00161", "PLX00180")
+# - PLX00178: CWRU stimulator; bench data shows I_mon ~1 mV/µA (≈8 mV at 8 µA),
+#   i.e. NIL scaling — added so it auto-applies NIL without needing a
+#   verification sweep.
+NIL_SERIAL_NUMBERS = ("PLX00078", "PLX00089", "PLX00161", "PLX00180",
+                      "PLX00178")
 
 #: Default voltage-monitor scaling, V/V (V_mon = stim_voltage * scale)
 VMON_SCALING_DEFAULT = 0.25
@@ -27,8 +31,22 @@ VMON_SCALING_NIL = 1.0
 IMON_SCALING_DEFAULT = 2.5e-3   # V_mon line shows 2.5 mV per µA of stim current
 IMON_SCALING_NIL = 1e-3
 
-#: Plexon stimulator output current resolution (μA per LSB)
+#: Plexon stimulator output current resolution (μA per LSB) for
+#: RECTANGULAR pulses.  Operator: "keep the current resolution at 0.1 µA
+#: for rectangular shapes.  I do not trust the 30 nA resolution of the
+#: stimulator but will use it for non-rectangular shapes."  Used as the
+#: validation floor + GUI spinbox grid for rectangular patterns.
 STIM_CURRENT_RESOLUTION_UA = 0.1
+
+#: Per-shape current QUANTIZATION grid (nA) applied when a PulsePattern is
+#: rendered to the device ``.pat``.  A pattern whose phases are ALL
+#: rectangular is rounded to the trusted 0.1 µA grid
+#: (:data:`STIM_CURRENT_STEP_RECT_NA`); any pattern containing a shaped
+#: (ramp / sine / bowtie / …) phase uses the PlexStim 2.0 native 30 nA
+#: resolution (:data:`STIM_CURRENT_STEP_FINE_NA`) so the curve renders
+#: smoothly.  See :meth:`stimtest.waveforms.PulsePattern.device_current_step_nA`.
+STIM_CURRENT_STEP_RECT_NA = 100    # 0.1 µA — trusted grid for rectangular pulses
+STIM_CURRENT_STEP_FINE_NA = 30     # PlexStim 2.0 native resolution (non-rectangular)
 
 #: Default GUI spinbox single-step for current / amplitude / offset
 #: spinboxes. Distinct from :data:`STIM_CURRENT_RESOLUTION_UA` (the
@@ -51,10 +69,24 @@ STIM_TIME_RESOLUTION_US = 1.0
 STIM_MAX_AMPLITUDE_UA = 1000.0
 
 #: Plexon PlexStim 2.0 voltage compliance (V).
-#: V_mon will saturate at ~±12 V when the load demands more voltage than
-#: the stimulator can supply. Crossing this means the device is no longer
-#: actually delivering the programmed current.
-STIM_VOLTAGE_COMPLIANCE_V = 12.0
+#: V_mon saturates at the device's output-compliance rail (~±9.6 V on the
+#: PlexStim 2.0) when the load demands more voltage than the stimulator
+#: can supply. Crossing it means the device is no longer actually
+#: delivering the programmed current.
+#:
+#: Detection threshold is 9.0 V, set DELIBERATELY BELOW the ~9.6 V rail so
+#: a trace that visibly rails (sits AT the rail) reliably clears it. The
+#: previous 12.0 V value sat ABOVE the rail, so a clearly-compliant trace
+#: that flat-topped at ~9–10 V never crossed 12 V and compliance went
+#: undetected (operator: "Why is compliance not being detected when the
+#: voltage clearly reaches it?"). 9.0 V is the MATLAB ground truth — the
+#: voltage-compliance check in ``getCapacitance.m`` is ``abs(voltage) > 9``
+#: (``getVoltageWaveform.m`` / ``getAcutePlot2.m`` use 10 for the distinct
+#: BROKEN-electrode test). ``cap.v_mon_v`` is in ELECTRODE volts
+#: (``raw_vmon / vmon_scaling``), the same space MATLAB compares in, so
+#: the threshold is dimensionally consistent across the Default (0.25 V/V)
+#: and NIL (1.0 V/V) presets.
+STIM_VOLTAGE_COMPLIANCE_V = 9.0
 
 #: Plexon's typical digital trigger / pattern start delay (µs) — the gap
 #: between the digital-sync TTL rising edge and the actual phase-1 stim
@@ -237,20 +269,33 @@ COATINGS: Dict[str, Coating] = {
 
 
 # ---------------------------------------------------------------------------
-# Connector catalog (Omnetics pinouts mirrored from MATLAB getDeviceType.m)
+# Connector / cable catalog (mirrored from MATLAB getDeviceType.m +
+# getCableType.m / selectChannels.m)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Connector:
-    """Maps a connector pin index (1..N) to the logical device channel.
+    """A cable's **device→Plexon** channel map.
 
-    Reproduces the channel-permutation arrays in ``getDeviceType.m``:
-    - ``omneticsUTD`` is the identity (1..16).
-    - ``omneticsNNX`` reorders the same pins for NeuroNexus headstages.
-    - ``utd_plexon`` is the PlexStim port-side mapping for UTD-style boards.
+    ``pin_to_channel[i]`` (0-based ``i``) is the **Plexon stim channel** the
+    cable wires the **device channel ``i+1``** to — selecting device CH ``i+1``
+    commands Plexon CH ``pin_to_channel[i]``.  ``SetupTab.current_channel_map``
+    turns this into the ``{device: plexon}`` map the runner installs
+    (:meth:`ExperimentRunner.set_channel_map`); an identity array ⇒ pulse
+    CH N stimulates device CH N (no translation).
+
+    Catalogued cables mirror the MATLAB reference arrays:
+    - ``omneticsUTD`` / 2×8 receptacle → identity (1..16) — ``getDeviceType.m``
+      / ``getCableType.m`` "Receptacle".
+    - ``omneticsNNX`` → NeuroNexus headstage reorder.
+    - ``utd_plexon`` → PlexStim port-side interleave for UTD boards
+      (device 8 → Plexon 1).
+    - ``BLACKROCK_TO_PLEXON_OMNETICS`` → the Plexon-Omnetics cable's 8-channel
+      **bank swap** (device 1-8 ↔ Plexon 9-16, so device 9 → Plexon 1) —
+      ``selectChannels.m`` / ``getCableType.m`` "Omnetics".
     """
     name: str
     description: str
-    pin_to_channel: tuple  #: 1-based logical channel for connector pin i (1-based)
+    pin_to_channel: tuple  #: Plexon stim channel for device channel i (1-based)
 
 
 CONNECTORS: Dict[str, Connector] = {
@@ -269,9 +314,54 @@ CONNECTORS: Dict[str, Connector] = {
         description="PlexStim port-side ordering for UTD-style boards",
         pin_to_channel=(15, 13, 11, 9, 7, 5, 3, 1, 16, 14, 12, 10, 8, 6, 4, 2),
     ),
-    "Other": Connector(
-        name="Other",
-        description="Pass-through (1:1) mapping for custom connectors",
+    # The two cables the MATLAB getCableType.m dialog offers, added verbatim
+    # (operator: "see the cable types from my MATLAB on how device CH09
+    # matches Plexon CH01").  Selecting one re-routes device→Plexon per its
+    # array; the older "Omnetics UTD" entry stays identity so existing
+    # device defaults don't silently re-route.
+    "2×8 Pin Receptacle": Connector(
+        name="2×8 Pin Receptacle",
+        description="Straight-through 2×8 pin receptacle — device CH N → "
+                    "Plexon CH N (MATLAB getCableType 'Receptacle')",
+        pin_to_channel=tuple(range(1, 17)),
+    ),
+    "Plexon Omnetics": Connector(
+        name="Plexon Omnetics",
+        description="Plexon Omnetics cable — 8-channel bank swap, device "
+                    "CH1–8 ↔ Plexon CH9–16 (device CH09 → Plexon CH01; "
+                    "MATLAB BLACKROCK_TO_PLEXON_OMNETICS)",
+        pin_to_channel=(9, 10, 11, 12, 13, 14, 15, 16, 1, 2, 3, 4, 5, 6, 7, 8),
+    ),
+    # The verification / test-board stimulation cable (Plexon
+    # 14-03-A-03), the "large black Omnetics" cable the calibration
+    # wizard uses to connect the PlexStim to the 14-04-A-03-A test
+    # board.  IDENTITY (straight-through): board channel N ↔ Plexon
+    # CH N, so the test board needs NO channel translation
+    # (``current_channel_map()`` == {}) — matches the verified
+    # test-board-is-identity behaviour.  It's the operator-chosen
+    # cable option for the Plexon Test Board (alongside the 2×8
+    # receptacle).
+    "Large Black Omnetics": Connector(
+        name="Large Black Omnetics",
+        description="Plexon large black Omnetics stimulation cable "
+                    "(14-03-A-03) — the verification / test-board cable. "
+                    "Straight-through: device CH N → Plexon CH N (identity).",
+        pin_to_channel=tuple(range(1, 17)),
+    ),
+    # ("Other" — a pass-through 1:1 connector — was REMOVED: it was
+    # redundant with "Custom", which is the operator-editable pinout
+    # (operator: "Remove other as a choice for cable type since that is
+    # what custom is for").  Back-compat: a stale saved ``connector =
+    # "Other"`` pref resolves through ``_cable_pin_to_channel`` → None →
+    # ``current_channel_map()`` == {} (identity / no translation), which
+    # is exactly what "Other" did, so no routing changes.)
+    # User-editable pinout. Starts identity (pin N → CH N); the Setup
+    # tab's cable-map tree lets the operator re-assign each pin's device
+    # channel, and the edited map is stored per-session in prefs
+    # (``custom_cable_map``). Selecting this connector unlocks the tree.
+    "Custom": Connector(
+        name="Custom",
+        description="Operator-defined pinout (edit the map below)",
         pin_to_channel=tuple(range(1, 17)),
     ),
 }
@@ -402,6 +492,14 @@ class DeviceDef:
     description: str
     mapping: tuple              #: tuple of tuples, 1-based ch numbers; 0 = empty
     default_connector: str = "Omnetics UTD"
+    #: Optional whitelist of cable / connector names the Setup tab's
+    #: cable dropdown offers WHEN THIS DEVICE IS SELECTED. Empty tuple
+    #: (the default) = the full :data:`CONNECTORS` list. The Plexon
+    #: Test Board pins this to just ("Large Black Omnetics", "2×8 Pin
+    #: Receptacle") per operator request — the two physical cables it's
+    #: ever wired with; every real array keeps the full list so their
+    #: Omnetics UTD / NNX / Plexon / Custom routing is unaffected.
+    cable_choices: tuple = ()
     default_surface_area_um2: float = 5000.0   # SIROF UEA, IEEE NER paper
     default_coating: str = "SIROF"
     layout: str = "rect"        #: "rect" | "triangular"
@@ -415,9 +513,47 @@ class DeviceDef:
     #: rounded. Has no effect for non-square / non-rectangle
     #: geometries; the GUI hides the toggle in those cases.
     default_rounded: bool = False
+    #: Whether this "device" carries real electrodes. ``False`` for a
+    #: bare test board (e.g. the Plexon test board — 16 resistive test
+    #: points, no electrodes). When ``False`` the Setup tab HIDES the
+    #: electrode-specific options (coating / geometry / surface area /
+    #: return-electrode coating) and :meth:`SetupTab.current_array`
+    #: forces ``surface_area_um2 = 0`` so area-normalised metrics
+    #: (current density, Q_inj density) are disabled and the plot shows
+    #: raw current instead of current density.
+    has_electrodes: bool = True
 
 
 DEVICES: Dict[str, DeviceDef] = {
+    # Plexon test board goes FIRST (operator: "top of the list").  It's a
+    # bare 16-channel resistive test board — no electrodes — so
+    # ``has_electrodes=False`` hides the coating/geometry/area options and
+    # disables area-normalised metrics.  Channels are the PlexStim outputs
+    # 1–16 laid out 4×4 for a compact selection grid; the physical Omnetics
+    # cable wiring (Plexon↔device renumbering) is chosen via the Connector /
+    # cable map — see matlab_reference + the "Electrode Mapping" pinout doc.
+    "Plexon Test Board": DeviceDef(
+        name="Plexon Test Board",
+        description="Plexon 16-channel resistive test board (no "
+                    "electrodes). Used to verify PlexStim output + scope "
+                    "wiring. 2×8 layout — top row even channels (2–16), "
+                    "bottom row odd channels (1–15). The board channel "
+                    "numbers MATCH the PlexStim (Plexon) channel numbers, "
+                    "so no cable translation is needed (identity). Electrode "
+                    "options (coating / geometry / area) are hidden and "
+                    "area-based metrics are disabled.",
+        # 2×8: bottom row odds 1,3,…,15; top row evens 2,4,…,16 (operator).
+        mapping=(
+            ( 2,  4,  6,  8, 10, 12, 14, 16),
+            ( 1,  3,  5,  7,  9, 11, 13, 15),
+        ),
+        # Test board is wired with the large black Omnetics verification
+        # cable (identity) — default to it, and restrict the cable
+        # dropdown to just the two cables it's ever used with (operator).
+        default_connector="Large Black Omnetics",
+        cable_choices=("Large Black Omnetics", "2×8 Pin Receptacle"),
+        has_electrodes=False,
+    ),
     # Order: simplest geometry first, then named arrays, UTD MEA right
     # before Other (it's a research-only stand-in that's rarely the
     # default pick).
@@ -531,7 +667,10 @@ DEVICES: Dict[str, DeviceDef] = {
                  (5, 6, 7, 8),
                  (9, 10, 11, 12),
                  (13, 14, 15, 16)),
-        default_connector="Other",
+        # Was "Other" (now removed) → the identity-equivalent "2×8 Pin
+        # Receptacle" (also 1:1, so routing is unchanged).  Pick "Custom"
+        # from the dropdown to hand-edit this device's pinout.
+        default_connector="2×8 Pin Receptacle",
         default_surface_area_um2=5000.0,
         default_coating="SIROF",
     ),
@@ -557,12 +696,21 @@ EXPERIMENTS: Dict[str, ExperimentDef] = {
     "SP": ExperimentDef("SP", "Short-Term Pulsing",
                         "Short-Term Pulsing",
                         "Fixed-amplitude pulsing for a fixed duration."),
+    "CP": ExperimentDef("CP", "Continuous Pulsing (manual start/stop)",
+                        "Continuous Pulsing",
+                        "Pulse until you press Stop — no fixed duration or "
+                        "pulse count; snapshot captures at a set cadence."),
     "LP": ExperimentDef("LP", "Long-Term Pulsing (with re-characterization)",
                         "Long-Term Pulsing",
                         "Long pulsing with periodic VT snapshots to track drift."),
     "PS": ExperimentDef("PS", "Progressive Stress (stepped current)",
                         "Progressive Stress",
                         "Stepped-current ramp with frequent characterization."),
+    "EIS": ExperimentDef("EIS",
+                         "Galvanostatic Electrochemical Impedance Spectroscopy",
+                         "Galvanostatic Electrochemical Impedance Spectroscopy",
+                         "Small-signal current sweep 1 Hz–100 kHz → complex "
+                         "impedance Z(f); Bode + Nyquist."),
 }
 
 

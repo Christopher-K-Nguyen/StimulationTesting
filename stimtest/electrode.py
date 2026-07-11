@@ -229,7 +229,7 @@ class Configuration:
     id: str
     active: int
     returns: Tuple[int, ...] = ()
-    counter_electrode_label: str = "Pt counter"
+    counter_electrode_label: str = "Pt"        # operator: just "Pt", not "Pt counter"
 
     @classmethod
     def monopolar(cls, active: int) -> "Configuration":

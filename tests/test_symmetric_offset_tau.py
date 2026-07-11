@@ -176,7 +176,7 @@ def test_exp_inc_dec_pair_builds_correct_per_phase_shapes(qapp):
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(SYMMETRIC)
-    panel.polarity.setCurrentText("Cathodic-first")
+    panel.polarity.setCurrentText("Cathodal-first")
     idx = panel.shape_combo.findData("exp_inc_dec")
     panel.shape_combo.setCurrentIndex(idx)
     panel.amp_excite.setValue(100.0)
@@ -243,8 +243,9 @@ def test_symmetric_tau_visible_only_for_exponential_shapes(qapp):
 
 
 def test_symmetric_offset_flows_into_phase(qapp):
-    """Symmetric offset spinbox value flows into both Phase
-    objects' ``offset_ua`` field."""
+    """Symmetric offset spinbox value flows into both Phase objects'
+    ``offset_ua`` field — but ONLY when the offset ENABLE checkbox is checked
+    (gotcha #120: the offset is now opt-in)."""
     from stimtest.gui.pattern_panel import (
         PatternControlPanel, BIPHASIC, SYMMETRIC,
     )
@@ -257,6 +258,10 @@ def test_symmetric_offset_flows_into_phase(qapp):
     panel.amp_excite.setValue(100.0)
     panel.width_shared.setValue(200.0)
     panel.sym_offset_ua.setValue(25.0)
+    # Unchecked (default) → offset NOT applied.
+    assert panel.pattern().phases[0].offset_ua == pytest.approx(0.0)
+    # Checked → offset flows into both phases.
+    panel.sym_offset_enable_chk.setChecked(True)
     pat = panel.pattern()
     assert pat.phases[0].offset_ua == pytest.approx(25.0)
     assert pat.phases[1].offset_ua == pytest.approx(25.0)

@@ -297,7 +297,7 @@ class ContributeDialog(QtWidgets.QDialog):
             "here for a one-off override (e.g. you're submitting "
             "on behalf of a collaborator at a different lab).")
         self.lbl_institution.setPlaceholderText(
-            "e.g. Neural Interfaces Lab, University of Texas at Dallas")
+            "e.g. Solzbacher Lab, University of Utah")
         # Keep the Institution field disabled until its checkbox is
         # ticked — otherwise the empty-state placeholder reads as
         # "type here" but nothing of the user's input ends up in the

@@ -39,16 +39,24 @@ _REPEAT_INTERVAL_MS = 60     # ms between subsequent ticks while still held
 _GROUP_SEP = " "
 
 
-def _format_with_thousands(value: float, decimals: int) -> str:
+def _format_with_thousands(value: float, decimals: int,
+                           force_sign: bool = False) -> str:
     """Format a numeric value with the SI narrow-space thousands
     separator. Decimal point stays as ``.`` (no localisation), so the
     result round-trips through ``float()`` after stripping the
     separator. Negative values keep their sign on the leading digit
-    group.
+    group.  ``force_sign`` prepends an explicit ``+`` to positive values
+    (e.g. ``+5``) so a signed amplitude reads its polarity at a glance
+    (operator: "I want the GUI input says +5, not just 5").
     """
     if value != value:    # NaN
         return "nan"
-    sign = "-" if value < 0 else ""
+    if value < 0:
+        sign = "-"
+    elif force_sign and value > 0:
+        sign = "+"
+    else:
+        sign = ""
     av = abs(value)
     if decimals > 0:
         s = f"{av:.{decimals}f}"
@@ -184,10 +192,25 @@ class RepeatingDoubleSpinBox(_HoldRepeatMixin, QtWidgets.QDoubleSpinBox):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        #: When True, positive values render with an explicit leading ``+``
+        #: (e.g. ``+5``) — set via :meth:`setForceSign` on signed-amplitude
+        #: spinboxes so the polarity is visible at a glance.
+        self._force_sign = False
         self._install_repeat()
 
+    def setForceSign(self, on: bool) -> None:
+        """Show / hide an explicit leading ``+`` on positive values."""
+        self._force_sign = bool(on)
+        # Re-render the current value under the new sign policy.
+        try:
+            self.lineEdit().setText(
+                self.prefix() + self.textFromValue(self.value()) + self.suffix())
+        except Exception:
+            pass
+
     def textFromValue(self, value: float) -> str:
-        return _format_with_thousands(value, self.decimals())
+        return _format_with_thousands(value, self.decimals(),
+                                      force_sign=self._force_sign)
 
     def valueFromText(self, text: str) -> float:
         # Strip suffix / prefix first so a typed-over partial edit

@@ -376,19 +376,24 @@ def test_restore_prefs_partial_on_bad_value_type(qapp):
 
 
 # ---------------------------------------------------------------------------
-# ConnectionPanel — the in-panel BiasConnector was removed
+# ConnectionPanel — the INTERSTELLAR connector lives in Setup (below the
+# oscilloscope) when the experimental feature is enabled.
 # ---------------------------------------------------------------------------
-def test_connection_panel_no_longer_has_in_panel_bias_connector(qapp):
-    """The bias connector + group moved to per-experiment Test
-    Parameters.  ConnectionPanel must not have a self.bias_connector
-    attribute anymore (else stale references would silently break
-    when MainWindow plumbs the host)."""
+def test_connection_panel_has_interstellar_connector_when_enabled(qapp):
+    """With INTERSTELLAR enabled (the default when running from source),
+    ConnectionPanel exposes ``self.bias_connector`` — the Connect /
+    Disconnect control now lives in the Setup tab, below the
+    oscilloscope, host-delegated to the panel's own driver facade.
+
+    The DISABLED case (public build → no connector) is covered in
+    ``tests/test_interstellar_feature_flag.py``."""
+    from stimtest.gui.bias_panel import BiasConnector
     from stimtest.gui.connection_panel import ConnectionPanel
     conn = ConnectionPanel()
-    assert not hasattr(conn, "bias_connector"), (
-        "bias_connector should have been removed when the connector "
-        "moved to per-experiment Test Parameters; left-over attribute "
-        "would create a stale parallel driver path.")
+    assert hasattr(conn, "bias_connector"), (
+        "ConnectionPanel should build the INTERSTELLAR connector when the "
+        "feature is enabled (default from source).")
+    assert isinstance(conn.bias_connector, BiasConnector)
 
 
 def test_connection_panel_still_exposes_host_facade(qapp):

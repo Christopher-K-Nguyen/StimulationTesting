@@ -192,6 +192,16 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     # from the background probe thread back to the GUI thread.
     # ``object`` carries bool | None | Exception from the probe.
     _stimDetectResult = QtCore.pyqtSignal(object)
+    # Internal signal for marshalling the stim-OPEN result from the
+    # background init thread back to the GUI thread.  Carries the opened
+    # Stimulator on success, or an Exception on failure.  ``PS_InitAllStim``
+    # can hang for many seconds (Sim-2 USB lock / wedged device), so the
+    # open() runs off the GUI thread — see ``_do_initialize_stim``.
+    _stimInitResult = QtCore.pyqtSignal(object)
+    # Watchdog: if a stim init is still running after this long, it's
+    # almost always the Plexon Sim-2 / Stim-2 USB lock — log an actionable
+    # hint (we can't interrupt the blocking DLL call, so we don't fail).
+    _STIM_INIT_WATCHDOG_MS = 15000
     # Internal signal for marshalling scope-connect results from the
     # background thread back to the GUI thread. Carries the opened
     # Oscilloscope on success, or an Exception on failure.
@@ -237,10 +247,11 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # ("uncalibrated stimulator") and is prompted to run the
         # calibration wizard or manually confirm the preset.
         self._scaling_by_serial: dict = self._load_scaling_memory()
-        # One-shot flag so the uncalibrated-serial warning fires
-        # at most once per stim lifecycle (cleared on
-        # ``_do_close_stim``).
-        self._uncalibrated_warned: bool = False
+        # True while a background stim init (``PS_InitAllStim``) is in
+        # flight.  Guards against a second, concurrent init — the PlexStim
+        # DLL is single-producer and the driver's _dll_lock would serialize
+        # (deadlock) a second open() anyway.
+        self._stim_init_in_flight: bool = False
 
         # ----- shared simulator toggle -----
         self.simulate = QtWidgets.QCheckBox("Use simulator")
@@ -403,19 +414,28 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # text temporarily becomes "Initializing…". Measure via
         # fontMetrics so the width tracks whatever font the platform
         # applies to QPushButtons.
+        # Widest TRANSIENT label is "Initializing…".  Size to the LARGER of a
+        # fontMetrics-advance estimate and the style's real ``sizeHint()``
+        # (which includes the platform button chrome), plus margin.  The
+        # advance-only estimate under-measured on the real (DPI-scaled) Windows
+        # display and clipped "Initializing…" (operator: "Initializing is not
+        # fitting"); sizeHint tracks the real font + content margins so the
+        # button is a touch wider and the transient label always fits.
         _fm = self.init_btn.fontMetrics()
-        _pad = 24   # QPushButton horizontal content margin (platform typical)
-        _btn_w = max(
-            _fm.horizontalAdvance("Initializing…"),   # widest transient label
-            _fm.horizontalAdvance("Initialize"),
-            _fm.horizontalAdvance("Close"),
-        ) + _pad
+        _labels = ("Initializing…", "Initialize", "Close")
+        _text_w = max(_fm.horizontalAdvance(_t) for _t in _labels)
+        _sh_w = 0
+        for _t in _labels:
+            self.init_btn.setText(_t)
+            _sh_w = max(_sh_w, self.init_btn.sizeHint().width())
+        self.init_btn.setText("Initialize")
+        _btn_w = max(_text_w + 24, _sh_w) + 16
         for _b in (self.init_btn, self.close_btn,
                    self.connect_btn, self.disconnect_btn):
             _b.setFixedWidth(_btn_w)
 
         # ----- calibration row -----
-        self.calibrate_btn = QtWidgets.QPushButton("Run Calibration")
+        self.calibrate_btn = QtWidgets.QPushButton("Run Verification")
         self.calibrate_btn.setEnabled(False)   # unlocks when stim+scope both connected
         self.calibrate_btn.setToolTip(
             "Initialize the stimulator and connect the oscilloscope first.")
@@ -503,50 +523,58 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         cal_row.addWidget(self.cal_label, stretch=1)
         v.addLayout(cal_row)
 
-        # ----- Bias module (STM32 interpulse-bias) — moved per-tab --
-        # The bias-module CONNECTOR + closed-loop FEEDBACK CONFIG live
-        # in each experiment tab's "Test parameters" page now (see
-        # :class:`BiasFeedbackPanel`).  Per-tab placement lets every
-        # experiment carry its own setpoint / tolerance / gating
-        # window in prefs, and avoids cluttering this Hardware panel
-        # with controls that only the active runner uses.
+        # ----- INTERSTELLAR (STM32 interpulse-bias module) ----------
+        # INTERSTELLAR is the experimental interpulse-bias module: an
+        # STM32 board that applies a DC bias to the return electrode
+        # between stimulation pulses.  Its CONNECT / DISCONNECT control
+        # lives HERE, directly below the oscilloscope, so the operator
+        # brings up every bench data source (stim, scope, camera, bias)
+        # from this one Hardware panel.  The closed-loop FEEDBACK CONFIG
+        # (setpoint / tolerance / gating window) stays per-experiment in
+        # each tab's "Test parameters" page — those parameters are
+        # per-run, so they belong with the run, whereas the connection
+        # is a bench-setup concern that belongs here.
         #
-        # ConnectionPanel still OWNS the driver — every per-tab
-        # BiasConnector runs in host-delegated mode against the
-        # facade methods + signals defined further down
-        # (:meth:`open_bias_module`, :meth:`close_bias_module`,
-        # ``biasConnected`` / ``biasDisconnected`` signals).  This
-        # means: (a) the driver is opened ONCE regardless of which
-        # tab the operator clicks Connect from, (b) tabs see each
-        # other's Connect / Disconnect in lockstep via signal
-        # mirroring, (c) the lifecycle still belongs to a panel that
-        # outlives any single run.
-        #
-        # ``self.bias`` mirror attribute kept here for the same
-        # reason — main_window + experiment runners read it without
-        # touching whichever connector raised the open call.
+        # ConnectionPanel OWNS the single shared driver: this connector
+        # runs in host-delegated mode against the facade methods +
+        # signals defined further down (:meth:`open_bias_module`,
+        # :meth:`close_bias_module`, ``biasConnected`` /
+        # ``biasDisconnected``).  Every per-tab BiasFeedbackPanel
+        # subscribes to those same signals to hide/show its config when
+        # INTERSTELLAR connects/disconnects.  ``self.bias`` is the live
+        # driver mirror (``None`` when disconnected) that main_window +
+        # experiment runners read.
         self.bias = None
-        # Tiny info notice so the operator looking for the bias UI
-        # in the Hardware panel finds the new home.  No widgets — just
-        # a hint label.  Removed entirely if it proves redundant after
-        # one bench session.
-        bias_notice = QtWidgets.QLabel(
-            "Interpulse-bias module configured per-experiment "
-            "(see Test parameters tab).")
-        # Reflow on width changes — the Hardware panel sits in a
-        # splitter the operator may drag to give more space to the
-        # log pane / camera preview.  Without word-wrap the italic
-        # one-liner would either stretch the panel sideways or
-        # truncate at the edge.
-        bias_notice.setWordWrap(True)
-        bias_notice.setStyleSheet("color: #777; font-style: italic;")
-        bias_notice.setToolTip(
-            "The STM32 bias module's Connect button + closed-loop "
-            "feedback parameters moved to each experiment tab's "
-            "Test parameters page.  ConnectionPanel still owns the "
-            "shared driver — every tab's connector talks to the "
-            "same instance.")
-        v.addWidget(bias_notice)
+        # OPT-IN BUILD GATE — INTERSTELLAR is experimental, so the whole
+        # connector is built ONLY when the feature flag is enabled.  The
+        # public installer ships with it OFF, so a normal install shows
+        # no bias UI at all (stimtest.feature_flags — see gotcha #103).
+        from ..feature_flags import (
+            INTERSTELLAR_DISPLAY_NAME, interstellar_enabled)
+        if interstellar_enabled():
+            from .bias_panel import BiasConnector
+            # ``host=self`` → the connector delegates Connect/Disconnect
+            # to THIS panel's open_bias_module/close_bias_module facade
+            # and mirrors state from its biasConnected/biasDisconnected
+            # signals.  Exposed as ``self.bias_connector`` so tests and
+            # main_window can reach it.
+            self.bias_connector = BiasConnector(self, host=self)
+            # Route the connector's command-level log lines into the
+            # panel's log pipe (same as the camera / scope / stim
+            # traffic), so they land in the MainWindow LogPane.
+            self.bias_connector.log.connect(self.log.emit)
+            interstellar_group = QtWidgets.QGroupBox(
+                f"{INTERSTELLAR_DISPLAY_NAME} (interpulse-bias module)")
+            interstellar_group.setToolTip(
+                "Experimental interpulse-bias module.  Connect it here, "
+                "then the per-experiment closed-loop feedback options "
+                "appear on each Test Parameters page.  When it is not "
+                "connected, those options stay hidden.")
+            _ig = QtWidgets.QVBoxLayout(interstellar_group)
+            _ig.setContentsMargins(8, 4, 8, 4)
+            _ig.setSpacing(6)
+            _ig.addWidget(self.bias_connector)
+            v.addWidget(interstellar_group)
 
         # ----- Camera (bench monitor) -------------------------------
         # The camera is part of the bench-instrument cluster (alongside
@@ -637,41 +665,149 @@ class ConnectionPanel(QtWidgets.QGroupBox):
 
     # ------------------------------------------------------------- stim
     def _do_initialize_stim(self):
-        """Open the stimulator, fetch its info, and apply remembered scaling."""
+        """Open the stimulator on a WORKER THREAD, then apply scaling.
+
+        ``PS_InitAllStim`` is a blocking DLL call that can hang for many
+        seconds — or indefinitely — when the Plexon Sim-2 / Stim-2 GUI is
+        holding the exclusive USB lock (or the device is wedged after that
+        GUI was force-killed mid-session).  Running it on the GUI thread
+        froze the whole app ("Not Responding") — a CWRU operator hit
+        exactly this, then force-quit + relaunched 13 times.  So the
+        open() runs on a background thread (mirroring
+        :meth:`_do_connect_scope`); the result is marshalled back on the
+        GUI thread via ``_stimInitResult``, and a watchdog logs a
+        "close Sim-2 / power-cycle" hint if the init is still running
+        after ~15 s.  The window stays responsive throughout.
+        """
+        if self._stim_init_in_flight:
+            # A previous init is still running on the worker thread.  The
+            # PlexStim DLL is single-producer and the driver's _dll_lock
+            # would serialize (deadlock) a second open() — never start a
+            # concurrent init; just remind the user how to clear a stall.
+            self.log.emit(
+                "Stimulator initialization already in progress — if it's "
+                "stuck, close the Plexon Sim-2 / Stim-2 application and "
+                "power-cycle the stimulator, then retry.")
+            return
         if self._stim is not None:
             # Already open — close first so a re-init refreshes info.
             self._do_close_stim()
         sim = self.simulate.isChecked()
         import time as _time
-        _t0 = _time.perf_counter()
+        self._stim_init_t0 = _time.perf_counter()
         self.log.emit(
             f"Initializing stimulator ({'simulator' if sim else 'PlexStim hardware'})…")
+
+        # Lock out a concurrent init + show a visible "working" state.
+        self._stim_init_in_flight = True
+        self.init_btn.setEnabled(False)
+        self.init_btn.setText("Initializing…")
+        self._set_dot(self.stim_dot, _DOT_WARN)
+
+        # Wire the result handler.  UniqueConnection → exactly one binding
+        # even if a previous disconnect silently failed (mirrors
+        # ``_do_connect_scope`` — prevents an N-times fire on rapid
+        # re-press).
         try:
-            # The PlexStim DLL is vendored inside the package
-            # (``stimtest/hardware/pyplexstim/bin/``); the loader
-            # picks it up automatically. There is no user-facing
-            # SDK-path input anymore — if the vendored DLL fails to
-            # load, the exception below surfaces the reason.
-            self._stim = open_stimulator(simulate=sim)
-            # Wire the SDK-call logger BEFORE open() so every
-            # PS_InitAllStim / PS_GetNStim / probe call during the
-            # handshake reaches the LogPane + .txt mirror.  Was set
-            # up much later (in MainWindow._on_connected) which left
-            # the init traffic invisible.
+            self._stimInitResult.disconnect(self._on_stim_init_result)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self._stimInitResult.connect(
+                self._on_stim_init_result,
+                QtCore.Qt.ConnectionType.UniqueConnection)
+        except TypeError:
+            pass
+
+        # Thread-safe log emitter for the worker thread.  Emitting
+        # ``self.log`` directly from a Python thread is documented as
+        # thread-safe but has been observed to silently drop in this
+        # stack, so route SDK-call logging through ``_emit_log_from_worker``
+        # via QMetaObject.invokeMethod (QueuedConnection) — same as
+        # ``_do_connect_scope``.
+        panel = self
+
+        def _log_emit(msg: str) -> None:
             try:
-                self._stim.cmd_logger = self.log.emit
+                QtCore.QMetaObject.invokeMethod(
+                    panel, "_emit_log_from_worker",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, str(msg)))
             except Exception:
                 pass
-            self._stim.open()
-        except Exception as e:
+
+        def _thread():
+            try:
+                # The PlexStim DLL is vendored inside the package
+                # (``stimtest/hardware/pyplexstim/bin/``); the loader
+                # picks it up automatically.  Hook the SDK-call logger
+                # BEFORE open() so every PS_InitAllStim / PS_GetNStim /
+                # probe during the handshake reaches the LogPane + .txt
+                # mirror.
+                stim = open_stimulator(simulate=sim)
+                try:
+                    stim.cmd_logger = _log_emit
+                except Exception:
+                    pass
+                stim.open()
+            except Exception as exc:
+                stim = exc
+            self._stimInitResult.emit(stim)
+
+        import threading
+        threading.Thread(target=_thread, daemon=True).start()
+
+        # Watchdog: if the init is still running after ~15 s, it's almost
+        # always the Sim-2 USB lock.  Log an actionable hint — we can't
+        # interrupt the blocking DLL call, and starting a second init
+        # would race the DLL, so we do NOT declare failure.  The button
+        # stays disabled via ``_stim_init_in_flight`` until the worker
+        # actually returns.
+        QtCore.QTimer.singleShot(
+            self._STIM_INIT_WATCHDOG_MS, self._on_stim_init_slow)
+
+    @QtCore.pyqtSlot()
+    def _on_stim_init_slow(self):
+        """Watchdog fired ~15 s after an init began.  If it's STILL
+        running, tell the operator what almost always causes it."""
+        if not self._stim_init_in_flight:
+            return   # init already finished — nothing to warn about
+        self.log.emit(
+            "Stimulator initialization is taking longer than expected. "
+            "This almost always means the Plexon Sim-2 / Stim-2 "
+            "application is holding the USB lock. Close it (via Task "
+            "Manager if needed), then power-cycle the stimulator. The "
+            "window stays responsive — you can retry once it's cleared.")
+
+    @QtCore.pyqtSlot(object)
+    def _on_stim_init_result(self, result):
+        """Apply the background stim-open result on the GUI thread.
+
+        ``result`` is the opened Stimulator on success, or the Exception
+        the worker caught.  All Qt-widget + SDK follow-up work (scaling
+        preset, auto-discharge, ``connected`` emit) stays here on the GUI
+        thread; only the blocking ``open()`` ran on the worker.
+        """
+        self._stim_init_in_flight = False
+        self.init_btn.setText("Initialize")
+        try:
+            self._stimInitResult.disconnect(self._on_stim_init_result)
+        except (RuntimeError, TypeError):
+            pass
+        import time as _time
+        from ..hardware.tektronix import _fmt_elapsed
+        _t0 = getattr(self, "_stim_init_t0", _time.perf_counter())
+        _elapsed = _fmt_elapsed(_time.perf_counter() - _t0)
+        if isinstance(result, Exception):
             self._stim = None
             self._set_dot(self.stim_dot, _DOT_OFF)
-            self.stim_label.setText(f"Stimulator: failed — {e}")
-            self.log.emit(f"Stimulator open failed: {e}")
+            self.stim_label.setText(f"Stimulator: failed — {result}")
+            self.log.emit(f"Stimulator open failed: {result}   ({_elapsed})")
             self.scaling_combo.setEnabled(False)
             self.close_btn.setEnabled(False)
             self.init_btn.setEnabled(True)
             return
+        self._stim = result
         info = self._stim.info
         # Apply any remembered scaling preset for this serial. The
         # combo is set FIRST (signals blocked) so we can then call
@@ -685,16 +821,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # or by the user explicitly picking a preset from the
         # combo (via ``_on_scaling_changed``).
         sn = (info.serial_number or "").strip()
-        # A serial counts as verified if it has a preset mapping in the
-        # shared prefs map OR a calibration.json payload was saved for
-        # this exact serial.  The latter catches the case where the
-        # user ran + saved a sweep but the preset detection came back
-        # "unknown" (so _record_serial_scaling didn't fire), or where a
-        # calibration file shipped from another install.
-        known_serial = bool(sn) and (
-            sn in self._scaling_by_serial
-            or _serial_has_saved_calibration(sn)
-        )
         preset = self._scaling_by_serial.get(sn, self.SCALE_AUTO)
         if preset not in (self.SCALE_AUTO, self.SCALE_DEFAULT, self.SCALE_NIL):
             preset = self.SCALE_AUTO
@@ -713,37 +839,48 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         except Exception as e:
             self.log.emit(f"Auto-discharge apply failed: {e}")
         self._set_dot(self.stim_dot, _DOT_WARN if info.is_simulated else _DOT_OK)
+        # A successful open is DEFINITIVE proof the device is present (we just
+        # enumerated it and read its S/N), so reconcile the pre-init PnP
+        # DETECTION indicator too.  Otherwise a machine where the
+        # ``Get-PnpDevice`` probe timed out / couldn't match the USB
+        # InstanceId leaves a stale amber "Stimulator detection unavailable"
+        # sitting next to the green "Initialized" — a contradictory display
+        # that reads as "the stimulator is broken" even though it opened fine
+        # (observed at CWRU).  Real hardware only; the simulator has no
+        # physical presence to confirm.
+        if not info.is_simulated:
+            self._set_dot(self.stim_detect_dot, _DOT_OK)
+            _dtip = ("Stimulator opened successfully (S/N "
+                     f"{info.serial_number or 'n/a'}) — device confirmed "
+                     "present by the driver.  (The pre-init OS PnP probe is "
+                     "advisory only and does not gate Initialize.)")
+            self.stim_detect_text.setText("Stimulator detected")
+            self.stim_detect_dot.setToolTip(_dtip)
+            self.stim_detect_text.setToolTip(_dtip)
         self._refresh_stim_label()
         self.scaling_label.setVisible(False)
         self.scaling_combo.setEnabled(True)
         self.init_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
         self._update_calibrate_btn()
-        from ..hardware.tektronix import _fmt_elapsed
         self.log.emit(
             f"Stimulator initialized: {info.description or 'sim stim'} "
             f"(S/N {info.serial_number or 'n/a'})   "
-            f"({_fmt_elapsed(_time.perf_counter() - _t0)})")
+            f"({_elapsed})")
         # If a scope is already connected, refresh the connected signal
         # so subscribers see both halves.
         if self._scope is not None:
             self.connected.emit(self._stim, self._scope)
-        # Warn the user if this device's scaling hasn't been
-        # validated yet. Simulated devices are exempt — their
-        # scaling is whatever the simulator hard-codes and has
-        # nothing to do with real hardware. The warning is
-        # non-blocking (just a message box) so the user can still
-        # use the stimulator if they're confident in the manually-
-        # picked preset.
-        if (not info.is_simulated and not known_serial
-                and not getattr(self, "_uncalibrated_warned",
-                                  False)):
-            self._warn_uncalibrated_serial(sn or "(no serial)")
-            # Stash a per-session flag so we don't re-warn for the
-            # same device every time the user closes and re-opens
-            # the connection in one session. Cleared on
-            # ``_do_close_stim``.
-            self._uncalibrated_warned = True
+        # Stimulator VERIFICATION IS OPTIONAL (operator) — no modal nag when a
+        # serial isn't in the shared scaling database.  The scaling preset is
+        # auto-detected (a serial in ``NIL_SERIAL_NUMBERS`` applies NIL, else
+        # Default) or restored from the remembered per-serial choice; a
+        # verification sweep is not required to run.  Log the applied preset so
+        # the operator still has a record of what scaling is in effect.
+        if not info.is_simulated:
+            self.log.emit(
+                f"Stimulator scaling: {self.scaling_combo.currentText()} "
+                f"(verification optional — not required to run).")
 
     def _do_close_stim(self):
         """Close the stimulator handle and reset the indicator."""
@@ -773,10 +910,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             self.close_btn.setEnabled(False)
             self._update_calibrate_btn()
             self.log.emit("Stimulator closed.")
-            # Reset the "uncalibrated serial" one-shot so the
-            # next Initialize re-evaluates the database
-            # membership and re-warns if appropriate.
-            self._uncalibrated_warned = False
 
     def _on_simulate_toggled(self, _checked: bool):
         # Drop the scope first because real-vs-sim isn't compatible
@@ -889,60 +1022,6 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                 self.scaling_combo.setCurrentText(resolved)
             finally:
                 self.scaling_combo.blockSignals(False)
-
-    def _warn_uncalibrated_serial(self, serial_number: str) -> None:
-        """Pop a modal warning when an Initialize completed for a
-        stimulator whose serial isn't in the shared scaling
-        database.
-
-        The shared database (``stim_scaling_by_serial`` in the
-        prefs JSON) is populated by:
-
-          * the calibration wizard's ``_record_serial_scaling``
-            after a successful sweep — the trusted, R²-validated
-            path; and
-          * the user explicitly picking Default / NIL from the
-            combo in this panel (``_on_scaling_changed``) — the
-            "I'm certain" override path.
-
-        Until one of those has happened, the device's I_mon
-        scaling is effectively unknown. Until calibration, the
-        readback values from V_mon / I_mon may be wildly wrong
-        if Auto-detect picks the wrong preset for this serial.
-
-        This is informational, not blocking — the user can still
-        proceed if they're confident.
-        """
-        text = (
-            f"<h3>Unverified stimulator</h3>"
-            f"<p>Serial <b>{serial_number}</b> isn't in the shared "
-            f"scaling database — its I_mon scaling hasn't been "
-            f"validated for this installation.</p>"
-            f"<p>Until the validation has run, V_mon / I_mon "
-            f"readback values may be off by 2.5× if Auto-detect "
-            f"picked the wrong preset for this device.</p>"
-            f"<p><b>Recommended:</b> connect the Plexon test "
-            f"board and run <i>Run → Stimulator Verification…</i>. The "
-            f"stimulator verification verifies the scaling and "
-            f"records this serial in the database so future "
-            f"sessions apply the right preset automatically.</p>"
-            f"<p><b>If you are CERTAIN of the scaling</b> for "
-            f"this device (e.g. you've confirmed it on the bench "
-            f"by other means), pick <b>Default</b> or <b>NIL</b> "
-            f"from the scaling combo on this panel — that also "
-            f"records the choice in the database. <b>Auto-detect</b> "
-            f"alone does NOT count as a stimulator verification.</p>"
-            f"<p>The scaling combo currently reads "
-            f"<b>{self.scaling_combo.currentText()}</b>.</p>"
-        )
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setWindowTitle("Unverified stimulator")
-        box.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        box.setText(text)
-        box.setStandardButtons(
-            QtWidgets.QMessageBox.StandardButton.Ok)
-        box.exec()
 
     def _on_scaling_changed(self, preset: str):
         """User picked a different scaling preset from the combo."""
@@ -1171,17 +1250,39 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         try:
             import warnings
             resources = ()
+            fallback = ()
             for backend in ("@py", ""):
                 try:
+                    # ``list_resources()`` MUST be inside the
+                    # catch_warnings block — the pyvisa-py TCPIP discovery
+                    # UserWarnings ("limited to the default interface" /
+                    # "requires the zeroconf package") fire during
+                    # enumeration, NOT during ResourceManager construction.
+                    # The old code only wrapped the constructor, so those
+                    # warnings leaked to the console at every startup probe.
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         rm = (pyvisa.ResourceManager(backend) if backend
                               else pyvisa.ResourceManager())
-                    resources = rm.list_resources()
-                    if resources:
-                        break
+                        res = rm.list_resources()
                 except Exception:
-                    pass
+                    continue
+                if not res:
+                    continue
+                # Prefer the backend that actually finds a scope. The @py
+                # (pyvisa-py) backend may enumerate only a serial COM port
+                # (e.g. ASRL3::INSTR) while NI-VISA (the default backend) is
+                # the one that sees the USB-TMC scope. Breaking on the first
+                # backend with ANY resource would lock onto @py's COM port
+                # and never reach NI-VISA -> "Oscilloscope not detected"
+                # even though NI-VISA can see it.
+                if any(vid in r for r in res for vid in scope_vendor_ids):
+                    resources = res
+                    break
+                if not fallback:
+                    fallback = res
+            if not resources:
+                resources = fallback
         except Exception as e:
             self._set_dot(self.scope_detect_dot, _DOT_OFF)
             text = "Oscilloscope not detected"
@@ -1465,7 +1566,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         ready = self._stim is not None and self._scope is not None
         self.calibrate_btn.setEnabled(ready)
         self.calibrate_btn.setToolTip(
-            "Open the Calibration tab to run the PlexStim test-board "
+            "Open the Verification tab to run the PlexStim test-board "
             "stimulator verification sweep."
             if ready else
             "Initialize the stimulator and connect the oscilloscope first."

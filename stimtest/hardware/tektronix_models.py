@@ -158,6 +158,21 @@ class TekCommandSet:
     Legacy: ``TRIGger:MAIn:EDGe:SOUrce``
     """
 
+    ext_trigger_scpi_source: str
+    """SCPI *value* for the external-trigger BNC as a trigger source.
+
+    Tek names the external-trigger BNC differently by dialect:
+      * Modern (TBS1000C, TBS2000B/C): ``AUX`` — the front-panel "Aux In"
+        connector (confirmed in the TBS1000C user manual: "Trigger on an
+        external signal using the Aux input" → select ``AUX`` source, valid for
+        Edge + Pulse-Width trigger types).
+      * Legacy (TDS200/1000/2000, TPS2000): ``EXT``.
+
+    ``TektronixOscilloscope.set_trigger`` writes THIS value whenever the
+    *logical* source is ``EXT``, so the driver's internal EXT-vs-channel logic
+    (``startswith("EXT")``) stays dialect-agnostic while the wire command uses
+    the name the firmware actually accepts."""
+
     trig_edge_slope: str
     """Command for the edge-trigger slope (RISe / FALL).
 
@@ -271,6 +286,57 @@ class TekCommandSet:
     the full grid (see ``TektronixOscilloscope._timebase_grid_seconds``).
     """
 
+    # ---- Pulse-width trigger ------------------------------------------------
+    has_pulse_width_trigger: bool = False
+    """True when the family supports a pulse-width trigger type.
+
+    Used for CONTINUOUS (no-interpulse-delay) shaped waveforms, where the
+    half-peak edge trigger can fire on narrow noise crossings at low
+    currents — the width qualification rejects them.  Enabled for the
+    MODERN dialect (TBS2000/B + TBS1000C — ``TRIGger:A:TYPe PULSEWidth``);
+    the legacy families' pulse-trigger SCPI differs per sub-family and is
+    left unsupported (the driver falls back to the edge trigger).
+    """
+
+    trig_type_pulse_cmd: str = ""
+    """Full command to switch the trigger TYPE to pulse-width.
+
+    Modern: ``TRIGger:A:TYPe PULSEWidth``
+    """
+
+    trig_pulse_source: str = ""
+    """Command stem for the pulse-width trigger source channel.
+
+    Modern: ``TRIGger:A:PULSEWidth:SOUrce``
+    """
+
+    trig_pulse_polarity: str = ""
+    """Command stem for the pulse polarity ({POSitive|NEGative}).
+
+    Modern: ``TRIGger:A:PULSEWidth:POLarity``
+    """
+
+    trig_pulse_when: str = ""
+    """Command stem for the width qualifier ({LESSthan|MOREthan|EQual|UNEQual}).
+
+    Modern: ``TRIGger:A:PULSEWidth:WHEN``
+    """
+
+    trig_pulse_width: str = ""
+    """Command stem for the qualification width (seconds).
+
+    Modern: ``TRIGger:A:PULSEWidth:WIDth``
+    """
+
+    trig_pulse_threshold_fmt: str = ""
+    """Format string for the pulse-width trigger threshold of a channel.
+
+    Modern: ``TRIGger:A:LOWerthreshold:{ch}`` — the pulse-width trigger
+    uses the per-channel LOWER threshold, NOT ``TRIGger:A:LEVel`` (which
+    is the EDGE level).  ``set_trigger_level`` routes here while a
+    pulse-width trigger is active.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Canonical command-set instances
@@ -297,10 +363,19 @@ MODERN_CMDS = TekCommandSet(
     # Trigger
     trig_type_edge_cmd      = "TRIGger:A:TYPe EDGE",
     trig_edge_source        = "TRIGger:A:EDGE:SOUrce",
+    ext_trigger_scpi_source = "AUX",   # modern BNC is "Aux In" (AUX in SCPI)
     trig_edge_slope         = "TRIGger:A:EDGE:SLOpe",
     trig_edge_coupling      = "TRIGger:A:EDGE:COUPling",
     trig_level              = "TRIGger:A:LEVel",
     trig_mode               = "TRIGger:A:MODe",
+    # Pulse-width trigger (TBS2000/B + TBS1000C manual, TRIGger:A:PULSEWidth)
+    has_pulse_width_trigger  = True,
+    trig_type_pulse_cmd      = "TRIGger:A:TYPe PULSEWidth",
+    trig_pulse_source        = "TRIGger:A:PULSEWidth:SOUrce",
+    trig_pulse_polarity      = "TRIGger:A:PULSEWidth:POLarity",
+    trig_pulse_when          = "TRIGger:A:PULSEWidth:WHEN",
+    trig_pulse_width         = "TRIGger:A:PULSEWidth:WIDth",
+    trig_pulse_threshold_fmt = "TRIGger:A:LOWerthreshold:{ch}",
     # Channel
     ch_coupling             = "{ch}:COUPling {coupling}",
     ch_bandwidth            = "{ch}:BANdwidth {bw}",
@@ -338,6 +413,7 @@ LEGACY_CMDS = TekCommandSet(
     # Trigger — no TYPe command; always edge; MAIn namespace
     trig_type_edge_cmd      = "",
     trig_edge_source        = "TRIGger:MAIn:EDGe:SOUrce",
+    ext_trigger_scpi_source = "EXT",   # legacy families name the BNC "EXT"
     trig_edge_slope         = "TRIGger:MAIn:EDGe:SLOpe",
     trig_edge_coupling      = "TRIGger:MAIn:EDGE:COUPling",
     trig_level              = "TRIGger:LEVel",
@@ -450,6 +526,22 @@ class TekSeriesSpec:
     under-using the screen.
     """
 
+    min_vdiv_v: float = 2e-3
+    """Smallest legal ``CHx:SCAle`` (V/div) the scope will accept at 1×
+    probe — the hardware floor below which off-grid writes CLAMP UP.
+
+    * **TBS2000B / TBS2000C** — **1 mV/div** (verified live on a TBS2204B:
+      0.5 mV/div requests all clamp to 1 mV; 1/1.25/1.5 mV/div held exactly).
+    * **TBS1000 / TDS / TPS and the original TBS1104B MATLAB targeted** —
+      **2 mV/div** (the getWaveform3.m grid's floor).
+
+    The default is the conservative 2 mV so an un-probed / unknown model
+    never asks for a finer scale than the hardware allows.  Consumed by
+    ``TektronixOscilloscope._vertical_grid_vpd``, which extends the base
+    getWaveform3.m grid (2 mV floor) DOWN to this value in 0.5 mV steps for
+    a capable scope.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Bandwidth-option canonical instances
@@ -509,8 +601,9 @@ _MODEL_BANDWIDTH_MHZ: Dict[str, int] = {
     "TDS1001C":  40,  "TDS1002C":  50,  "TDS1012C": 100,
     # TDS200
     "TDS210":    60,  "TDS220":   100,  "TDS224":  100,
-    # TPS2000
+    # TPS2000 / TPS2000B
     "TPS2012": 100,   "TPS2014": 100,   "TPS2024": 200,
+    "TPS2012B": 100,  "TPS2014B": 100,  "TPS2024B": 200,
 }
 
 
@@ -559,15 +652,30 @@ _SERIES: Sequence[TekSeriesSpec] = [
         # this registry).
         n_horiz_divs    = 15,
         n_vert_divs     = 10,
+        # TBS2000B goes one step finer than the TBS1104B — 1 mV/div min
+        # (verified live on a TBS2204B), vs the 2 mV/div getWaveform3.m
+        # floor MATLAB used.
+        min_vdiv_v      = 1e-3,
     ),
 
-    # ---- TBS1000C — 2-channel, modern, NO EXT trigger ---------------------
+    # ---- TBS1000C — 2-channel, modern, HAS EXT trigger via "Aux In" -------
     # Models: TBS1052C TBS1072C TBS1102C TBS1152C TBS1202C
+    #
+    # ``has_ext_trigger`` was WRONG at False: unlike the TBS2000B (whose rear
+    # "AUX OUT" is a probe-comp OUTPUT — see that spec's note), the TBS1000C
+    # has a front-panel "Aux In" — a real EXTERNAL TRIGGER INPUT.  The TBS1000C
+    # user manual §"Trigger on an external signal using the Aux input" says to
+    # select the ``AUX`` source (valid for Edge + Pulse-Width trigger types)
+    # and set its Coupling / Level / Slope.  So the flag is True and
+    # ``ext_trigger_scpi_source = "AUX"`` (MODERN_CMDS) routes the EXT trigger
+    # to that BNC.  On the 2-channel TBS1072C this is the CLEAN way to trigger
+    # on the Plexon digital sync without sacrificing a channel or relying on
+    # the small-signal I_mon edge (gotchas #160/#162).
     TekSeriesSpec(
         series_name     = "TBS1000C",
         pattern         = r"TBS1\d{3}C",
         commands        = MODERN_CMDS,
-        has_ext_trigger = False,
+        has_ext_trigger = True,
         record_lengths  = (1_000, 2_000, 20_000, 200_000, 2_000_000, 5_000_000),
         bandwidth_options    = (_BW_FULL_GENERIC, _BW_TWENTY),
         recommended_imon_bw  = _BW_TWENTY,
@@ -634,11 +742,14 @@ _SERIES: Sequence[TekSeriesSpec] = [
         recommended_imon_bw  = _BW_LEGACY_ON,
     ),
 
-    # ---- TPS2000 — 4-channel isolated, legacy, max 2500 pts ---------------
-    # Models: TPS2012 TPS2014 TPS2024
+    # ---- TPS2000 / TPS2000B — 4-channel isolated, legacy, max 2500 pts ----
+    # Models: TPS2012 TPS2014 TPS2024 + B variants (TPS2012B TPS2014B
+    # TPS2024B).  The shared legacy programmer manual is titled
+    # "… TPS2000/B Series" — same fixed 2500-pt record, same RS-232
+    # command group, same LEGACY dialect for both generations.
     TekSeriesSpec(
         series_name     = "TPS2000",
-        pattern         = r"TPS2\d{3}",
+        pattern         = r"TPS2\d{3}B?",
         commands        = LEGACY_CMDS,
         has_ext_trigger = False,
         record_lengths  = (2_500,),

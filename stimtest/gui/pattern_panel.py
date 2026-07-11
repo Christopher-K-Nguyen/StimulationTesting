@@ -28,6 +28,8 @@ each tab can wrap it in its own QGroupBox with the right title.
 """
 from __future__ import annotations
 
+import math
+
 from typing import List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -167,7 +169,6 @@ SYMMETRIC_BIPHASIC_SHAPES = (
     ("Linear increasing → decreasing", "linear_inc_dec"),
     ("Linear decreasing → increasing", "linear_dec_inc"),
     ("Sinusoidal",        SHAPE_SINUSOIDAL),
-    ("Speedbumps",        SHAPE_SPEEDBUMPS),
     # Sahin & Tie (2007) compared 7 monophasic waveforms for
     # neural stimulation efficiency through practical (TiN /
     # IrOx) electrodes; ExpDec, LinDec, and Gaussian were the
@@ -185,11 +186,13 @@ SYMMETRIC_BIPHASIC_SHAPES = (
     ("Exponential decreasing", SHAPE_EXP_DECAY),
     ("Exponential increasing → decreasing", "exp_inc_dec"),
     ("Exponential decreasing → increasing", "exp_dec_inc"),
-    # Bowtie and Halfpipe are the two "exotic" symmetric shapes
-    # — kept available but moved to the bottom of the dropdown
-    # since they're rarely the right answer for routine neural
-    # stim and clutter the list above where the commonly-used
-    # waveforms live.
+    # The "exotic" trio clusters at the bottom of the dropdown —
+    # they're rarely the right answer for routine neural stim and
+    # would clutter the commonly-used waveforms above.  Order within
+    # the trio: Speedbumps DIRECTLY above Bowtie (operator: "Move the
+    # speedbumps shape above bowtie shape in the list"), matching the
+    # mix-and-match dropdowns' Speedbumps → Bowtie → Halfpipe order.
+    ("Speedbumps",        SHAPE_SPEEDBUMPS),
     ("Bowtie",            SHAPE_BOWTIE),
     ("Halfpipe",          SHAPE_HALFPIPE),
 )
@@ -670,7 +673,14 @@ def _pixmap_to_html_img(pm: QtGui.QPixmap) -> str:
 class PatternControlPanel(QtWidgets.QGroupBox):
     """Pulse-shape control panel + live PulsePattern output."""
 
-    patternChanged = QtCore.pyqtSignal(object)   # PulsePattern
+    patternChanged = QtCore.pyqtSignal(object)   # PulsePattern (LIVE — per keystroke)
+    # patternCommitted fires ONLY when the user COMMITS an edit — Enter /
+    # focus-out on a spinbox, or a discrete combo / checkbox / radio change —
+    # NOT on every keystroke (operator: "when typing in the input, do not print
+    # in the log pane with every key.  Only print after return/enter is pressed
+    # or clicked out").  The LIVE preview stays on ``patternChanged``; the LOG
+    # PANE listens to ``patternCommitted`` instead.
+    patternCommitted = QtCore.pyqtSignal(object)  # PulsePattern (on commit)
     # Emitted alongside patternChanged with a True/False indicating
     # whether the charge-balance warning should be visible at all
     # (only meaningful in biphasic + asymmetric + manual mode).
@@ -683,6 +693,15 @@ class PatternControlPanel(QtWidgets.QGroupBox):
     # main window's central handler — see ``set_auto_discharge_silent``
     # below for the programmatic-update entry point.
     autoDischargeToggled = QtCore.pyqtSignal(bool)
+    # Emitted when the user edits the INLINE average-count spinbox that
+    # sits beside the acquisition-time readout (operator: "add an input
+    # that can change the average count").  MainWindow forwards the new
+    # count into the Setup tab's ``acq_navg_spin`` — the single source
+    # of truth — whose ``acquisitionChanged`` signal then re-broadcasts
+    # to every experiment tab (and back into this panel via
+    # ``set_acquisition_info``, which is a no-op when the value already
+    # matches, so there is no signal loop).
+    acqNavgEdited = QtCore.pyqtSignal(int)
 
     # Triphasic proportions are MAGNITUDES only — the polarity is set
     # by the polarity selector and the SIGNS alternate per phase
@@ -715,6 +734,17 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Current rate-spinbox unit. Default = pps to match prior
         # behaviour and what the runner / hardware see at the boundary.
         self._rate_unit: str = self.UNIT_PPS
+        # Approximate per-capture acquisition time readout (rendered to the
+        # RIGHT of the rate unit combo).  The estimate = averaged-sweep
+        # count / pulse rate — each averaged capture must wait through one
+        # pulse per averaged sweep, and pulses arrive at the pulse rate
+        # (same formula the runner uses to size its capture timeout,
+        # gotcha #32).  The averaging count + mode come from the Setup-tab
+        # oscilloscope acquisition selection, pushed in via
+        # :meth:`set_acquisition_info`; these defaults keep a sane estimate
+        # on screen before the first push.
+        self._acq_mode: str = "AVERAGE"
+        self._acq_n_avg: int = 16
         # ---- Login profile (gates restricted shapes) ----------------
         # Starts as ANONYMOUS (Profile.NONE) so the panel populates
         # its shape dropdowns WITHOUT the gated entries.  MainWindow
@@ -777,11 +807,19 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "shape inputs so you can build cap-coupled or unbalanced "
             "pulses.")
         self.polarity = QtWidgets.QComboBox()
-        self.polarity.addItems(["Cathodic-first", "Anodic-first"])
+        # Display wording is "Cathodal / Anodal" (operator: 'Rename the
+        # pulse polarity as "cathodal/anodal" instead of
+        # "cathodic/anodic"').  Every polarity KEY in this file matches
+        # the common prefix ``startswith("Cathod")`` so both spellings
+        # test identically; legacy prefs text ("Cathodic-first") is
+        # mapped to the new item in ``restore_prefs``.  Scientific metric
+        # names (cathodic water-window limit, E_mc, …) are NOT renamed —
+        # the request targets the pulse-polarity wording only.
+        self.polarity.addItems(["Cathodal-first", "Anodal-first"])
         self.polarity.setToolTip(
-            "Sign of the LEADING phase. ``Cathodic-first`` makes "
+            "Sign of the LEADING phase. ``Cathodal-first`` makes "
             "phase 1 negative (electrode pulled toward the cathodic "
-            "limit first). ``Anodic-first`` flips every phase's sign. "
+            "limit first). ``Anodal-first`` flips every phase's sign. "
             "Phase 2 (and phase 3 in triphasic) inherit the "
             "alternating-sign convention enforced in ``PulsePattern."
             "triphasic``.")
@@ -790,7 +828,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Hardware resolution: 0.1 μA on amplitudes, 1 μs on widths.
         self.amp_excite = self._dspin(*self.AMP_RANGE, 50.0,
                                       step=STIM_CURRENT_UI_STEP_UA, decimals=1,
-                                      suffix=" " + rich.UA)
+                                      suffix=" " + rich.UA, force_sign=True)
         self.amp_excite.setToolTip(
             "Magnitude of the excitation phase (largest |Q_ph|). For "
             "symmetric biphasic that's both phases. For triphasic "
@@ -839,7 +877,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 f"<b>{label}</b><br>"
                 f"{_pixmap_to_html_img(tip_pm)}<br>"
                 f"<span style='color:#555;font-size:9pt;'>"
-                f"Cathodic-first symmetric biphasic preview "
+                f"Cathodal-first symmetric biphasic preview "
                 f"(both phases share the shape; phase 2 is "
                 f"this shape mirrored).</span></div></qt>"
             )
@@ -882,7 +920,8 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             self.phase_amp.append(self._dspin(*self.AMP_RANGE,
                                               -50.0 if i == 0 else 50.0,
                                               step=STIM_CURRENT_UI_STEP_UA,
-                                              decimals=1, suffix=" " + rich.UA))
+                                              decimals=1, suffix=" " + rich.UA,
+                                              force_sign=True))
             self.phase_width.append(self._dspin(*self.WIDTH_RANGE,
                                                 DEFAULT_PHASE_WIDTH_US,
                                                 step=STIM_TIME_RESOLUTION_US,
@@ -1171,6 +1210,41 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "milliseconds. The underlying rate (pps) is preserved "
             "when you toggle between units.")
         self.rate_unit_combo.currentTextChanged.connect(self._on_rate_unit_changed)
+        # Approximate per-capture acquisition-time readout, sits to the
+        # RIGHT of the unit combo (operator: "an output next to the pulse
+        # rate to indicate what is the approximate acquisition time based
+        # on the average count and the pulse rate").  The text SHOWS the
+        # calculation (operator: "show the calculation"), e.g.
+        # "64 ÷ 100 pps ≈ 0.64 s / capture".  Derived / read-only —
+        # italicised (theme-safe: no hardcoded colour, just font style) so
+        # it reads as a computed indicator, not an input.  Text is set by
+        # :meth:`_update_acq_time_label`.
+        self.acq_time_label = QtWidgets.QLabel("")
+        self.acq_time_label.setObjectName("acq_time_label")
+        _acqf = self.acq_time_label.font(); _acqf.setItalic(True)
+        self.acq_time_label.setFont(_acqf)
+        # Inline AVERAGE-COUNT editor beside the readout (operator: "add
+        # an input that can change the average count").  Editing it emits
+        # ``acqNavgEdited`` → MainWindow pushes the value into the Setup
+        # tab's acq_navg_spin (the source of truth), whose signal chain
+        # re-broadcasts to every tab.  ``set_acquisition_info`` keeps
+        # this spin in sync (signal-guarded) and disables it in SAMPLE
+        # mode, where the scope ignores the average count.
+        self.acq_navg_inline = RepeatingSpinBox()
+        self.acq_navg_inline.setObjectName("acq_navg_inline")
+        self.acq_navg_inline.setRange(2, 512)
+        self.acq_navg_inline.setValue(self._acq_n_avg)
+        self.acq_navg_inline.setToolTip(
+            "Oscilloscope average count (NUMAVg) used by the acquisition-"
+            "time estimate to the right.  Editing here changes the SAME "
+            "setting as Setup → Oscilloscope acquisition → Average count "
+            "— the two stay in sync.")
+        # Commit on Enter/return/focus-out (operator: "enter/return or clicking
+        # out"), NOT per keystroke — editing this pushes the value into the
+        # Setup spin, whose broadcast arms a scope round-trip; a per-keystroke
+        # wiring would re-run that on every digit.
+        self.acq_navg_inline.editingFinished.connect(
+            self._on_inline_navg_changed)
 
         # Toggles for the three "have / pin" delay shortcuts. All three
         # use the "ON = HAS the delay" convention so a checked box reads
@@ -1301,6 +1375,17 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         self._amp_row_label = QtWidgets.QLabel()
         self._amp_row_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._sym_form.addRow(self._amp_row_label, self.amp_excite)
+        # Inline warning shown when the I_mon-trigger minimum-magnitude
+        # constraint clamps a 0 µA entry (operator: "When Imon is the trigger
+        # source, current cannot be 0").  Red so it's visible on either theme
+        # (NOT palette(mid) — invisible on dark, gotchas #87/#135).
+        self._amp_min_mag_ua = 0.0        # 0 = unconstrained (digital trigger)
+        self._amp_trigger_warn = QtWidgets.QLabel("")
+        self._amp_trigger_warn.setWordWrap(True)
+        self._amp_trigger_warn.setStyleSheet(
+            "color: #c62828; font-size: 9pt; padding: 1px 4px;")
+        self._amp_trigger_warn.setVisible(False)
+        self._sym_form.addRow(self._amp_trigger_warn)
         self._sym_form.addRow(
             rich.field_label("Phase width", rich.T_PH, rich.US),
             self.width_shared,
@@ -1353,7 +1438,24 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "matches the phase polarity. Set to 0 for the "
             "historical 0-to-peak shapes.")
         self.sym_offset_ua.valueChanged.connect(self._emit)
-        self._sym_offset_label = QtWidgets.QLabel("Offset:")
+        # ENABLE checkbox (operator: "a checkbox to enable the current offset
+        # under certain shapes").  The offset is opt-in: unchecked → the
+        # spinbox is disabled and the offset reads 0 (historical no-offset
+        # behaviour).  The checkbox IS the form row's label widget, so the
+        # existing non-rectangular shape-visibility code (which toggles
+        # ``_sym_offset_label``) shows/hides it — the checkbox appears ONLY
+        # for non-rectangular shapes ("under certain shapes").
+        self.sym_offset_enable_chk = QtWidgets.QCheckBox("Current offset")
+        self.sym_offset_enable_chk.setChecked(False)          # default OFF
+        self.sym_offset_enable_chk.setToolTip(
+            "Enable a baseline FLOOR current the shape ramps to / from "
+            "instead of zero (a pedestal — turns a ramp / sine / gaussian "
+            "into a trapezoidal-style waveform).  Only applies to "
+            "non-rectangular shapes; unchecked = no offset (0 to peak).")
+        self.sym_offset_ua.setEnabled(False)                  # gated by the box
+        self.sym_offset_enable_chk.toggled.connect(
+            self._on_sym_offset_enable_toggled)
+        self._sym_offset_label = self.sym_offset_enable_chk   # row label = box
         self._sym_form.addRow(self._sym_offset_label, self.sym_offset_ua)
         # τ spinbox — time constant for the exponential shapes
         # (decay / increasing) and the exp-pair entries. Hidden
@@ -1467,7 +1569,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # opposite (the recharge phase). ``_refresh_shape_combo_icons``
         # below regenerates all of these when the user flips the
         # polarity dropdown.
-        cath_first = self.polarity.currentText().startswith("Cathodic")
+        cath_first = self.polarity.currentText().startswith("Cathod")
         phase_signs = (-1, +1) if cath_first else (+1, -1)
         for i in range(2):
             cb = QtWidgets.QComboBox()
@@ -1691,6 +1793,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         rate_row.addWidget(self.interpulse_check)
         rate_row.addWidget(self.rate_pps, stretch=1)
         rate_row.addWidget(self.rate_unit_combo)
+        # NOTE: the average-count editor + the acquisition-time readout
+        # used to sit here on the rate row, but the (verbose) per-capture
+        # calculation widened the whole panel — they now live on their own
+        # "Average count" row just below (operator: "the calculation of
+        # time per capture is making the panel too wide … Move the Average
+        # count to below the pulse rate with the calculation on its right").
         rate_w = QtWidgets.QWidget(); rate_w.setLayout(rate_row)
 
         iph_row = QtWidgets.QHBoxLayout()
@@ -1721,6 +1829,18 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             rich.field_label("Pulse rate", rich.F_STIM, rich.PPS))
         self._rate_row_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         delays.addRow(self._rate_row_label, rate_w)
+        # Average count on its OWN form row directly below the pulse rate,
+        # with the per-capture acquisition-time calculation to its right
+        # (operator: "Move the Average count to below the pulse rate with
+        # the calculation on its right").  Keeping the acq-time readout off
+        # the rate row is what stops it widening the whole panel.
+        avg_row = QtWidgets.QHBoxLayout()
+        avg_row.setContentsMargins(0, 0, 0, 0)
+        avg_row.setSpacing(6)
+        avg_row.addWidget(self.acq_navg_inline)
+        avg_row.addWidget(self.acq_time_label, stretch=1)
+        avg_w = QtWidgets.QWidget(); avg_w.setLayout(avg_row)
+        delays.addRow("Average count", avg_w)
         outer.addLayout(delays)
 
         # Auto-discharge mode toggle. Constructed here but laid out at
@@ -1850,6 +1970,10 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         for i in range(len(self.phase_amp)):
             self.phase_amp[i].editingFinished.connect(
                 lambda idx=i: self._on_phase_amp_value_changed(idx))
+        # The symmetric excitation amplitude follows the polarity sign too, so
+        # the displayed value (e.g. +5 / -5) always matches the polarity.
+        self.amp_excite.editingFinished.connect(
+            self._on_amp_excite_value_changed)
         for w in (self.amp_excite, self.width_shared,
                   self.interphase_us, self.discharge_us, self.rate_pps,
                   *self.ratio_spins, *self.phase_amp, *self.phase_width):
@@ -1857,14 +1981,59 @@ class PatternControlPanel(QtWidgets.QGroupBox):
 
         # Initial visibility
         self._on_mode_changed()
+        # Initial sign sync: the default polarity is cathodic-first, so the
+        # excitation amplitude must show its negative sign to match (the
+        # phase_amp defaults already carry the right sign per index).
+        self._sync_excite_amp_sign()
+        # First render of the acquisition-time readout (default n_avg / mode
+        # until the Setup tab pushes the real acquisition selection).
+        self._update_acq_time_label()
+        # Wire COMMIT signals for the log pane (Enter / focus-out on spinboxes,
+        # discrete change on combos / checkboxes) — decoupled from the live
+        # preview (patternChanged).
+        self._wire_commit_signals()
+
+    def _emit_committed(self, *_):
+        """Emit ``patternCommitted`` (the log-pane trigger) when the user
+        COMMITS an edit.  Guarded by ``_suspend_signals`` so a prefs restore /
+        programmatic mode switch doesn't fire it."""
+        if getattr(self, "_suspend_signals", False):
+            return
+        try:
+            self.patternCommitted.emit(self.pattern())
+        except Exception:
+            pass
+
+    def _wire_commit_signals(self) -> None:
+        """Connect every pattern-input's COMMIT signal to ``_emit_committed``:
+        spin boxes on ``editingFinished`` (Enter / focus-out — NOT per
+        keystroke), combos on ``currentIndexChanged``, checkboxes / radios on
+        ``toggled``.  Enumerated via ``findChildren`` so new inputs are covered
+        automatically; the main-window log de-dupes on the pattern description,
+        so a commit on a non-shape input (e.g. the acq-average spinbox) that
+        leaves the pattern unchanged produces no line."""
+        try:
+            for sb in self.findChildren(QtWidgets.QAbstractSpinBox):
+                sb.editingFinished.connect(self._emit_committed)
+            for cb in self.findChildren(QtWidgets.QComboBox):
+                cb.currentIndexChanged.connect(self._emit_committed)
+            for bt in self.findChildren(QtWidgets.QAbstractButton):
+                if bt.isCheckable():
+                    bt.toggled.connect(self._emit_committed)
+        except Exception:
+            pass
 
     # ----------------------------------------------------------- helpers
     @staticmethod
     def _dspin(lo: float, hi: float, val: float,
                step: float = 1.0, decimals: int = 2,
-               suffix: str = "") -> RepeatingDoubleSpinBox:
+               suffix: str = "", force_sign: bool = False
+               ) -> RepeatingDoubleSpinBox:
         sp = RepeatingDoubleSpinBox()
         sp.setRange(lo, hi); sp.setDecimals(decimals)
+        # Set the explicit-sign policy BEFORE the first setValue so the
+        # initial display already carries the ``+`` (signed-amplitude fields).
+        sp._force_sign = bool(force_sign)
         sp.setSingleStep(step); sp.setValue(val); sp.setSuffix(suffix)
         return sp
 
@@ -2079,6 +2248,14 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # firing ``_on_polarity_changed`` directly, so we apply
         # here too — idempotent + cheap (just setRange calls).
         self._apply_polarity_sign_locks()
+        self._emit()
+
+    def _on_sym_offset_enable_toggled(self, on: bool) -> None:
+        """Enable / disable the symmetric current-offset spinbox (operator
+        opt-in checkbox).  Unchecked → the spinbox is disabled and
+        :meth:`pattern` reads the offset as 0."""
+        if hasattr(self, "sym_offset_ua"):
+            self.sym_offset_ua.setEnabled(bool(on))
         self._emit()
 
     def _on_asym_shape_changed(self, *_):
@@ -2424,7 +2601,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         ``_render_*_pixmap`` helpers). Block ``currentIndexChanged``
         on each combo while rebuilding so the icon refresh doesn't
         trigger a spurious shape-changed signal."""
-        polarity = -1 if self.polarity.currentText().startswith("Cathodic") else +1
+        polarity = -1 if self.polarity.currentText().startswith("Cathod") else +1
         # Symmetric biphasic shape combo.
         if hasattr(self, "shape_combo"):
             self.shape_combo.blockSignals(True)
@@ -2519,7 +2696,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         method.
         """
         text = self.polarity.currentText()
-        cathodic_first = text.startswith("Cathodic")
+        cathodic_first = text.startswith("Cathod")
         # Map each phase index → which sign it should carry.
         # Convention: phase 0 = excitation (matches polarity);
         # phase 1 = recharge (opposite); phase 2 (triphasic third
@@ -2556,6 +2733,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                     sp.setValue(target)
             finally:
                 sp.blockSignals(False)
+        # The symmetric excitation amplitude carries the polarity sign too so
+        # its displayed value flips with the dropdown (e.g. +5 anodic / -5
+        # cathodic).  Signals stay blocked inside the helper; the polarity
+        # dropdown's own change already triggers a pattern re-emit.
+        self._sync_excite_amp_sign()
 
     def _wanted_phase_sign(self, phase_idx: int) -> int:
         """Return ``+1`` or ``−1`` indicating which sign the
@@ -2565,7 +2747,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         (opposite), phase 2 (triphasic third phase) = back to
         excitation polarity (alternating pattern, McCreery / Liu).
         """
-        cathodic_first = self.polarity.currentText().startswith("Cathodic")
+        cathodic_first = self.polarity.currentText().startswith("Cathod")
         sign_for_phase = {
             0: (-1 if cathodic_first else +1),
             1: (+1 if cathodic_first else -1),
@@ -2589,10 +2771,29 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         if not (0 <= idx < len(self.phase_amp)):
             return
         sp = self.phase_amp[idx]
-        value = float(sp.value())
-        if value == 0.0:
+        # Phase 0 is the excitation phase the trigger fires on — enforce the
+        # I_mon-trigger minimum magnitude (0 µA → ±0.1, polarity-correct) before
+        # the sign-flip logic (which would otherwise stamp a signed zero).
+        if idx == 0 and self._enforce_min_amp_magnitude(sp, 0):
+            self._emit()
             return
+        value = float(sp.value())
         wanted_sign = self._wanted_phase_sign(idx)
+        if value == 0.0:
+            # Stamp the polarity-correct SIGNED ZERO (-0.0 cathodal /
+            # +0.0 anodal) rather than leaving the spinbox's default
+            # +0.0.  ``pattern()`` re-derives the sign every call
+            # (load-bearing), but keeping the spinbox self-consistent
+            # is defense-in-depth so a stale +0.0 never leaks into a
+            # 0 µA cathodal VT-max ramp read.
+            want0 = math.copysign(0.0, -1.0 if wanted_sign == -1 else +1.0)
+            if math.copysign(1.0, value) != math.copysign(1.0, want0):
+                sp.blockSignals(True)
+                try:
+                    sp.setValue(want0)
+                finally:
+                    sp.blockSignals(False)
+            return
         actual_sign = -1 if value < 0 else +1
         if actual_sign != wanted_sign:
             # Suppress the inner setValue's valueChanged so the
@@ -2610,6 +2811,91 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 self._refresh_mix_offset_max(idx)
             except Exception:
                 pass
+            self._emit()
+
+    def _sync_excite_amp_sign(self) -> bool:
+        """Force the SYMMETRIC excitation-amplitude spinbox to carry the sign
+        of the current polarity (phase-0 = excitation sign), keeping its
+        magnitude.  The display then reads e.g. ``+5`` (anodic-first) / ``-5``
+        (cathodic-first) — operator: "when setting the polarity, the
+        stimulation/first current amplitude matches sign … I want the GUI input
+        says +5, not just 5".  The pattern math is unaffected (``pattern()``
+        reads ``abs(amp_excite)`` and applies the polarity separately), so this
+        is display-consistency only.  Returns True if the value changed."""
+        sp = getattr(self, "amp_excite", None)
+        if sp is None:
+            return False
+        want = self._wanted_phase_sign(0)          # phase 0 = excitation
+        v = float(sp.value())
+        target = want * abs(v)
+        if v != target:
+            sp.blockSignals(True)
+            try:
+                sp.setValue(target)
+            finally:
+                sp.blockSignals(False)
+            return True
+        return False
+
+    def set_min_amp_magnitude(self, min_ua: float) -> None:
+        """Require ``|amplitude| >= min_ua`` (0 disables the constraint).
+
+        The experiment tab calls this with ``IMON_TRIGGER_MIN_AMPLITUDE_UA``
+        (0.1 µA) when I_mon is the trigger source and 0 when a digital Trigger
+        channel is selected (operator: "When Imon is the trigger source,
+        current cannot be 0" — the I_mon signal can't trigger below ~0.1 µA;
+        a digital sync fires regardless, so 0 µA / a VT-max-from-0 stays legal).
+        Immediately clamps the current excitation amplitude if it violates.
+        The amp field is a SIGNED spinbox with a symmetric ±1000 µA range, so
+        the forbidden interval (−min, +min) can't be a plain ``setMinimum`` —
+        it's enforced by intercepting the committed value here + on every edit.
+        """
+        self._amp_min_mag_ua = max(0.0, float(min_ua or 0.0))
+        changed = self._enforce_min_amp_magnitude(self.amp_excite, 0)
+        if getattr(self, "phase_amp", None):
+            changed = self._enforce_min_amp_magnitude(self.phase_amp[0], 0) \
+                or changed
+        if changed:
+            self._emit()
+
+    def _enforce_min_amp_magnitude(self, sp, phase_idx: int) -> bool:
+        """Clamp ``sp`` to ``±_amp_min_mag_ua`` (sign from the polarity) when
+        its magnitude is below the minimum; toggle the inline warning.  Returns
+        True if the value was changed.  No-op (and hides the warning) when the
+        constraint is disabled (min = 0, i.e. a digital trigger)."""
+        warn = getattr(self, "_amp_trigger_warn", None)
+        mn = float(getattr(self, "_amp_min_mag_ua", 0.0) or 0.0)
+        if mn <= 0.0 or sp is None:
+            if warn is not None:
+                warn.setVisible(False)
+            return False
+        if abs(float(sp.value())) >= mn:
+            if warn is not None:
+                warn.setVisible(False)
+            return False
+        want = self._wanted_phase_sign(phase_idx)
+        sp.blockSignals(True)
+        try:
+            sp.setValue(want * mn)                 # ±min, polarity-correct
+        finally:
+            sp.blockSignals(False)
+        if warn is not None:
+            warn.setText(
+                f"I_mon is the trigger source — current magnitude must be "
+                f"≥ {mn:.1f} µA (the I_mon signal can't trigger below that). "
+                f"Use a digital Trigger channel to test from 0 µA.")
+            warn.setVisible(True)
+        return True
+
+    def _on_amp_excite_value_changed(self) -> None:
+        """Auto-flip the excitation amplitude to the polarity sign after the
+        user commits an edit (Enter / focus-out / step) — typing ``-5`` in
+        anodic-first flips to ``+5``.  Mirrors ``_on_phase_amp_value_changed``
+        for the symmetric single-knob path.  Also enforces the I_mon-trigger
+        minimum magnitude (clamps a 0 µA commit to ±0.1 when constrained)."""
+        changed = self._sync_excite_amp_sign()
+        changed = self._enforce_min_amp_magnitude(self.amp_excite, 0) or changed
+        if changed:
             self._emit()
 
     def _refresh_ratio_excitation_label(self, *_):
@@ -2639,7 +2925,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Apply the strict-alternation sign convention. Polarity comes
         # from the dropdown above: "Cathodic-first" → -1, anything
         # else → +1.
-        polarity = (-1 if self.polarity.currentText().startswith("Cathodic")
+        polarity = (-1 if self.polarity.currentText().startswith("Cathod")
                     else +1)
         sign_pattern = (polarity, -polarity, polarity)
         signed_vals = [s * abs(v) for s, v in zip(sign_pattern, vals)]
@@ -2771,7 +3057,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
     # ----------------------------------------------------------- pattern build
     def pattern(self) -> PulsePattern:
         """Build a PulsePattern from the current control state."""
-        polarity = -1 if self.polarity.currentText().startswith("Cathodic") else +1
+        polarity = -1 if self.polarity.currentText().startswith("Cathod") else +1
         kind = self.phase_count.currentText()
         triphasic = (kind == TRIPHASIC)
         arbitrary = (kind == ARBITRARY)
@@ -2851,8 +3137,14 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 # ignores it. Both default to 0 when the widgets
                 # haven't been laid out yet (early construction-
                 # time emit path).
-                sym_offset = float(getattr(self, "sym_offset_ua", None).value()
-                                   if hasattr(self, "sym_offset_ua") else 0.0)
+                # Offset is applied ONLY when its enable checkbox is checked
+                # (operator opt-in); unchecked → 0 (historical no-offset).
+                _offset_on = (getattr(self, "sym_offset_enable_chk", None)
+                              is not None
+                              and self.sym_offset_enable_chk.isChecked())
+                sym_offset = (float(self.sym_offset_ua.value())
+                              if (_offset_on and hasattr(self, "sym_offset_ua"))
+                              else 0.0)
                 sym_tau = float(getattr(self, "sym_tau_us", None).value()
                                 if hasattr(self, "sym_tau_us") else 0.0)
                 # τ is only meaningful for the exponential shapes;
@@ -2931,6 +3223,19 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 # user's signed amplitude in the spinbox (asymmetric
                 # mode lets them pick polarity directly).
                 I_c_signed = float(self.phase_amp[0].value())
+                # Force the polarity-correct SIGNED ZERO so a 0 µA
+                # cathodal-first template carries -0.0 (not +0.0).
+                # ``_pattern_at_amplitude`` recovers polarity from a
+                # 0 µA base via ``math.copysign(1.0, phases[0].amp)`` —
+                # and copysign(1.0, +0.0)=+1.0 vs copysign(1.0, -0.0)=
+                # -1.0 — so an unsigned +0.0 rebuilt a cathodal 0 µA
+                # VT-max ramp as ANODAL-first (the pcc-run polarity bug).
+                # ``math.copysign(abs(x), sign)`` also corrects a
+                # mis-signed non-zero value.  Mirrors the symmetric path
+                # (``_sync_excite_amp_sign``: sign * abs(v)).
+                I_c_signed = math.copysign(
+                    abs(I_c_signed),
+                    -1.0 if self._wanted_phase_sign(0) == -1 else +1.0)
                 t_c = float(self.phase_width[0].value())
                 # Phase 2: exp-decay anodic. Lock-mode picks which of
                 # (width, amplitude) is the user's input.
@@ -2983,8 +3288,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                     finally:
                         self.tau_us.blockSignals(False)
                 # Anodic recharge phase is opposite polarity to the
-                # cathodic phase. Cathodic-first (I_c < 0) → I_a > 0.
-                anodic_sign = +1.0 if I_c_signed < 0 else -1.0
+                # cathodic phase. Cathodic-first → I_a > 0.  Derive from
+                # ``_wanted_phase_sign(1)`` (the recharge sign) NOT from
+                # ``I_c_signed < 0`` — the latter is False for a -0.0
+                # cathodal zero, which would stamp the recharge phase
+                # with the wrong signed-zero at 0 µA.
+                anodic_sign = float(self._wanted_phase_sign(1))
                 I_a_signed = anodic_sign * bal.anodic_amplitude_ua
                 phases.append(Phase(
                     amplitude_ua=I_c_signed, width_us=t_c,
@@ -3117,6 +3426,15 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 _EXP_SHAPES_LOCAL = {SHAPE_EXP_DECAY, SHAPE_EXP_INCREASING}
                 for i in range(n):
                     amp = float(self.phase_amp[i].value())
+                    # Stamp the polarity-correct SIGNED ZERO so a 0 µA
+                    # asymmetric phase carries -0.0 / +0.0 per its
+                    # polarity — otherwise a 0 µA cathodal-first excitation
+                    # phase is stored +0.0 and ``_pattern_at_amplitude``
+                    # rebuilds the VT-max ramp ANODAL-first (same
+                    # signed-zero bug as the cap-coupled path above).
+                    amp = math.copysign(
+                        abs(amp),
+                        -1.0 if self._wanted_phase_sign(i) == -1 else +1.0)
                     w = float(self.phase_width[i].value())
                     # All phases except the last get the interphase delay;
                     # the last gets the discharge delay (matches Plexon order).
@@ -3403,6 +3721,132 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         """Display ``rate_hz`` in the spinbox using the current unit."""
         self.rate_pps.setValue(self._hz_to_unit(rate_hz))
 
+    # ------------------------------------------------- acquisition-time readout
+    def set_acquisition_info(self, mode: str, n_avg: int) -> None:
+        """Push the Setup-tab oscilloscope acquisition selection so the
+        per-capture acquisition-time readout beside the rate is accurate.
+
+        Called from ``_BaseExperimentTab.set_acquisition`` — which is the
+        single funnel for the Setup-tab ``acquisitionChanged`` signal and
+        the Test-parameters entry sync — so every experiment tab's pattern
+        panel tracks the same average count / mode the runner will apply.
+        """
+        self._acq_mode = str(mode or "AVERAGE")
+        try:
+            self._acq_n_avg = max(1, int(n_avg))
+        except (TypeError, ValueError):
+            self._acq_n_avg = 16
+        # Keep the inline average-count spinbox in sync with the pushed
+        # value.  Signal-guarded: without the block, setValue would fire
+        # _on_inline_navg_changed → acqNavgEdited → Setup spin →
+        # acquisitionChanged → back here (a needless round-trip; the
+        # same-value no-op in the slot breaks the loop anyway, this just
+        # avoids the churn).  The spin is meaningful only in AVERAGE
+        # mode — SAMPLE captures are single sweeps, so grey it out.
+        sp = getattr(self, "acq_navg_inline", None)
+        if sp is not None:
+            sp.blockSignals(True)
+            try:
+                sp.setValue(self._acq_n_avg)
+            finally:
+                sp.blockSignals(False)
+            sp.setEnabled("AVER" in self._acq_mode.upper())
+        self._update_acq_time_label()
+
+    def _on_inline_navg_changed(self, n_avg: "int | None" = None) -> None:
+        """The user COMMITTED the inline average-count spinbox (Enter/return/
+        focus-out).
+
+        Refresh the local estimate immediately, then publish the new
+        count via ``acqNavgEdited`` so MainWindow can push it into the
+        Setup tab's ``acq_navg_spin`` (single source of truth — the
+        runner reads the Setup value at Start).  Same-value edits are
+        dropped to keep the signal chain quiet.
+        """
+        # Wired to ``editingFinished`` (no value arg) — read the widget.
+        if n_avg is None:
+            n_avg = self.acq_navg_inline.value()
+        try:
+            n = max(1, int(n_avg))
+        except (TypeError, ValueError):
+            return
+        if n == self._acq_n_avg:
+            return
+        self._acq_n_avg = n
+        self._update_acq_time_label()
+        self.acqNavgEdited.emit(n)
+
+    def _update_acq_time_label(self) -> None:
+        """Recompute the approximate per-capture acquisition-time readout.
+
+        ``t ≈ sweeps / rate`` — an AVERAGE-mode capture waits through one
+        pulse per averaged sweep (``sweeps = n_avg``); a SAMPLE-mode capture
+        is a single sweep (``sweeps = 1``, average count irrelevant).  Pulses
+        arrive at the pulse rate, so the time to fill the average is
+        ``sweeps / rate_hz`` — the same estimate the runner uses to size its
+        capture timeout (gotcha #32).  Overhead (trigger latency, USB-TMC
+        transfer) is not modelled — this is the "approximate" figure the
+        operator asked for.
+        """
+        lbl = getattr(self, "acq_time_label", None)
+        if lbl is None:
+            return
+        rate_hz = self._current_rate_hz()
+        is_avg = "AVER" in self._acq_mode.upper()
+        sweeps = self._acq_n_avg if is_avg else 1
+        if not (rate_hz > 0.0) or not math.isfinite(rate_hz):
+            lbl.setText("")
+            lbl.setToolTip("")
+            return
+        t_s = sweeps / rate_hz
+        # Show the CALCULATION inline in terms of the CURRENTLY-SELECTED
+        # rate unit (operator: "show the calculation" + "If the pulse rate
+        # is set to pulse period, then have the calculation change
+        # accordingly"):
+        #   rate (pps)   AVERAGE →  "64 ÷ 100 pps ≈ 0.64 s / capture"
+        #                SAMPLE  →  "1 sweep ÷ 100 pps ≈ 10 ms / capture"
+        #   period (ms)  AVERAGE →  "64 × 10 ms ≈ 0.64 s / capture"
+        #                SAMPLE  →  "1 sweep × 10 ms ≈ 10 ms / capture"
+        # Numerically t = sweeps / rate = sweeps × period either way — the
+        # DISPLAY just mirrors whichever the unit dropdown is showing so the
+        # operator reads a calculation in the same terms they dialled in.
+        lead = f"{sweeps}" if is_avg else "1 sweep"
+        if self._rate_unit == self.UNIT_MS:
+            period_disp = float(self.rate_pps.value())
+            calc = f"{lead} × {period_disp:g} {self.UNIT_MS}"
+            tip_op, tip_unit = "&times;", f"{period_disp:g} {self.UNIT_MS} period"
+        else:
+            calc = f"{lead} ÷ {rate_hz:g} pps"
+            tip_op, tip_unit = "&divide;", f"{rate_hz:g} pps"
+        lbl.setText(f"{calc} ≈ {self._fmt_acq_time(t_s)} / capture")
+        if is_avg:
+            basis = f"{self._acq_n_avg} averaged sweeps {tip_op} {tip_unit}"
+        else:
+            basis = f"single sweep (SAMPLE mode) {tip_op} {tip_unit}"
+        lbl.setToolTip(
+            "Approximate acquisition time per captured waveform.<br>"
+            f"Estimate: {basis}.<br>"
+            "Overhead (trigger latency, transfer) is not included.")
+
+    @staticmethod
+    def _fmt_acq_time(t_s: float) -> str:
+        """Human-readable acquisition-time string with an adaptive unit."""
+        if not (t_s > 0.0) or not math.isfinite(t_s):
+            return ""
+        if t_s < 1e-3:
+            return f"{t_s * 1e6:.0f} µs"
+        if t_s < 0.1:
+            return f"{t_s * 1e3:.0f} ms"
+        if t_s < 10.0:
+            return f"{t_s:.2f} s"
+        if t_s < 60.0:
+            return f"{t_s:.1f} s"
+        if t_s < 3600.0:
+            m, s = divmod(int(round(t_s)), 60)
+            return f"{m} min {s} s"
+        h, rem = divmod(int(round(t_s)), 3600)
+        return f"{h} h {rem // 60} min"
+
     def _on_rate_unit_changed(self, new_unit: str):
         """User flipped the unit toggle — convert the spinbox display
         without changing the underlying rate, and rebuild the spinbox
@@ -3417,21 +3861,11 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Suffix + decimals + bounds + label flip per unit.
         self._suspend_signals = True
         try:
-            if new_unit == self.UNIT_PPS:
-                self.rate_pps.setSuffix(" " + rich.PPS)
-                self.rate_pps.setDecimals(3)
-                # ``f_stim`` — stimulation frequency. Sourced from
-                # :data:`stimtest.gui.rich.F_STIM` so the label
-                # ``Pulse rate (f_stim) [pps]:`` is consistent with
-                # any other tab that surfaces the same knob.
-                self._rate_row_label.setText(
-                    rich.field_label("Pulse rate", rich.F_STIM, rich.PPS))
-            else:
-                self.rate_pps.setSuffix(" " + self.UNIT_MS)
-                self.rate_pps.setDecimals(3)
-                # ``T_pulse`` — inter-pulse period (= 1 / f_stim).
-                self._rate_row_label.setText(
-                    rich.field_label("Pulse period", rich.T_PULSE, self.UNIT_MS))
+            self.rate_pps.setDecimals(3)
+            # Label + suffix follow BOTH the unit AND the interpulse
+            # on/off state (continuous mode shows "Pulse frequency [Hz]")
+            # — single source of truth in ``_refresh_rate_label``.
+            self._refresh_rate_label()
             # Rebuild bounds from the canonical rate envelope.
             # _update_rate_max below tightens further based on pulse width.
             self._reapply_rate_bounds()
@@ -3488,6 +3922,22 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         max_rate_hz = max(max_rate_hz, self.RATE_HZ_MIN)
         self._suspend_signals = True
         try:
+            if not self.interpulse_check.isChecked():
+                # CONTINUOUS mode: the widths FOLLOW a typed frequency
+                # (``_sync_widths_from_frequency``), so the spinbox ceiling
+                # is the HARDWARE max — capping it at the current-width max
+                # would block typing a higher frequency (whose whole point
+                # is to shrink the widths).  The VALUE is pinned to the
+                # ACHIEVED frequency ``1e6 / total`` — idempotent right
+                # after a width-sync, and it corrects the display when the
+                # sync clamped at the width spinboxes' minimums.
+                if self._rate_unit == self.UNIT_PPS:
+                    self.rate_pps.setMaximum(self.RATE_HZ_MAX)
+                else:
+                    self.rate_pps.setMinimum(
+                        self._hz_to_unit(self.RATE_HZ_MAX))
+                self._set_rate_hz(max_rate_hz)
+                return
             # Translate the Hz ceiling into the spinbox's current unit.
             # In pps that's the upper bound; in period units that's the
             # LOWER bound (smaller period <=> higher rate).
@@ -3495,13 +3945,9 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 self.rate_pps.setMaximum(max_rate_hz)
             else:
                 self.rate_pps.setMinimum(self._hz_to_unit(max_rate_hz))
-            # Clamp / pin behaviour — same logic, expressed in Hz so
-            # it's unit-agnostic. With interpulse delay turned OFF,
-            # the rate is pinned to the running max.
+            # Clamp behaviour — expressed in Hz so it's unit-agnostic.
             cur_hz = self._current_rate_hz()
-            if not self.interpulse_check.isChecked():
-                self._set_rate_hz(max_rate_hz)
-            elif cur_hz > max_rate_hz:
+            if cur_hz > max_rate_hz:
                 self._set_rate_hz(max_rate_hz)
         finally:
             self._suspend_signals = False
@@ -3522,12 +3968,20 @@ class PatternControlPanel(QtWidgets.QGroupBox):
 
     def _on_interpulse_toggled(self, checked: bool):
         """Interpulse delay: a CHECKED box means the user picks the
-        rate freely (within the pulse-width ceiling); an UNCHECKED
-        box forces "no interpulse delay" — the rate gets pinned to
-        the running max ``1e6 / (total_pulse_us + 0)`` and the
-        spinbox is disabled because it's now driven live by
-        :meth:`_update_rate_max`. Toggling the box back ON restores
-        the rate the user had typed before they pinned it.
+        rate freely (within the pulse-width ceiling).  An UNCHECKED box
+        forces "no interpulse delay" — the waveform is CONTINUOUS, so the
+        knob becomes the pulse **FREQUENCY (Hz)** (operator: "allow the
+        pulse rate to be called pulse frequency (Hz)") and stays EDITABLE
+        in BOTH directions (operator: "don't disable width — it gives the
+        user [the choice] to change width or frequency/period"):
+
+          * editing the FREQUENCY rescales the phase WIDTHS so the pulse
+            fills exactly one period (``_sync_widths_from_frequency``);
+          * editing a WIDTH updates the displayed frequency (the
+            ``_update_rate_max`` pin, ``1e6 / total_pulse_us``).
+
+        Toggling the box back ON restores the rate the user had typed
+        before unchecking.
         """
         if not checked:
             # Capture the user-typed rate (in Hz) so toggling on
@@ -3544,13 +3998,101 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 finally:
                     self._suspend_signals = False
             self._saved_rate_hz = None
-        # Spinbox is locked while interpulse delay is OFF (the value
-        # is driven live by ``_update_rate_max``); when interpulse is
-        # ON the user can edit it freely. The unit-toggle stays
-        # enabled in either case so the user can still flip the
-        # display between pps and ms.
-        self.rate_pps.setEnabled(checked)
+        # The knob stays EDITABLE in both modes (it was previously locked
+        # while interpulse was OFF); the label + suffix flip between
+        # "Pulse rate [pps]" and "Pulse frequency [Hz]".
+        self.rate_pps.setEnabled(True)
+        self._refresh_rate_label()
         self._emit()
+
+    def _refresh_rate_label(self) -> None:
+        """Sync the rate-row label + spinbox suffix with the current
+        (interpulse on/off, display unit) combination:
+
+          * interpulse ON  + pps → ``Pulse rate (f_stim) [pps]``
+          * interpulse OFF + pps → ``Pulse frequency (f_stim) [Hz]`` — a
+            CONTINUOUS waveform's rate IS its frequency (operator; the
+            "pps" display convention applies to pulse RATES, and the
+            operator explicitly asked for Hz here).
+          * period unit (ms) → ``Pulse period (T_pulse) [ms]`` either way.
+        """
+        continuous = not self.interpulse_check.isChecked()
+        if self._rate_unit == self.UNIT_PPS:
+            if continuous:
+                self.rate_pps.setSuffix(" Hz")
+                self._rate_row_label.setText(
+                    rich.field_label("Pulse frequency", rich.F_STIM, "Hz"))
+            else:
+                self.rate_pps.setSuffix(" " + rich.PPS)
+                self._rate_row_label.setText(
+                    rich.field_label("Pulse rate", rich.F_STIM, rich.PPS))
+        else:
+            self.rate_pps.setSuffix(" " + self.UNIT_MS)
+            self._rate_row_label.setText(
+                rich.field_label("Pulse period", rich.T_PULSE, self.UNIT_MS))
+
+    def _sync_widths_from_frequency(self) -> None:
+        """CONTINUOUS mode (interpulse delay OFF): the user edited the
+        pulse FREQUENCY — rescale the phase WIDTHS so the pulse fills
+        exactly one period (``Σ widths = 1e6/f − Σ delays``), preserving
+        the per-phase width RATIOS (all width knobs scale by one factor).
+        Interphase / discharge delays are kept as typed.  Spinbox min/max
+        clamp naturally; the ``_update_rate_max`` pin then corrects the
+        displayed frequency to whatever total was actually achieved.
+        Arbitrary-table patterns are skipped (their per-row durations
+        aren't auto-scaled)."""
+        if self.phase_count.currentText() == ARBITRARY:
+            return
+        try:
+            pat = self.pattern()
+            widths = float(sum(ph.width_us for ph in pat.phases))
+            delays = float(sum(ph.delay_after_us for ph in pat.phases))
+        except Exception:
+            return
+        f_user = self._current_rate_hz()
+        if not (f_user > 0.0) or widths <= 0.0:
+            return
+        target_widths = 1e6 / f_user - delays
+        if target_widths <= 0.0:
+            return          # delays alone exceed the period; the pin corrects
+        factor = target_widths / widths
+        if abs(factor - 1.0) < 1e-9:
+            return
+        triphasic = self.phase_count.currentText() == TRIPHASIC
+        asym = (not triphasic) and (self.symmetry.currentText() == ASYMMETRIC)
+        self._suspend_signals = True
+        try:
+            if asym:
+                # Per-phase widths: each snaps to its nearest 1 µs value
+                # (the spinbox's decimals=0 grid); the pin then shows the
+                # achieved frequency.
+                for sp in self.phase_width:
+                    sp.setValue(float(sp.value()) * factor)
+            else:
+                # Shared width (the common / KHFAC case): snap to the 1 µs
+                # grid neighbour whose ACHIEVED frequency is NEAREST the
+                # typed one (operator: "Have the pulse frequency snap to
+                # the nearest to satisfy the time resolution").  Plain
+                # width rounding is NOT the same thing — f = 1e6/total is
+                # nonlinear in the width, so near the midpoint the closer
+                # WIDTH can be the farther FREQUENCY.
+                cur_w = float(self.width_shared.value())
+                w_ideal = cur_w * factor
+                per_unit = widths / max(cur_w, 1e-12)   # Σwidths per knob-µs
+                lo_w = max(math.floor(w_ideal), int(self.width_shared.minimum()))
+                hi_w = min(math.ceil(w_ideal), int(self.width_shared.maximum()))
+                best_w, best_err = None, float("inf")
+                for cand in {lo_w, hi_w}:
+                    if cand <= 0:
+                        continue
+                    f_cand = 1e6 / (per_unit * cand + delays)
+                    err = abs(f_cand - f_user)
+                    if err < best_err:
+                        best_w, best_err = cand, err
+                if best_w is not None:
+                    self.width_shared.setValue(float(best_w))
+        finally:
+            self._suspend_signals = False
 
     # ----------------------------------------------------------- auto-discharge
     def _on_auto_discharge_combo_changed(self, _index: int):
@@ -3634,6 +4176,18 @@ class PatternControlPanel(QtWidgets.QGroupBox):
     def _emit(self, *_):
         if self._suspend_signals:
             return
+        # CONTINUOUS mode, FREQUENCY edited (the signal came from the rate
+        # spinbox): rescale the widths to match BEFORE the pin below reads
+        # the total — otherwise ``_update_rate_max`` would clobber the typed
+        # frequency with the stale ``1e6/old_total``.  Width edits don't
+        # take this path (their sender is the width spinbox), so they keep
+        # the width→frequency direction via the pin.
+        try:
+            _from_rate = self.sender() is self.rate_pps
+        except Exception:
+            _from_rate = False
+        if _from_rate and not self.interpulse_check.isChecked():
+            self._sync_widths_from_frequency()
         # Always re-clamp the rate ceiling first so the emitted pattern
         # already reflects the (possibly newly-tighter) max rate.
         self._update_rate_max()
@@ -3666,6 +4220,10 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         asym = (not triphasic) and (self.symmetry.currentText() == ASYMMETRIC)
         manual = self.charge_mode.currentText() == CHARGE_BAL_OFF
         self.balanceWarningVisibility.emit(asym and manual)
+        # Refresh the approximate-acquisition-time readout — the rate may
+        # have just changed (and _update_rate_max above may have clamped
+        # it), so recompute after the pattern is emitted.
+        self._update_acq_time_label()
 
     def _refresh_sym_slope_readout(self) -> None:
         """Render the per-phase slope (µA/µs) for linear shapes in
@@ -4363,7 +4921,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 ("Exp decreasing",    SHAPE_EXP_DECAY),
                 ("Exp increasing",    SHAPE_EXP_INCREASING),
             )
-            cath_first = self.polarity.currentText().startswith("Cathodic")
+            cath_first = self.polarity.currentText().startswith("Cathod")
             phase_signs = (-1, +1) if cath_first else (+1, -1)
             for i, cb in enumerate(self.mix_phase_shape_combo):
                 self._rebuild_shape_combo(
@@ -4478,6 +5036,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             ],
             # Symmetric-mode offset and τ spinbox values.
             "sym_offset_ua": float(self.sym_offset_ua.value()),
+            "sym_offset_enable": bool(self.sym_offset_enable_chk.isChecked()),
             "sym_tau_us": float(self.sym_tau_us.value()),
         }
 
@@ -4498,7 +5057,17 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         if not p: return
         if "phase_count" in p: self.phase_count.setCurrentText(p["phase_count"])
         if "symmetry" in p: self.symmetry.setCurrentText(p["symmetry"])
-        if "polarity" in p: self.polarity.setCurrentText(p["polarity"])
+        if "polarity" in p:
+            # Legacy prefs carry the pre-rename wording ("Cathodic-first" /
+            # "Anodic-first"); map those to the current "Cathodal / Anodal"
+            # items — setCurrentText on a non-editable combo silently
+            # NO-OPS for an unknown item, which would lose a saved
+            # Anodal-first selection.
+            _legacy_polarity = {"Cathodic-first": "Cathodal-first",
+                                "Anodic-first": "Anodal-first"}
+            _pol_text = str(p["polarity"])
+            self.polarity.setCurrentText(
+                _legacy_polarity.get(_pol_text, _pol_text))
         for key, sp in (("amp_excite", self.amp_excite),
                         ("width_shared", self.width_shared),
                         ("interphase_us", self.interphase_us),
@@ -4618,6 +5187,13 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 self.sym_offset_ua.setValue(float(p["sym_offset_ua"]))
             except (TypeError, ValueError):
                 pass
+        # Offset-enable checkbox (absent in pre-checkbox prefs → default OFF).
+        try:
+            _en = bool(p.get("sym_offset_enable", False))
+            self.sym_offset_enable_chk.setChecked(_en)
+            self.sym_offset_ua.setEnabled(_en)
+        except (TypeError, ValueError, AttributeError):
+            pass
         if "sym_tau_us" in p:
             try:
                 self.sym_tau_us.setValue(float(p["sym_tau_us"]))
@@ -4641,6 +5217,10 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # (amp, width) still load above.
         self._on_mode_changed()
         self._on_balance_changed()
+        # After restoring the amplitude + polarity, force the excitation
+        # amplitude's DISPLAYED sign to match the restored polarity — a legacy
+        # prefs file may have saved an unsigned/mismatched value.
+        self._sync_excite_amp_sign()
 
     def _load_arb_table(self, rows):
         """Re-populate the arbitrary table from a list-of-lists snapshot."""

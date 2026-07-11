@@ -109,18 +109,38 @@ pyinstaller installer/StimulationTesting.spec `
 
 ## How the prerequisite checks work
 
-The `[Components]` page lets the user untick any of the three; whatever
-stays checked is verified after the file copy and, if missing, fetched.
+**"Required hardware drivers" wizard page.** Right after Welcome — and
+BEFORE anything is installed — a custom page (`InitializeWizard`) checks
+for **Stim-2** and **NI-VISA** and shows each one's status (`INSTALLED`
+/ `NOT FOUND`). For each missing driver it shows a clickable blue
+hyperlink that **automatically downloads and runs that driver's
+installer** (rather than just opening a website), and it spells out that
+both drivers **require a reboot** — recommended order: install the
+driver(s), restart Windows, then re-run this installer to install PULSAR
+and POLARIS. If both are missing, both links are shown.
 
 | # | Prereq | Detection | If missing |
 |---|--------|-----------|------------|
-| 1 | **MS Visual C++ 2015–2022 Redist (x64)** — required by PyQt6 / numpy / scipy DLLs | `HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64\Installed = 1` | Silently downloads `vc_redist.x64.exe` from `aka.ms/vs/17/release` and installs with `/quiet /norestart`. Tolerates exit codes 0 / 1638 (newer present) / 3010 (reboot needed). |
-| 2 | **Plexon PlexStim 2.0 SDK** — needed for a real stimulator | Walks `Uninstall` keys in **both** `HKLM` and `HKLM32` (PlexStim's installer is 32-bit) for a `DisplayName` matching `PlexStim`, `Stimulator V2`, or `Plexon Inc` | Prompts user, then downloads `StimulatorV2Setup.exe` from Plexon's canonical URL and launches it interactively. |
-| 3 | **NI-VISA / any IVI VISA** — required for real Tek scopes over USB | Looks for `System32\visa64.dll`, then `HKLM\SOFTWARE\IVI Foundation\VISA\Win64`, then `HKLM\SOFTWARE\National Instruments\NI-VISA` (TekVISA / Keysight / R&S all satisfy this) | Prompts user; opens the NI-VISA download page in the browser. See [NI-VISA installation](#ni-visa-installation) below. |
+| 1 | **MS Visual C++ 2015–2022 Redist (x64)** — required by PyQt6 / numpy / scipy DLLs | `HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64\Installed = 1` | Silently downloads `vc_redist.x64.exe` from `aka.ms/vs/17/release` and installs with `/quiet /norestart` at post-install. Tolerates exit codes 0 / 1638 / 3010. |
+| 2 | **Plexon Stim-2 (PlexStim 2.0)** — needed for a real stimulator | **DLL presence** (operator's criterion): `PlexStim64.dll` / `PlexStim.dll` in `System32`, `SysWOW64`, the fixed `…\Plexon Inc\PlexStim 2.0\` folders, or a walk of `C:\PlexonSDKs\*`. | Wizard-page link **downloads `StimulatorV2Setup.exe` (~5 MB) and runs it** (or runs a bundled installer — see below). |
+| 3 | **NI-VISA / any IVI VISA** — required for real Tek scopes over USB | `System32\visa64.dll`, then `HKLM\SOFTWARE\IVI Foundation\VISA\Win64`, then `HKLM\SOFTWARE\National Instruments\NI-VISA` (TekVISA / Keysight / R&S all satisfy this) | Wizard-page link **runs a bundled NI-VISA installer if present**, else opens NI's download page (NI gates downloads behind a free login + the runtime is ~700 MB, so it can't be auto-fetched). |
 
-All downloads use PowerShell `Invoke-WebRequest` so no extra installer
-machinery is needed; failures fall back to a clear message with the
-manual URL.
+**Bundling the driver installers for full offline auto-run (optional).**
+The wizard page will auto-RUN a bundled installer if the build included
+one — drop the vendor setups here before running `build.py`:
+
+```
+installer/prereqs/stim2-setup.exe    # Plexon Stimulator V2 setup
+installer/prereqs/nivisa-setup.exe   # NI-VISA (e.g. the "online" installer)
+```
+
+They are added with `Flags: dontcopy skipifsourcedoesntexist`, so the
+build still succeeds without them (the wizard then downloads Stim-2 /
+opens NI's page instead). This is the way to make **NI-VISA** auto-run
+too — bundle `nivisa-setup.exe`.
+
+Downloads use PowerShell `Invoke-WebRequest`; failures fall back to a
+clear message with the manual URL.
 
 ### NI-VISA installation
 

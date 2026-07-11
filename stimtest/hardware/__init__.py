@@ -36,8 +36,18 @@ def open_stimulator(simulate: bool = False,
         return SimulatedStimulator()
 
 
-def open_oscilloscope(simulate: bool = False, resource: str | None = None) -> Oscilloscope:
-    """Factory: return a real Tektronix scope or (if simulate=True) the simulator.
+def open_oscilloscope(simulate: bool = False, resource: str | None = None,
+                      *, backend: str = "tektronix",
+                      pico_series: str = "ps4000a",
+                      pico_resolution_bits: int | None = None) -> Oscilloscope:
+    """Factory: return a real scope (Tektronix or PicoScope) or the simulator.
+
+    ``backend`` selects the hardware driver: ``"tektronix"`` (default — every
+    existing caller/test is unchanged) or ``"pico"`` (the PicoScope block-mode
+    backend, :mod:`stimtest.hardware.picoscope`).  ``pico_series`` picks the
+    picosdk submodule (``"ps4000a"`` for the 4000-series); ``resource`` is a
+    VISA address for Tektronix or a Pico SERIAL string for PicoScope (None =
+    first unit).
 
     Does NOT silently fall back to the simulator when a real scope is requested
     — the caller (connection panel) catches any exception and shows the error
@@ -45,6 +55,10 @@ def open_oscilloscope(simulate: bool = False, resource: str | None = None) -> Os
     """
     if simulate:
         return SimulatedOscilloscope()
+    if backend == "pico":
+        from .picoscope import PicoScopeOscilloscope
+        return PicoScopeOscilloscope(series=pico_series, resource=resource,
+                                     resolution_bits=pico_resolution_bits)
     from .tektronix import TektronixOscilloscope
     return TektronixOscilloscope(resource=resource)
 

@@ -211,14 +211,14 @@ def test_alignment_check_picks_first_edge_in_multiedge_biphasic():
         f"onset at t≈0), not a later edge.  Got t_edge={t_edge:.2f} µs.")
 
 
-def test_alignment_check_warns_when_first_edge_is_genuinely_late():
-    """When the leading edge is genuinely far from t=0, the warning
-    fires.  Genuine pre-fix scenario: time axis bug puts pulse at
-    +320 µs.  Even with the new "first ≥80%-max" logic, a real
-    misalignment still surfaces."""
+def test_alignment_check_is_silent_even_when_first_edge_is_late():
+    """The check NEVER warns — even for a far-from-zero edge (operator: "Do
+    not have warnings about the trigger warning … I use the digital signal
+    as trigger than current … smaller pulse widths do notable delays
+    between the voltage drop and the current drop").  It still RETURNS the
+    edge time for any caller that wants to record it."""
     runner = _make_runner_with_aliases({"imon": "CH2"})
 
-    # Simulate the pre-fix time-axis bug: pulse onset at +320 µs.
     t = np.linspace(0, 640, 6401)
     i_mon = np.zeros_like(t)
     i_mon[(t >= 320) & (t < 520)] = -100  # phase 1 starts at +320
@@ -230,10 +230,9 @@ def test_alignment_check_warns_when_first_edge_is_genuinely_late():
 
     t_edge = runner.check_trigger_alignment(acq, tolerance_us=5.0)
     assert t_edge is not None
-    assert t_edge >= 300  # picked up the edge near +320
-    assert any("alignment off" in m for m in log_messages), (
-        f"genuinely-misaligned pulse should still trigger the warning; "
-        f"got messages: {log_messages!r}")
+    assert t_edge >= 300  # still picks up the edge near +320
+    assert not any("alignment off" in m for m in log_messages), (
+        f"the alignment check must be silent; got messages: {log_messages!r}")
 
 
 def test_alignment_check_no_warning_when_aligned():

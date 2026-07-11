@@ -42,18 +42,27 @@ from typing import Dict, Optional
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .prefs import prefs_dir, load_prefs, save_prefs
+from ..readback_calibration import _IMON_GAIN_MIN, _IMON_GAIN_MAX
 from ..config import (IMON_SCALING_DEFAULT, IMON_SCALING_NIL,
                       VMON_SCALING_DEFAULT, VMON_SCALING_NIL,
-                      NIL_SERIAL_NUMBERS)
+                      NIL_SERIAL_NUMBERS, DEFAULT_RECORD_LENGTH)
 
 
 def _round_sig(x: float, sig: int = 1) -> float:
-    """Round x to sig significant figures (MATLAB round(x,sig,'significant'))."""
+    """Round x to sig significant figures (MATLAB round(x,sig,'significant')).
+
+    Half AWAY from zero (not Python's half-to-even) so an exact-half bound
+    like -45 µs frames to -50 as MATLAB does, keeping the calibration plot's
+    X bounds identical to the experiment plot (``widgets._round_sig``)."""
+    if not math.isfinite(x):
+        return x
     if x == 0.0:
         return 0.0
     d = math.ceil(math.log10(abs(x)))
-    factor = 10 ** (sig - d)
-    return round(x * factor) / factor
+    scale = 10.0 ** (d - sig)
+    scaled = x / scale
+    r = math.floor(scaled + 0.5) if scaled >= 0.0 else math.ceil(scaled - 0.5)
+    return r * scale
 
 
 # I_mon trigger-level + vertical-scale formulas both live in
@@ -382,7 +391,7 @@ class CalibrationTab(QtWidgets.QWidget):
             "Series resistance of the test-board load each "
             "channel drives. Fixed at 4.99 kΩ by the Plexon "
             "14-04-A-03-A board's soldered components. The "
-            "calibration recovers I from the I·R edge step at "
+            "verification recovers I from the I·R edge step at "
             "each phase transition.")
         form.addRow("Load R (series):", load_r_label)
         load_c_label = QtWidgets.QLabel(
@@ -525,6 +534,9 @@ class CalibrationTab(QtWidgets.QWidget):
             _ls_right= {"font-size": "11pt", "color": IMON_COLOR}
             self._plot_widget = pg.PlotWidget()
             self._plot_widget.setBackground("w")
+            # Mouse wheel must NOT zoom (operator request).
+            from .widgets import disable_plot_wheel_zoom
+            disable_plot_wheel_zoom(self._plot_widget)
             self._plot_widget.setLabel("bottom", "Time", units="µs", **_ls_x)
             self._plot_widget.setLabel("left",   "V_mon",   units="V",  **_ls_left)
             self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
@@ -826,7 +838,7 @@ class CalibrationTab(QtWidgets.QWidget):
         # let a logging failure abort the sweep.
         if self.log_pane is not None:
             try:
-                self.log_pane.log(f"[calibration] {msg}")
+                self.log_pane.log(f"[verification] {msg}")
             except Exception:
                 pass
         QtWidgets.QApplication.processEvents()
@@ -1058,7 +1070,7 @@ class CalibrationTab(QtWidgets.QWidget):
         # ---- One-time scope setup (mirrors experiment_tabs pre-run sequence) ----
         if self._scope is not None:
             self._log(
-                f"Calibration start: {len(channels_to_sweep)} channel(s), "
+                f"Verification start: {len(channels_to_sweep)} channel(s), "
                 f"{len(amplitudes)} amplitude(s) "
                 f"[{','.join(f'{a:.0f}' for a in amplitudes)} µA], "
                 f"phase={self.PHASE_WIDTH_US:.0f} µs, "
@@ -1072,15 +1084,23 @@ class CalibrationTab(QtWidgets.QWidget):
                 # to resolve the 50 µs phases on the test board.  On
                 # TBS-series scopes the quantized set is {1k, 2k, 20k, 200k,
                 # 2M, 5M}; the driver snaps to the nearest legal value.
-                self._log("Scope setup: record length 2000")
-                self._scope.set_record_length(2000)
+                # Calibration uses the SAME record length as experiments
+                # (operator: "the calibration record length should match the
+                # experimental record length").  set_record_length snaps to
+                # the model's appropriate choice (20000 on TBS2000/TBS1000C,
+                # 2500 on fixed-record families) — so calibration + experiment
+                # records always match on a given scope.
+                self._log(
+                    f"Scope setup: record length "
+                    f"{DEFAULT_RECORD_LENGTH} (snapped to model choices)")
+                self._scope.set_record_length(DEFAULT_RECORD_LENGTH)
                 # Hardcoded: AVERAGE mode, NUMAVg = 64.  See
                 # :data:`CAL_ACQ_MODE` / :data:`CAL_N_AVERAGES`.
                 acq_mode = self.CAL_ACQ_MODE
                 navg_val = self._cal_navg()
                 self._log(
                     f"Scope setup: acquisition mode {acq_mode}, "
-                    f"n_avg={navg_val} (hardcoded for calibration)")
+                    f"n_avg={navg_val} (hardcoded for verification)")
                 self._scope.set_acquisition_mode(acq_mode, n_avg=navg_val)
                 # Trigger: always I_mon (CH2), FALL edge, negative threshold.
                 # Calibration pulse is cathodic-first → I_mon goes negative
@@ -1555,26 +1575,26 @@ class CalibrationTab(QtWidgets.QWidget):
                         self._scope._w(f"SELect:{ch_name} ON")
                     except Exception:
                         pass
-                # Apply the per-channel bandwidth recommended by this
-                # scope's series spec.  V_mon → full bandwidth (preserve
-                # stim pulse leading edges).  I_mon → 20 MHz limit on
-                # TBS-series so the trigger comparator sees a clean
-                # signal that comfortably exceeds the MATLAB
-                # ``setTriggerLevel.m`` threshold.  Silent no-op when
-                # the scope's series lacks the BANdwidth option.
+                # Per operator request, run BOTH V_mon and I_mon at FULL
+                # bandwidth (overriding the former 20 MHz I_mon limit).
+                # See TektronixOscilloscope.set_channel_bandwidth_full.
+                # Trade-off: more broadband noise on I_mon, so the
+                # trigger comparator may be less reliable.  Silent no-op
+                # when the scope's series lacks the BANdwidth option.
                 try:
-                    bw_v = self._scope.set_channel_bandwidth_for_purpose(
-                        v_mon_phys, "vmon")
-                    bw_i = self._scope.set_channel_bandwidth_for_purpose(
-                        i_mon_phys, "imon")
+                    bw_v = self._scope.set_channel_bandwidth_full(v_mon_phys)
+                    bw_i = self._scope.set_channel_bandwidth_full(i_mon_phys)
+
+                    def _fmt_bw(_b):
+                        if _b is None or _b == float("inf"):
+                            return "FULL"
+                        return f"{_b:.0f} MHz"
                     if bw_v is not None or bw_i is not None:
                         self._log(
-                            f"Scope setup: bandwidth limits — "
-                            f"{v_mon_phys} (V_mon) ≤ "
-                            f"{bw_v:.0f} MHz, "
-                            f"{i_mon_phys} (I_mon) ≤ "
-                            f"{bw_i:.0f} MHz (less I_mon noise → "
-                            f"cleaner trigger).")
+                            f"Scope setup: bandwidth — "
+                            f"{v_mon_phys} (V_mon) = {_fmt_bw(bw_v)}, "
+                            f"{i_mon_phys} (I_mon) = {_fmt_bw(bw_i)} "
+                            f"(full BW on all channels, incl. I_mon).")
                 except Exception:
                     pass
                 # Initial V_mon / I_mon scales sized for the SMALLEST amp in
@@ -1645,27 +1665,13 @@ class CalibrationTab(QtWidgets.QWidget):
                 except Exception:
                     pass
 
-            # ---- One-time settings-change transient discard --------------
-            # The scope's averager carries forward state across our
-            # initial set_acquisition_mode / set_trigger / horizontal-
-            # layout changes for one or two frames before settling.
-            # Per-amplitude captures used to take TWO sequences and
-            # discard the first, doubling sweep time.  Instead we
-            # take ONE throwaway sequence here at setup, then every
-            # per-amplitude capture is a single clean averaged frame.
-            try:
-                self._log(
-                    "Scope setup: discarding 1st averaged frame "
-                    "(absorbs settings-change transient one time, "
-                    "then every per-amplitude capture is a single "
-                    "averaged frame).")
-                self._scope.capture_single_sequence(
-                    n_acq=self._cal_navg(),
-                    timeout_s=10.0,
-                    tick_fn=lambda: QtWidgets.QApplication.processEvents())
-            except Exception as _disc_err:
-                self._log(
-                    f"Setup-time discard frame skipped: {_disc_err}")
+            # NOTE: the one-time setup discard frame was REMOVED.  Operator
+            # (CWRU, "calibration runs too quickly" + "skip the first
+            # completed acquisition") wants EVERY amplitude to discard its
+            # first completed averaged acquisition — see
+            # ``_capture_one_amplitude``.  That per-amplitude skip also
+            # absorbs the initial settings-change transient on the first
+            # step, so a separate setup-time discard is redundant.
 
             # ---- Main sweep loop ----------------------------------------
             step_idx = 0
@@ -1975,6 +1981,24 @@ class CalibrationTab(QtWidgets.QWidget):
         # Timeout: N_avg periods + generous 5 s overhead for trigger latency.
         seq_timeout_s = navg * pulse_period_s + 5.0
 
+        # Skip the FIRST completed averaged acquisition (operator: "skip
+        # the first completed acquisition").  After load_channel +
+        # start_channel the scope's averager is still flushing the
+        # PREVIOUS amplitude's frames, so the first completed average is a
+        # stale blend of old + new amplitude; discard it and read the NEXT
+        # one, accumulated purely from THIS amplitude's pulses.  This
+        # restores the per-amplitude discard that was traded away for
+        # speed — the operator wants the cleaner, slower capture ("the
+        # calibration runs too quickly").  Wrapped so a failed throwaway
+        # never aborts the real capture below.
+        try:
+            self._scope.capture_single_sequence(
+                n_acq=navg, timeout_s=seq_timeout_s,
+                tick_fn=lambda: QtWidgets.QApplication.processEvents())
+        except Exception as _skip_err:
+            self._log(
+                f"  skip-first frame at {amp_ua:.0f} µA skipped: {_skip_err}")
+
         def _clipped(arr):
             mn, mx = arr.min(), arr.max()
             n = len(arr)
@@ -1986,12 +2010,9 @@ class CalibrationTab(QtWidgets.QWidget):
         i_mon = None
         try:
             for _attempt in range(5):
-                # Settings-change transient is now absorbed at SETUP
-                # time (one untimed discard immediately after
-                # set_acquisition_mode / set_trigger).  Per-amplitude
-                # we take a single averaged acquisition — restores
-                # ~50 % of calibration runtime that the per-step
-                # discard was costing.
+                # The amplitude-change transient / stale-blend frame was
+                # already discarded by the skip-first capture above, so
+                # THIS is the clean averaged acquisition we keep.
                 acq = self._scope.capture_single_sequence(
                     n_acq=navg,
                     timeout_s=seq_timeout_s,
@@ -2011,24 +2032,91 @@ class CalibrationTab(QtWidgets.QWidget):
                 # setting so the stored waveform reflects the correct range.
                 scale_changed = False
                 vlo, vhi = float(v_arr_f.min()), float(v_arr_f.max())
-                if _clipped(v_arr_f):
+                # ---- ONE-SIDED rail detection (position-aware) --------
+                # The test-board V_mon is strongly asymmetric (cathodic
+                # |v_min| ≈ (R + W/C)/R × v_max — ~3.1× at 50 µs phases),
+                # and ``_clipped`` (5 %-of-samples-at-extremes) MISSES the
+                # narrow railed V_C peak (< 5 % dwell).  The result was a
+                # self-consistent CLIPPED equilibrium: the rail truncated
+                # the observed half-range until adapt settled
+                # (ideal == current) with the cathodic peak still off-
+                # screen, biasing the I·R edge step −13…−18 % — exactly
+                # the band that trips the >10 % R-retry.  The position-
+                # aware ``channel_is_clipped`` (observed extent within
+                # 5 % of the physical rail around POSition) catches it;
+                # base/simulator default returns None → unchanged there.
+                _v_railed = False
+                try:
+                    _v_railed = (self._scope.channel_is_clipped(
+                        v_mon_phys, vlo, vhi) is True)
+                except Exception:
+                    pass
+                _v_overflow = _clipped(v_arr_f) or _v_railed
+                if _v_overflow:
                     vlo, vhi = vlo * 2.0, vhi * 2.0
                 try:
                     if self._scope.adapt_channel_scale(
                             v_mon_phys, v_min=vlo, v_max=vhi,
-                            shrink_stable_count=1) is not None:
+                            shrink_stable_count=1,
+                            # Rail-truncated reads are extrapolations —
+                            # the fits-now veto must not block the
+                            # escape grow (same contract as the
+                            # experiment runners' rescale loop).
+                            force_grow=_v_railed) is not None:
                         scale_changed = True
                 except Exception:
                     pass
+                # ---- Centre the asymmetric V_mon (faithful data only) --
+                # Cathodic-heavy waveform at position 0 wastes the upper
+                # half-screen and pushes the cathodic peak toward the
+                # rail.  When the capture is faithful (no clip / rail),
+                # offset the excursion midpoint to screen centre at the
+                # CURRENT scale — both peaks then fit at a finer V/div
+                # (better ADC resolution on the I·R edge).  POSition is
+                # ADC-centering only; reconstructed volts are unaffected,
+                # so the edge-step extraction and per-capture offset math
+                # see identical physics.  Mirrors the runners' settled-
+                # recentre (CLAUDE.md §5 #12).
+                if not _v_overflow:
+                    try:
+                        _mid = 0.5 * (vlo + vhi)
+                        _cur_vpd = float(self._scope._q(
+                            f"{v_mon_phys}:SCAle?"))
+                        _cur_pos = float(self._scope._q(
+                            f"{v_mon_phys}:POSition?"))
+                        _swing = max(vhi - vlo, 1e-9)
+                        _bias_ratio = 2.0 * abs(_mid) / _swing
+                        _pos_tgt = max(-5.0, min(5.0, -_mid / _cur_vpd))
+                        if (_bias_ratio >= 0.1
+                                and abs(_pos_tgt - _cur_pos) > 0.25):
+                            self._scope.set_channel_position(
+                                v_mon_phys, _pos_tgt)
+                            scale_changed = True  # re-capture centred
+                    except Exception:
+                        pass
                 if i_mon is not None and len(i_mon) >= 2:
                     i_arr_f = np.asarray(i_mon, dtype=float)
                     ilo, ihi = float(i_arr_f.min()), float(i_arr_f.max())
-                    if _clipped(i_arr_f):
+                    _i_railed = False
+                    try:
+                        _i_railed = (self._scope.channel_is_clipped(
+                            i_mon_phys, ilo, ihi) is True)
+                    except Exception:
+                        pass
+                    if _clipped(i_arr_f) or _i_railed:
                         ilo, ihi = ilo * 2.0, ihi * 2.0
                     try:
+                        # NOTE: force_grow keys on the RAIL check ONLY —
+                        # NOT on ``_clipped``, which false-positives on
+                        # I_mon's square plateaus (the full phase width
+                        # sits at the array extremes by definition).
+                        # Keying force_grow on _clipped would reintroduce
+                        # the per-step I_mon coarsening the fits-now gate
+                        # was verified to remove.
                         if self._scope.adapt_channel_scale(
                                 i_mon_phys, v_min=ilo, v_max=ihi,
-                                shrink_stable_count=1) is not None:
+                                shrink_stable_count=1,
+                                force_grow=_i_railed) is not None:
                             scale_changed = True
                     except Exception:
                         pass
@@ -2079,32 +2167,26 @@ class CalibrationTab(QtWidgets.QWidget):
                         f"samples) → using 0.0")
                     return 0.0
                 a_arr = np.asarray(arr, dtype=float)
-                samples = None
-                # PRIMARY: time-based mask (samples before −1 µs of
-                # the trigger event).  Requires t_us to be the same
-                # length as arr and to actually contain pre-trigger
-                # samples.
-                if (t_us is not None and len(t_us) == len(arr)):
-                    t_arr = np.asarray(t_us, dtype=float)
-                    pre_mask = t_arr < -1.0
-                    n_pre = int(np.count_nonzero(pre_mask))
-                    if n_pre >= 8:
-                        samples = a_arr[pre_mask]
-                # FALLBACK: index-based — first 10 % of the trace
-                # (capped at 200 samples).  Works whenever the
-                # horizontal position has ANY pre-trigger window
-                # (which our calibration setup always does, at
-                # ~30 %), and crucially it reads from the SAME
-                # ``arr`` the plot widget reads from.
-                if samples is None:
-                    n_first = max(8, min(200, len(arr) // 10))
-                    self._log(
-                        f"  [{label}] per-capture baseline: time-mask "
-                        f"unusable → using first {n_first} samples "
-                        f"of the {len(arr)}-sample trace.")
-                    samples = a_arr[:n_first]
-                # MAD-based outlier rejection so a few pulse-leak
-                # samples don't drag the mean.
+                n = a_arr.size
+                # LEADING-EDGE idle baseline — kept in lock-step with
+                # ``readback_calibration.per_capture_baseline``.  Do NOT
+                # average the whole pre-trigger window (t < −1 µs): when
+                # the trigger is the I_mon protocol it fires on the
+                # ANODIC current edge, so for a cathodic-first pulse the
+                # CATHODIC phase fills the pre-trigger window and its
+                # average is the cathodic level (≈ −amplitude), NOT the
+                # idle level — subtracting that shifts the trace up by
+                # ~one amplitude (the "wrong offset" bug).  auto_layout
+                # always puts idle baseline before the first phase, so
+                # the EARLIEST samples are the idle baseline regardless
+                # of where the trigger sits within the pulse.
+                if t_us is not None and len(t_us) == n:
+                    order = np.argsort(np.asarray(t_us, dtype=float))
+                    a_arr = a_arr[order]
+                n_lead = max(8, min(800, n // 16))
+                samples = a_arr[:n_lead]
+                # MAD-based outlier rejection so a few edge samples
+                # don't drag the mean.
                 med = float(np.median(samples))
                 mad = float(np.median(np.abs(samples - med)))
                 if mad > 0:
@@ -2233,59 +2315,20 @@ class CalibrationTab(QtWidgets.QWidget):
         # offset.  This is the same physics MATLAB's setDriving uses
         # when extracting R from the V_mon trace.
         try:
-            from ..metrics import (access_voltage_and_resistance,
-                                    _abs_derivative,
-                                    _find_n_peaks,
-                                    _localize_access_point)
-            _va_list, _ra_list, access_idx_list = \
-                access_voltage_and_resistance(t_us_arr, v_arr, pat)
-            # Re-run the smoothed-derivative peak detection so we
-            # have BOTH the peak (edge moment) and access (settling
-            # point) indices for each boundary in one pass.
-            deriv_abs, _ = _abs_derivative(t_us_arr, v_arr)
-            peak_max = (float(np.max(deriv_abs))
-                        if deriv_abs.size else 0.0)
-            peaks_idx_arr = (
-                _find_n_peaks(deriv_abs,
-                              len(access_idx_list),
-                              peak_max * 0.9)
-                if peak_max > 0 else np.array([], dtype=int))
+            from ..metrics import access_voltage_and_resistance
+            # SAME method as the experiment (operator: "calibration should use
+            # the same method for access points as the experiment"): the
+            # TIME-ANCHORED localizer (onset=0 — the time axis was re-zeroed to
+            # the phase-1 onset above) + the SHARED before/after edge-
+            # extrapolation (``access_step_by_extrapolation``) that returns the
+            # PURE IR step with the cap ramp subtracted.  The returned ``va``
+            # list IS those steps (the calibration used to inline this exact
+            # extrapolation, with identical windows), so we just average them.
+            _va_list, _ra_list, _acc_idx = access_voltage_and_resistance(
+                t_us_arr, v_arr, pat, onset_us=0.0)
         except Exception:
-            access_idx_list = []
-            peaks_idx_arr = []
-        step_mags: list = []
-        for peak_idx, acc_idx in zip(peaks_idx_arr, access_idx_list):
-            try:
-                peak_idx = int(peak_idx)
-                acc_idx = int(acc_idx)
-                if not (0 <= peak_idx < acc_idx < v_arr.size):
-                    continue
-                # Linear fit V_mon over the cap-ramp window:
-                # [access_idx, access_idx + 30] is safely past
-                # the IR-jump rise-time region.
-                hi_end = min(acc_idx + 30, v_arr.size)
-                if hi_end - acc_idx < 4:
-                    continue
-                t_hi = t_us_arr[acc_idx:hi_end] * 1e-6
-                v_hi = v_arr[acc_idx:hi_end]
-                slope_hi, intercept_hi = np.polyfit(t_hi, v_hi, 1)
-                # Same on the BEFORE side — pre-pulse or interphase
-                # plateau.  10..50 samples before the peak avoids
-                # the rise-time region too.
-                lo_end   = max(peak_idx - 10, 0)
-                lo_start = max(lo_end - 40, 0)
-                if lo_end - lo_start < 4:
-                    continue
-                t_lo = t_us_arr[lo_start:lo_end] * 1e-6
-                v_lo = v_arr[lo_start:lo_end]
-                slope_lo, intercept_lo = np.polyfit(t_lo, v_lo, 1)
-                # Extrapolate both fits to the edge moment t_peak.
-                t_peak_s = float(t_us_arr[peak_idx]) * 1e-6
-                v_after  = slope_hi * t_peak_s + intercept_hi
-                v_before = slope_lo * t_peak_s + intercept_lo
-                step_mags.append(abs(v_after - v_before))
-            except Exception:
-                continue
+            _va_list = []
+        step_mags = [float(v) for v in _va_list if np.isfinite(v)]
         if not step_mags:
             return (float("nan"), imon_peak_v, acq)
         step_v = float(np.mean(step_mags))
@@ -2573,6 +2616,27 @@ class CalibrationTab(QtWidgets.QWidget):
             a_fit = float("nan")
             _b_polyfit = float("nan")
             rmsd = float("nan")
+        # A degenerate polyfit on BAD captures (railing V_mon / a
+        # mis-triggered I_mon on a 2-channel scope) can produce an ABSURD
+        # gain slope — ``a ≈ 1e14`` was observed at CWRU, which then
+        # multiplied every subsequent I_mon reading into physical nonsense
+        # (±1e8 A).  A real I_mon gain is a small correction (~O(1)); reject
+        # anything outside the plausible bounds so it is NEVER saved as a
+        # valid coefficient.  Save identity (a=1) instead, and flag the
+        # channel so the operator knows verification did not produce a usable
+        # gain (root cause is almost always the test-board connection / the
+        # I_mon trigger not firing — fix that, then re-verify).
+        _gain_implausible = not (
+            math.isfinite(a_fit)
+            and _IMON_GAIN_MIN <= abs(a_fit) <= _IMON_GAIN_MAX)
+        if _gain_implausible:
+            self._log(
+                f"⚠ CH{ch}: I_mon gain fit = {a_fit:.3g} is implausible "
+                f"(a real gain is ~1) — the captures are unreliable (check "
+                f"the test-board connection + I_mon trigger).  Saving "
+                f"identity gain (a=1) so it can't corrupt current readings; "
+                f"re-run verification once the signal is clean.")
+            a_fit = 1.0   # identity — safe; the channel is flagged below
         # b is now the I_mon DC baseline in µA (resting interpulse
         # current), averaged over the sweep's captures — a quantity
         # the user can directly verify on the scope.
@@ -2599,7 +2663,8 @@ class CalibrationTab(QtWidgets.QWidget):
         # an RC pair at all (open circuit, shorted output, missing
         # captures, etc.).
         is_flagged = bool(
-            not (np.isfinite(median_r_ohm) and median_r_ohm > 0)
+            _gain_implausible
+            or not (np.isfinite(median_r_ohm) and median_r_ohm > 0)
             or not (np.isfinite(median_cap_pf) and median_cap_pf > 0))
         self._append_results_row(
             ch, a_fit, b_fit, rmsd,

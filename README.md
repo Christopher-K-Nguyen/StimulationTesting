@@ -103,9 +103,37 @@ python run_gui.py --simulate
 | **NI-VISA** | Tektronix oscilloscope over USB | [ni.com/en/support/downloads/drivers/download.ni-visa.html](https://www.ni.com/en/support/downloads/drivers/download.ni-visa.html) |
 | **Plexon PlexStim 2.0 SDK** | Real PlexStim stimulator | Contact Plexon Inc. |
 
-Install NI-VISA and restart your computer before connecting the scope.
 Both prerequisites are detected and prompted during the Windows installer
 setup. The GUI works without hardware using `--simulate`.
+
+#### Installing NI-VISA (for the Tektronix oscilloscope)
+
+The Tektronix scope talks to PULSAR over USB through NI-VISA, which installs
+the `visa64.dll` system library **and** the USB-TMC driver Windows binds to the
+scope. Without it the scope shows up in Device Manager with an **Error** status
+and PULSAR reports *"Oscilloscope not detected."* It is free and does **not**
+require a paid NI license.
+
+1. **Download** NI-VISA from
+   [ni.com/en/support/downloads/drivers/download.ni-visa.html](https://www.ni.com/en/support/downloads/drivers/download.ni-visa.html).
+   A free NI account is required to download. Either the small **online (web)
+   installer** or the full **offline installer** works; version **2026 Q1
+   (26.3) or newer** is known-good with the TBS2204B.
+2. **Run the installer.** The **NI-VISA Runtime** component alone is sufficient —
+   you don't need the full development support. Accept the license and let it
+   complete (admin rights required).
+3. **Restart your computer** after the install finishes.
+4. **Connect the scope** via USB. Windows now binds the USB-TMC driver
+   automatically.
+5. **Verify.** Launch PULSAR and open the connection panel — the oscilloscope
+   indicator should turn green and show the scope's VISA address
+   (e.g. `USB0::0x0699::0x03C7::<serial>::INSTR`). The scope's Device Manager
+   status should read **OK** rather than Error.
+
+> If the scope still isn't found, confirm `C:\Windows\System32\visa64.dll`
+> exists (created by NI-VISA) and that you restarted after installing. Any
+> IVI-compliant VISA runtime — NI-VISA, TekVISA, Keysight IO Libraries — also
+> works; PULSAR accepts whichever one provides `visa64.dll`.
 
 ### Production installer (Windows end users)
 
@@ -165,7 +193,7 @@ same runner classes directly — see [`run_cli.py`](run_cli.py) for examples.
 Per the IEEE NER 2025 paper conventions:
 
 - **Charge** — `Q_ph` (per-phase, shape-aware), `Q_inj` (charge density mC/cm²),
-  `Q_net` (residual after biphasic — imbalance %), `C_eff`, `C_d`
+  `Q_net` (residual after biphasic — imbalance %), `C_d`
 - **Voltage** — `V_d` (driving), `V_a` (access, per phase), `E_pol`
   (polarization), `E_ip` (interpulse rest potential)
 - **Resistance** — `R_a` (access, per phase, on both active + return sides)

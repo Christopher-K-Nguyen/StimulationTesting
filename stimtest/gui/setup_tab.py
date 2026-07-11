@@ -164,6 +164,31 @@ ROLE_EACT   = "E_act"
 ROLE_ERET   = "E_ret"
 ROLE_TRIG   = "Trigger"
 SCOPE_ROLES = (ROLE_NONE, ROLE_VMON, ROLE_IMON, ROLE_EACT, ROLE_ERET, ROLE_TRIG)
+
+# Per-channel analog-bandwidth override (Setup tab, in line with the role
+# dropdown).  "Auto" = the automatic policy (full BW on data channels, 20 MHz
+# on the trigger channel for a clean comparator — gotcha #162); a concrete
+# choice overrides that channel.
+SCOPE_BW_AUTO  = "Auto"
+SCOPE_BW_FULL  = "Full"
+SCOPE_BW_20MHZ = "20 MHz"
+SCOPE_BANDWIDTHS = (SCOPE_BW_AUTO, SCOPE_BW_FULL, SCOPE_BW_20MHZ)
+# Per-channel input-coupling override.  "Auto" = the role-based default (DC for
+# V_mon / I_mon / electrodes, AC for a distinct digital trigger — gotcha #83);
+# "DC" / "AC" force that raw coupling.  "DC + AC" runs the capture-in-DC-then-AC
+# fine-scale trick (gotcha #85): capture DC to read the rest potential, switch
+# to AC so the small swing fine-scales, then sum the DC offset back on save.
+# Setting "DC + AC" on an electrode channel (E_ret / E_act) is the ONLY control
+# for that trick — the old global "Electrode coupling" dropdown in the
+# acquisition group was REMOVED because the per-channel dropdown supersedes it
+# (operator: "remove electrode coupling since the oscilloscope channels can set
+# it").
+SCOPE_COUP_AUTO  = "Auto"
+SCOPE_COUP_DC    = "DC"
+SCOPE_COUP_AC    = "AC"
+SCOPE_COUP_DC_AC = "DC + AC"
+SCOPE_COUPLINGS = (SCOPE_COUP_AUTO, SCOPE_COUP_DC, SCOPE_COUP_AC,
+                   SCOPE_COUP_DC_AC)
 # Default (channel → role) wiring — matches the legacy layout
 # (CH1 = V_mon, CH2 = I_mon, CH3 = E_ret, CH4 = E_act).
 DEFAULT_CHANNEL_ROLES = {
@@ -308,6 +333,11 @@ class SetupTab(QtWidgets.QWidget):
     # (acquisition_mode, n_avg) — runner-side code applies these to the
     # scope before each capture. n_avg is ignored for SAMPLE mode.
     acquisitionChanged = QtCore.pyqtSignal(str, int)
+    # Horizontal auto-fit window preference — "wide" (more post-pulse
+    # recovery) or "tight" (the pulse fills more of the screen).  Applied to
+    # the scope's ``set_horizontal_fit_mode`` (the ``auto_layout_for_pulse``
+    # fill floor).
+    horizontalScalingChanged = QtCore.pyqtSignal(str)
     # Trigger source selection — "EXT" for digital sync, the physical
     # channel name of a Trigger-role channel (e.g. "CH4"), or the
     # I_mon channel name (e.g. "CH2") as the fallback.
@@ -341,15 +371,20 @@ class SetupTab(QtWidgets.QWidget):
     # editing either field. The runner uses these to address the
     # completion / failure email.
     userIdentityChanged = QtCore.pyqtSignal(str, str)
+    # Emitted as ``(phone, carrier_key)`` when the user edits the phone or
+    # picks a carrier — the runner uses these for run-end TEXT alerts.
+    smsRecipientChanged = QtCore.pyqtSignal(str, str)
     # Emitted with the raw Session text so the runner can put it in
     # the email subject. Distinct from ``sessionFilenameChanged``,
     # which carries the composed log-filename stem.
     sessionSubjectChanged = QtCore.pyqtSignal(str)
-    # Emitted as ``(enabled, fmt)`` whenever the user flips the
-    # "Save plots after session" checkbox or picks a different file
-    # format from the adjacent dropdown. Format is one of
-    # ``png`` / ``jpg`` / ``tif`` / ``svg`` (lowercase, no dot).
-    autoSavePlotsChanged = QtCore.pyqtSignal(bool, str)
+    # Emitted as ``(enabled, fmt, dpi)`` whenever the user flips the
+    # "Save plots after session" checkbox, picks a different file
+    # format from the adjacent dropdown, or edits the DPI spinbox.
+    # Format is one of ``png`` / ``jpg`` / ``tif`` / ``svg`` (lowercase,
+    # no dot); ``dpi`` is the raster resolution for the saved figure
+    # (ignored for the vector ``svg`` format).
+    autoSavePlotsChanged = QtCore.pyqtSignal(bool, str, int)
     # Emitted as ``(cathodic_v, anodic_v, tolerance_v)`` whenever the
     # user adjusts a potential-limit spinbox or picks a different
     # coating that auto-fills new values. The VT runner uses these
@@ -370,6 +405,15 @@ class SetupTab(QtWidgets.QWidget):
     # electrode-potential learning store, the contribute-data
     # payload) read it for cohort provenance.
     spargeGasChanged = QtCore.pyqtSignal(str)
+    # General-purpose "a Setup input changed" signal carrying a ready-to-log
+    # human-readable "<field> = <value>" string.  Used for the electrode-
+    # config inputs (return / reference electrode, geometry, connector,
+    # remember-potential toggle) that otherwise only fold into the generic
+    # ``arrayChanged`` metadata line and so were NOT individually indicated in
+    # the log pane (operator: "changing the return electrode, there was not new
+    # text in the log pane … make sure that all input and selection are
+    # indicated").  MainWindow connects this straight to ``_log_setup_change``.
+    settingChanged = QtCore.pyqtSignal(str)
 
     def __init__(self, connection_panel=None, parent=None):
         super().__init__(parent)
@@ -423,6 +467,39 @@ class SetupTab(QtWidgets.QWidget):
             "anonymised electrode data. Optional.")
         self.user_name.editingFinished.connect(self._emit_user_identity)
         self.user_email.editingFinished.connect(self._emit_user_identity)
+        # Optional phone + carrier for run-end TEXT notifications via the
+        # email-to-SMS gateway (operator: "Allow for a phone number option
+        # for text messages").  Like email, gated by the notifications
+        # toggle below and the SMTP credentials.
+        self.user_phone = QtWidgets.QLineEdit()
+        self.user_phone.setPlaceholderText("e.g. 8015551234 (digits only)")
+        self.user_phone.setToolTip(
+            "Mobile number (digits only) for run-end text alerts via your "
+            "carrier's email-to-SMS gateway. Needs the carrier set and the "
+            "notifications toggle on. Optional.")
+        self.user_carrier = QtWidgets.QComboBox()
+        self.user_carrier.addItem("(no text)", "")
+        from ..notifications import SMS_GATEWAYS
+        # Friendly display labels for the common carriers; the userData is
+        # the gateway key send_sms_via_gateway expects.
+        _carrier_labels = {
+            "att": "AT&T", "verizon": "Verizon", "tmobile": "T-Mobile",
+            "sprint": "Sprint", "uscellular": "US Cellular", "boost": "Boost",
+            "cricket": "Cricket", "metropcs": "Metro by T-Mobile",
+            "virgin": "Virgin Mobile", "tracfone": "Tracfone",
+            "alltel": "Alltel", "nextel": "Nextel",
+            "cingular": "Cingular", "cingular2": "Cingular (alt)",
+        }
+        for _key in SMS_GATEWAYS:
+            self.user_carrier.addItem(_carrier_labels.get(_key, _key.title()),
+                                      _key)
+        self.user_carrier.setToolTip(
+            "Mobile carrier — selects the email-to-SMS gateway used to "
+            "deliver the text. (Gateways can be unreliable; email is more "
+            "dependable.)")
+        self.user_phone.editingFinished.connect(self._emit_sms_recipient)
+        self.user_carrier.currentIndexChanged.connect(
+            self._emit_sms_recipient)
         # Institution / company affiliation. Persisted alongside the
         # user identity so the data-contribution dialog
         # (Help → Contribute electrode data…) can pre-populate the
@@ -435,7 +512,7 @@ class SetupTab(QtWidgets.QWidget):
         # without dropdowns getting in the way.
         self.user_institution = QtWidgets.QLineEdit()
         self.user_institution.setPlaceholderText(
-            "e.g. Neural Interfaces Lab, University of Texas at Dallas")
+            "e.g. Solzbacher Lab, University of Utah")
         self.user_institution.setToolTip(
             "Optional. Used as attribution if you opt in to contribute "
             "anonymised electrode data via Help → Contribute electrode "
@@ -568,12 +645,13 @@ class SetupTab(QtWidgets.QWidget):
         # user at the end of every run with the saved .npz attached.
         # Off by default — the user has to opt in.
         self.email_notifications = QtWidgets.QCheckBox(
-            "Email notifications")
+            "Notify on finish (email / text)")
         self.email_notifications.setToolTip(
-            "Email the User email address at the end of every run "
-            "(success or failure). Requires SMTP credentials in env "
-            "vars STIMTEST_SMTP_USER / STIMTEST_SMTP_PASSWORD or in "
-            "~/.stimtest/email_config.json. Off by default.")
+            "At the end of every run (success or failure) email the User "
+            "email and/or text the User phone (if a carrier is set). "
+            "Requires SMTP credentials in env vars STIMTEST_SMTP_USER / "
+            "STIMTEST_SMTP_PASSWORD or in ~/.stimtest/email_config.json. "
+            "Off by default.")
         self.email_notifications.toggled.connect(
             self._emit_email_notifications)
         # Auto-save channel / combination plots after each run. Off by
@@ -581,34 +659,60 @@ class SetupTab(QtWidgets.QWidget):
         # using the format picked from the adjacent dropdown. Mirrors
         # the manual "Export plot" button on the Results tab.
         self.auto_save_plots = QtWidgets.QCheckBox(
-            "Save plots after session")
+            "Save plots during session")
         self.auto_save_plots.setToolTip(
-            "When checked, every experiment writes one plot per "
-            "channel/combination next to the .npz session in the "
-            "selected format. Manual export from the Results tab still "
-            "works either way.")
+            "When checked, each channel/combination's plot is written "
+            "next to the .npz IN REAL TIME as that channel completes "
+            "(no end-of-session save burst). Manual export from the "
+            "Results tab still works either way.")
         self.auto_save_plots_fmt = QtWidgets.QComboBox()
         self.auto_save_plots_fmt.setToolTip(
             "File format for the auto-saved plots: PNG for "
-            "quick review, PDF/SVG for vector quality, TIFF "
+            "quick review, SVG for vector quality, TIF "
             "for journals that require it. Only used when "
-            "'Save plots after session' is on.")
-        # Display labels are uppercase but the underlying data is the
-        # lowercase extension matplotlib expects.
+            "'Save plots during session' is on.")
+        # Display labels match the actual file extension written
+        # (operator: "Why is the toggle called TIFF when the files are
+        # TIF") — the data value is the lowercase extension matplotlib
+        # infers the format from.
         for label, ext in (("PNG", "png"), ("JPEG", "jpg"),
-                           ("TIFF", "tif"), ("SVG", "svg")):
+                           ("TIF", "tif"), ("SVG", "svg")):
             self.auto_save_plots_fmt.addItem(label, ext)
-        # Default to TIFF — matches MATLAB ``-r600`` and the catalog
+        # Default to TIF — matches MATLAB ``-r600`` and the catalog
         # plotting helpers' default extension.
         self.auto_save_plots_fmt.setCurrentIndex(2)
+        # Raster resolution for the saved figure (matplotlib ``-rNNN``).
+        # A fixed dropdown of the standard print resolutions (operator
+        # request) rather than a free spinbox.  Default 600 (==
+        # plotting.DEFAULT_DPI / MATLAB ``-r600``).  Disabled for the
+        # vector ``svg`` format (DPI is meaningless there).
+        self.auto_save_plots_dpi = QtWidgets.QComboBox()
+        for _dpi in (300, 600, 900, 1200):
+            self.auto_save_plots_dpi.addItem(f"{_dpi} DPI", _dpi)
+        self.auto_save_plots_dpi.setCurrentIndex(1)   # 600
+        self.auto_save_plots_dpi.setToolTip(
+            "Resolution of the saved raster plots (matplotlib -rNNN). "
+            "600 matches the lab's MATLAB export; raise it for print, "
+            "lower it for smaller files. Not used for the vector SVG "
+            "format. Only used when 'Save plots during session' is on.")
         # Greyed out until the toggle is on so the user reads the
-        # combo as conditional on the checkbox.
+        # combo + DPI as conditional on the checkbox.  The DPI combo is
+        # ALSO greyed when the format is SVG (vector → DPI irrelevant);
+        # ``_update_dpi_enabled`` is the single apply point for that
+        # combined gate.
         self.auto_save_plots_fmt.setEnabled(False)
+        self.auto_save_plots_dpi.setEnabled(False)
         self.auto_save_plots.toggled.connect(
             self.auto_save_plots_fmt.setEnabled)
         self.auto_save_plots.toggled.connect(
+            self._update_dpi_enabled)
+        self.auto_save_plots.toggled.connect(
             self._emit_auto_save_plots)
         self.auto_save_plots_fmt.currentIndexChanged.connect(
+            self._update_dpi_enabled)
+        self.auto_save_plots_fmt.currentIndexChanged.connect(
+            self._emit_auto_save_plots)
+        self.auto_save_plots_dpi.currentIndexChanged.connect(
             self._emit_auto_save_plots)
         self.auto_export_xlsx.setToolTip(
             "When checked, every experiment automatically writes a "
@@ -620,6 +724,16 @@ class SetupTab(QtWidgets.QWidget):
         # Device
         self.device_combo = QtWidgets.QComboBox()
         for k in DEVICES: self.device_combo.addItem(k)
+        # The Plexon Test Board is FIRST in the list (operator: "top of the
+        # list") but should NOT be the fresh-install DEFAULT — default to a
+        # real electrode array so a new user lands on an electrode device
+        # (with the coating/geometry/area options visible).  Set the index
+        # BEFORE wiring the signal so this doesn't fire `_on_device_changed`
+        # (the explicit call at the end of __init__ applies it); prefs restore
+        # overrides it for returning users.
+        _def_idx = self.device_combo.findText("Linear")
+        if _def_idx >= 0:
+            self.device_combo.setCurrentIndex(_def_idx)
         self.device_combo.currentTextChanged.connect(self._on_device_changed)
         self.device_combo.setToolTip(
             "Choose the electrode array model. Selecting a device "
@@ -655,12 +769,19 @@ class SetupTab(QtWidgets.QWidget):
         # Connector
         self.connector_combo = QtWidgets.QComboBox()
         for k in CONNECTORS: self.connector_combo.addItem(k)
-        self.connector_combo.currentTextChanged.connect(self._emit_array)
+        self.connector_combo.currentTextChanged.connect(
+            lambda name: (self._emit_array(),
+                          self.settingChanged.emit(f"cable / connector = {name}")))
         self.connector_combo.setToolTip(
             "Headstage connector / pinout. Maps each PlexStim port to "
             "the device pad it ultimately drives. The choice does not "
             "change device-side wiring — it only adjusts how the "
-            "channel mapping is rendered in the GUI and saved files.")
+            "channel mapping is rendered in the GUI and saved files.\n\n"
+            "Pinouts mirror the MATLAB getDeviceType.m arrays:\n"
+            "  • Omnetics UTD  — omneticsUTD (identity 1:16)\n"
+            "  • Omnetics NNX  — omneticsNNX (NeuroNexus re-order)\n"
+            "  • Plexon (UTD)  — utd_plexon (PlexStim port order)\n"
+            "  • Custom        — type your own pinout in the map below.")
 
         # Surface area mode + units + value
         # Surface area: "Same for all electrodes" toggle (default on).
@@ -705,15 +826,24 @@ class SetupTab(QtWidgets.QWidget):
         # current unit as both old and new and skip the rescale).
         self._area_last_unit: str = self.area_unit.currentText()
         self.area_unit.currentTextChanged.connect(self._on_area_unit_changed)
-        self.area_value.valueChanged.connect(self._emit_array)
+        # Commit on Enter/return/focus-out, NOT per keystroke (operator: "I
+        # want pressing enter/return or clicking out" — logging + persistence
+        # must not fire on every digit typed).
+        self.area_value.editingFinished.connect(self._emit_array)
         self.area_mode.toggled.connect(self._on_area_mode_changed)
 
-        # Coating mode toggle — checked = "Same for all electrodes"
-        # (the common case), unchecked surfaces the per-channel
-        # override table. Replaces the older Same/Different dropdown
-        # to take less horizontal room and read more naturally.
+        # Coating mode toggle — checked = "Same for all electrodes".
+        # HIDDEN + permanently checked (operator: the active/working
+        # electrode coating is never per-channel-different, so the
+        # "Same for all" checkbox was removed from the UI).  The widget
+        # is kept constructed-but-invisible so every ``coating_mode
+        # .isChecked()`` read downstream (device-view per-channel gate,
+        # prefs round-trip, snapshot) still returns True and the
+        # single-coating path is always taken.  Do NOT re-add it to the
+        # coating row layout.
         self.coating_mode = QtWidgets.QCheckBox("Same for all")
         self.coating_mode.setChecked(True)
+        self.coating_mode.setVisible(False)
         self.coating_mode.setToolTip(
             "When checked, every electrode uses the coating selected "
             "in the dropdown. Uncheck to expose a per-channel coating "
@@ -784,7 +914,10 @@ class SetupTab(QtWidgets.QWidget):
             "Filleted corners (square) / pill-cap ends (rectangle). "
             "Only meaningful for the square and rectangle geometries; "
             "hidden for circle / cone / ring / band.")
-        self.geometry_rounded.toggled.connect(self._emit_array)
+        self.geometry_rounded.toggled.connect(
+            lambda on: (self._emit_array(),
+                        self.settingChanged.emit(
+                            f"electrode corners = {'rounded' if on else 'square'}")))
         # Initial visibility: hidden because default geometry is
         # circle. ``_on_geometry_changed`` flips the visibility on
         # demand whenever the user picks square / rectangle.
@@ -882,11 +1015,12 @@ class SetupTab(QtWidgets.QWidget):
             "value is the OCP that the limit-shift math applies when "
             "no separate reference electrode is enabled and the "
             "return is acting as the reference baseline.")
-        # Live updates: typing a new value reshuffles the limit
-        # spinboxes immediately AND repaints the readout text.
-        self.return_custom_ocp_v.valueChanged.connect(
+        # Commit on Enter/return/focus-out (operator: "enter/return or clicking
+        # out"), NOT per keystroke — the OCP reshuffles the limit spinboxes,
+        # logs, and persists, so it must fire once on commit, not every digit.
+        self.return_custom_ocp_v.editingFinished.connect(
             self._on_return_coating_changed)
-        self.return_custom_ocp_v.valueChanged.connect(
+        self.return_custom_ocp_v.editingFinished.connect(
             self._refresh_return_potential_label)
         # Initial render (after both widgets exist).
         self._refresh_return_potential_label()
@@ -967,6 +1101,12 @@ class SetupTab(QtWidgets.QWidget):
         self.reference_potential_label = QtWidgets.QLabel("")
         self.reference_potential_label.setTextFormat(
             QtCore.Qt.TextFormat.RichText)
+        # Do NOT word-wrap (operator: "Do not wrap this") — wrapping broke the
+        # readout mid-token ("+0.000 V vs Ag|" / "AgCl (no shift applied)").
+        # The tag was shortened (task #150: "tested +X ± Y V", no
+        # "(learned, N samples)"), so a single line no longer forces the
+        # panel wide the way the old long text did.
+        self.reference_potential_label.setWordWrap(False)
         self.reference_potential_label.setStyleSheet(
             "color: #1565c0; font-size: 9pt; padding-left: 8px;")
         self.reference_potential_label.setToolTip(
@@ -998,9 +1138,9 @@ class SetupTab(QtWidgets.QWidget):
             "value is the OCP that the limit-shift math applies, "
             "re-expressing the cathodic / anodic limits as "
             "``V vs <custom reference>``.")
-        # Live updates: typing a new value reshuffles the limit
-        # spinboxes immediately AND repaints the readout text.
-        self.reference_custom_ocp_v.valueChanged.connect(
+        # Commit on Enter/return/focus-out (operator), NOT per keystroke — the
+        # OCP reshuffles the limit spinboxes + logs + persists.
+        self.reference_custom_ocp_v.editingFinished.connect(
             self._on_reference_changed)
         # Initial render. Default reference = Ag|AgCl (0 V), so no
         # shift is applied to the catalog limits.
@@ -1057,7 +1197,10 @@ class SetupTab(QtWidgets.QWidget):
             "limit before stopping.")
         for sp in (self.cathodic_limit_v, self.anodic_limit_v,
                    self.polarization_tol_v):
-            sp.valueChanged.connect(self._on_limits_user_edited)
+            # Commit on Enter/return/focus-out, NOT per keystroke (operator).
+            # Also means a PROGRAMMATIC limit shift (reference-OCP reshuffle via
+            # setValue) no longer false-fires this "user edited" handler.
+            sp.editingFinished.connect(self._on_limits_user_edited)
 
         # Oscilloscope channel mapping — inverted from the legacy
         # design: rows are the four scope channels, the dropdown picks
@@ -1068,18 +1211,84 @@ class SetupTab(QtWidgets.QWidget):
         # opts in once a scope is connected, and the panel calls
         # :meth:`apply_default_scope_mapping` on first connect.
         self._role_combos: dict = {}
+        # Has the user (or restored prefs) configured the channel→role
+        # mapping?  ``apply_default_scope_mapping`` (called on EVERY scope
+        # connect) must NOT stomp the operator's choices once they've set
+        # them — in particular a deliberate ``None`` on a channel.  The
+        # flag flips True on the first real role assignment (restore_prefs
+        # or a user combo change via ``_on_role_changed``) or after the
+        # one-time catalog default is applied; from then on connect is a
+        # no-op for the mapping.  (Operator: "The oscilloscope channel
+        # choices are not being remembered … I have been using NONE for
+        # CH3" — every connect re-filled CH3's None with the E_ret
+        # default.)  Set BEFORE the combos wire ``_on_role_changed`` so
+        # construction can't trip it.
+        self._scope_roles_user_configured = False
         # Row labels are kept around so apply_scope_capabilities can
         # hide CH3/CH4 rows on a 2-channel scope (TBS1072C, TBS1052C,
         # etc.) — both the label and the combo are hidden together so
         # the form doesn't show empty placeholder rows. Set in
         # ``_assemble_pages`` when the form is laid out.
         self._role_labels: dict = {}
+        # How many scope channels the connected scope physically has.
+        # ``current_aliases`` only maps roles on CH1..CH``n`` so a hidden
+        # channel's PRESERVED role (see ``_set_visible_scope_channels``)
+        # never leaks to the runner.  Defaults to 4 (all available until a
+        # scope says otherwise).
+        self._n_visible_scope_channels = 4
+        # Per-channel scope BANDWIDTH + COUPLING override dropdowns, laid out
+        # in line with the role dropdown (operator).  Default "Auto" preserves
+        # the automatic policies; a concrete choice overrides that channel.
+        self._bw_combos: dict = {}
+        self._coupling_combos: dict = {}
+        # Row container widgets (role + bandwidth + coupling) so the whole row
+        # can be hidden together on a 2-channel scope.
+        self._scope_role_row_widgets: dict = {}
         for ch in ("CH1", "CH2", "CH3", "CH4"):
             cb = QtWidgets.QComboBox()
             cb.addItems(SCOPE_ROLES)
             cb.setCurrentText(ROLE_NONE)
             cb.currentTextChanged.connect(self._on_role_changed)
             self._role_combos[ch] = cb
+            bw = QtWidgets.QComboBox()
+            bw.addItems(SCOPE_BANDWIDTHS)
+            bw.setToolTip(
+                "Analog bandwidth for this channel.  Auto = full bandwidth on "
+                "data channels, 20 MHz on the trigger channel (clean "
+                "comparator).  Pick 20 MHz to quiet a noisy channel; Full for "
+                "maximum edge detail.")
+            bw.currentTextChanged.connect(
+                lambda _t, c=ch: self._on_channel_scope_opt_changed(
+                    "bandwidth", c))
+            self._bw_combos[ch] = bw
+            cp = QtWidgets.QComboBox()
+            cp.addItems(SCOPE_COUPLINGS)
+            cp.setToolTip(
+                "Input coupling for this channel.  Auto = DC for V_mon / "
+                "I_mon / electrodes, AC for a distinct digital trigger.  "
+                "DC / AC force that coupling.  'DC + AC' captures in DC to "
+                "read the rest potential, then AC-couples so the small swing "
+                "fine-scales, summing the DC offset back — best for a "
+                "DC-biased electrode (e.g. monopolar E_ret).")
+            cp.currentTextChanged.connect(
+                lambda _t, c=ch: self._on_channel_scope_opt_changed(
+                    "coupling", c))
+            self._coupling_combos[ch] = cp
+        # When a no-electrode device (test board) is selected the E_act / E_ret
+        # roles are removed from the scope-mapping dropdowns (operator: "when
+        # the Test Board is selected, do not show Eret and Eact as options").
+        # A channel that HELD one of those roles is stashed here so switching
+        # back to a real electrode array restores it (honours gotcha #49 — the
+        # operator's scope choices must be remembered).  Persisted in prefs.
+        self._stashed_electrode_roles: dict = {}
+        # Prior I_mon bandwidth choice, stashed while I_mon is the trigger (no
+        # Trigger channel → bandwidth locked to 20 MHz) and restored when a
+        # Trigger channel is re-added.
+        self._imon_bw_stash = None
+        # Initial state: all roles start at None → the bandwidth + coupling
+        # dropdowns start disabled (the initial setCurrentText(None) above fires
+        # BEFORE the slot is connected, so do it explicitly here).
+        self._refresh_scope_option_enabled()
 
         # Oscilloscope acquisition controls — Sampling vs Average, plus
         # an averaging-count widget that's either a combo (for scopes
@@ -1096,6 +1305,16 @@ class SetupTab(QtWidgets.QWidget):
             "lower noise floor, but the runner waits for N stable "
             "captures per step.")
         self.acq_mode_combo.currentTextChanged.connect(self._on_acq_changed)
+        # Connected scope (set in ``apply_scope_capabilities``; None when
+        # offline/disconnected) — used by the average-count confirm below.
+        self._scope = None
+        # Debounce for the average-count → scope round-trip confirm.  A
+        # 300 ms single-shot coalesces typing / arrow-holding into ONE
+        # NUMAVg write + read-back so we don't spam the scope mid-edit.
+        self._navg_confirm_timer = QtCore.QTimer(self)
+        self._navg_confirm_timer.setSingleShot(True)
+        self._navg_confirm_timer.setInterval(300)
+        self._navg_confirm_timer.timeout.connect(self._confirm_navg_on_scope)
         # Default n_avg widget = a generic spinbox; replaced when the
         # scope reports a discrete list of choices.
         self.acq_navg_spin = RepeatingSpinBox()
@@ -1105,8 +1324,35 @@ class SetupTab(QtWidgets.QWidget):
             "Number of captures to average together when AVERAGE mode "
             "is selected. Higher counts give cleaner traces but "
             "lengthen each ramp step.")
-        self.acq_navg_spin.valueChanged.connect(self._on_acq_changed)
+        # Commit on Enter/Return OR focus-out (``editingFinished``), NOT per
+        # keystroke (operator: "I want pressing enter/return or clicking out" —
+        # ``valueChanged`` fired the log + scope round-trip on every digit while
+        # typing, and holding an arrow spammed it too).
+        self.acq_navg_spin.editingFinished.connect(self._on_acq_changed)
+        self._last_acq_emitted = None   # (mode, n_avg) — skip no-op commits
         self.acq_navg_combo: QtWidgets.QComboBox | None = None
+
+        # Horizontal auto-scaling window — Wide (more post-pulse recovery,
+        # MATLAB-like) vs Tight (the pulse fills more of the screen).  Drives
+        # the scope's ``auto_layout_for_pulse`` fill floor.
+        self.horiz_scaling_combo = QtWidgets.QComboBox()
+        self.horiz_scaling_combo.addItems(["Wide", "Tight"])
+        self.horiz_scaling_combo.setCurrentText("Wide")
+        self.horiz_scaling_combo.setToolTip(
+            "Horizontal (time) auto-scaling window.\n"
+            "Wide: a wider capture window with more post-pulse recovery "
+            "(MATLAB-style) — the pulse fills less of the screen.\n"
+            "Tight: the pulse fills more of the screen, with less trailing "
+            "recovery time.\n"
+            "The scope's SEC/DIV grid is coarse, so the two modes pick "
+            "different grid steps (e.g. a 400 µs biphasic → 1500 µs Wide vs "
+            "600 µs Tight on a TBS2204B).")
+        self.horiz_scaling_combo.currentTextChanged.connect(
+            self._on_horiz_scaling_changed)
+
+        # (The global "Electrode coupling" dropdown was removed — the
+        # per-channel Coupling column's "DC + AC" item is the sole control for
+        # the gotcha-#85 DC→AC trick now.)
 
         # Tracks whether the last connected scope had an EXT BNC input.
         # Default False so the toggle stays hidden at app launch until
@@ -1185,7 +1431,9 @@ class SetupTab(QtWidgets.QWidget):
 
         # ---------------- right column: device view ----------------
         self.device_view = DeviceView()
-        self.device_view.mappingChanged.connect(lambda *_: self._emit_array())
+        self.device_view.mappingChanged.connect(
+            lambda *_: (self._emit_array(),
+                        self.settingChanged.emit("channel mapping edited")))
         self.device_view.perChannelChanged.connect(self._emit_array)
 
         # ---------------- assemble forms ----------------
@@ -1198,6 +1446,9 @@ class SetupTab(QtWidgets.QWidget):
         sess_form.addRow(self._lbl("Session:"), self.subject)
         sess_form.addRow(self._lbl("User name:"), self.user_name)
         sess_form.addRow(self._lbl("User email:"), self.user_email)
+        # Optional phone + carrier for run-end text alerts.
+        sess_form.addRow(self._lbl("User phone:"), self.user_phone)
+        sess_form.addRow(self._lbl("Carrier:"), self.user_carrier)
         sess_form.addRow(self._lbl("Institution/Company:"), self.user_institution)
         # Environment + sparge-gas were originally added to the
         # session form. They were moved BELOW the Potential-limits
@@ -1230,6 +1481,7 @@ class SetupTab(QtWidgets.QWidget):
         plots_row.setSpacing(6)
         plots_row.addWidget(self.auto_save_plots)
         plots_row.addWidget(self.auto_save_plots_fmt)
+        plots_row.addWidget(self.auto_save_plots_dpi)
         plots_row.addStretch(1)
         plots_w = QtWidgets.QWidget(); plots_w.setLayout(plots_row)
         sess_form.addRow(self._lbl(""), plots_w)
@@ -1253,7 +1505,47 @@ class SetupTab(QtWidgets.QWidget):
         dev_pick_row.addWidget(self.grid_type_combo, stretch=0)
         dev_pick_w = QtWidgets.QWidget(); dev_pick_w.setLayout(dev_pick_row)
         dev_form.addRow(self._lbl("Test device:"), dev_pick_w)
-        dev_form.addRow(self._lbl("Connector:"), self.connector_combo)
+        # Cable selection sits directly BELOW the device dropdown (operator:
+        # "cable selection should be a dropdown list below the Device dropdown
+        # list").  Labelled "Cable" (was "Connector") to match the cable-map
+        # tree on the right — it's the device→Plexon channel translation.
+        dev_form.addRow(self._lbl("Cable:"), self.connector_combo)
+
+        # Cable channel-mapping tree (operator: "we need a map/tree of channel
+        # mapping of the cable" + "show the cable mapping below the channel
+        # mapping on the right side" + "allow for a custom option for the user
+        # to change the mapping themselves").  Visualises the selected
+        # connector's ``pin_to_channel`` — each connector PIN → the DEVICE
+        # CHANNEL it drives.  Identity (pin N → CH N) for the standard Omnetics
+        # UTD cable; re-ordered for NeuroNexus / PlexStim-port-side cables,
+        # whose remapped rows are shown in BOLD.  READ-ONLY for the catalogued
+        # cables; EDITABLE when the "Custom" connector is selected (the
+        # operator types each pin's device channel, stored in
+        # ``self._custom_cable_map`` + prefs).  The widget is laid out on the
+        # RIGHT column, below the device geometry view (see the split assembly
+        # below) — NOT in this left-hand device form.
+        self._custom_cable_map: Dict[int, int] = {}
+        self._cable_map_editing = False  # re-entrancy guard for itemChanged
+        self.cable_map_tree = QtWidgets.QTreeWidget()
+        self.cable_map_tree.setColumnCount(2)
+        self.cable_map_tree.setHeaderLabels(["Connector pin", "Device channel"])
+        self.cable_map_tree.setRootIsDecorated(False)
+        self.cable_map_tree.setUniformRowHeights(True)
+        self.cable_map_tree.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cable_map_tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.cable_map_tree.setMaximumHeight(300)
+        self.cable_map_tree.setToolTip(
+            "Cable channel translation: each DEVICE channel you pulse (col 1) "
+            "→ the PLEXON stim channel PULSAR commands (col 2).  Identity "
+            "(CH N → CH N) means pulsing CH01 stimulates device CH01 — the "
+            "test board + standard cables; re-ordered (bold) for cables that "
+            "renumber.  Pick the “Custom” connector to type your own map.")
+        self.cable_map_tree.itemChanged.connect(self._on_cable_map_item_changed)
+        self.connector_combo.currentTextChanged.connect(
+            self._refresh_cable_map_tree)
+        self._refresh_cable_map_tree()
 
         # Coating row: combo + custom field follow the "Same for all"
         # checkbox directly. The custom field auto-hides when the
@@ -1264,7 +1556,9 @@ class SetupTab(QtWidgets.QWidget):
         coat_row = QtWidgets.QHBoxLayout()
         coat_row.setContentsMargins(0, 0, 0, 0)
         coat_row.setSpacing(6)
-        coat_row.addWidget(self.coating_mode)
+        # ``coating_mode`` ("Same for all") is intentionally NOT added —
+        # it's hidden + permanently checked (operator: active/working
+        # coating is never per-channel-different).
         coat_row.addWidget(self.coating_combo)
         coat_row.addWidget(self.coating_custom)
         coat_row.addStretch(1)
@@ -1333,22 +1627,115 @@ class SetupTab(QtWidgets.QWidget):
         ref_w = QtWidgets.QWidget(); ref_w.setLayout(ref_row)
         dev_form.addRow(self._lbl("Reference electrode:"), ref_w)
 
+        # "Remember return-electrode potential" toggle — gates whether
+        # finished captures feed the return electrode's measured E_ret
+        # rest potential into the per-coating learned-OCP store
+        # (``electrode_potential_history.record_capture``).  Operator
+        # wanted control over this after early builds recorded bad
+        # values.  Default ON; the learned value is shown only as a
+        # RECOMMENDATION and no longer overrides the user's set defaults
+        # (see ``_effective_ref_potential_v``), so leaving it on is safe.
+        # Round-trips through prefs under ``remember_return_potential``.
+        # QCheckBox can't render rich text (no setTextFormat), so the label —
+        # which needs SUBSCRIPTS on E_oc and E_ret (operator: "use subscript
+        # for … learn E_oc from E_ret") — is a separate RichText QLabel paired
+        # with a text-less checkbox; clicking the label toggles the box.
+        self.remember_potential_chk = QtWidgets.QCheckBox()
+        self.remember_potential_chk.setChecked(True)
+        _rem_tip = (
+            "When ON, each finished capture records the return "
+            "electrode's measured rest potential (E_ret) into the "
+            "per-coating learned-OCP store, building up a measured value "
+            "over time.  It is shown as a \"tested\" annotation "
+            "next to the reference / return readout but does NOT change "
+            "your set water-window limits.  Turn OFF to stop recording — "
+            "e.g. if you don't trust the current data (you can also clear "
+            "it via Help → Reset learned electrode potentials).")
+        self.remember_potential_chk.setToolTip(_rem_tip)
+        self.remember_potential_label = QtWidgets.QLabel(
+            "Remember return-electrode potential (learn "
+            f"{rich.var('E', 'oc')} from {rich.E_RET})")
+        self.remember_potential_label.setTextFormat(
+            QtCore.Qt.TextFormat.RichText)
+        self.remember_potential_label.setToolTip(_rem_tip)
+        # Clicking the label toggles the checkbox (same UX as a native label).
+        self.remember_potential_label.mousePressEvent = (
+            lambda _e: self.remember_potential_chk.toggle())
+        _rem_row = QtWidgets.QWidget()
+        _rem_h = QtWidgets.QHBoxLayout(_rem_row)
+        _rem_h.setContentsMargins(0, 0, 0, 0)
+        _rem_h.setSpacing(6)
+        _rem_h.addWidget(self.remember_potential_chk)
+        _rem_h.addWidget(self.remember_potential_label)
+        _rem_h.addStretch(1)
+        # Re-render BOTH readouts when toggled so the recommendation tag
+        # appears / disappears immediately on each.
+        self.remember_potential_chk.toggled.connect(
+            self._refresh_reference_potential_label)
+        self.remember_potential_chk.toggled.connect(
+            self._refresh_return_potential_label)
+        self.remember_potential_chk.toggled.connect(
+            lambda on: self.settingChanged.emit(
+                f"remember return potential = {'ON' if on else 'OFF'}"))
+        dev_form.addRow("", _rem_row)
+
+        # Electrode-specific rows, held so `_on_device_changed` can HIDE them
+        # for a bare test board (operator: "hide the electrode options since
+        # there are no electrodes on there").  `QFormLayout.setRowVisible`
+        # (Qt 6.4+) hides the field AND its label together.
+        self._dev_form = dev_form
+        self._electrode_option_rows = [coat_w, area_w, geom_w,
+                                       ret_w, ref_w, _rem_row]
+
         # Potential limits — cathodic + anodic share the top row;
         # tolerance lives on its own line BELOW the cathodic limit so
         # it visually distinguishes the asymmetric +/- band from the
         # two distinct water-window endpoints. Each inline label uses
         # the project's standard "Name (variable) [unit]:" format
         # from rich.field_label.
+        # ORIGINAL (unshifted, vs Ag|AgCl) value — ONE small italic line UNDER
+        # EACH limit spinbox showing that limit's original value + the shift,
+        # shown ONLY when a reference electrode has SHIFTED the displayed limits
+        # (operator: "just show the original values below the adjusted limit" +
+        # "the value and shifted under each limit").  Hidden when no shift.
+        def _orig_lbl():
+            _l = QtWidgets.QLabel("")
+            _l.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            _l.setWordWrap(True)
+            # ``palette(windowText)`` (NOT ``palette(mid)`` — invisible on dark
+            # themes, gotcha #87); the italic marks it as a secondary annotation.
+            _l.setStyleSheet("color: palette(windowText); font-size: 9pt;")
+            _l.setVisible(False)
+            return _l
+        self.cathodic_original_label = _orig_lbl()
+        self.anodic_original_label = _orig_lbl()
+
+        def _limit_col(field_lbl, spin, orig_lbl):
+            """Vertical mini-column: [label + spinbox] with the original value
+            line UNDER it."""
+            _row = QtWidgets.QHBoxLayout()
+            _row.setContentsMargins(0, 0, 0, 0)
+            _row.setSpacing(6)
+            _row.addWidget(self._lbl(field_lbl))
+            _row.addWidget(spin)
+            _row.addStretch(1)
+            _col = QtWidgets.QVBoxLayout()
+            _col.setContentsMargins(0, 0, 0, 0)
+            _col.setSpacing(2)
+            _col.addLayout(_row)
+            _col.addWidget(orig_lbl)
+            return _col
+
         lim_top = QtWidgets.QHBoxLayout()
         lim_top.setContentsMargins(0, 0, 0, 0)
         lim_top.setSpacing(6)
-        lim_top.addWidget(self._lbl(rich.field_label(
-            "Cathodic limit", rich.E_LC, "V")))
-        lim_top.addWidget(self.cathodic_limit_v)
-        lim_top.addSpacing(12)
-        lim_top.addWidget(self._lbl(rich.field_label(
-            "Anodic limit", rich.E_LA, "V")))
-        lim_top.addWidget(self.anodic_limit_v)
+        lim_top.addLayout(_limit_col(
+            rich.field_label("Cathodic limit", rich.E_LC, "V"),
+            self.cathodic_limit_v, self.cathodic_original_label))
+        lim_top.addSpacing(16)
+        lim_top.addLayout(_limit_col(
+            rich.field_label("Anodic limit", rich.E_LA, "V"),
+            self.anodic_limit_v, self.anodic_original_label))
         lim_top.addStretch(1)
 
         lim_bot = QtWidgets.QHBoxLayout()
@@ -1361,9 +1748,9 @@ class SetupTab(QtWidgets.QWidget):
 
         lim_v = QtWidgets.QVBoxLayout()
         lim_v.setContentsMargins(0, 0, 0, 0)
-        lim_v.setSpacing(2)
-        lim_v.addLayout(lim_top)
-        lim_v.addLayout(lim_bot)
+        lim_v.setSpacing(4)
+        lim_v.addLayout(lim_top)      # cathodic + anodic (each w/ original under)
+        lim_v.addLayout(lim_bot)      # …then Tolerance
         lim_w = QtWidgets.QWidget(); lim_w.setLayout(lim_v)
         dev_form.addRow(self._lbl("Potential limits:"), lim_w)
 
@@ -1396,10 +1783,18 @@ class SetupTab(QtWidgets.QWidget):
         acq_form = rich.make_form()
         acq_form.addRow("Mode:", self.acq_mode_combo)
         self._acq_navg_holder = QtWidgets.QHBoxLayout()
+        # Zero the wrapper margins so the inner combo/spinbox fills the whole
+        # form field column — otherwise the QWidget wrapper's default layout
+        # margins inset it and the "Average count" dropdown renders NARROWER
+        # than the (unwrapped) Mode + Horizontal-window combos (operator:
+        # "make the dropdown list width for average count the same as Mode and
+        # Horizontal window").
+        self._acq_navg_holder.setContentsMargins(0, 0, 0, 0)
         self._acq_navg_holder.addWidget(self.acq_navg_spin, stretch=1)
         navg_w = QtWidgets.QWidget(); navg_w.setLayout(self._acq_navg_holder)
         self._acq_navg_label = QtWidgets.QLabel("Average count:")
         acq_form.addRow(self._acq_navg_label, navg_w)
+        acq_form.addRow("Horizontal window:", self.horiz_scaling_combo)
         acq_box = QtWidgets.QGroupBox("Oscilloscope acquisition")
         acq_vbox = QtWidgets.QVBoxLayout(acq_box)
         acq_vbox.addLayout(acq_form)
@@ -1410,10 +1805,31 @@ class SetupTab(QtWidgets.QWidget):
         # are kept in self._role_labels so 2-channel scopes can hide
         # the CH3/CH4 rows without rebuilding the layout.
         sf = rich.make_form()
+        # Column header row (Role / Bandwidth / Coupling) above the channels.
+        _hdr = QtWidgets.QHBoxLayout()
+        _hdr.setContentsMargins(0, 0, 0, 0)
+        _hdr.setSpacing(4)
+        for _t, _stretch in (("Role", 2), ("Bandwidth", 1), ("Coupling", 1)):
+            _hl = QtWidgets.QLabel(_t)
+            _hl.setStyleSheet("color: #555; font-size: 8pt;")
+            _hdr.addWidget(_hl, _stretch)
+        _hdr_w = QtWidgets.QWidget()
+        _hdr_w.setLayout(_hdr)
+        self._scope_map_header = _hdr_w
+        sf.addRow(QtWidgets.QLabel(""), _hdr_w)
         for ch in ("CH1", "CH2", "CH3", "CH4"):
             lbl = QtWidgets.QLabel(f"{ch}:")
             self._role_labels[ch] = lbl
-            sf.addRow(lbl, self._role_combos[ch])
+            _row = QtWidgets.QHBoxLayout()
+            _row.setContentsMargins(0, 0, 0, 0)
+            _row.setSpacing(4)
+            _row.addWidget(self._role_combos[ch], 2)
+            _row.addWidget(self._bw_combos[ch], 1)
+            _row.addWidget(self._coupling_combos[ch], 1)
+            _rw = QtWidgets.QWidget()
+            _rw.setLayout(_row)
+            self._scope_role_row_widgets[ch] = _rw
+            sf.addRow(lbl, _rw)
         # Stash the form so the channel-visibility helper can poke it.
         self._scope_role_form = sf
         scope_box = QtWidgets.QGroupBox("Oscilloscope channel mapping")
@@ -1455,6 +1871,12 @@ class SetupTab(QtWidgets.QWidget):
         lv.addWidget(acq_box)
         lv.addWidget(exp_box)
         lv.addStretch(1)
+        # Held so the run-lock can disable the INNER form (inputs +
+        # Hardware panel) while leaving the scroll area itself enabled —
+        # otherwise the operator can't scroll/read Setup during a run
+        # (operator: "allow for scrolling through … Setup and Test
+        # Parameters" while an experiment runs).  See ``set_run_locked``.
+        self._run_lock_content = left_w
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_w)
         left_scroll.setWidgetResizable(True)
@@ -1466,11 +1888,35 @@ class SetupTab(QtWidgets.QWidget):
         # comfortable margin. 520 px holds those without truncation.
         left_scroll.setMinimumWidth(520)
 
+        # ---------------- right column: device view + cable map ----------------
+        # Operator: "show the cable mapping below the channel mapping on the
+        # right side of the setup tab".  The electrode-geometry / channel view
+        # (``device_view``) sits on top; the cable pin→channel map group sits
+        # beneath it, editable when the "Custom" connector is selected.
+        cable_box = QtWidgets.QGroupBox("Cable channel mapping")
+        cbv = QtWidgets.QVBoxLayout(cable_box)
+        self._cable_map_hint = QtWidgets.QLabel(
+            "Device channel → Plexon channel.  Identity means pulsing CH01 "
+            "stimulates device CH01.  Pick “Custom” (left) to edit.")
+        self._cable_map_hint.setWordWrap(True)
+        # NO ``color: palette(mid)`` — it's invisible on dark themes (operator:
+        # "I cannot see the text … on dark mode").  Italic reads as a hint
+        # while inheriting the theme's default (always-visible) text colour.
+        _hf = self._cable_map_hint.font(); _hf.setItalic(True)
+        self._cable_map_hint.setFont(_hf)
+        cbv.addWidget(self._cable_map_hint)
+        cbv.addWidget(self.cable_map_tree)
+        right_w = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right_w)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.addWidget(self.device_view, 1)
+        rv.addWidget(cable_box)
+
         # ---------------- top-level split ----------------
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self._main_split = split
         split.addWidget(left_scroll)
-        split.addWidget(self.device_view)
+        split.addWidget(right_w)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 1)
         # Make sure the user can't drag the divider all the way over and
@@ -1489,10 +1935,33 @@ class SetupTab(QtWidgets.QWidget):
         # Initial population
         self._on_device_changed(self.device_combo.currentText())
         self._on_experiment_changed(self.experiment_combo.currentIndex())
+        # Gate the save/export options on the initial save-path viability
+        # (operator: "disable saving options" when there's no viable folder).
+        self._refresh_save_options()
         QtCore.QTimer.singleShot(0, self._emit_aliases)
         QtCore.QTimer.singleShot(0, self._emit_limits)
 
     # ---------------------------------------------------------------- helpers
+    def set_run_locked(self, locked: bool) -> None:
+        """View-only lock for the duration of a run.
+
+        Disables the form INPUTS (the scrollable left column — which holds
+        the Hardware/Connection panel, session, device, scope, acquisition
+        and experiment groups) plus the array/device view, so the operator
+        can't reconfigure the device, coating, scope mapping, or hardware
+        connection mid-run.  Crucially it leaves the SetupTab itself (and
+        its enclosing scroll area) ENABLED, so the operator can still scroll
+        through and READ every setting while the experiment runs (operator:
+        "allow for scrolling through the other tabs … Setup and Test
+        Parameters").  Replaces the old blunt ``setEnabled(False)`` on the
+        whole tab, which propagated the disabled state to the scroll area
+        and froze scrolling.
+        """
+        for w in (getattr(self, "_run_lock_content", None),
+                  getattr(self, "device_view", None)):
+            if w is not None:
+                w.setEnabled(not locked)
+
     @staticmethod
     def _lbl(html: str) -> QtWidgets.QLabel:
         l = QtWidgets.QLabel(html)
@@ -1538,8 +2007,64 @@ class SetupTab(QtWidgets.QWidget):
 
     def _emit_save_path(self):
         path = self.save_path.text().strip()
+        self._refresh_save_options()
         if path:
             self.savePathChanged.emit(path)
+
+    def save_dir_viable(self, path_str: "str | None" = None) -> bool:
+        """True ONLY when the save-path folder ALREADY EXISTS and is a
+        writable directory.  An empty path, a file, or a non-existent path is
+        NOT viable.
+
+        Operator: "There is no viable directory path for saving, then disable
+        saving options" — the sin_cont run saved into an ACCIDENTAL folder
+        (``…\\GitHub\\test\\StimulationTesting\\…`` — a StimulationTesting
+        folder nested inside the ``test`` folder).  The runner ``mkdir``s
+        missing folders, so a typo'd path silently CREATES a wrong location;
+        requiring the directory to already exist forces the operator to notice
+        + confirm the destination (pick it via Browse…, which only offers
+        existing folders) before a run can arm its saves.
+        """
+        import os
+        p = (self.save_path.text() if path_str is None else path_str or "").strip()
+        if not p:
+            return False
+        try:
+            path = Path(p)
+            return path.is_dir() and os.access(path, os.W_OK)
+        except Exception:
+            return False
+
+    def _refresh_save_options(self) -> None:
+        """Enable the save-related options ONLY when the save directory is
+        viable; otherwise disable them + flag the path field so the user
+        can't arm a save that will fail (operator: "disable saving options"
+        when there is no viable directory path)."""
+        viable = self.save_dir_viable()
+        # Visual cue + tooltip on the path field.
+        try:
+            self.save_path.setStyleSheet(
+                "" if viable else "QLineEdit { border: 1px solid #d9534f; }")
+            self.save_path.setToolTip(
+                "Folder where session .npz files (and optional .xlsx exports "
+                "/ autosaved plots) land. Use Browse… to pick interactively. "
+                "Path is made absolute on commit."
+                if viable else
+                "⚠ This folder can't be used for saving — it doesn't exist "
+                "or isn't a writable folder.  Pick an EXISTING folder "
+                "(Browse…); the save options stay disabled until then.")
+        except Exception:
+            pass
+        # The auto-export / auto-save toggles are gated on viability.
+        for w in (getattr(self, "auto_export_xlsx", None),
+                  getattr(self, "auto_save_plots", None)):
+            if w is not None:
+                w.setEnabled(viable)
+        # Format / DPI follow BOTH viability AND the auto-save toggle.
+        if getattr(self, "auto_save_plots_fmt", None) is not None:
+            self.auto_save_plots_fmt.setEnabled(
+                viable and self.auto_save_plots.isChecked())
+        self._update_dpi_enabled()
 
     def _emit_auto_export_xlsx(self, checked: bool):
         """User flipped the auto-export checkbox — broadcast."""
@@ -1554,14 +2079,23 @@ class SetupTab(QtWidgets.QWidget):
     def current_email_notifications(self) -> bool:
         return bool(self.email_notifications.isChecked())
 
+    def _update_dpi_enabled(self, *_):
+        """Single apply point for the DPI combo's enabled state: enabled
+        only when auto-save is ON **and** the format is a raster (not the
+        vector SVG, where DPI is meaningless)."""
+        on = bool(self.auto_save_plots.isChecked())
+        is_svg = self.current_auto_save_plots_format() == "svg"
+        viable = self.save_dir_viable()
+        self.auto_save_plots_dpi.setEnabled(viable and on and not is_svg)
+
     def _emit_auto_save_plots(self, *_):
-        """Toggle or format-combo edited — broadcast the (on, fmt) pair.
-        Connected to both the checkbox toggle and the combo's index
-        change, so the runner picks up either kind of edit on the next
-        run."""
+        """Toggle, format-combo, or DPI-combo edited — broadcast the
+        (on, fmt, dpi) tuple.  Connected to all three so the runner picks
+        up any edit on the next run."""
         self.autoSavePlotsChanged.emit(
             bool(self.auto_save_plots.isChecked()),
             self.current_auto_save_plots_format(),
+            self.current_auto_save_plots_dpi(),
         )
 
     def current_auto_save_plots(self) -> bool:
@@ -1571,11 +2105,29 @@ class SetupTab(QtWidgets.QWidget):
         ext = self.auto_save_plots_fmt.currentData()
         return str(ext) if ext else "tif"
 
+    def current_auto_save_plots_dpi(self) -> int:
+        data = self.auto_save_plots_dpi.currentData()
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return 600
+
     def _emit_user_identity(self):
         self.userIdentityChanged.emit(
             self.user_name.text().strip(),
             self.user_email.text().strip(),
         )
+
+    def _emit_sms_recipient(self, *_):
+        self.smsRecipientChanged.emit(
+            self.current_user_phone(), self.current_user_carrier())
+
+    def current_user_phone(self) -> str:
+        # Keep digits only — gateways reject formatting.
+        return "".join(ch for ch in self.user_phone.text() if ch.isdigit())
+
+    def current_user_carrier(self) -> str:
+        return str(self.user_carrier.currentData() or "")
 
     def _emit_session_subject(self):
         self.sessionSubjectChanged.emit(self.subject.text().strip())
@@ -1700,6 +2252,28 @@ class SetupTab(QtWidgets.QWidget):
         cleaned = cleaned.strip("_")
         return cleaned[:80]
 
+    def current_session_stem(self) -> str:
+        """``<Notebook>_<Session>`` filesystem stem from the current
+        fields — the SAME composition the log filename uses, shared by
+        the .npz / .xlsx / plot exports (operator: "the file name should
+        be '[notebook]_[session]'").  Empty string when both fields are
+        blank.
+        """
+        session = self._sanitize_filename_part(self.subject.text())
+        use_notebook = (self.notebook_check.isChecked()
+                        and self.notebook.text().strip())
+        if use_notebook:
+            notebook = self._sanitize_filename_part(self.notebook.text())
+            return f"{notebook}_{session}" if session else notebook
+        return session
+
+    def current_notebook(self) -> str:
+        """Sanitized notebook field (empty when blank or toggled off)."""
+        if not (self.notebook_check.isChecked()
+                and self.notebook.text().strip()):
+            return ""
+        return self._sanitize_filename_part(self.notebook.text())
+
     def current_log_filename(self) -> str:
         """Compose the on-disk log filename from the current fields.
 
@@ -1710,14 +2284,7 @@ class SetupTab(QtWidgets.QWidget):
         With BOTH missing (truly fresh launch with cleared fields):
             ``log.txt``
         """
-        session = self._sanitize_filename_part(self.subject.text())
-        use_notebook = (self.notebook_check.isChecked()
-                        and self.notebook.text().strip())
-        if use_notebook:
-            notebook = self._sanitize_filename_part(self.notebook.text())
-            stem = f"{notebook}_{session}" if session else notebook
-        else:
-            stem = session
+        stem = self.current_session_stem()
         return f"{stem}_log.txt" if stem else "log.txt"
 
     def _emit_session_filename(self, *_):
@@ -1734,16 +2301,103 @@ class SetupTab(QtWidgets.QWidget):
 
     # ----------------------------------------------------------- acquisition
     def _on_acq_changed(self, *_):
-        """Mode or count widget changed → re-emit the (mode, n_avg) pair."""
+        """Mode change (combo) or count COMMIT (spin editingFinished) → re-emit
+        the (mode, n_avg) pair.
+
+        The count spin is wired to ``editingFinished`` (Enter/return/focus-out),
+        NOT ``valueChanged``, so this fires once per commit rather than per
+        keystroke (operator).  A no-op commit (focus-out with no change) is
+        skipped via ``_last_acq_emitted`` so it doesn't re-log / re-confirm an
+        unchanged value.  The enable/grey state is refreshed UNCONDITIONALLY."""
+        mode = self.acq_mode_combo.currentText()
         n_avg = self._current_n_avg()
-        self.acquisitionChanged.emit(self.acq_mode_combo.currentText(), n_avg)
         # Average count is only meaningful in AVERAGE mode — grey it out
-        # otherwise so the user sees the value won't be used.
-        is_avg = self.acq_mode_combo.currentText().upper() == "AVERAGE"
+        # otherwise so the user sees the value won't be used.  (Always, even on
+        # a skipped no-op, so the enable state can't drift.)
+        is_avg = mode.upper() == "AVERAGE"
         self._acq_navg_label.setEnabled(is_avg)
         if self.acq_navg_combo is not None:
             self.acq_navg_combo.setEnabled(is_avg)
         self.acq_navg_spin.setEnabled(is_avg)
+        # Skip a no-op commit (e.g. a focus-out that changed nothing) so it
+        # doesn't re-emit the log line + re-run the scope round-trip.
+        if (mode, n_avg) == getattr(self, "_last_acq_emitted", None):
+            return
+        self._last_acq_emitted = (mode, n_avg)
+        self.acquisitionChanged.emit(mode, n_avg)
+        # Confirm the count against the CONNECTED scope by actually setting
+        # NUMAVg and reading back what it applied (operator: "Always check
+        # with commands to the oscilloscope about changing settings by
+        # getting what is set to confirm" + "if it is different, probably
+        # due to rounding … change the input to reflect that").  Debounced
+        # so a commit that snaps + re-broadcasts coalesces; the confirm itself
+        # no-ops without a scope or in SAMPLE mode.  See
+        # :meth:`_confirm_navg_on_scope`.
+        t = getattr(self, "_navg_confirm_timer", None)
+        if is_avg and t is not None:
+            t.start()
+
+    def _confirm_navg_on_scope(self) -> None:
+        """Send the average count to the scope and read back what it set.
+
+        Operator: "When the average count is set, apply it on the
+        oscilloscope, get what is set, and if it is different, probably due
+        to rounding … change the input to reflect that" + "Always check
+        with commands to the oscilloscope about changing settings by
+        getting what is set to confirm".
+
+        Calls :meth:`Oscilloscope.set_average_count`, which WRITES
+        ``ACQuire:NUMAVg`` and RE-QUERIES the device to return the value it
+        actually applied (Tektronix snaps to its power-of-two grid).  If
+        the confirmed value differs from what the operator entered, the
+        spinbox is updated to the real value (signal-blocked so it doesn't
+        re-fire) and the change is logged + re-broadcast so the inline
+        editor and every experiment tab reflect it too.
+
+        Touches ONLY NUMAVg (not ``ACQuire:MODe``) so it can't trigger the
+        multi-second SAMPLE↔AVERAGE reconfiguration — safe to run on the
+        GUI thread from the debounce.  No-op without a connected scope, in
+        SAMPLE mode, or while a run is locking the tab.
+        """
+        scope = getattr(self, "_scope", None)
+        if scope is None:
+            return
+        if self.acq_mode_combo.currentText().upper() != "AVERAGE":
+            return
+        requested = int(self.acq_navg_spin.value())
+        try:
+            applied = int(scope.set_average_count(requested))
+        except Exception as exc:  # never let a scope hiccup break the GUI
+            self.settingChanged.emit(
+                f"average count: could not confirm on scope ({exc})")
+            return
+        if applied <= 0 or applied == requested:
+            return
+        self.acq_navg_spin.blockSignals(True)
+        try:
+            self.acq_navg_spin.setValue(applied)
+        finally:
+            self.acq_navg_spin.blockSignals(False)
+        self.settingChanged.emit(
+            f"average count = {applied} (oscilloscope set + confirmed; "
+            f"you entered {requested})")
+        # Re-broadcast the confirmed value so the pattern-panel inline
+        # editor + every experiment tab's cached count reflect it.  Emit
+        # directly (not via setValue) so this doesn't re-arm the confirm
+        # timer.  Keep ``_last_acq_emitted`` coherent with the snapped value so
+        # a later no-op focus-out on it is correctly skipped.
+        self._last_acq_emitted = (self.acq_mode_combo.currentText(), applied)
+        self.acquisitionChanged.emit(
+            self.acq_mode_combo.currentText(), applied)
+
+    def _on_horiz_scaling_changed(self, *_):
+        """Horizontal-window (Wide/Tight) dropdown changed → re-emit."""
+        self.horizontalScalingChanged.emit(self.current_horizontal_scaling())
+
+    def current_horizontal_scaling(self) -> str:
+        """The selected horizontal auto-fit window — ``"wide"`` or
+        ``"tight"`` (lower-case, for the scope's ``set_horizontal_fit_mode``)."""
+        return self.horiz_scaling_combo.currentText().strip().lower()
 
     def _on_trigger_source_changed(self, *_):
         """EXT-trigger checkbox toggled → re-emit the trigger source.
@@ -1835,14 +2489,209 @@ class SetupTab(QtWidgets.QWidget):
     # from the trigger-source / phase-1-polarity rule set internally
     # at run start (see ``_BaseExperimentTab._start_runner``).
 
+    def current_acquisition(self) -> tuple[str, int]:
+        """Return the ``(mode, n_avg)`` oscilloscope-acquisition pair —
+        the same payload ``acquisitionChanged`` emits.  Used by
+        MainWindow to pull the scope acquisition settings into the
+        active experiment tab on entering the Test parameters page."""
+        return (self.acq_mode_combo.currentText(), self._current_n_avg())
+
     def _current_n_avg(self) -> int:
-        if self.acq_navg_combo is not None and self.acq_navg_combo.isVisible():
+        # Prefer the discrete-choice combo whenever it EXISTS — it holds
+        # the user's selected averaging count.  Do NOT gate on
+        # ``isVisible()``: a Qt widget reports not-visible whenever its
+        # page isn't the active tab, and the acquisition combo lives on
+        # the Setup tab.  The moment the user navigates to Test
+        # parameters (which is exactly when the entry-sync calls
+        # ``current_acquisition()`` to pull settings into the runner),
+        # the Setup page is hidden → ``isVisible()`` is False → this used
+        # to fall back to the stale hidden ``acq_navg_spin`` (still at the
+        # prefs default) and silently lose the user's combo selection
+        # (e.g. 64 → 32).  The spin is the fallback ONLY when no combo was
+        # built (scope without a discrete NUMAVg list / no scope yet).
+        if self.acq_navg_combo is not None:
             data = self.acq_navg_combo.currentData()
             try:
                 return int(data) if data is not None else int(self.acq_navg_combo.currentText())
             except (TypeError, ValueError):
                 return int(self.acq_navg_spin.value())
         return int(self.acq_navg_spin.value())
+
+    def _refresh_cable_map_tree(self, *_a) -> None:
+        """Populate the cable-map tree — one row per **device channel → Plexon
+        stim channel** (operator: "I want the cable mapping to be like a tree
+        that points to the location.  When pulsing CH01, it should be device
+        CH01").  Column 0 is the channel the operator SELECTS / sees (the
+        device channel); column 1 is the PLEXON stim channel the cable wires it
+        to — the value PULSAR actually commands (MATLAB ``Channels.Plexon``).
+        Rows where the two differ are bold (a re-mapped cable).  When the
+        "Custom" connector is selected column 1 is EDITABLE — values come from
+        ``self._custom_cable_map`` (identity default) and edits flow back
+        through :meth:`_on_cable_map_item_changed`.  No-op before the tree
+        exists / when the connector is unknown."""
+        tree = getattr(self, "cable_map_tree", None)
+        if tree is None:
+            return
+        name = self.connector_combo.currentText()
+        is_custom = (name == "Custom")
+        plexon = self._cable_pin_to_channel(name)   # device i → Plexon plexon[i]
+        if plexon is None:
+            return
+        # Populating fires itemChanged for every setText/flag write — guard it
+        # so a repopulate never reads back as a user edit.
+        self._cable_map_editing = True
+        try:
+            tree.clear()
+            tree.setEditTriggers(
+                QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+                | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+                if is_custom else
+                QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            tree.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+                if is_custom else
+                QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            _remap = 0
+            for dev, plx in enumerate(plexon, start=1):
+                plx = int(plx)
+                it = QtWidgets.QTreeWidgetItem([f"CH{dev:02d}", f"CH{plx:02d}"])
+                it.setTextAlignment(0, QtCore.Qt.AlignmentFlag.AlignLeft)
+                it.setData(0, QtCore.Qt.ItemDataRole.UserRole, dev)
+                if is_custom:                 # unlock col-1 for editing
+                    it.setFlags(it.flags()
+                                | QtCore.Qt.ItemFlag.ItemIsEditable)
+                if plx != dev:                # non-identity → highlight
+                    _remap += 1
+                    _f = it.font(1); _f.setBold(True)
+                    it.setFont(0, _f); it.setFont(1, _f)
+                tree.addTopLevelItem(it)
+            tree.resizeColumnToContents(0)
+            # Header hints identity / re-mapped / custom at a glance.
+            _tag = ("  (custom — double-click to edit)" if is_custom
+                    else f"  ({_remap} re-mapped)" if _remap
+                    else "  (identity)")
+            tree.setHeaderLabels(["Device channel", "Plexon channel" + _tag])
+        finally:
+            self._cable_map_editing = False
+        hint = getattr(self, "_cable_map_hint", None)
+        if hint is not None:
+            hint.setText(
+                "Type each device channel's Plexon channel (1–16); the map "
+                "stays a permutation (editing one swaps with the channel that "
+                "held it)."
+                if is_custom else
+                "Device channel → Plexon channel.  Identity means pulsing "
+                "CH01 stimulates device CH01.  Pick “Custom” (left) to edit.")
+
+    def _cable_pin_to_channel(self, name: str) -> Optional[tuple]:
+        """The 16-entry **device→Plexon** tuple for connector ``name`` (index
+        ``i`` = device channel ``i+1`` → Plexon stim channel).
+
+        For "Custom" this is ``self._custom_cable_map`` overlaid on identity
+        (any device channel the operator hasn't re-assigned stays CH N → Plexon
+        CH N); for a catalogued connector it's the frozen
+        ``Connector.pin_to_channel`` array.  Returns ``None`` for an unknown
+        connector."""
+        if name == "Custom":
+            return tuple(self._custom_cable_map.get(dev, dev)
+                         for dev in range(1, 17))
+        conn = CONNECTORS.get(name)
+        return None if conn is None else tuple(conn.pin_to_channel)
+
+    def current_channel_map(self) -> dict:
+        """The active **device→Plexon** channel map as ``{device: plexon}``,
+        NON-identity entries only (empty ⇒ identity / no translation).
+
+        This is what the runner installs via
+        :meth:`ExperimentRunner.set_channel_map` so that pulsing a device
+        channel commands the Plexon stim channel the cable wires it to, while
+        captures stay labelled by the device channel (operator: "when pulsing
+        CH01, it should be device CH01").  The test board + every identity
+        cable return ``{}`` → the runner never wraps."""
+        plexon = self._cable_pin_to_channel(self.connector_combo.currentText())
+        if plexon is None:
+            return {}
+        return {dev: int(plx) for dev, plx in enumerate(plexon, start=1)
+                if int(plx) != dev}
+
+    def _on_cable_map_item_changed(self, item, column) -> None:
+        """Apply a user edit to the Custom cable map, keeping it a valid
+        PERMUTATION (each device channel is driven by exactly ONE connector
+        pin — the cable is physically a bijection).
+
+        Editing pin P's device channel to CH C SWAPS channels with whichever
+        pin currently drives CH C, so the map stays a permutation and a single
+        edit is always possible (in a full identity map every channel is
+        already taken, so a plain reject-on-duplicate rule would make ALL edits
+        impossible).  Out-of-range / non-numeric input is rejected and the cell
+        reverts.  Accepts ``CH07`` / ``7`` / ``ch 7``.  Only col-1 under the
+        "Custom" connector is live."""
+        if (self._cable_map_editing or column != 1
+                or self.connector_combo.currentText() != "Custom"):
+            return
+        pin = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if pin is None:
+            return
+        pin = int(pin)
+        # Resolve the FULL current permutation (identity for un-edited pins).
+        cur = {p: int(self._custom_cable_map.get(p, p)) for p in range(1, 17)}
+        old = cur[pin]
+        raw = item.text(1).strip().upper().replace("CH", "").strip()
+        try:
+            ch = int(raw)
+            if not (1 <= ch <= 16):
+                raise ValueError("out of range")
+        except ValueError:
+            self._revert_cable_cell(item, old)
+            return
+        if ch == old:
+            return
+        # Swap: the pin that currently drives CH ``ch`` inherits P's old channel.
+        victim = next((p for p, c in cur.items() if c == ch and p != pin), None)
+        cur[pin] = ch
+        if victim is not None:
+            cur[victim] = old
+        # Store only the non-identity entries (keeps the prefs blob compact).
+        self._custom_cable_map = {p: c for p, c in cur.items() if c != p}
+        # Update ONLY the two affected rows, in place.  Do NOT clear/repopulate
+        # the tree here — that would delete ``item`` while its own itemChanged
+        # signal is still on the stack (use-after-free risk on a real display).
+        self._cable_map_editing = True
+        try:
+            self._set_cable_row(item, pin, ch)
+            if victim is not None:
+                vitem = self._cable_item_for_pin(victim)
+                if vitem is not None:
+                    self._set_cable_row(vitem, victim, old)
+        finally:
+            self._cable_map_editing = False
+        self._emit_array()
+        self.settingChanged.emit(
+            f"custom cable map: pin {pin} → Plexon CH{ch:02d}"
+            + (f" (swapped pin {victim} → CH{old:02d})"
+               if victim is not None else ""))
+
+    def _cable_item_for_pin(self, pin: int):
+        tr = self.cable_map_tree
+        for i in range(tr.topLevelItemCount()):
+            it = tr.topLevelItem(i)
+            if it.data(0, QtCore.Qt.ItemDataRole.UserRole) == pin:
+                return it
+        return None
+
+    def _set_cable_row(self, item, pin: int, ch: int) -> None:
+        """Set a row's device-channel text + bold-if-remapped (caller guards
+        ``_cable_map_editing``)."""
+        item.setText(1, f"CH{int(ch):02d}")
+        _f = item.font(1); _f.setBold(int(ch) != int(pin))
+        item.setFont(0, _f); item.setFont(1, _f)
+
+    def _revert_cable_cell(self, item, prev: int) -> None:
+        self._cable_map_editing = True
+        try:
+            item.setText(1, f"CH{int(prev):02d}")
+        finally:
+            self._cable_map_editing = False
 
     def _refresh_scope_trigger_hint(self, *, has_ext: bool) -> None:
         """Update the helper text under the channel-mapping form.
@@ -1880,10 +2729,19 @@ class SetupTab(QtWidgets.QWidget):
         """Show/hide CH-role rows so only n_channels of them remain.
 
         Used by :meth:`apply_scope_capabilities` to hide CH3/CH4 on a
-        2-channel scope (TBS1052C/1072C/1102C). Hidden channels are
-        also reset to ``ROLE_NONE`` so they don't sneak into
-        :meth:`current_aliases` and confuse the runner with a mapping
-        the user can't actually honour.
+        2-channel scope (TBS1052C/1072C/1102C).
+
+        **Hidden channels keep their stored role** (operator: "the
+        choices for oscilloscope channels is not being remembered") — the
+        earlier version reset them to ``ROLE_NONE`` here, but that wiped
+        the user's deliberate CH3/CH4 choice the moment a 2-channel scope
+        (or a transient channel-count mis-probe) connected; the next prefs
+        save then persisted the ``None`` and the choice was lost across
+        restarts.  Instead we record the available count in
+        ``self._n_visible_scope_channels`` and :meth:`current_aliases`
+        SKIPS channels beyond it, so a hidden role can't leak onto a
+        channel that doesn't exist AND the choice survives — reappearing
+        intact when a 4-channel scope reconnects.
 
         ``n_channels`` is clamped to [2, 4]: scopes outside that range
         aren't supported by this codebase (every PlexStim experiment
@@ -1891,26 +2749,26 @@ class SetupTab(QtWidgets.QWidget):
         4-channel TBS2204B-class hardware).
         """
         n = max(2, min(4, int(n_channels)))
+        self._n_visible_scope_channels = n
         for i, ch in enumerate(("CH1", "CH2", "CH3", "CH4"), start=1):
             visible = (i <= n)
             lbl = self._role_labels.get(ch)
-            cb = self._role_combos.get(ch)
+            # Hide the WHOLE row (role + bandwidth + coupling) together so a
+            # 2-channel scope doesn't show orphaned bandwidth/coupling combos.
+            row = getattr(self, "_scope_role_row_widgets", {}).get(ch)
             if lbl is not None:
                 lbl.setVisible(visible)
-            if cb is not None:
-                cb.setVisible(visible)
-                # Resetting hidden channels to None means current_aliases
-                # builds the {logical → physical} dict without ever
-                # mapping a role onto a channel that doesn't exist.
-                if not visible and cb.currentText() != ROLE_NONE:
-                    cb.blockSignals(True)
-                    try:
-                        cb.setCurrentText(ROLE_NONE)
-                    finally:
-                        cb.blockSignals(False)
+            if row is not None:
+                row.setVisible(visible)
+            else:
+                cb = self._role_combos.get(ch)
+                if cb is not None:
+                    cb.setVisible(visible)
         # Re-emit so any listeners (the runner aliases path) see the
         # cleaned-up mapping immediately rather than waiting for the
-        # next user click.
+        # next user click.  current_aliases() already drops roles on
+        # channels beyond ``n`` so the runner never sees a hidden one.
+        self._refresh_scope_option_enabled()
         self.aliasesChanged.emit(self.current_aliases())
 
     def apply_scope_capabilities(self, scope=None):
@@ -1926,6 +2784,10 @@ class SetupTab(QtWidgets.QWidget):
         returns ``None`` (arbitrary), the spinbox stays visible with
         its max set from ``scope.max_average_count()``.
         """
+        # Remember the connected scope so the average-count confirm
+        # (``_confirm_navg_on_scope``) can round-trip NUMAVg through it.
+        # ``None`` on disconnect → the confirm becomes a no-op.
+        self._scope = scope
         # Channel-count visibility: read from scope.info if present,
         # else default to all 4 visible (the user might be running
         # offline / simulated, where we don't constrain).
@@ -1973,51 +2835,125 @@ class SetupTab(QtWidgets.QWidget):
         finally:
             self.acq_mode_combo.blockSignals(False)
 
-        # n_avg widget — combo for fixed lists, spinbox otherwise.
+        # n_avg widget — ALWAYS an input spinbox with up/down arrows
+        # (operator: "let average count be an input number with up and down
+        # arrows … set the limit based on the oscilloscope model").  The range
+        # is the connected model's NUMAVg floor/ceiling
+        # (``average_count_choices`` min/max, or ``max_average_count``); the
+        # scope snaps a typed count to its nearest supported value on apply
+        # (``set_acquisition_mode``, gotcha #84).  No dropdown — older builds
+        # showed a combo for fixed lists; that's gone.
         prev_navg = self._current_n_avg()
-        # Tear down the previous combo if any.
+        # Drop any legacy combo left over from a prior rebuild.
         if self.acq_navg_combo is not None:
             self._acq_navg_holder.removeWidget(self.acq_navg_combo)
             self.acq_navg_combo.deleteLater()
             self.acq_navg_combo = None
+        _lo = int(min(choices)) if choices else 2
+        _hi = int(max_n) if max_n else (int(max(choices)) if choices else 512)
+        if _hi < _lo:
+            _hi = _lo
+        self.acq_navg_spin.setVisible(True)
+        self.acq_navg_spin.setRange(_lo, _hi)
+        self.acq_navg_spin.setValue(max(_lo, min(int(prev_navg), _hi)))
+        # Hover tip lists the connected model's TYPICAL NUMAVg choices
+        # (operator: "the hover message should include the typical choices for
+        # the oscilloscope model") — a typed off-grid value is snapped to the
+        # nearest of these on apply.
+        _tip = ("Number of captures to average together in AVERAGE mode. "
+                "Higher = cleaner traces but a longer capture.")
         if choices:
-            self.acq_navg_spin.setVisible(False)
-            cb = QtWidgets.QComboBox()
-            for v in choices:
-                cb.addItem(str(v), userData=int(v))
-            # Pick the choice closest to the previously-set count.
-            nearest = min(choices, key=lambda v: abs(v - int(prev_navg)))
-            cb.setCurrentText(str(nearest))
-            cb.currentTextChanged.connect(self._on_acq_changed)
-            self.acq_navg_combo = cb
-            self._acq_navg_holder.insertWidget(0, cb, 1)
+            _tip += ("\n\nTypical values for this scope: "
+                     + ", ".join(str(int(c)) for c in choices)
+                     + f"  (range {_lo}–{_hi}; a typed value snaps to the "
+                     "nearest supported count).")
         else:
-            self.acq_navg_spin.setVisible(True)
-            self.acq_navg_spin.setMaximum(int(max_n))
-            self.acq_navg_spin.setValue(min(int(prev_navg), int(max_n)))
+            _tip += f"\n\nRange for this scope: {_lo}–{_hi}."
+        self.acq_navg_spin.setToolTip(_tip)
         self._on_acq_changed()
 
-    def apply_default_scope_mapping(self):
-        """Set every channel-role combo to its catalog default.
+    def _apply_scope_role_options(self, allow_electrode_roles: bool) -> None:
+        """Show / hide the E_act + E_ret roles in the scope-mapping combos.
 
-        Called by ``MainWindow`` the first time a scope connects, so
-        the user doesn't have to fill the four rows by hand. If the
-        user has already overridden a row (it's not at "None"), that
-        row is left alone so we don't stomp deliberate choices.
+        Operator: "when the Test Board is selected, do not show Eret and Eact
+        as options."  A bare test board has no active / return electrode, so
+        only V_mon / I_mon / Trigger / None make sense.  Removing the two roles
+        rebuilds each combo's item list; a channel that HELD E_act / E_ret is
+        stashed (``self._stashed_electrode_roles``) and RESTORED when a real
+        electrode array is re-selected (gotcha #49 — remember the operator's
+        scope choices).  Signals are blocked so this programmatic re-fill never
+        reads as a user change (would trip ``_scope_roles_user_configured``)."""
+        roles = (SCOPE_ROLES if allow_electrode_roles else
+                 tuple(r for r in SCOPE_ROLES
+                       if r not in (ROLE_EACT, ROLE_ERET)))
+        for ch, cb in self._role_combos.items():
+            cur = cb.currentText()
+            cb.blockSignals(True)
+            cb.clear()
+            cb.addItems(roles)
+            if allow_electrode_roles and ch in self._stashed_electrode_roles:
+                cb.setCurrentText(self._stashed_electrode_roles.pop(ch))
+            elif cur in roles:
+                cb.setCurrentText(cur)
+            else:
+                # ``cur`` was E_act / E_ret and we're hiding them — stash it so
+                # a switch back to a real device restores the choice.
+                if cur in (ROLE_EACT, ROLE_ERET):
+                    self._stashed_electrode_roles[ch] = cur
+                cb.setCurrentText(ROLE_NONE)
+            cb.blockSignals(False)
+        # Signals were blocked above, so _on_role_changed didn't fire — refresh
+        # the bandwidth/coupling enabled-state directly (a channel forced to
+        # None must grey them; a channel restored to a real role on switch-back
+        # must re-enable them).
+        self._refresh_scope_option_enabled()
+
+    def apply_default_scope_mapping(self):
+        """Fill the channel-role combos with their catalog defaults — but
+        ONLY on a genuinely fresh setup, never overriding the operator.
+
+        ``MainWindow`` calls this on EVERY scope connect.  The earlier
+        version filled any combo at ``None`` with the default, so a
+        DELIBERATE ``None`` (operator: "I have been using NONE for CH3")
+        was re-filled with the catalog role (E_ret) on every reconnect —
+        the choice "was not being remembered".  Now once the mapping has
+        been configured — by restored prefs, by a user combo change, or by
+        a prior call to this method — ``_scope_roles_user_configured`` is
+        True and this is a NO-OP.  So defaults apply exactly once (a fresh
+        install's first connect, when nothing is configured) and the
+        operator's subsequent choices — including ``None`` — always
+        survive a disconnect / reconnect / restart.
         """
+        if self._scope_roles_user_configured:
+            return
         for ch, default_role in DEFAULT_CHANNEL_ROLES.items():
             cb = self._role_combos.get(ch)
             if cb is not None and cb.currentText() == ROLE_NONE:
                 cb.setCurrentText(default_role)
+        # The mapping is now configured (by the default) — don't re-apply
+        # on subsequent connects, so a later user-set None sticks.
+        self._scope_roles_user_configured = True
 
     def clear_scope_mapping(self):
-        """Reset every channel role to ``None`` — used when the
-        oscilloscope is disconnected so the GUI doesn't claim a
-        mapping it can't honour. Also restores all 4 rows to visible
-        and resets the trigger hint to its 'EXT available' wording
-        since 'no scope' means we don't know either yet."""
-        for cb in self._role_combos.values():
-            cb.setCurrentText(ROLE_NONE)
+        """Restore all 4 channel rows to visible and reset the trigger
+        hint when the oscilloscope disconnects — but KEEP the user's
+        channel→role assignments.
+
+        The roles used to be wiped to ``None`` here "so the GUI doesn't
+        claim a mapping it can't honour", but that wipe was the cause of
+        the operator bug "the choices for oscilloscope channels is not
+        being remembered. CH3 is constantly set to Eret": a disconnect
+        reset every role to ``None``, the next prefs save persisted those
+        ``None``s, and on the following connect ``apply_default_scope_
+        mapping`` re-applied the catalog default (CH3 = E_ret).  The
+        channel→role map is only ever consumed at RUN time (which
+        requires a connected scope), so a "stale" map while disconnected
+        is harmless — and keeping it means the user's choices survive a
+        disconnect / reconnect / restart and round-trip through prefs.
+        Switching to a SMALLER scope is still handled:
+        ``apply_scope_capabilities`` → ``_set_visible_scope_channels(n)``
+        clears CH3/CH4 for a genuine 2-channel scope on reconnect.
+        """
         self._set_visible_scope_channels(4)
         self._refresh_scope_trigger_hint(has_ext=True)
 
@@ -2041,6 +2977,16 @@ class SetupTab(QtWidgets.QWidget):
         triggers on the wrong channel even though the Setup tab's
         dropdown shows the correct one.
         """
+        # Any role change — a user pick OR a restore_prefs setCurrentText
+        # — means the mapping is now configured; ``apply_default_scope_
+        # mapping`` must not stomp it on the next connect.  (Not fired
+        # during construction: the combos connect this slot AFTER their
+        # initial ``setCurrentText(None)``.)
+        self._scope_roles_user_configured = True
+        # A channel set to None has nothing to configure → grey its Bandwidth +
+        # Coupling dropdowns (operator: "if an oscilloscope channel is set to
+        # none, disable the bandwidth and coupling dropdown lists").
+        self._refresh_scope_option_enabled()
         self._emit_aliases()
         # Re-emit trigger source whenever a role change *could* affect
         # the resolved source.  When EXT is checked, none of the role
@@ -2056,7 +3002,158 @@ class SetupTab(QtWidgets.QWidget):
             self.triggerSourceChanged.emit(self.current_trigger_source())
             self.digitalTriggerChanged.emit(self.is_digital_trigger())
 
+    def _on_channel_scope_opt_changed(self, kind: str, ch: str) -> None:
+        """A per-channel bandwidth / coupling dropdown changed — log it (these
+        are hardware-setup preferences applied to the scope at run start, NOT
+        part of the alias mapping, so they don't re-emit ``aliasesChanged``)."""
+        combo = (self._bw_combos if kind == "bandwidth"
+                 else self._coupling_combos).get(ch)
+        val = combo.currentText() if combo is not None else "?"
+        self.settingChanged.emit(f"{ch} {kind} = {val}")
+
+    def _refresh_scope_option_enabled(self) -> None:
+        """Grey the Bandwidth + Coupling dropdowns of any scope channel whose
+        Role is None — there's nothing to configure on an unused channel
+        (operator: "if an oscilloscope channel is set to none, disable the
+        bandwidth and coupling dropdown lists").
+
+        ALSO lock the I_mon channel's BANDWIDTH when there is NO Trigger channel:
+        I_mon then becomes the trigger source and its bandwidth is forced to
+        20 MHz at run start (gotcha #162), so editing it is meaningless
+        (operator: "disable editing the Imon bandwidth if there is no trigger
+        channel").  While locked the combo is pinned to "20 MHz" so the display
+        is honest; the operator's prior choice is stashed and restored when a
+        Trigger channel is re-added.
+
+        Runs on every role change + construction + prefs restore + visible-
+        channel changes."""
+        has_trigger = any(rc.currentText() == ROLE_TRIG
+                          for rc in self._role_combos.values())
+        imon_ch = next((ch for ch, rc in self._role_combos.items()
+                        if rc.currentText() == ROLE_IMON), None)
+        for ch, rc in self._role_combos.items():
+            role_used = rc.currentText() != ROLE_NONE
+            bw = self._bw_combos.get(ch)
+            cp = self._coupling_combos.get(ch)
+            # I_mon-as-trigger (no Trigger channel) → its bandwidth is locked.
+            imon_is_trigger = (ch == imon_ch and not has_trigger)
+            if bw is not None:
+                bw.setEnabled(role_used and not imon_is_trigger)
+            if cp is not None:
+                cp.setEnabled(role_used)
+        self._sync_locked_imon_bandwidth(imon_ch, has_trigger)
+
+    def _sync_locked_imon_bandwidth(self, imon_ch, has_trigger) -> None:
+        """Pin the I_mon bandwidth combo to "20 MHz" while I_mon is the trigger
+        (no Trigger channel), stashing the prior choice; restore it when a
+        Trigger channel is re-added.  Value change is signal-guarded so it
+        doesn't read as a user edit."""
+        bw = self._bw_combos.get(imon_ch) if imon_ch is not None else None
+        if bw is None:
+            return
+        if not has_trigger:
+            # Entering the locked state — stash the prior (non-forced) choice.
+            if getattr(self, "_imon_bw_stash", None) is None \
+                    and bw.currentText() != SCOPE_BW_20MHZ:
+                self._imon_bw_stash = bw.currentText()
+            if bw.currentText() != SCOPE_BW_20MHZ:
+                bw.blockSignals(True)
+                bw.setCurrentText(SCOPE_BW_20MHZ)
+                bw.blockSignals(False)
+        else:
+            # A Trigger channel exists → restore the stashed choice.
+            stash = getattr(self, "_imon_bw_stash", None)
+            if stash is not None:
+                bw.blockSignals(True)
+                bw.setCurrentText(stash)
+                bw.blockSignals(False)
+                self._imon_bw_stash = None
+
+    def current_channel_bandwidths(self) -> dict:
+        """``{CHx: 'Auto'|'Full'|'20 MHz'}`` for every VISIBLE scope channel.
+        ``Auto`` means "use the automatic policy"; the run-start push passes
+        only the concrete choices to the scope."""
+        out = {}
+        for i, ch in enumerate(("CH1", "CH2", "CH3", "CH4"), start=1):
+            if i > self._n_visible_scope_channels:
+                continue
+            cb = self._bw_combos.get(ch)
+            if cb is not None:
+                out[ch] = cb.currentText()
+        return out
+
+    def current_channel_couplings(self) -> dict:
+        """``{CHx: 'Auto'|'DC'|'AC'}`` for every VISIBLE scope channel."""
+        out = {}
+        for i, ch in enumerate(("CH1", "CH2", "CH3", "CH4"), start=1):
+            if i > self._n_visible_scope_channels:
+                continue
+            cb = self._coupling_combos.get(ch)
+            if cb is not None:
+                out[ch] = cb.currentText()
+        return out
+
     # ---------------------------------------------------------------- slots
+    def _populate_connector_choices(self, dev) -> None:
+        """Fill the cable dropdown with the connectors valid for ``dev``.
+
+        A device may pin ``cable_choices`` to a whitelist (the Plexon
+        Test Board offers only its two physical cables — "Large Black
+        Omnetics" + "2×8 Pin Receptacle"); every other device gets the
+        full :data:`CONNECTORS` list.  Preserves the current selection
+        when it survives into the new list so a device→device→back
+        round-trip doesn't drop the user's cable choice.  Callers must
+        block signals around this (it's part of the device-change
+        sequence which sets the connector itself).
+        """
+        choices = tuple(getattr(dev, "cable_choices", ()) or ()) or tuple(
+            CONNECTORS.keys())
+        current = self.connector_combo.currentText()
+        # Only rebuild when the set actually changed — avoids needless
+        # clear()/re-add churn (and the resulting currentTextChanged even
+        # under blocked signals is a no-op, but the clear itself resets
+        # the index).
+        existing = [self.connector_combo.itemText(i)
+                    for i in range(self.connector_combo.count())]
+        if existing == list(choices):
+            return
+        self.connector_combo.clear()
+        for k in choices:
+            self.connector_combo.addItem(k)
+        if current in choices:
+            self.connector_combo.setCurrentText(current)
+
+    def _apply_device_ui_constraints(self, dev) -> None:
+        """Apply the STRUCTURAL, device-dependent UI constraints that must
+        hold whether the device was picked interactively OR restored from
+        prefs at startup.
+
+        Three things, all keyed on the device:
+
+        * the cable-dropdown whitelist (``_populate_connector_choices`` —
+          the Plexon Test Board offers only its two physical cables);
+        * electrode-option-row visibility (a bare test board hides
+          coating / area / geometry / return + reference electrode);
+        * scope-role filtering (``_apply_scope_role_options`` — a test
+          board drops E_act / E_ret so only V_mon / I_mon / Trigger /
+          None remain).
+
+        Deliberately EXCLUDES the value defaults (area / coating /
+        geometry / connector selection) that ``_on_device_changed`` also
+        resets — those are the operator's to keep on a prefs restore, so
+        restore_prefs must NOT reset them.  This is the shared source of
+        truth so a RESTORED test board is constrained identically to an
+        interactively-selected one (operator: "When the Test Board is
+        selected only Vmon, Imon, and Trigger are the only available
+        oscilloscope channels" — which also has to hold after a restart
+        that restores the test board from prefs).
+        """
+        self._populate_connector_choices(dev)
+        has_elec = getattr(dev, "has_electrodes", True)
+        for _w in getattr(self, "_electrode_option_rows", []):
+            self._set_form_row_visible(_w, has_elec)
+        self._apply_scope_role_options(allow_electrode_roles=has_elec)
+
     def _on_device_changed(self, name: str):
         # Save outgoing state for any user-named custom device so a
         # round-trip (custom A → built-in → custom A) doesn't lose
@@ -2095,12 +3192,25 @@ class SetupTab(QtWidgets.QWidget):
         self.device_view.set_device(dev)
         # Apply device-recommended defaults to area / coating / connector
         self.connector_combo.blockSignals(True)
+        # Structural, device-dependent UI constraints — cable-dropdown
+        # whitelist (repopulated FIRST so the setCurrentText below picks
+        # from the right list), electrode-row visibility, and scope-role
+        # filtering.  Shared with restore_prefs (see the helper docstring).
+        self._apply_device_ui_constraints(dev)
         self.connector_combo.setCurrentText(dev.default_connector)
         self.connector_combo.blockSignals(False)
-        # Linear arrays are 1-D — connector wiring isn't a meaningful
-        # choice (the channels just go in order), so hide the row.
-        is_linear = (name == "Linear")
-        self._set_form_row_visible(self.connector_combo, not is_linear)
+        # Signals were blocked above, so the cable-map tree didn't follow the
+        # new default connector — refresh it explicitly.
+        self._refresh_cable_map_tree()
+        # The Cable dropdown stays visible for EVERY device — it now drives the
+        # device→Plexon channel translation (not just a cosmetic pinout), which
+        # is meaningful for any array (operator: "cable selection should be a
+        # dropdown list below the Device dropdown list").  (It used to hide for
+        # the 1-D Linear device.)
+        self._set_form_row_visible(self.connector_combo, True)
+        # Electrode-row visibility + the E_act/E_ret scope-role filtering are
+        # applied above via ``_apply_device_ui_constraints(dev)`` (shared with
+        # restore_prefs so a restored test board is constrained too).
         # The Grid-type chooser is only meaningful for the *Other (custom
         # grid)* device or any user-named custom-device entry — built-
         # ins ship with a fixed layout in their ``DeviceDef.layout``.
@@ -2313,6 +3423,9 @@ class SetupTab(QtWidgets.QWidget):
         self.coating_custom.setEnabled(not diff)
         self._update_perchan_visibility()
         self._emit_array()
+        self.settingChanged.emit(
+            "electrodes share coating = "
+            + ("NO (per electrode)" if diff else "YES"))
 
     def _on_return_enable_changed(self, _checked: bool = True):
         # Toggling the return-electrode checkbox greys / un-greys the
@@ -2328,6 +3441,10 @@ class SetupTab(QtWidgets.QWidget):
         # is a no-op when the reference toggle is on.
         self._apply_effective_reference_shift()
         self._emit_array()
+        self.settingChanged.emit(
+            "return electrode "
+            + ("enabled" if self.return_enable.isChecked() else "disabled")
+            + f" ({self.return_coating.currentText()})")
 
     def _on_return_coating_changed(self, *_):
         """Return-electrode coating dropdown changed.
@@ -2351,11 +3468,16 @@ class SetupTab(QtWidgets.QWidget):
                                      on_confirm=lambda _name: (
                                          self._apply_effective_reference_shift(),
                                          self._emit_array(),
+                                         self.settingChanged.emit(
+                                             "return electrode coating = "
+                                             + self.return_coating.currentText()),
                                      ))
             return
         self._prev_return_data = self.return_coating.currentData()
         self._apply_effective_reference_shift()
         self._emit_array()
+        self.settingChanged.emit(
+            "return electrode coating = " + self.return_coating.currentText())
 
     def _apply_effective_reference_shift(self) -> None:
         """Compute the live effective-reference OCP, diff against the
@@ -2370,6 +3492,7 @@ class SetupTab(QtWidgets.QWidget):
         self._shift_limits_by(delta)
         self._current_ref_potential_v = new_pot
         self._refresh_reference_potential_label()
+        self._refresh_limits_original_label()
 
     def _refresh_return_potential_label(self, *_):
         """Update the right-of-dropdown readout that shows the return
@@ -2412,25 +3535,27 @@ class SetupTab(QtWidgets.QWidget):
                 f"<b>{ocp_v:+.3f} V</b> <i>vs Ag|AgCl</i>"
             )
             return
-        # Try the learning store first; surface a "learned"
-        # annotation when we have enough data.
-        learned = self._learned_ocp(short or "")
-        if learned is not None:
-            n = self._learned_sample_count(short or "")
-            self.return_potential_label.setText(
-                f"<b>{learned:+.3f} V</b> <i>vs Ag|AgCl</i> "
-                f"<span style='color:#0072B2;'>(learned, {n} samples)</span>"
-            )
-            return
+        # The BOLD value is the CATALOG default — kept as the user's
+        # baseline.  The learned mean is shown only as a RECOMMENDATION
+        # (operator: "keep the default values I set originally"); it is
+        # NOT bolded and never auto-applied.
+        rec = self._recommendation_tag(short or "")
         ocp_v = COATING_OCP_VS_AG_AG_CL_V.get(short)
         if ocp_v is None:
+            # No catalog value — show n/a, but still surface the learned
+            # recommendation if one exists.
             self.return_potential_label.setText(
-                "<i>n/a vs Ag|AgCl</i>")
+                f"<i>n/a vs Ag|AgCl</i>{rec}")
             return
-        # Catalog value; if a partial bin exists, surface "X / N"
-        # progress so the user knows learning is in flight without
-        # having to dig into the JSON.
-        n = self._learned_sample_count(short or "")
+        if rec:
+            self.return_potential_label.setText(
+                f"<b>{ocp_v:+.3f} V</b> <i>vs Ag|AgCl</i>{rec}")
+            return
+        # No learned recommendation yet — show catalog, plus a partial-
+        # progress hint while a bin fills (only when recording is on).
+        n = (self._learned_sample_count(short or "")
+             if (hasattr(self, "remember_potential_chk")
+                 and self.remember_potential_chk.isChecked()) else 0)
         if n > 0:
             from ..electrode_potential_history import (
                 MIN_SAMPLES_FOR_LEARNED_OCP)
@@ -2492,6 +3617,26 @@ class SetupTab(QtWidgets.QWidget):
         except Exception:
             return None
 
+    @staticmethod
+    def _learned_ocp_std(short: str) -> Optional[float]:
+        """Sample standard deviation of the learned OCP for ``short``, or
+        ``None``.  Wraps
+        :func:`stimtest.electrode_potential_history.learned_ocp_std_v`
+        (same lazy-import + ≥ MIN_SAMPLES gate as :meth:`_learned_ocp`) so
+        the "tested +X ± Y V" annotation can show the spread of the
+        recorded rest potentials.  Returns ``None`` on any error / below
+        threshold so the caller renders the mean without the ± term."""
+        if not short:
+            return None
+        try:
+            from ..electrode_potential_history import learned_ocp_std_v
+        except Exception:
+            return None
+        try:
+            return learned_ocp_std_v(short)
+        except Exception:
+            return None
+
     def _effective_ref_potential_v(self) -> float:
         """The reference-electrode OCP (V vs Ag|AgCl) currently in
         effect, in priority order:
@@ -2513,28 +3658,26 @@ class SetupTab(QtWidgets.QWidget):
         because there's no canonical bin to consult ("Custom" doesn't
         identify a real material).
         """
+        # NOTE: the EFFECTIVE potential is the CATALOG / user-set default
+        # — the learned OCP is deliberately NOT applied here (operator:
+        # "Show the recommended potentials based on what has been
+        # learned, but keep the default values that I had set originally
+        # in the beginning").  The learned value is surfaced only as a
+        # RECOMMENDATION in the readout label
+        # (``_refresh_reference_potential_label``); it no longer shifts
+        # the user's water-window limits.  ``Custom`` still reads the
+        # user-typed spinbox.
         if self.reference_enable.isChecked():
             short = self.reference_combo.currentData() or REF_AG_AGCL
             if short == REF_CUSTOM:
-                # User typed their own potential — read it live from
-                # the dedicated spinbox; never overridden by the
-                # learning store (no canonical bin for Custom).
                 return float(self.reference_custom_ocp_v.value())
-            learned = self._learned_ocp(short)
-            if learned is not None:
-                return float(learned)
             return float(REFERENCE_ELECTRODES_OCP_V.get(short, 0.0))
         # Reference toggle is off — fall back to the return electrode.
         if (hasattr(self, "return_enable") and self.return_enable.isChecked()
                 and hasattr(self, "return_coating")):
             short = self.return_coating.currentData() or ""
             if short == REF_CUSTOM:
-                # Same logic on the return side: user typed the OCP
-                # of an out-of-catalog return material.
                 return float(self.return_custom_ocp_v.value())
-            learned = self._learned_ocp(short)
-            if learned is not None:
-                return float(learned)
             ocp = COATING_OCP_VS_AG_AG_CL_V.get(short)
             if ocp is not None:
                 return float(ocp)
@@ -2609,56 +3752,109 @@ class SetupTab(QtWidgets.QWidget):
                 ref_on and ref_short == REF_CUSTOM)
         if ref_on:
             short = ref_short
-            # Custom always wins over learning (no canonical bin to
-            # consult); otherwise the learned mean wins over the
-            # catalog when 10+ samples have accumulated.
-            learned_tag = ""
+            # The BOLD value is the CATALOG / user default (kept as-is —
+            # the learned OCP no longer overrides it).  The learned mean
+            # is appended only as a RECOMMENDATION via _recommendation_tag
+            # (operator: "Show the recommended potentials … but keep the
+            # default values I set originally").
             if short == REF_CUSTOM:
                 pot_v = float(self.reference_custom_ocp_v.value())
+                rec_tag = ""
             else:
-                learned = self._learned_ocp(short)
-                if learned is not None:
-                    pot_v = float(learned)
-                    n = self._learned_sample_count(short)
-                    learned_tag = (f" <span style='color:#0072B2;'>"
-                                   f"(learned, {n} samples)</span>")
-                else:
-                    pot_v = REFERENCE_ELECTRODES_OCP_V.get(short, 0.0)
+                pot_v = REFERENCE_ELECTRODES_OCP_V.get(short, 0.0)
+                rec_tag = self._recommendation_tag(short)
             if abs(pot_v) < 1e-9:
                 self.reference_potential_label.setText(
                     f"<b>{pot_v:+.3f} V</b> <i>vs Ag|AgCl "
-                    f"(no shift applied)</i>{learned_tag}"
+                    f"(no shift applied)</i>{rec_tag}"
                 )
             else:
                 self.reference_potential_label.setText(
                     f"<b>{pot_v:+.3f} V</b> <i>vs Ag|AgCl "
-                    f"(limits vs {short})</i>{learned_tag}"
+                    f"(limits vs {short})</i>{rec_tag}"
                 )
             return
         if ret_on and hasattr(self, "return_coating"):
             short = self.return_coating.currentData() or ""
-            learned_tag = ""
             if short == REF_CUSTOM:
                 # Custom return material — read its user-typed OCP.
                 ocp = float(self.return_custom_ocp_v.value())
+                rec_tag = ""
             else:
-                learned = self._learned_ocp(short)
-                if learned is not None:
-                    ocp = float(learned)
-                    n = self._learned_sample_count(short)
-                    learned_tag = (f" <span style='color:#0072B2;'>"
-                                   f"(learned, {n} samples)</span>")
-                else:
-                    ocp = COATING_OCP_VS_AG_AG_CL_V.get(short)
+                ocp = COATING_OCP_VS_AG_AG_CL_V.get(short)
+                rec_tag = self._recommendation_tag(short)
             if ocp is not None:
                 self.reference_potential_label.setText(
                     f"<b>{float(ocp):+.3f} V</b> <i>vs Ag|AgCl "
-                    f"(limits vs {short} return)</i>{learned_tag}"
+                    f"(limits vs {short} return)</i>{rec_tag}"
                 )
                 return
         # Both off, or return coating has no catalog OCP — leave the
         # label blank to match the historical behaviour.
         self.reference_potential_label.setText("")
+
+    def _refresh_limits_original_label(self, *_) -> None:
+        """Show the ORIGINAL (unshifted) water-window limits vs Ag|AgCl when a
+        reference electrode has shifted them, so the operator sees the shift
+        (operator: "Show the original potential limits so that the user can see
+        how it is shifted, if it is shifted").
+
+        The displayed spinbox limits are ``original − ref_pot`` (a reference at
+        ``ref_pot`` V vs Ag|AgCl shifts the catalog Ag|AgCl limits DOWN by
+        ``ref_pot``; see :meth:`_shift_limits_by`), so ``original = displayed +
+        ref_pot``.  Blank when there is no shift (``ref_pot == 0`` — the
+        displayed limits ARE the Ag|AgCl values)."""
+        cl = getattr(self, "cathodic_original_label", None)
+        al = getattr(self, "anodic_original_label", None)
+        if cl is None or al is None:
+            return
+
+        def _blank():
+            for _l in (cl, al):
+                _l.setText("")
+                _l.setVisible(False)
+
+        ref = float(getattr(self, "_current_ref_potential_v", 0.0) or 0.0)
+        if abs(ref) < 1e-9:
+            _blank()                              # no reference shift
+            return
+        try:
+            oc = float(self.cathodic_limit_v.value()) + ref
+            oa = float(self.anodic_limit_v.value()) + ref
+        except Exception:
+            _blank()
+            return
+        # One line UNDER each limit: its own original (unshifted) value vs
+        # Ag|AgCl (operator: "Remove 'shifted' underneath the limits").
+        cl.setText(f"<i>original {oc:+.3f} V vs Ag|AgCl</i>")
+        al.setText(f"<i>original {oa:+.3f} V vs Ag|AgCl</i>")
+        cl.setVisible(True)
+        al.setVisible(True)
+
+    def _recommendation_tag(self, short: str) -> str:
+        """HTML ``· tested X V`` tag for the learned/measured OCP of coating
+        ``short`` — shown ONLY when the "Remember return-electrode potential"
+        toggle is on and a learned value exists.  Empty string otherwise.
+        Operator: label it "tested" (it's the OCP measured during testing) and
+        DROP the "(learned, N samples)" parenthetical — it made the panel too
+        wide.  Informational only: NEVER auto-applied to the limits (operator
+        keeps their own defaults; see ``_effective_ref_potential_v``)."""
+        if not (hasattr(self, "remember_potential_chk")
+                and self.remember_potential_chk.isChecked()):
+            return ""
+        learned = self._learned_ocp(short)
+        if learned is None:
+            return ""
+        # Append the sample spread as "± Y V" when we have it (operator:
+        # "for the tested potential value, have standard deviation").  A
+        # degenerate all-identical bin gives std 0.000; below the sample
+        # threshold ``_learned_ocp_std`` returns None and we show just the
+        # mean.
+        std = self._learned_ocp_std(short)
+        spread = (f" ± {float(std):.3f}"
+                  if std is not None and float(std) == float(std) else "")
+        return (f" &nbsp;·&nbsp; <span style='color:#0072B2;'>"
+                f"tested {float(learned):+.3f}{spread} V</span>")
 
     def _on_reference_changed(self, *_):
         """Reference dropdown changed — shift the limit spinboxes by
@@ -2678,11 +3874,16 @@ class SetupTab(QtWidgets.QWidget):
                                      on_confirm=lambda _name: (
                                          self._apply_effective_reference_shift(),
                                          self._emit_array(),
+                                         self.settingChanged.emit(
+                                             "reference electrode = "
+                                             + self.reference_combo.currentText()),
                                      ))
             return
         self._prev_reference_data = self.reference_combo.currentData()
         self._apply_effective_reference_shift()
         self._emit_array()
+        self.settingChanged.emit(
+            "reference electrode = " + self.reference_combo.currentText())
 
     def _on_reference_enable_changed(self, _checked: bool = True):
         """Toggling the reference electrode on / off greys the
@@ -2696,6 +3897,10 @@ class SetupTab(QtWidgets.QWidget):
         self.reference_combo.setEnabled(self.reference_enable.isChecked())
         self._apply_effective_reference_shift()
         self._emit_array()
+        self.settingChanged.emit(
+            "reference electrode "
+            + ("enabled" if self.reference_enable.isChecked() else "disabled")
+            + f" ({self.reference_combo.currentText()})")
 
     def _update_perchan_visibility(self):
         """Per-channel override table is needed if EITHER area or coating
@@ -2722,6 +3927,10 @@ class SetupTab(QtWidgets.QWidget):
         rounded_visible = code in self._SQUARE_OR_RECT_GEOMETRIES
         self.geometry_rounded.setVisible(rounded_visible)
         self._emit_array()
+        self.settingChanged.emit(
+            f"electrode geometry = {self.geometry_combo.currentText()}"
+            + (" (rounded)"
+               if rounded_visible and self.geometry_rounded.isChecked() else ""))
 
     def _on_coating_changed(self, label: str):
         # ``Custom…`` is a *trigger*, not a real coating: when the
@@ -2854,6 +4063,9 @@ class SetupTab(QtWidgets.QWidget):
         new values for the next run.
         """
         self._limits_user_edited = True
+        # A hand-edit of the displayed (shifted) limits changes the derived
+        # original vs-Ag|AgCl values too — keep that annotation current.
+        self._refresh_limits_original_label()
         self._emit_limits()
 
     def _on_experiment_changed(self, idx: int):
@@ -2895,6 +4107,16 @@ class SetupTab(QtWidgets.QWidget):
         else:
             coating = coating_short or ""
 
+        # Bare test board (no electrodes): FORCE area to 0 and a neutral
+        # coating label regardless of the (hidden) coating/area widgets, so
+        # area-normalised metrics (current density, Q_inj density) are
+        # disabled and the plot shows raw current (operator: "because the
+        # test board has no electrodes, disable area for waveform metrics").
+        _dev = DEVICES.get(device_name)
+        if _dev is not None and not getattr(_dev, "has_electrodes", True):
+            area_um2 = 0.0
+            coating = "Test board"
+
         # Resolve geometry. The combo's userData is the short
         # geometry code (``circle`` / ``square`` / ``rectangle`` /
         # ``cone`` / ``ring`` / ``band``). Rounded is only
@@ -2934,11 +4156,20 @@ class SetupTab(QtWidgets.QWidget):
         * If no channel is set as ``Trigger``, fall back to whichever
           channel carries the current monitor (I_mon).
         * Channels set to ``None`` are simply not represented.
+        * Channels the connected scope DOESN'T HAVE (beyond
+          ``self._n_visible_scope_channels``, e.g. CH3/CH4 on a 2-channel
+          scope) are skipped — their stored role is preserved for
+          persistence (see :meth:`_set_visible_scope_channels`) but must
+          never map onto a channel that doesn't physically exist.
         """
         out: dict = {}
         explicit_trigger = None
         imon_ch = None
+        n_vis = getattr(self, "_n_visible_scope_channels", 4)
+        order = ("CH1", "CH2", "CH3", "CH4")
         for ch, combo in self._role_combos.items():
+            if ch in order and order.index(ch) >= n_vis:
+                continue  # channel not present on the connected scope
             role = combo.currentText()
             if role == ROLE_VMON: out["vmon"] = ch
             elif role == ROLE_IMON: out["imon"] = ch; imon_ch = ch
@@ -3033,10 +4264,28 @@ class SetupTab(QtWidgets.QWidget):
 
         snap = {
             "device": self.device_combo.currentText(),
+            # Whether the selected device has real electrodes.  False only for
+            # the Plexon Test Board (no reference / return electrode), which
+            # makes the plot voltage axis stay plain "Voltage [V]" instead of
+            # the reference-aware "Potential vs <ref>" / "Voltage vs <return>"
+            # relabel (operator: "If the Test Board is connected, the unit for
+            # the voltage channels can only be Voltage [V]").
+            "has_electrodes": bool(getattr(
+                DEVICES.get(self.device_combo.currentText()),
+                "has_electrodes", True)),
             "grid_type": self.grid_type_combo.currentData() or "rect",
             "connector": self.connector_combo.currentText(),
+            "custom_cable_map": {str(k): int(v)
+                                 for k, v in self._custom_cable_map.items()},
+            # Active device→Plexon cable translation (non-identity entries
+            # only; empty ⇒ identity).  The runner installs this via
+            # ``set_channel_map`` so pulsing a device channel commands the
+            # mapped Plexon stim channel.  str keys for JSON round-trip.
+            "channel_map": {str(k): int(v)
+                            for k, v in self.current_channel_map().items()},
             "acq_mode": self.acq_mode_combo.currentText(),
             "acq_n_avg": self._current_n_avg(),
+            "horiz_scaling": self.current_horizontal_scaling(),
             "ext_trigger": self.ext_trigger_check.isChecked(),
             # ``trig_slope`` is intentionally not saved — the
             # operator-facing edge selector was removed in favour of
@@ -3061,6 +4310,11 @@ class SetupTab(QtWidgets.QWidget):
             "reference_enable": bool(self.reference_enable.isChecked()),
             "reference_electrode_short": ref_short,
             "reference_electrode_label": ref_label,
+            # Whether finished captures record E_ret into the learned-OCP
+            # store (electrode_potential_history.record_capture gates on
+            # this).  Default True for snapshots predating the toggle.
+            "remember_return_potential": bool(
+                self.remember_potential_chk.isChecked()),
             # Water window (live values, post any reference shift)
             "cathodic_limit_v": cathodic_v,
             "anodic_limit_v": anodic_v,
@@ -3072,6 +4326,12 @@ class SetupTab(QtWidgets.QWidget):
                 ch: cb.currentText() for ch, cb in self._role_combos.items()
             },
             "channel_roles_by_role": role_to_channel,
+            # Per-channel scope bandwidth / coupling overrides (Setup tab
+            # dropdowns in line with the role).  Pushed to the scope at run
+            # start by the experiment tab; "Auto" entries mean "use the
+            # automatic policy".
+            "channel_bandwidths": self.current_channel_bandwidths(),
+            "channel_couplings": self.current_channel_couplings(),
             # Channel-mapping table — a 2-D list of ints (0 = empty).
             "channel_mapping": self.device_view.current_mapping().tolist(),
             # Per-channel area / coating overrides (only populated when
@@ -3111,6 +4371,8 @@ class SetupTab(QtWidgets.QWidget):
             "subject": self.subject.text(),
             "user_name": self.user_name.text(),
             "user_email": self.user_email.text(),
+            "user_phone": self.user_phone.text(),
+            "user_carrier": self.current_user_carrier(),
             "user_institution": self.user_institution.text(),
             "environment_short": self.current_environment_short(),
             "environment_custom": self.current_environment_custom_text(),
@@ -3120,8 +4382,10 @@ class SetupTab(QtWidgets.QWidget):
             "email_notifications": self.email_notifications.isChecked(),
             "auto_save_plots": self.auto_save_plots.isChecked(),
             "auto_save_plots_fmt": self.current_auto_save_plots_format(),
+            "auto_save_plots_dpi": self.current_auto_save_plots_dpi(),
             "acq_mode": self.acq_mode_combo.currentText(),
             "acq_n_avg": self._current_n_avg(),
+            "horiz_scaling": self.current_horizontal_scaling(),
             "ext_trigger": self.ext_trigger_check.isChecked(),
             # ``trig_slope`` removed — see :meth:`current_prefs` for why.
             "scope_has_ext": self._scope_has_ext,
@@ -3132,6 +4396,8 @@ class SetupTab(QtWidgets.QWidget):
             # ``DeviceDef.layout``).
             "grid_type": self.grid_type_combo.currentData() or "rect",
             "connector": self.connector_combo.currentText(),
+            "custom_cable_map": {str(k): int(v)
+                                 for k, v in self._custom_cable_map.items()},
             "area_mode": self.area_mode.isChecked(),
             "area_unit": self.area_unit.currentText(),
             "area_value": self.area_value.value(),
@@ -3155,6 +4421,8 @@ class SetupTab(QtWidgets.QWidget):
             "reference_enable": self.reference_enable.isChecked(),
             "reference_electrode": self.reference_combo.currentData(),
             "reference_custom_ocp_v": float(self.reference_custom_ocp_v.value()),
+            "remember_return_potential": bool(
+                self.remember_potential_chk.isChecked()),
             # User-added custom-electrode names per combo, in
             # insertion order. Restored at launch so a previously-
             # added custom entry shows up in the dropdown again
@@ -3191,6 +4459,13 @@ class SetupTab(QtWidgets.QWidget):
             # current_aliases().
             "channel_roles": {ch: cb.currentText()
                               for ch, cb in self._role_combos.items()},
+            # Per-channel bandwidth / coupling override dropdowns (in line with
+            # the role dropdown).  Stored for all four channels regardless of
+            # visibility so a 2-ch scope session doesn't drop a hidden choice.
+            "channel_bandwidths": {ch: cb.currentText()
+                                   for ch, cb in self._bw_combos.items()},
+            "channel_couplings": {ch: cb.currentText()
+                                  for ch, cb in self._coupling_combos.items()},
             "experiment": self.experiment_combo.currentData(),
             # Channel mapping is persisted as a list of lists so a hand-edited
             # mapping survives a restart even if the device default changes
@@ -3243,7 +4518,23 @@ class SetupTab(QtWidgets.QWidget):
             # Manually populate the device view since we suppressed the signal
             from ..config import DEVICES
             if p["device"] in DEVICES:
-                self.device_view.set_device(DEVICES[p["device"]])
+                dev = DEVICES[p["device"]]
+                self.device_view.set_device(dev)
+                # The device-change SIGNAL was suppressed, so re-apply the
+                # STRUCTURAL device-dependent UI constraints by hand — the
+                # cable whitelist + electrode-row visibility + E_act/E_ret
+                # scope-role filtering.  Without this a RESTORED test board
+                # kept all 6 scope roles (+ the full cable list) at startup
+                # (operator: "When the Test Board is selected only Vmon,
+                # Imon, and Trigger are the only available oscilloscope
+                # channels").  Runs BEFORE the connector / role restores
+                # below so their setCurrentText picks from the constrained
+                # lists (a saved E_act on a test board simply no-ops).
+                self.connector_combo.blockSignals(True)
+                try:
+                    self._apply_device_ui_constraints(dev)
+                finally:
+                    self.connector_combo.blockSignals(False)
             elif p["device"] in self._device_custom_entries:
                 # User-named custom device — apply its saved state.
                 self._apply_custom_device(p["device"])
@@ -3295,8 +4586,23 @@ class SetupTab(QtWidgets.QWidget):
                     combo.blockSignals(False)
                 if name not in tracker:
                     tracker.append(name)
+        # Restore the custom pinout BEFORE selecting the connector so that
+        # picking "Custom" repopulates the tree from the saved map (validated:
+        # pins + channels must be 1–16 ints; anything malformed is dropped).
+        raw_map = p.get("custom_cable_map")
+        if isinstance(raw_map, dict):
+            parsed: Dict[int, int] = {}
+            for k, v in raw_map.items():
+                try:
+                    pk, cv = int(k), int(v)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= pk <= 16 and 1 <= cv <= 16:
+                    parsed[pk] = cv
+            self._custom_cable_map = parsed
         if "connector" in p:
             self.connector_combo.setCurrentText(p["connector"])
+            self._refresh_cable_map_tree()   # in case the value was unchanged
         # Re-apply a saved hand-edited mapping over the device default
         if "mapping" in p and p["mapping"]:
             try:
@@ -3389,6 +4695,12 @@ class SetupTab(QtWidgets.QWidget):
         if "reference_enable" in p:
             try: self.reference_enable.setChecked(bool(p["reference_enable"]))
             except Exception: pass
+        if "remember_return_potential" in p:
+            try:
+                self.remember_potential_chk.setChecked(
+                    bool(p["remember_return_potential"]))
+            except Exception:
+                pass
         if "reference_electrode" in p:
             idx = self.reference_combo.findData(p["reference_electrode"])
             if idx >= 0:
@@ -3430,6 +4742,11 @@ class SetupTab(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self._emit_session_filename)
         if "user_name" in p: self.user_name.setText(p["user_name"])
         if "user_email" in p: self.user_email.setText(p["user_email"])
+        if "user_phone" in p: self.user_phone.setText(str(p["user_phone"]))
+        if "user_carrier" in p:
+            _ci = self.user_carrier.findData(str(p["user_carrier"]))
+            if _ci >= 0:
+                self.user_carrier.setCurrentIndex(_ci)
         if "user_institution" in p:
             self.user_institution.setText(p["user_institution"])
         # Restore the environment combo + custom text. Block
@@ -3495,21 +4812,41 @@ class SetupTab(QtWidgets.QWidget):
                     self.auto_save_plots_fmt.setCurrentIndex(idx)
             except Exception:
                 pass
+        if "auto_save_plots_dpi" in p:
+            try:
+                idx = self.auto_save_plots_dpi.findData(
+                    int(p["auto_save_plots_dpi"]))
+                if idx >= 0:
+                    self.auto_save_plots_dpi.setCurrentIndex(idx)
+            except Exception:
+                pass
         if "auto_save_plots" in p:
             try:
                 self.auto_save_plots.setChecked(bool(p["auto_save_plots"]))
                 # Combo enable-state is wired to the checkbox toggle
                 # signal — manually setting ``setChecked`` to the same
                 # value as the default doesn't fire ``toggled``, so
-                # mirror it here for the initial state.
+                # mirror it here for the initial state (format combo +
+                # the SVG-aware DPI gate).
                 self.auto_save_plots_fmt.setEnabled(
                     self.auto_save_plots.isChecked())
+                self._update_dpi_enabled()
                 QtCore.QTimer.singleShot(0, self._emit_auto_save_plots)
             except Exception:
                 pass
         if "acq_mode" in p:
             try: self.acq_mode_combo.setCurrentText(str(p["acq_mode"]))
             except Exception: pass
+        if "horiz_scaling" in p:
+            try:
+                self.horiz_scaling_combo.setCurrentText(
+                    "Tight" if str(p["horiz_scaling"]).lower().startswith("tight")
+                    else "Wide")
+            except Exception:
+                pass
+        # (Legacy prefs may carry "eret_coupling" from the removed global
+        # electrode-coupling dropdown — it's silently ignored now; the
+        # per-channel Coupling column carries the "DC + AC" choice instead.)
         if "acq_n_avg" in p:
             try:
                 n = int(p["acq_n_avg"])
@@ -3552,7 +4889,31 @@ class SetupTab(QtWidgets.QWidget):
             for ch, role in p["channel_roles"].items():
                 if ch in self._role_combos and role in SCOPE_ROLES:
                     self._role_combos[ch].setCurrentText(role)
-        else:
+            # Restored a real mapping → mark configured so a scope connect
+            # won't re-apply the catalog default over it (e.g. a deliberate
+            # None on CH3).  Gated on "at least one non-None role" so a
+            # degenerate all-None prefs blob still lets the first-connect
+            # default kick in.  (The setCurrentText calls above usually
+            # flip the flag via _on_role_changed too; this is the explicit
+            # backstop for a re-restore where values already match.)
+            if any(r != ROLE_NONE for r in p["channel_roles"].values()
+                   if r in SCOPE_ROLES):
+                self._scope_roles_user_configured = True
+        # Per-channel bandwidth / coupling override dropdowns.
+        if isinstance(p.get("channel_bandwidths"), dict):
+            for ch, mode in p["channel_bandwidths"].items():
+                if ch in self._bw_combos and mode in SCOPE_BANDWIDTHS:
+                    self._bw_combos[ch].setCurrentText(mode)
+        if isinstance(p.get("channel_couplings"), dict):
+            for ch, mode in p["channel_couplings"].items():
+                if ch in self._coupling_combos and mode in SCOPE_COUPLINGS:
+                    self._coupling_combos[ch].setCurrentText(mode)
+        # Re-grey bandwidth/coupling for any None-role channel (a re-restore
+        # where the role text already matched won't have fired _on_role_changed).
+        self._refresh_scope_option_enabled()
+        # Legacy channel-role format (below) applies ONLY when the modern
+        # ``channel_roles`` dict is absent from the prefs blob.
+        if not isinstance(p.get("channel_roles"), dict):
             # Legacy format: {vmon_ch: 'CH1', imon_ch: 'CH2', ...}
             # — translate into role-by-channel before applying.
             legacy = {
@@ -3563,6 +4924,7 @@ class SetupTab(QtWidgets.QWidget):
                 ch = p.get(key)
                 if ch in self._role_combos:
                     self._role_combos[ch].setCurrentText(role)
+                    self._scope_roles_user_configured = True
         # All 4 channel rows stay visible until a scope actually
         # connects (we don't constrain when no hardware is known).
         # apply_scope_capabilities will hide CH3/CH4 — and reset

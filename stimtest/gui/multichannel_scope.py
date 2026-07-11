@@ -46,6 +46,128 @@ TRACE_IMON = "I_mon"
 TRACE_EACT = "E_act"
 TRACE_ERET = "E_ret"
 ALL_TRACES = (TRACE_VMON, TRACE_IMON, TRACE_EACT, TRACE_ERET)
+
+# Ghazavi & Cogan 2018 access-resistance-CORRECTED interface waveforms —
+# shown ONLY for continuous-sinusoidal (KHFAC) captures (operator: "Plot the
+# corrected waveforms like how Ghazavi did … I want Ei be E'act and E'ret for
+# correcting for access resistance").  E′act = active_trace − R_a·I_ac (the
+# active interface), E′ret = E_ret − R_ret·I_ac (the return interface).  The
+# key carries an apostrophe on the variable (``E'_act`` → ``<i>E'</i><sub>act
+# </sub>``); drawn DASHED in its base electrode's colour to read as the
+# de-ohm'd companion of the measured trace.
+TRACE_EACT_CORR = "E'_act"
+TRACE_ERET_CORR = "E'_ret"
+ALL_CORRECTED_TRACES = (TRACE_EACT_CORR, TRACE_ERET_CORR)
+
+# Chronopotentiometry derivative traces (Harris 2019 — capacitive/Faradaic
+# analysis; operator: "Have that derivative and reciprocal of derivative as
+# option traces").  dE/dt (constant = capacitive, dip → 0 = Faradaic) and its
+# reciprocal 1/(dE/dt) (Faradaic = peak), computed from the active trace.  Their
+# native scale (V/µs, and the huge 1/(dE/dt)) doesn't fit the V or I axes, so
+# they are drawn as a NORMALIZED OVERLAY (scaled to the visible voltage range —
+# shape only, dashed) when toggled on (operator chose "normalized overlay").
+TRACE_DEDT = "dV/dt"
+TRACE_RECIP_DEDT = "1/(dV/dt)"
+ALL_DERIV_TRACES = (TRACE_DEDT, TRACE_RECIP_DEDT)
+
+
+def _subscript_trace_name(trace: str) -> str:
+    """``"V_mon"`` -> ``"<i>V</i><sub>mon</sub>"`` for HTML-rendering
+    surfaces (the pyqtgraph legend's LabelItem).  Subscripting the
+    monitor / electrode names makes the legend match the subscripted
+    markers + title instead of showing a bare underscore (operator: "If
+    V_mon, I_mon, E_ret, and E_act are not going to be with subscripts,
+    then remove the underscore").  Names without an underscore pass
+    through unchanged."""
+    if "_" in trace:
+        base, _, sub = trace.partition("_")
+        return rich.var(base, sub)
+    return trace
+
+
+class _RichTextItemDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint each combo item's text as HTML (so trace names render in
+    variable format — ``V`` italic + ``mon`` subscript — instead of the raw
+    ``<i>V</i><sub>mon</sub>`` markup)."""
+
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        html = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget else QtWidgets.QApplication.style()
+        style.drawControl(
+            QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        # Theme-aware text colour — a bare QTextDocument defaults to BLACK,
+        # which is invisible on a dark popup background.  Use the item
+        # palette's (Highlighted)Text so it reads on any theme.
+        selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        color = opt.palette.color(
+            QtGui.QPalette.ColorRole.HighlightedText if selected
+            else QtGui.QPalette.ColorRole.Text)
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(f'<span style="color:{color.name()}">{html}</span>')
+        rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+        painter.save()
+        painter.translate(rect.topLeft())
+        painter.translate(
+            0.0, max(0.0, (rect.height() - doc.size().height()) / 2.0))
+        doc.drawContents(painter, QtCore.QRectF(
+            0, 0, rect.width(), rect.height()))
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        # A COMPACT per-row size from the text only.  Do NOT floor the height
+        # at ``option.rect.height()`` — during the popup's sizing pass that
+        # rect can be the whole viewport, which made every row gigantic and
+        # blew the dropdown up to full-screen height (operator screenshot).
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(opt.text)
+        return QtCore.QSize(int(doc.idealWidth()) + 12,
+                            int(doc.size().height()) + 6)
+
+
+class _RichComboBox(QtWidgets.QComboBox):
+    """A non-editable combo whose items + closed display render as HTML, so
+    trace names appear in variable format (operator: "Change the inset
+    dropdown list to show variables instead of plain text")."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setItemDelegate(_RichTextItemDelegate(self))
+
+    def paintEvent(self, _ev):
+        painter = QtWidgets.QStylePainter(self)
+        opt = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        html = opt.currentText
+        opt.currentText = ""
+        # Frame + arrow WITHOUT the plain text …
+        painter.drawComplexControl(
+            QtWidgets.QStyle.ComplexControl.CC_ComboBox, opt)
+        # … then the current item's HTML into the field rect.
+        rect = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_ComboBox, opt,
+            QtWidgets.QStyle.SubControl.SC_ComboBoxEditField, self)
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(self.font())
+        color = self.palette().color(
+            QtGui.QPalette.ColorRole.ButtonText
+            if self.isEnabled() else QtGui.QPalette.ColorRole.Text)
+        doc.setHtml(f'<span style="color:{color.name()}">{html}</span>')
+        painter.save()
+        painter.translate(rect.topLeft())
+        painter.translate(
+            2.0, max(0.0, (rect.height() - doc.size().height()) / 2.0))
+        doc.drawContents(painter, QtCore.QRectF(
+            0, 0, rect.width(), rect.height()))
+        painter.restore()
 # Trace colour palette — Wong's colourblind-safe set
 # (https://www.nature.com/articles/nmeth.1618) so red and green stay
 # distinguishable under deuteranopia / protanopia.  Mapping:
@@ -63,6 +185,13 @@ TRACE_COLOURS = {
     TRACE_IMON: "#00B4C8",   # Current/density  — teal-cyan
     TRACE_EACT: "#009E73",   # Active Potential — bluish-green
     TRACE_ERET: "#D55E00",   # Return Potential — vermillion (red)
+    # Corrected (interface) waveforms share their base electrode's hue —
+    # dashed line disambiguates measured-vs-corrected (see set_traces styles).
+    TRACE_EACT_CORR: "#009E73",   # E′act — active interface (bluish-green)
+    TRACE_ERET_CORR: "#D55E00",   # E′ret — return interface (vermillion)
+    # Derivative overlays — distinct from the trace-palette hues (purple arc).
+    TRACE_DEDT: "#7E2F8E",        # dV/dt          — purple
+    TRACE_RECIP_DEDT: "#CC79A7",  # 1/(dV/dt)      — reddish-purple
 }
 # Default per-trace Y-axis assignment. I_mon goes to the right axis so
 # its µA range doesn't compress the V/E traces on the left axis;
@@ -72,7 +201,22 @@ DEFAULT_TRACE_AXIS = {
     TRACE_IMON: AXIS_RIGHT,
     TRACE_EACT: AXIS_LEFT,
     TRACE_ERET: AXIS_LEFT,
+    # Corrected interface traces default to the left voltage axis (visible),
+    # so they auto-show for a KHFAC capture; the user can re-assign / hide
+    # them independently of E_act / E_ret via their own toggle-bar combo.
+    TRACE_EACT_CORR: AXIS_LEFT,
+    TRACE_ERET_CORR: AXIS_LEFT,
+    # Derivative overlays default OFF (N/A) — the operator opts into them; when
+    # on, they're normalized to the left (voltage) axis, not its true scale.
+    TRACE_DEDT: AXIS_NA,
+    TRACE_RECIP_DEDT: AXIS_NA,
 }
+# The full set of traces the toggle bar + inset picker offer (base + the
+# Ghazavi corrected interface traces + the derivative overlays).  The corrected
+# pair is only AVAILABLE for continuous-sinusoidal captures (see
+# ``MultiChannelScope.set_corrected_shape``); the derivative pair is always
+# available (any capture has a differentiable V_mon).
+ALL_TOGGLE_TRACES = ALL_TRACES + ALL_CORRECTED_TRACES + ALL_DERIV_TRACES
 
 
 class _ChannelPage(QtWidgets.QWidget):
@@ -112,38 +256,50 @@ class _ChannelPage(QtWidgets.QWidget):
         self._current_idx: int = -1
 
         # ----- capture-history nav row -----
-        # Prev / next buttons + "X of Y" label. Hidden when only one
-        # capture has landed (no point showing nav for nothing to
-        # navigate). Updated by ``_refresh_nav_row``.
-        self._nav_prev = QtWidgets.QToolButton()
-        self._nav_prev.setText("◀")
-        self._nav_prev.setToolTip("Previous capture on this channel / combo")
-        self._nav_prev.clicked.connect(self._nav_step_back)
-        self._nav_next = QtWidgets.QToolButton()
-        self._nav_next.setText("▶")
-        self._nav_next.setToolTip("Next capture on this channel / combo")
-        self._nav_next.clicked.connect(self._nav_step_forward)
+        # A DROPDOWN of every capture taken on this channel / combo
+        # (operator: "change it to a dropdown list").  Replaces the old
+        # ◀ / ▶ arrows, which were broken — they called ``set_index``
+        # without a visibility map, so the guard skipped ``_refresh_
+        # traces`` and the waveform never changed (only the last capture
+        # ever rendered).  Hidden when only one capture has landed.
+        self._nav_combo = QtWidgets.QComboBox()
+        self._nav_combo.setToolTip(
+            "Pick which capture of this channel / combination to view.")
+        # Wide enough for the full "Capture NN  ·  ±NNN µA  ·  kind  ·
+        # latest" entry text (operator: "increase the width of the dropdown
+        # list for viewing different capture numbers"); the popup also
+        # sizes itself to the longest entry.
+        self._nav_combo.setMinimumWidth(280)
+        self._nav_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._nav_combo.currentIndexChanged.connect(
+            self._on_nav_combo_changed)
+        # Guard so a programmatic rebuild of the combo doesn't re-fire
+        # ``set_index`` (and clobber the user's selection / auto-follow).
+        self._nav_combo_updating = False
         self._nav_latest = QtWidgets.QToolButton()
-        self._nav_latest.setText("Latest")
+        self._nav_latest.setText("Go to latest waveform")
         self._nav_latest.setToolTip(
-            "Jump to the most-recent capture and re-arm auto-follow so "
-            "the page snaps to new captures as they arrive.")
+            "Jump to the most-recent waveform — the latest capture of the "
+            "latest channel/combo — and re-arm auto-follow so the view "
+            "snaps to new captures as they arrive.")
         self._nav_latest.clicked.connect(self._nav_jump_latest)
-        self._nav_label = QtWidgets.QLabel("—")
-        self._nav_label.setStyleSheet("color: #555;")
         self._nav_kind = QtWidgets.QLabel("")
         self._nav_kind.setStyleSheet("color: #888; font-style: italic;")
         # Auto-follow flag — when True (default), incoming captures
-        # snap the page to the newest one. The user breaking out of
-        # latest via prev/next disables follow until they hit Latest.
+        # snap the page to the newest one. The user picking an older
+        # capture from the dropdown disables follow until they hit Latest.
         self._auto_follow: bool = True
+        # Last render context (visibility / axis map / inset / area) from
+        # the most recent ``set_capture`` / ``refresh_visibility`` — the
+        # dropdown re-renders through this since it carries no map.
+        self._last_ctx: Optional[dict] = None
 
         nav_row = QtWidgets.QHBoxLayout()
         nav_row.setContentsMargins(0, 0, 0, 0)
         nav_row.setSpacing(4)
-        nav_row.addWidget(self._nav_prev)
-        nav_row.addWidget(self._nav_next)
-        nav_row.addWidget(self._nav_label)
+        nav_row.addWidget(QtWidgets.QLabel("Capture:"))
+        nav_row.addWidget(self._nav_combo)
         nav_row.addWidget(self._nav_kind, stretch=1)
         nav_row.addWidget(self._nav_latest)
         self._nav_row_w = QtWidgets.QWidget()
@@ -162,7 +318,7 @@ class _ChannelPage(QtWidgets.QWidget):
         self._title_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._title_label.setStyleSheet(
-            "QLabel { font-size: 11pt; font-weight: bold; padding: 2px; }")
+            "QLabel { font-size: 13pt; font-weight: bold; padding: 2px; }")
         self._title_label.setVisible(False)
 
         # The inline metric table that used to sit below the scope
@@ -197,9 +353,13 @@ class _ChannelPage(QtWidgets.QWidget):
             parts.append(f"<b>CH{self.key:02d}</b>")
         else:
             parts.append(f"<b>{self.key}</b>")
-        # I_stim — pull from the pattern's excitation phase.
+        # I_stim — pull from the pattern's excitation phase, SIGNED
+        # (operator: "Have Istim and Jstim in the heading above the
+        # experiment plot reflect the polarity") — a cathodal-first
+        # pulse reads −1000.0 µA here, matching the metrics table's
+        # signed I_stim row.
         try:
-            amp_ua = abs(float(capture.pattern.excitation_phase.amplitude_ua))
+            amp_ua = float(capture.pattern.excitation_phase.amplitude_ua)
         except Exception:
             amp_ua = None
         if amp_ua is not None:
@@ -212,7 +372,8 @@ class _ChannelPage(QtWidgets.QWidget):
                 area_um2 = 0.0
             if area_um2 > 0:
                 # J_stim = I_stim / A;  amp_ua × 1e-6 A / (area_um2 ×
-                # 1e-8 cm²) = amp_ua / area_um2 × 100  A/cm²
+                # 1e-8 cm²) = amp_ua / area_um2 × 100  A/cm².  Carries
+                # I_stim's sign (same polarity convention).
                 density = amp_ua / area_um2 * 100.0
                 parts.append(
                     f"<i>J</i><sub>stim</sub> = {density:.2f} A/cm<sup>2</sup>")
@@ -228,8 +389,16 @@ class _ChannelPage(QtWidgets.QWidget):
             parts.append(
                 f"<i>Q</i><sub>ph</sub> = {q_ph:.2f} nC")
         if q_inj is not None and math.isfinite(q_inj):
-            parts.append(
-                f"<i>Q</i><sub>inj</sub> = {q_inj:.3f} mC/cm<sup>2</sup>")
+            # Auto-scale to µC/cm² when Q_inj would round to 0.000 mC — SHARED
+            # with the exported subtitle (operator: "if the charge injection
+            # capacity is 0 mC/cm2 … due to low precision, then use uC/cm2").
+            from ..plotting import qinj_use_micro
+            if qinj_use_micro(q_inj):
+                parts.append(
+                    f"<i>Q</i><sub>inj</sub> = {q_inj * 1e3:.3f} µC/cm<sup>2</sup>")
+            else:
+                parts.append(
+                    f"<i>Q</i><sub>inj</sub> = {q_inj:.3f} mC/cm<sup>2</sup>")
         # Capture # — 1-based for the operator-facing display.
         try:
             cap_num = int(capture.index) + 1
@@ -293,7 +462,8 @@ class _ChannelPage(QtWidgets.QWidget):
                     axis_map: Optional[Dict[str, str]] = None,
                     inset_visible: bool = False,
                     inset_traces: Optional[set] = None,
-                    surface_area_um2: Optional[float] = None):
+                    surface_area_um2: Optional[float] = None,
+                    title_area_um2: Optional[float] = None):
         """Append ``capture`` to the history and (when auto-following)
         render it. Use ``set_index`` to navigate to a different
         capture without appending.
@@ -305,6 +475,17 @@ class _ChannelPage(QtWidgets.QWidget):
         self._captures.append(capture)
         if self._auto_follow or self._current_idx < 0:
             self._current_idx = len(self._captures) - 1
+        # The TITLE's J_stim uses the RAW area (``title_area_um2``) so it shows
+        # whenever a surface area is set — INDEPENDENT of the I_mon TRACE's
+        # µA/density toggle, which drives ``surface_area_um2`` (gotcha #126).
+        if title_area_um2 is None:
+            title_area_um2 = surface_area_um2
+        # Remember the render context so the dropdown can re-render an
+        # older capture (it carries no visibility map of its own).
+        self._last_ctx = dict(
+            visible=visible, axis_map=axis_map,
+            inset_visible=inset_visible, inset_traces=inset_traces,
+            surface_area_um2=surface_area_um2, title_area_um2=title_area_um2)
         self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
                              surface_area_um2=surface_area_um2)
         cap = self.current_capture()
@@ -313,7 +494,7 @@ class _ChannelPage(QtWidgets.QWidget):
             # right-side ``metrics_side`` panel (subscribed to the same
             # capture stream via the ``CaptureBus``) — the inline table
             # that used to live below the scope plot was removed.
-            self._set_title_from(cap, surface_area_um2=surface_area_um2)
+            self._set_title_from(cap, surface_area_um2=title_area_um2)
         self._refresh_nav_row()
 
     def set_index(self, idx: int,
@@ -321,7 +502,8 @@ class _ChannelPage(QtWidgets.QWidget):
                   axis_map: Optional[Dict[str, str]] = None,
                   inset_visible: bool = False,
                   inset_traces: Optional[set] = None,
-                  surface_area_um2: Optional[float] = None) -> bool:
+                  surface_area_um2: Optional[float] = None,
+                  title_area_um2: Optional[float] = None) -> bool:
         """Render the capture at ``idx`` (0-based). Returns True on
         success, False if the index is out of range. Disables
         auto-follow so subsequent ``set_capture`` calls don't snap
@@ -331,14 +513,40 @@ class _ChannelPage(QtWidgets.QWidget):
             return False
         self._current_idx = idx
         self._auto_follow = (idx == len(self._captures) - 1)
-        if visible is not None:
-            self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
-                                 surface_area_um2=surface_area_um2)
+        # Re-render the selected capture.  The dropdown / Latest button
+        # call this WITHOUT a visibility map, so fall back to the last
+        # context we saw (the old arrows didn't do this — that's why
+        # only the latest capture ever rendered).
+        _area = surface_area_um2
+        _title_area = title_area_um2
+        if visible is None and self._last_ctx is not None:
+            _ctx = self._last_ctx
+            _area = _ctx.get("surface_area_um2")
+            _title_area = _ctx.get("title_area_um2")
+            self._refresh_traces(
+                _ctx.get("visible"), _ctx.get("axis_map"),
+                _ctx.get("inset_visible", False), _ctx.get("inset_traces"),
+                surface_area_um2=_area)
+        elif visible is not None:
+            self._refresh_traces(visible, axis_map, inset_visible,
+                                 inset_traces, surface_area_um2=surface_area_um2)
         cap = self.current_capture()
         if cap is not None:
             # Metric numbers come from the experiment tab's right-side
-            # panel; this page only owns the scope plot now.
-            self._set_title_from(cap, surface_area_um2=surface_area_um2)
+            # panel; this page only owns the scope plot now.  Title uses the
+            # RAW area so J_stim shows regardless of the trace µA/density toggle.
+            if _title_area is None:
+                _title_area = _area
+            self._set_title_from(cap, surface_area_um2=_title_area)
+            # Tell the experiment tab to re-point the metrics table at the
+            # capture we just navigated to (set_index is only ever called
+            # by the per-capture nav on the VISIBLE page).
+            _parent = getattr(self, "_scope_parent", None)
+            if _parent is not None:
+                try:
+                    _parent.captureChanged.emit(cap)
+                except Exception:
+                    pass
         self._refresh_nav_row()
         return True
 
@@ -346,46 +554,92 @@ class _ChannelPage(QtWidgets.QWidget):
                            axis_map: Optional[Dict[str, str]] = None,
                            inset_visible: bool = False,
                            inset_traces: Optional[set] = None,
-                           surface_area_um2: Optional[float] = None):
+                           surface_area_um2: Optional[float] = None,
+                           title_area_um2: Optional[float] = None):
         cap = self.current_capture()
         if cap is not None:
+            if title_area_um2 is None:
+                title_area_um2 = surface_area_um2
+            # Keep the render context current so a later dropdown pick
+            # re-renders with the right visibility / axis map.
+            self._last_ctx = dict(
+                visible=visible, axis_map=axis_map,
+                inset_visible=inset_visible, inset_traces=inset_traces,
+                surface_area_um2=surface_area_um2, title_area_um2=title_area_um2)
             self._refresh_traces(visible, axis_map, inset_visible, inset_traces,
                                  surface_area_um2=surface_area_um2)
-            # Re-render the title too — area-toggle off / on flips
-            # whether the density line appears in the title.
-            self._set_title_from(cap, surface_area_um2=surface_area_um2)
+            # The title's J_stim uses the RAW area so it appears whenever an
+            # area is set — the µA/density toggle only affects the I_mon trace.
+            self._set_title_from(cap, surface_area_um2=title_area_um2)
 
     # ----- nav-row helpers -----
-    def _nav_step_back(self):
-        if self._current_idx > 0:
-            self.set_index(self._current_idx - 1)
-
-    def _nav_step_forward(self):
-        if self._current_idx < len(self._captures) - 1:
-            self.set_index(self._current_idx + 1)
+    def _on_nav_combo_changed(self, idx: int):
+        """User picked a capture from the dropdown — render it."""
+        if self._nav_combo_updating:
+            return
+        if 0 <= idx < len(self._captures):
+            self.set_index(idx)   # re-renders via the stored context
 
     def _nav_jump_latest(self):
+        """Jump to the latest WAVEFORM — the most-recent capture of the
+        most-recent channel/combo, not just of THIS page (operator:
+        "I pressed 'Go to latest sample', but it did nothing" — they were
+        pinned on an older combo, and the old page-local jump had nothing
+        newer on its own page).  Re-arms BOTH follow levels: the entry
+        list snaps back to the live channel/combo AND that page snaps to
+        its newest capture."""
+        # Re-arm this page's follow regardless of where we jump.
+        self._auto_follow = True
+        parent = getattr(self, "_scope_parent", None)
+        if parent is not None:
+            try:
+                parent._jump_latest_entry()      # → latest channel/combo page
+                lk = getattr(parent, "_latest_key", None)
+                page = parent._pages.get(lk) if lk is not None else None
+                if page is not None and page._captures:
+                    page.set_index(len(page._captures) - 1)
+                    page._auto_follow = True
+                    return
+            except Exception:
+                pass
+        # Standalone / no parent: page-local latest.
         if self._captures:
             self.set_index(len(self._captures) - 1)
-        # Re-arm auto-follow even if we were already at latest, so
-        # future captures keep snapping into view.
-        self._auto_follow = True
+
+    def _capture_combo_label(self, i: int, c) -> str:
+        """One dropdown entry — ``Capture N  ·  ±amp µA  ·  kind``."""
+        parts = [f"Capture {i + 1}"]
+        try:
+            amp = float(c.pattern.excitation_phase.amplitude_ua)
+            parts.append(f"{amp:+.1f} µA")   # always one decimal (operator)
+        except Exception:
+            pass
+        kind = getattr(c, "kind", "") or ""
+        if kind:
+            parts.append(str(kind))
+        if i == len(self._captures) - 1:
+            parts.append("latest")
+        return "  ·  ".join(parts)
 
     def _refresh_nav_row(self):
-        """Update the prev/next button enable-state, the index label,
-        and the optional kind tag. Hide the whole row when ≤ 1
-        captures (nothing to navigate)."""
+        """Rebuild the capture dropdown + the optional kind tag. Hide the
+        whole row when ≤ 1 captures (nothing to pick between)."""
         n = len(self._captures)
         if n <= 1:
             self._nav_row_w.setVisible(False)
             return
         self._nav_row_w.setVisible(True)
-        idx = self._current_idx
-        self._nav_prev.setEnabled(idx > 0)
-        self._nav_next.setEnabled(idx < n - 1)
-        self._nav_label.setText(
-            f"Capture {idx + 1} of {n}"
-            + (" (latest)" if idx == n - 1 else ""))
+        idx = max(0, min(self._current_idx, n - 1))
+        # Rebuild the combo to match the capture list, guarded so the
+        # programmatic update doesn't re-enter ``set_index``.
+        self._nav_combo_updating = True
+        try:
+            self._nav_combo.clear()
+            for i, c in enumerate(self._captures):
+                self._nav_combo.addItem(self._capture_combo_label(i, c))
+            self._nav_combo.setCurrentIndex(idx)
+        finally:
+            self._nav_combo_updating = False
         cap = self.current_capture()
         # Optional capture-kind tag — set by the experiment runner
         # via ``Capture.kind`` (e.g. 'pre_char', 'post_char',
@@ -407,8 +661,15 @@ class _ChannelPage(QtWidgets.QWidget):
         the curve key stable across the µA ↔ A/cm² swap so
         ScopePlot reuses the existing PlotDataItem rather than
         recreating it.
+
+        The monitor / electrode names are SUBSCRIPTED to match the
+        subscripted markers + title (operator: "If V_mon, I_mon, E_ret,
+        and E_act are not going to be with subscripts, then remove the
+        underscore" — we subscript them).  ``V_mon`` →
+        ``<i>V</i><sub>mon</sub>``; pyqtgraph's LegendItem (a LabelItem)
+        renders the HTML.  The HTML string is still a STABLE curve key.
         """
-        return trace
+        return _subscript_trace_name(trace)
 
     def _refresh_traces(self, visible: Dict[str, bool],
                         axis_map: Optional[Dict[str, str]] = None,
@@ -417,9 +678,33 @@ class _ChannelPage(QtWidgets.QWidget):
                         surface_area_um2: Optional[float] = None):
         cap = self.current_capture()
         if cap is None: return
+        # A TRIMMED snapshot (LP drops the raw arrays after metrics are
+        # extracted, gotcha #11) has no waveform to draw — ``time_us`` is
+        # None.  Leave the previous frame on screen and return; the
+        # metrics table + Tracking plot are fed elsewhere and don't need
+        # the arrays.  (Without this, the render crashed on ``None.size``
+        # / ``set_traces(None, …)`` and — since ``_on_capture`` renders
+        # BEFORE feeding the Tracking plot — starved LP's tracking curves.)
+        if getattr(cap, "time_us", None) is None:
+            return
         axis_map = axis_map or DEFAULT_TRACE_AXIS
         traces: Dict[str, np.ndarray] = {}
         axis: Dict[str, str] = {}
+        # A trace's data is computed when it's shown in the MAIN plot OR
+        # selected for the INSET — so the inset can draw a trace that's HIDDEN
+        # from the main plot (operator: "The inset trace should not have to also
+        # be in the main plot as well").  ``_want`` gates the (sometimes
+        # expensive) array build; ``_axis_for`` routes a visible trace to its
+        # real axis and an inset-only (hidden) trace to AXIS_NA — which
+        # ``ScopePlot.set_traces`` STORES for the inset but does NOT draw.
+        _inset_roles = set(inset_traces or ())
+
+        def _want(_role: str) -> bool:
+            return bool(visible.get(_role, True)) or _role in _inset_roles
+
+        def _axis_for(_role: str, _default: str) -> str:
+            return (axis_map.get(_role, _default)
+                    if visible.get(_role, True) else AXIS_NA)
         # Decide once whether to present I_mon as raw current (µA) or
         # current density (A/cm²).  Conversion needs a strictly-
         # positive area; anything else falls back to µA.
@@ -428,29 +713,34 @@ class _ChannelPage(QtWidgets.QWidget):
         except (TypeError, ValueError):
             _area_um2 = 0.0
         _use_density = _area_um2 > 0.0
-        # Per-capture baseline subtraction — display-only.  ``cap.v_mon_v``
-        # and ``cap.i_mon_ua`` keep their raw values for compliance
-        # checks, on-disk persistence, and polarization metrics; here
-        # we strip the channel's idle DC level *just for the rendered
-        # trace* so the operator sees the pulse start at zero (same
-        # treatment the calibration plot applies via
-        # ``CalibrationDialog._per_capture_baseline``).  Without this
-        # the experiment plot shows whatever DC offset is currently on
-        # V_mon, which drifts with scope warm-up / ambient
-        # temperature and looks like a "very bad offset" relative to
-        # the calibration plot.
-        from ..readback_calibration import per_capture_baseline
-        _t_us_for_baseline = cap.time_us if cap.time_us is not None else None
-        if visible.get(TRACE_VMON, True) and cap.v_mon_v.size:
+        # ALL traces are shown RAW — operator spec: "There should be no
+        # subtraction in V_mon and I_mon.  You should be able to convert
+        # the int8 data to double without any other processing, besides
+        # the optional moving average."  The raw int8→double conversion
+        # (Tek formula in _read_channel) already yields the true voltage
+        # — the per-channel preamble-cache invalidation fix removed the
+        # stale-YOFf acquisition offset, and the leading-edge work
+        # removed the cathodic-contaminated display baseline — so V_mon /
+        # I_mon idle at ~0 on their own and need NO baseline subtraction.
+        # The optional moving average is applied upstream in the runner
+        # (``_smooth_acquisition``), so ``cap.*`` already carries it when
+        # enabled.  Do NOT reintroduce per_capture_baseline here.
+        # NONE-guard every raw array: a TRIMMED snapshot (LP drops V_mon /
+        # I_mon / E_act / E_ret to save memory over a multi-hour run,
+        # gotcha #11) has ``cap.v_mon_v is None``.  Without the guard the
+        # scope render raised AttributeError on ``None.size`` — and because
+        # ``_on_capture`` renders the scope BEFORE feeding the Tracking
+        # plot, that swallowed exception starved LP's tracking curves (they
+        # never got fed).  A trimmed snapshot simply draws no waveform here;
+        # its metrics still flow to the metric table + Tracking plot.
+        if (_want(TRACE_VMON) and cap.v_mon_v is not None
+                and cap.v_mon_v.size):
             k = self._trace_label(TRACE_VMON)
-            _v = np.asarray(cap.v_mon_v, dtype=float)
-            _v = _v - per_capture_baseline(_v, _t_us_for_baseline)
-            traces[k] = _v
-            axis[k] = axis_map.get(TRACE_VMON, AXIS_LEFT)
-        if visible.get(TRACE_IMON, True) and cap.i_mon_ua is not None and cap.i_mon_ua.size:
+            traces[k] = np.asarray(cap.v_mon_v, dtype=float)
+            axis[k] = _axis_for(TRACE_VMON, AXIS_LEFT)
+        if _want(TRACE_IMON) and cap.i_mon_ua is not None and cap.i_mon_ua.size:
             k = self._trace_label(TRACE_IMON)
             _i = np.asarray(cap.i_mon_ua, dtype=float)
-            _i = _i - per_capture_baseline(_i, _t_us_for_baseline)
             if _use_density:
                 # A/cm² = (i_mon_ua × 1e-6 A/µA) / (area_um2 × 1e-8 cm²/µm²)
                 #       = i_mon_ua × 100 / area_um2
@@ -458,54 +748,155 @@ class _ChannelPage(QtWidgets.QWidget):
             else:
                 # ``i_mon_ua`` is already in microamps — no conversion.
                 traces[k] = _i
-            axis[k] = axis_map.get(TRACE_IMON, AXIS_RIGHT)
-        # E_ret first (so we can use it to derive E_act below if needed).
+            axis[k] = _axis_for(TRACE_IMON, AXIS_RIGHT)
+        # E_ret — RAW (its non-zero electrode rest potential is real
+        # information, not an offset to scrub).  Compute the array whenever it's
+        # AVAILABLE (E_act derivation + the corrected traces below reuse
+        # ``_e_ret_arr``), even if E_ret itself is neither shown nor inset.
         _e_ret_arr = None
-        if visible.get(TRACE_ERET, True) and cap.e_ret_v is not None and cap.e_ret_v.size:
-            k = self._trace_label(TRACE_ERET)
+        if cap.e_ret_v is not None and cap.e_ret_v.size:
             _e_ret_arr = np.asarray(cap.e_ret_v, dtype=float)
+        if _want(TRACE_ERET) and _e_ret_arr is not None:
+            k = self._trace_label(TRACE_ERET)
             traces[k] = _e_ret_arr
-            axis[k] = axis_map.get(TRACE_ERET, AXIS_LEFT)
+            axis[k] = _axis_for(TRACE_ERET, AXIS_LEFT)
         # E_act — prefer the recorded trace when present, otherwise
         # derive it from V_mon + E_ret using the differential identity
         # ``V_mon = E_act − E_ret``  →  ``E_act = V_mon + E_ret``.  This
         # gives the operator an active-electrode trace whenever the
         # instrumentation amp is wired to one electrode but not both,
         # without needing a third channel on the scope.
-        if visible.get(TRACE_EACT, True):
+        if _want(TRACE_EACT):
             k = self._trace_label(TRACE_EACT)
             if cap.e_act_v is not None and cap.e_act_v.size:
-                traces[k] = cap.e_act_v
-                axis[k] = axis_map.get(TRACE_EACT, AXIS_LEFT)
+                # Recorded E_act — RAW.
+                traces[k] = np.asarray(cap.e_act_v, dtype=float)
+                axis[k] = _axis_for(TRACE_EACT, AXIS_LEFT)
             elif (_e_ret_arr is not None
                   and cap.v_mon_v is not None
                   and cap.v_mon_v.size == _e_ret_arr.size):
-                # Use the BASELINE-SUBTRACTED V_mon (same treatment as
-                # the displayed V_mon trace).  Scope DC drift on V_mon
-                # otherwise leaks straight into the derived E_act as a
-                # constant offset.  After baseline subtract:
-                #
-                #   V_mon_pulse   = V_mon − V_mon_baseline
-                #                 ≈ E_act_signal − E_ret_signal
-                #     (since V_mon's idle baseline for matched
-                #     electrodes is approximately zero — any non-zero
-                #     residual is scope DC drift, not real signal)
-                #   E_ret_raw     = E_ret_signal + E_ret_rest
-                #   derived_E_act = V_mon_pulse + E_ret_raw
-                #                 = E_act_signal + E_ret_rest
-                #                 ≈ E_act  (when E_act_rest ≈ E_ret_rest
-                #                            for matched coatings)
-                _v_mon_bs = np.asarray(cap.v_mon_v, dtype=float)
-                _v_mon_bs = _v_mon_bs - per_capture_baseline(
-                    _v_mon_bs, _t_us_for_baseline)
-                traces[k] = _v_mon_bs + _e_ret_arr
-                axis[k] = axis_map.get(TRACE_EACT, AXIS_LEFT)
+                # Derived E_act = RAW V_mon + RAW E_ret — the pure
+                # differential identity ``E_act = V_mon + E_ret``.  No
+                # subtraction, consistent with every other trace.
+                traces[k] = (np.asarray(cap.v_mon_v, dtype=float)
+                             + _e_ret_arr)
+                axis[k] = _axis_for(TRACE_EACT, AXIS_LEFT)
+        # Ghazavi ACCESS-RESISTANCE-CORRECTED interface waveforms — ONLY for a
+        # continuous-sinusoidal (KHFAC) capture (operator: "Plot the corrected
+        # waveforms like how Ghazavi did … Ei be E'act and E'ret for correcting
+        # for access resistance").  E′act / E′ret are the measured active /
+        # return voltage with the resistive (in-phase-with-I) iR drop removed;
+        # they're the interface potential the water-window limit really cares
+        # about.  Drawn DASHED in the base electrode's colour.
+        # E′act / E′ret are FIRST-CLASS toggleable traces + inset options — each
+        # has its OWN axis-map entry (independent of E_act / E_ret), so drawing
+        # is gated on ``axis_map[key] != AXIS_NA`` (its own toggle), NOT the base
+        # trace's visibility (operator: "Eact and E'act should be separate").
+        _corr_styles: Dict[str, str] = {}
+        try:
+            from ..metrics import (is_continuous_sinusoidal,
+                                   ghazavi_corrected_waveforms)
+            _is_sinus = (getattr(cap, "pattern", None) is not None
+                         and is_continuous_sinusoidal(cap.pattern))
+        except Exception:
+            _is_sinus = False
+        # Tell the parent whether the corrected pair should be OFFERED (rows +
+        # inset options) for this capture's shape.  Idempotent + UI-only, so no
+        # repaint recursion (the drawing below is independent of availability).
+        _parent = getattr(self, "_scope_parent", None)
+        if _parent is not None and hasattr(_parent, "set_corrected_shape"):
+            try:
+                _parent.set_corrected_shape(_is_sinus)
+            except Exception:
+                pass
+        if (_is_sinus and cap.i_mon_ua is not None and cap.i_mon_ua.size):
+            _i_raw = np.asarray(cap.i_mon_ua, dtype=float)
+            _n_i = _i_raw.size
+            # --- E′act: from the ACTIVE trace (recorded E_act, else derived
+            #     V_mon+E_ret, else V_mon as the active-vs-return proxy) ---
+            _active = None
+            if cap.e_act_v is not None and cap.e_act_v.size == _n_i:
+                _active = np.asarray(cap.e_act_v, dtype=float)
+            elif (_e_ret_arr is not None and _e_ret_arr.size == _n_i
+                  and cap.v_mon_v is not None and cap.v_mon_v.size == _n_i):
+                _active = np.asarray(cap.v_mon_v, dtype=float) + _e_ret_arr
+            elif cap.v_mon_v is not None and cap.v_mon_v.size == _n_i:
+                _active = np.asarray(cap.v_mon_v, dtype=float)
+            _act_axis = axis_map.get(TRACE_EACT_CORR, AXIS_LEFT)
+            if _active is not None and (_act_axis != AXIS_NA
+                                        or TRACE_EACT_CORR in _inset_roles):
+                _ei, _vr, _r = ghazavi_corrected_waveforms(_active, _i_raw)
+                if _ei is not None:
+                    k = self._trace_label(TRACE_EACT_CORR)
+                    traces[k] = _ei
+                    axis[k] = _act_axis      # AXIS_NA (inset-only) ⇒ not drawn
+                    _corr_styles[k] = "dash"
+            # --- E′ret: from the RETURN trace (recorded E_ret only) ---
+            _ret_axis = axis_map.get(TRACE_ERET_CORR, AXIS_LEFT)
+            if (_e_ret_arr is not None and _e_ret_arr.size == _n_i
+                    and (_ret_axis != AXIS_NA
+                         or TRACE_ERET_CORR in _inset_roles)):
+                _ei_r, _vr_r, _r_r = ghazavi_corrected_waveforms(
+                    _e_ret_arr, _i_raw)
+                if _ei_r is not None:
+                    k = self._trace_label(TRACE_ERET_CORR)
+                    traces[k] = _ei_r
+                    axis[k] = _ret_axis
+                    _corr_styles[k] = "dash"
+        # --- Derivative overlays (Harris 2019): dV/dt + 1/(dV/dt) from the
+        # active trace (V_mon preferred, else E_act), drawn as a NORMALIZED
+        # overlay — scaled to the V_mon amplitude, centred at 0 (SHAPE ONLY;
+        # their V/µs and huge-reciprocal scales don't fit the V or I axes).
+        # Operator: "Have that derivative and reciprocal of derivative as option
+        # traces … normalized overlay."  Only computed when toggled on.
+        _dedt_axis = axis_map.get(TRACE_DEDT, AXIS_NA)
+        _recip_axis = axis_map.get(TRACE_RECIP_DEDT, AXIS_NA)
+        if (_dedt_axis != AXIS_NA or _recip_axis != AXIS_NA
+                or TRACE_DEDT in _inset_roles
+                or TRACE_RECIP_DEDT in _inset_roles):
+            _vref = None
+            if cap.v_mon_v is not None and cap.v_mon_v.size == cap.time_us.size:
+                _vref = np.asarray(cap.v_mon_v, dtype=float)
+            elif cap.e_act_v is not None and cap.e_act_v.size == cap.time_us.size:
+                _vref = np.asarray(cap.e_act_v, dtype=float)
+            if _vref is not None:
+                try:
+                    from ..metrics import charge_transfer_dedt
+                    _tt, _dedt = charge_transfer_dedt(
+                        cap.time_us, _vref, cap.pattern, onset_us=0.0)
+                except Exception:
+                    _dedt = None
+                if _dedt is not None:
+                    _rmax = float(np.nanmax(np.abs(_vref - np.nanmedian(_vref)))) or 1.0
+
+                    def _norm_overlay(d):
+                        d = np.asarray(d, dtype=float)
+                        dc = d - np.nanmedian(d)
+                        dmx = float(np.nanmax(np.abs(dc)))
+                        return dc / dmx * _rmax if dmx > 1e-30 else None
+                    if _dedt_axis != AXIS_NA or TRACE_DEDT in _inset_roles:
+                        _o = _norm_overlay(_dedt)
+                        if _o is not None:
+                            k = self._trace_label(TRACE_DEDT)
+                            traces[k] = _o; axis[k] = _dedt_axis
+                            _corr_styles[k] = "dash"
+                    if (_recip_axis != AXIS_NA
+                            or TRACE_RECIP_DEDT in _inset_roles):
+                        _recip = 1.0 / np.where(np.abs(_dedt) < 1e-9,
+                                                np.nan, _dedt)
+                        _o = _norm_overlay(_recip)
+                        if _o is not None:
+                            k = self._trace_label(TRACE_RECIP_DEDT)
+                            traces[k] = _o; axis[k] = _recip_axis
+                            _corr_styles[k] = "dash"
         # Cache the colour map on first build — it's constant for
         # the lifetime of this widget so rebuilding the dict on
-        # every capture was pure overhead.
+        # every capture was pure overhead.  Includes the corrected
+        # (E′act / E′ret) labels so their dashed curves are coloured.
         if not hasattr(self, "_trace_colours_cache"):
             self._trace_colours_cache = {
-                self._trace_label(t): TRACE_COLOURS[t] for t in ALL_TRACES}
+                self._trace_label(t): TRACE_COLOURS[t]
+                for t in (ALL_TRACES + ALL_CORRECTED_TRACES + ALL_DERIV_TRACES)}
         # Declarative update — ``set_traces(remove_missing=True)``
         # both updates the curves we want and drops the curves we
         # don't, in a single pass.  Avoids the destroy-and-recreate
@@ -515,7 +906,11 @@ class _ChannelPage(QtWidgets.QWidget):
         self.scope.set_traces(cap.time_us, traces,
                               colors=self._trace_colours_cache,
                               axis=axis,
+                              styles=_corr_styles,
                               remove_missing=True)
+        # (Metric cursors are drawn LAST — after align_y_zeros — so the
+        # label-placement collision/edge logic sees the FINAL view range,
+        # not this-or-last-frame's stale range.  See below.)
         # Right-axis label tracks the I_mon presentation chosen above.
         # Density mode bakes the µA equivalent of 1 A/cm² for this
         # specific electrode area straight into the label so the
@@ -527,28 +922,157 @@ class _ChannelPage(QtWidgets.QWidget):
         #           = area_um2 × 0.01   µA
         if _use_density:
             ua_per_density = _area_um2 * 0.01
+            # Density->current conversion baked into the bracketed unit so
+            # the operator can read the right-axis ticks as raw current too
+            # (operator: "I want the current density scale in brackets,
+            # e.g., [A/cm2 = 50 uA]").
             self.scope.set_axis_labels(
                 right=f"Current Density [A/cm² = {ua_per_density:g} µA]")
         else:
             self.scope.set_axis_labels(right="Current [µA]")
-        # Voltage label is constant for now but pass through every
-        # refresh so a future call that hides the left axis can
-        # restore it just by re-rendering.
-        self.scope.set_axis_labels(left="Voltage [V]")
+        # Left-axis title: "Voltage [V]" normally, but "Potential vs
+        # <ref> [V]" when only electrode potentials (E_act / E_ret, incl. their
+        # corrected E′act / E′ret variants) are on the left axis — no raw V_mon
+        # — and "Voltage vs <return> [V]" when only V_mon is on the axis
+        # (operator: V_mon is a driving voltage; E_act / E_ret are potentials
+        # vs the reference electrode).  This is AUTOMATIC (operator: "I do not
+        # want those checkboxes.  It should be automatic") — always applied;
+        # the SHARED ``plotting._voltage_axis_label`` helper is self-gating, so
+        # a MIXED voltage+current (or V_mon+potential) axis stays plain
+        # "Voltage [V]".  Derivative overlays (dV/dt) are normalized SHAPE-only
+        # curves, not a volts quantity, so they don't count here.  Pushed
+        # through every refresh so a trace / area / electrode-name change
+        # updates it live, and kept as the single source of truth with the
+        # export / POLARIS figures.
+        _parent = getattr(self, "_scope_parent", None)
+        # ON by default, but OFF (→ plain "Voltage [V]") when the device has no
+        # electrodes — the Plexon Test Board has no reference / return electrode
+        # to name (operator: "If the Test Board is connected, the unit for the
+        # voltage channels can only be Voltage [V]").
+        _ref_aware = bool(getattr(_parent, "_reference_aware_labels", True))
+        _pot_on = _ref_aware
+        _ret_on = _ref_aware
+        _ref = (getattr(_parent, "_reference_label", "") if _parent else "") \
+            or "Ag|AgCl"
+        _ret = (getattr(_parent, "_return_label", "") if _parent else "") \
+            or "Pt"
+        _left_keys = {k for k, a in axis.items() if a == AXIS_LEFT}
+        _left_waves: set = set()
+        if self._trace_label(TRACE_VMON) in _left_keys:
+            _left_waves.add("V_mon")
+        if ({self._trace_label(TRACE_EACT),
+             self._trace_label(TRACE_EACT_CORR)} & _left_keys):
+            _left_waves.add("E_act")
+        if ({self._trace_label(TRACE_ERET),
+             self._trace_label(TRACE_ERET_CORR)} & _left_keys):
+            _left_waves.add("E_ret")
+        from ..plotting import _voltage_axis_label
+        self.scope.set_axis_labels(
+            left=_voltage_axis_label(_left_waves, potential_axis=_pot_on,
+                                     reference_label=_ref, return_axis=_ret_on,
+                                     return_label=_ret, brackets=True))
         # Align the 0 V tick with the 0 µA / 0 A·cm⁻² tick — port of
         # MATLAB getPlot.m, same routine the calibration plot uses.
         # Skipped silently if pyqtgraph is missing or the right axis
         # has no data this frame.
         self.scope.align_y_zeros()
+        # ---- Metric cursors on the live plot (MATLAB getPlot style) ----
+        # Drawn AFTER align_y_zeros so the label placement (which avoids
+        # the trace, the screen edges, AND other labels by choosing a
+        # side / corner per marker) sees the FINAL view range.  V_a / V_d
+        # use a horizontal bar, electrode polarization a "+" (Emc/Ema);
+        # all black (the glyph shape distinguishes the kind).
+        try:
+            from ..plotting import (compute_metric_markers, marker_label_html,
+                                     MARKER_COLOURS)
+            # Per-kind colourblind-safe colours (operator: "vary the color of
+            # the markers and respective label, colorblind safe") — SHARED with
+            # the export via ``MARKER_COLOURS``; each label inherits its glyph's
+            # colour (``_color`` below).
+            _style = {
+                "access":        (MARKER_COLOURS["access"], "hbar"),
+                # V_d glyph is a PLUS (operator: "Change the driving voltage
+                # marker symbol as a plus instead of a horizontal bar") — the
+                # reddish-purple colour still separates it from the purple
+                # polarization plus.
+                "driving":       (MARKER_COLOURS["driving"], "+"),
+                "driving_other": (MARKER_COLOURS["driving_other"], "hbar"),
+                "polar":         (MARKER_COLOURS["polar"], "+"),
+                "interphase":    (MARKER_COLOURS["interphase"], "o"),
+                "badclass":      (MARKER_COLOURS["badclass"], "x"),
+            }
+            _markers = []
+            for _mk in compute_metric_markers(cap):
+                _color, _sym = _style.get(
+                    _mk["kind"], (MARKER_COLOURS["badclass"], "x"))
+                _no_label = bool(_mk.get("no_label"))
+                _markers.append((
+                    _mk["label"], _mk["t_us"], _mk["y"], _mk["text"],
+                    _color, _sym,
+                    None if _no_label else marker_label_html(_mk),
+                    not _no_label,                       # 8th: draw_label
+                ))
+            # The scope parks the legend clear of the waveform + these labels.
+            self.scope.set_markers(_markers)
+            # Vertical guide lines at the EXPECTED E_pol locations (12 µs
+            # after each delayed phase) — a geometric reference so the
+            # operator can verify the measured Emc/Ema landed correctly,
+            # especially for smooth sine/gaussian pulses (operator request).
+            try:
+                from ..plotting import expected_epol_times_us
+                self.scope.set_epol_guides(expected_epol_times_us(cap))
+            except Exception:
+                pass
+        except Exception:
+            # Cursor decoration must never break the waveform render.
+            pass
         # Inset state: pass through to the plot. The inset trace
         # selection comes in as raw role tags (V_mon / I_mon / ...);
         # translate to the unit-suffixed names that ScopePlot uses
-        # internally.
+        # internally.  NOT filtered by main-plot visibility — an inset trace
+        # need NOT be shown in the main plot (operator: "The inset trace should
+        # not have to also be in the main plot as well").  Its data was stored
+        # (as a data-only AXIS_NA trace) above, so the inset can draw it.
         if inset_traces:
-            inset_keys = {self._trace_label(t) for t in inset_traces
-                          if visible.get(t, True)}
+            inset_keys = {self._trace_label(t) for t in inset_traces}
         else:
             inset_keys = set()
+        # Inset LEFT-axis title for a voltage / potential inset — mirror the
+        # main-axis "Potential vs <ref>" / "Voltage vs <return>" options
+        # (gotcha #159).  The inset is single-select, so its content is the one
+        # inset trace; map its role to a wave set and reuse the SAME shared
+        # helper the main axis uses.  Ignored by the plot when the inset shows
+        # current (I_mon).  ``_pot_on`` / ``_ret_on`` / ``_ref`` / ``_ret`` /
+        # ``_voltage_axis_label`` were computed for the main label above.
+        _inset_wave: set = set()
+        for _t in (inset_traces or ()):
+            if _t == TRACE_VMON:
+                _inset_wave.add("V_mon")
+            elif _t in (TRACE_EACT, TRACE_EACT_CORR):
+                _inset_wave.add("E_act")
+            elif _t in (TRACE_ERET, TRACE_ERET_CORR):
+                _inset_wave.add("E_ret")
+        self.scope.set_inset_voltage_label(
+            _voltage_axis_label(_inset_wave, potential_axis=_pot_on,
+                                reference_label=_ref, return_axis=_ret_on,
+                                return_label=_ret, brackets=True))
+        # If the I_mon (current) curve is in the inset, tell the plot which
+        # unit it's in so the inset's SINGLE left axis is labelled accordingly
+        # — Current [µA] or Current Density [A/cm²] per the experiment tab's
+        # unit dropdown.  NO density right axis (operator: "for the inset with
+        # Imon, do not have a right axis … Only change between current and
+        # current density based on the dropdown list unit").  The stored curve
+        # data is ALREADY in the chosen unit (``_use_density`` tracks the
+        # dropdown), so the inset draws it as-is.
+        try:
+            _imon_key = self._trace_label(TRACE_IMON)
+            if _imon_key in inset_keys:
+                self.scope.set_inset_current_scale(
+                    _imon_key, density=_use_density)
+            else:
+                self.scope.set_inset_current_scale(None)
+        except Exception:
+            pass
         self.scope.set_inset_traces(inset_keys)
         self.scope.set_inset_visible(bool(inset_visible))
 
@@ -571,6 +1095,14 @@ class MultiChannelScope(QtWidgets.QWidget):
       subset of waveforms while keeping the full set visible above.
     """
 
+    #: Emitted with the Capture now SHOWN in the plot whenever the user
+    #: navigates (per-capture dropdown / prev / next, the entry list, or the
+    #: Latest button).  The experiment tab connects this to the metrics-side
+    #: table so the numbers always match the displayed waveform (operator:
+    #: "the plot values [are] not matching with the table values" — the table
+    #: used to stay on the last LIVE capture while the plot was navigated).
+    captureChanged = QtCore.pyqtSignal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # ----- top bar: per-trace axis dropdowns -----
@@ -582,29 +1114,70 @@ class MultiChannelScope(QtWidgets.QWidget):
         # Visibility is encoded as AXIS_NA — no separate flag.
         self._axis_map: Dict[str, str] = dict(DEFAULT_TRACE_AXIS)
         # Which traces the scope is actually capturing. Default to all
-        # four; ``set_available_traces`` narrows the list once the
-        # experiment tab pushes its alias map.
-        self._available_traces: set = set(ALL_TRACES)
+        # four (+ the always-available derivative overlays); ``set_available_traces``
+        # narrows the base once the experiment tab pushes its alias map, and
+        # ``_recompute_available`` re-adds the derivatives.
+        self._available_traces: set = set(ALL_TRACES) | set(ALL_DERIV_TRACES)
+        # BASE availability (from the alias map) vs the CORRECTED interface
+        # pair (E′act / E′ret), which is only available when a continuous-
+        # sinusoidal capture is being shown (``set_corrected_shape``).  The
+        # effective ``_available_traces`` is recomputed from both.
+        self._base_available: set = set(ALL_TRACES)
+        self._corrected_shape_ok: bool = False
         # Electrode surface area for the current run — pushed by the
         # experiment tab at run start.  ``None`` / 0 → plot I_mon in
         # µA; a positive value → plot current density (A/cm²) on the
         # right axis, with the unit on the second line of the label.
         self._surface_area_um2: Optional[float] = None
+        # I_mon PLOTTING UNIT — the ``imon_unit_combo`` next to the I_mon
+        # axis dropdown lets the operator choose µA vs A/cm² (operator:
+        # "unit dropdown list by Imon in experiment tab to select plotting
+        # in uA or A/cm2").  Default "uA" (matches the app-wide "default
+        # current" preference, gotcha #49).  The A/cm² choice only takes
+        # effect when a surface area is set; ``_effective_area_um2`` folds
+        # the two together so the raw ``_surface_area_um2`` stays intact.
+        self._imon_unit: str = "uA"
+        # LEFT-AXIS LABEL — AUTOMATIC reference-aware relabel (operator: "I do
+        # not want those checkboxes.  It should be automatic").  When only
+        # electrode potentials (E_act / E_ret, incl. their corrected variants)
+        # are on the left axis and no V_mon, it reads "Potential vs <ref> [V]"
+        # (V_mon is a driving voltage; E_act / E_ret are potentials vs the
+        # reference electrode); when only V_mon is on the axis it reads
+        # "Voltage vs <return> [V]"; a mixed axis stays plain "Voltage [V]".
+        # The electrode NAMES are pushed per run from the Setup tab (reference
+        # short name / return coating); they fall back to Ag|AgCl / Pt.
+        self._reference_label: str = "Ag|AgCl"
+        self._return_label: str = "Pt"
+        # AUTOMATIC reference-aware relabel is ON unless the device has no
+        # electrodes (Plexon Test Board) — then the voltage axis stays plain
+        # "Voltage [V]" (operator: "If the Test Board is connected, the unit for
+        # the voltage channels can only be Voltage [V]").  Pushed per run from
+        # the Setup snapshot's ``has_electrodes``.
+        self._reference_aware_labels: bool = True
 
-        bar = QtWidgets.QHBoxLayout()
-        for trace in ALL_TRACES:
-            # Coloured trace name — same hue family as the curve in the
-            # plot so the user reads the row at a glance.
-            lbl = QtWidgets.QLabel(self._trace_label(trace))
+        # Trace toggles laid out as a COLUMN (operator) — one row per trace:
+        # [coloured name][axis dropdown], both FIXED width so every dropdown
+        # lines up at the same left edge AND the same width (operator: "same
+        # width") regardless of label length ("1/(dV/dt)" is wider than
+        # "V_mon").  The I_mon current/density unit dropdown goes on its own
+        # indented row below (the narrow left column can't fit it inline).
+        trace_col = QtWidgets.QVBoxLayout()
+        trace_col.setSpacing(2)
+        _LBL_W, _COMBO_W = 80, 112
+        for trace in ALL_TOGGLE_TRACES:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            # Coloured trace name in VARIABLE format (V italic + mon
+            # subscript via HTML), same hue as the curve in the plot.
+            lbl = QtWidgets.QLabel(_subscript_trace_name(trace))
+            lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
             lbl.setStyleSheet(
                 f"color: {TRACE_COLOURS[trace]}; font-weight: bold;")
+            lbl.setFixedWidth(_LBL_W)
             self.axis_labels[trace] = lbl
-            bar.addWidget(lbl)
-            # Single dropdown collapses the old (visibility checkbox +
-            # L/R combo) pair: ``N/A`` hides the trace, the two axis
-            # entries place it on left or right. Items spelled out per
-            # the user spec so ``L`` / ``R`` aren't ambiguous on first
-            # encounter.
+            row.addWidget(lbl)
+            # Single dropdown: ``N/A`` hides the trace, the two axis entries
+            # place it on the left or right y-axis.
             axis_combo = QtWidgets.QComboBox()
             axis_combo.addItem("N/A",          userData=AXIS_NA)
             axis_combo.addItem("Left y-axis",  userData=AXIS_LEFT)
@@ -612,59 +1185,112 @@ class MultiChannelScope(QtWidgets.QWidget):
             default_axis = DEFAULT_TRACE_AXIS.get(trace, AXIS_LEFT)
             axis_combo.setCurrentIndex(
                 {AXIS_NA: 0, AXIS_LEFT: 1, AXIS_RIGHT: 2}[default_axis])
+            axis_combo.setFixedWidth(_COMBO_W)
+            _is_deriv = trace in ALL_DERIV_TRACES
             axis_combo.setToolTip(
-                f"{trace} placement on the scope: pick "
-                f"<b>N/A</b> to hide it, <b>Left y-axis</b> for the "
-                f"main voltage scale, <b>Right y-axis</b> for the "
-                f"second (current / alternate) scale. Default for "
-                f"{trace} is "
-                f"<b>{'Right y-axis' if DEFAULT_TRACE_AXIS[trace] == AXIS_RIGHT else 'Left y-axis'}</b>.")
+                (f"{trace}: a NORMALIZED overlay (scaled to fit the voltage "
+                 f"axis — shape only, dashed) when set to an axis; N/A hides it."
+                 if _is_deriv else
+                 f"{trace} placement on the scope: pick "
+                 f"<b>N/A</b> to hide it, <b>Left y-axis</b> for the "
+                 f"main voltage scale, <b>Right y-axis</b> for the "
+                 f"second (current / alternate) scale."))
             axis_combo.currentIndexChanged.connect(
                 lambda _idx, t=trace: self._on_axis_changed(t))
             self.axis_combos[trace] = axis_combo
-            bar.addWidget(axis_combo)
-        bar.addSpacing(12)
+            row.addWidget(axis_combo)
+            row.addStretch(1)
+            trace_col.addLayout(row)
+            # I_mon unit dropdown — µA vs current density (A/cm²), enabled only
+            # when a surface area is set — on its OWN row, aligned under the
+            # axis dropdown (won't fit inline in the narrow left column).
+            if trace == TRACE_IMON:
+                self.imon_unit_combo = QtWidgets.QComboBox()
+                # Show JUST the unit (operator) — the row already reads "I_mon",
+                # so the descriptive "Current …" text is redundant.
+                self.imon_unit_combo.addItem("µA", userData="uA")
+                self.imon_unit_combo.addItem("A/cm²", userData="density")
+                self.imon_unit_combo.setToolTip(
+                    "Plot the I_mon trace as raw current (µA) or current "
+                    "density (A/cm²).  Density requires a surface area to be "
+                    "set in Setup — otherwise only µA is available.")
+                self.imon_unit_combo.setSizeAdjustPolicy(
+                    QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+                self.imon_unit_combo.currentIndexChanged.connect(
+                    self._on_imon_unit_changed)
+                # Right-align the (narrow) unit dropdown so its RIGHT edge lines
+                # up with the axis dropdowns' right edge (operator: "aligned to
+                # the right with the other lists").  Mirror the axis row geometry
+                # [label _LBL_W][combo _COMBO_W]: an _LBL_W leader (matching the
+                # trace label) + a fixed _COMBO_W slot that RIGHT-aligns the
+                # narrow unit combo within it — so its right edge sits at exactly
+                # the axis dropdowns' right edge regardless of column width.
+                urow = QtWidgets.QHBoxLayout()
+                urow.setSpacing(4)
+                _unit_leader = QtWidgets.QWidget()
+                _unit_leader.setFixedWidth(_LBL_W)
+                urow.addWidget(_unit_leader)
+                _unit_slot = QtWidgets.QHBoxLayout()
+                _unit_slot.setContentsMargins(0, 0, 0, 0)
+                _unit_slot.setSpacing(0)
+                _unit_slot.addStretch(1)
+                _unit_slot.addWidget(self.imon_unit_combo)
+                _unit_slot_w = QtWidgets.QWidget()
+                _unit_slot_w.setFixedWidth(_COMBO_W)
+                _unit_slot_w.setLayout(_unit_slot)
+                urow.addWidget(_unit_slot_w)
+                urow.addStretch(1)
+                trace_col.addLayout(urow)
+                self._refresh_imon_unit_combo()
+        self._trace_col = trace_col
 
-        # ----- inset controls -----
-        # Toggle button: when on, the small inset plot below the main
-        # view is visible.
+        # NOTE: the left-axis label ("Voltage [V]" vs "Potential vs <ref> [V]"
+        # vs "Voltage vs <return> [V]") is now AUTOMATIC (operator: "I do not
+        # want those checkboxes.  It should be automatic") — decided per
+        # refresh in ``_ChannelPage._refresh_traces`` from the axis content.
+        # The old "Potential axis" / "Voltage vs return" checkboxes are gone.
+
+        # ----- inset controls (placed ON TOP of the left column) -----
         self.inset_check = QtWidgets.QCheckBox("Inset")
         self.inset_check.setChecked(False)
         self.inset_check.setToolTip(
             "Show a compact inset plot below the main scope, mirroring "
-            "the trace(s) you pick from the dropdown next to this "
+            "the trace you pick from the dropdown next to this "
             "toggle. Useful for keeping a focused single-trace view "
             "alongside the full multi-trace plot.")
         self.inset_check.toggled.connect(self._on_inset_toggled)
-        bar.addWidget(self.inset_check)
-        # Multi-select dropdown for inset traces — a QToolButton
-        # whose popup menu carries one checkable QAction per trace.
-        # Mirrors the spreadsheet "Filter" UX (and combination_panel's
-        # checkable list-widget pattern, just inside a popup).
-        self.inset_btn = QtWidgets.QToolButton()
-        self.inset_btn.setText("(pick traces)")
-        self.inset_btn.setPopupMode(
-            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.inset_btn.setToolTip(
-            "Pick which traces appear in the inset. Multi-select; "
-            "default starts empty so the inset is blank until you "
-            "pick at least one.")
-        self._inset_menu = QtWidgets.QMenu(self.inset_btn)
-        self.inset_actions: Dict[str, "QtGui.QAction"] = {}
-        for trace in ALL_TRACES:
-            act = self._inset_menu.addAction(trace)
-            act.setCheckable(True)
-            act.setChecked(False)
-            act.triggered.connect(self._on_inset_traces_changed)
-            self.inset_actions[trace] = act
-        self.inset_btn.setMenu(self._inset_menu)
-        # Keep the button label in sync with the picked subset.
-        self._refresh_inset_button_label()
-        # Disabled until the inset is toggled on — clearer affordance
-        # that the dropdown is inert without the inset.
-        self.inset_btn.setEnabled(False)
-        bar.addWidget(self.inset_btn)
-        bar.addStretch(1)
+        # SINGLE-select dropdown for the inset trace (operator: "For the
+        # inset, only one trace can be selected").  A ``_RichComboBox`` so the
+        # trace names render in VARIABLE format (V<sub>mon</sub>).  "(none)"
+        # keeps the inset blank; userData carries the trace key ("" for none).
+        self.inset_combo = _RichComboBox()
+        self.inset_combo.addItem("(none)", userData="")
+        for trace in ALL_TOGGLE_TRACES:
+            self.inset_combo.addItem(_subscript_trace_name(trace),
+                                     userData=trace)
+        self.inset_combo.setToolTip(
+            "Pick the ONE trace to mirror in the inset plot below the main "
+            "scope.  '(none)' leaves the inset blank.")
+        self.inset_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.inset_combo.setMinimumContentsLength(6)
+        self.inset_combo.setMaximumWidth(96)
+        self.inset_combo.currentIndexChanged.connect(
+            self._on_inset_traces_changed)
+        # Disabled until the inset is toggled on — clearer affordance that the
+        # dropdown is inert without the inset.
+        self.inset_combo.setEnabled(False)
+        # Inset controls live in a container widget that is MOUNTED at the far
+        # right of the ACTIVE page's view-controls row (operator: "move the
+        # inset option in [reset view's former] place") — see
+        # ``_reposition_inset_controls``.  Kept parented to ``self`` when no
+        # page is shown so a page teardown (``clear``) never deletes it.
+        self._inset_controls = QtWidgets.QWidget(self)
+        _ir = QtWidgets.QHBoxLayout(self._inset_controls)
+        _ir.setContentsMargins(0, 0, 0, 0)
+        _ir.setSpacing(4)
+        _ir.addWidget(self.inset_check)
+        _ir.addWidget(self.inset_combo)
 
         # ----- entry list + content stack -----
         # Replaces the previous QTabWidget — a left-side ``QListWidget``
@@ -679,11 +1305,31 @@ class MultiChannelScope(QtWidgets.QWidget):
         # that share an active channel get distinct rows because
         # their ``str`` keys differ.
         self._pages: Dict[object, _ChannelPage] = {}
+        # View → Gridlines state, forwarded to every page's ScopePlot AND
+        # re-applied to any page created later (gotcha: the toggle used to
+        # do nothing because MultiChannelScope had no set_grid_visible, so
+        # main_window's `getattr(widget, "set_grid_visible")` was None).
+        self._grid_visible = False
         # ``_keys_in_order`` maintains the insertion order so a list
         # row at index ``i`` corresponds to the i-th page on the stack
         # — Qt doesn't expose a direct row→key lookup so we keep one.
         self._keys_in_order: List[object] = []
         self._completed: set = set()
+        # ----- channel/combo follow state -----
+        # When True (default), a new capture auto-selects its entry so
+        # the view tracks the live channel/combo.  The user selecting a
+        # DIFFERENT entry pins the view there (follow OFF) until they
+        # press "Latest" — operator: "If a different channel/combo was
+        # selected from the latest, do not automatically go to the new
+        # latest … Include a latest button … (and move to the latest
+        # until a different channel/combo is selected)."  Mirrors the
+        # per-page capture follow on _ChannelPage.  ``_latest_key`` is
+        # the key of the most-recent capture — what "Latest" jumps to.
+        # ``_programmatic_select`` guards auto-selection so it doesn't
+        # read as a user pin in ``_on_entry_changed``.
+        self._entry_auto_follow: bool = True
+        self._latest_key = None
+        self._programmatic_select: bool = False
 
         self.entry_list = QtWidgets.QListWidget()
         self.entry_list.setToolTip(
@@ -692,6 +1338,17 @@ class MultiChannelScope(QtWidgets.QWidget):
             "trace and metric table on the right.")
         self.entry_list.setMaximumWidth(220)
         self.entry_list.currentRowChanged.connect(self._on_entry_changed)
+        # "Latest" button — re-arms follow + jumps to the most-recent
+        # channel/combo.  Lives under the entry list.
+        self._entry_latest_btn = QtWidgets.QToolButton()
+        self._entry_latest_btn.setText("⤓ Latest")
+        self._entry_latest_btn.setToolTip(
+            "Jump to the most recently captured channel / combination "
+            "and re-arm auto-follow so the view snaps to new ones as "
+            "they appear. Selecting a different entry above pins the "
+            "view there until you press this.")
+        self._entry_latest_btn.clicked.connect(self._jump_latest_entry)
+        self._entry_latest_btn.setEnabled(False)
         self.content_stack = QtWidgets.QStackedWidget()
         # When the stack is empty we show a placeholder so the right
         # pane doesn't render as an empty grey rectangle pre-run.
@@ -703,22 +1360,45 @@ class MultiChannelScope(QtWidgets.QWidget):
         self._placeholder.setWordWrap(True)
         self._placeholder.setStyleSheet("color: #888; padding: 32px;")
         self.content_stack.addWidget(self._placeholder)
+        # Keep the inset control mounted on whichever page is shown (far right
+        # of that page's view-controls row); detach it when the placeholder is
+        # shown so a page teardown can't delete it.
+        self.content_stack.currentChanged.connect(
+            self._reposition_inset_controls)
 
-        # Horizontal splitter so the user can tune how much room the
-        # entry list gets — e.g. 4-cell list vs a long combination
-        # name set.
+        # Left column, top → bottom: the inset control, the aligned trace-axis
+        # dropdowns, the axis-label options, then the channel/combination list
+        # (stretch) with the Latest button below it.  Putting ALL the controls
+        # in this narrow left column — rather than in a top strip above the
+        # plot — lets the plot fill the FULL height on the right, removing the
+        # empty band that used to sit above it (operator: "stretch the
+        # experiment up, remove the empty space").
+        left_col = QtWidgets.QWidget()
+        left_v = QtWidgets.QVBoxLayout(left_col)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(4)
+        # (The inset control is no longer in the left column — it's mounted on
+        # the active plot's control row, next to Reset view.)
+        left_v.addLayout(self._trace_col)            # aligned trace dropdowns
+        left_v.addWidget(self.entry_list, stretch=1)  # channel/combo list
+        left_v.addWidget(self._entry_latest_btn)
+        left_col.setMaximumWidth(215)
+
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        split.addWidget(self.entry_list)
+        split.addWidget(left_col)
         split.addWidget(self.content_stack)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([180, 520])
+        split.setSizes([205, 520])
         self._main_split = split
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addLayout(bar)
         v.addWidget(split, stretch=1)
+        # Initial state: the placeholder is shown → keep the inset control
+        # detached + hidden until the first page appears (currentChanged then
+        # mounts it on that page).
+        self._reposition_inset_controls()
 
     # ---------------------------------------------------------- public API
     def visibility(self) -> Dict[str, bool]:
@@ -731,7 +1411,7 @@ class MultiChannelScope(QtWidgets.QWidget):
         """
         return {t: (self._axis_map.get(t) != AXIS_NA
                     and t in self._available_traces)
-                for t in ALL_TRACES}
+                for t in ALL_TOGGLE_TRACES}
 
     def set_visibility(self, vis: Dict[str, bool]):
         """Compatibility shim for legacy prefs.
@@ -804,41 +1484,71 @@ class MultiChannelScope(QtWidgets.QWidget):
         available (the default; useful for tests / legacy callers).
         """
         if not available:
-            available_set = set(ALL_TRACES)
+            base_set = set(ALL_TRACES)
         else:
-            available_set = {str(t) for t in available if t in ALL_TRACES}
+            base_set = {str(t) for t in available if t in ALL_TRACES}
         # E_ret implies E_act per the user spec.
-        if TRACE_ERET in available_set:
-            available_set.add(TRACE_EACT)
-        self._available_traces = available_set
-        # Show / hide the per-trace controls (label + axis combo) as
-        # a unit. Unavailable traces get their axis forced to AXIS_NA
-        # so ``visibility()`` reads ``False`` and the plot skips them.
-        for trace in ALL_TRACES:
-            visible = trace in available_set
-            self.axis_labels[trace].setVisible(visible)
-            self.axis_combos[trace].setVisible(visible)
-            if not visible:
-                # Don't clobber the user's saved axis choice for the
-                # eventual return of this trace — only the runtime
-                # ``_available_traces`` check gates rendering. The
-                # axis combo state stays put.
-                pass
-        # Also prune the inset selection: a trace that's no longer
-        # available shouldn't keep its inset checkbox set, otherwise
-        # toggling availability back on later would re-introduce a
-        # stale selection silently.
-        for trace, act in self.inset_actions.items():
-            act.setVisible(trace in available_set)
-            if trace not in available_set and act.isChecked():
-                act.blockSignals(True)
-                try:
-                    act.setChecked(False)
-                finally:
-                    act.blockSignals(False)
-        self._refresh_inset_button_label()
-        # Repaint every existing page with the new availability.
-        self._on_visibility_toggled()
+        if TRACE_ERET in base_set:
+            base_set.add(TRACE_EACT)
+        self._base_available = base_set
+        # Recompute the effective availability (base + the corrected pair when
+        # a sinusoidal capture is shown) and repaint — an alias change is a
+        # real run event.
+        self._recompute_available(repaint=True)
+
+    def set_corrected_shape(self, sinusoidal: bool) -> None:
+        """Mark whether the CURRENTLY-shown capture is a continuous sinusoid,
+        which is what makes the corrected interface pair (E′act / E′ret)
+        AVAILABLE as toggle-bar rows + inset options.  Called per-capture from
+        the page's ``_refresh_traces``; idempotent (a no-op when unchanged) so
+        it never loops.  UI-only (no page repaint) — the current
+        ``_refresh_traces`` already draws the corrected curves via the
+        axis-map gate, so this only shows/hides the toggle-bar controls."""
+        sinusoidal = bool(sinusoidal)
+        if sinusoidal == self._corrected_shape_ok:
+            return
+        self._corrected_shape_ok = sinusoidal
+        self._recompute_available(repaint=False)
+
+    def _recompute_available(self, *, repaint: bool) -> None:
+        """Rebuild ``_available_traces`` from the base alias set + the
+        corrected pair (available only when a sinusoidal capture is shown AND
+        its source electrode is captured), then show / hide the per-trace rows
+        and prune the inset selection."""
+        avail = set(self._base_available)
+        if self._corrected_shape_ok:
+            # E′act needs V_mon OR E_act; E′ret needs E_ret.
+            if TRACE_VMON in avail or TRACE_EACT in avail:
+                avail.add(TRACE_EACT_CORR)
+            if TRACE_ERET in avail:
+                avail.add(TRACE_ERET_CORR)
+        # Derivative overlays are ALWAYS available (any capture is
+        # differentiable) as long as a source trace (V_mon or E_act) is present.
+        if TRACE_VMON in avail or TRACE_EACT in avail:
+            avail.update(ALL_DERIV_TRACES)
+        self._available_traces = avail
+        # Show / hide the per-trace controls (label + axis combo) as a unit.
+        # An unavailable trace keeps its saved axis choice; only the runtime
+        # ``_available_traces`` check gates rendering.
+        for trace in ALL_TOGGLE_TRACES:
+            vis = trace in avail
+            self.axis_labels[trace].setVisible(vis)
+            self.axis_combos[trace].setVisible(vis)
+        # Prune the inset selection: a trace that's no longer available
+        # shouldn't stay selected, and its combo row is hidden so it can't be
+        # re-picked while absent.
+        self.inset_combo.blockSignals(True)
+        try:
+            for i in range(1, self.inset_combo.count()):      # skip "(none)"
+                trace = self.inset_combo.itemData(i)
+                self.inset_combo.view().setRowHidden(i, trace not in avail)
+            cur = self.inset_combo.currentData()
+            if cur and cur not in avail:
+                self.inset_combo.setCurrentIndex(0)           # → "(none)"
+        finally:
+            self.inset_combo.blockSignals(False)
+        if repaint:
+            self._on_visibility_toggled()
 
     def available_traces(self) -> set:
         """Snapshot of the currently-captured traces (after the
@@ -852,22 +1562,44 @@ class MultiChannelScope(QtWidgets.QWidget):
         self.inset_check.setChecked(bool(on))   # triggers _on_inset_toggled
 
     def inset_traces(self) -> List[str]:
-        return [t for t, act in self.inset_actions.items() if act.isChecked()]
+        # SINGLE-select: the combo carries at most one trace (or "(none)").
+        cur = self.inset_combo.currentData()
+        return [cur] if cur else []
 
     def set_inset_traces(self, traces) -> None:
-        names = set(traces or [])
-        for t, act in self.inset_actions.items():
-            act.blockSignals(True)
-            try:
-                act.setChecked(t in names)
-            finally:
-                act.blockSignals(False)
-        self._refresh_inset_button_label()
+        # Single-select: take the FIRST requested trace (backward-compatible
+        # with the old multi-select prefs, which stored a list).  Unknown /
+        # empty → "(none)".
+        names = list(traces or [])
+        want = names[0] if names else ""
+        idx = self.inset_combo.findData(want) if want else 0
+        if idx < 0:
+            idx = 0
+        self.inset_combo.blockSignals(True)
+        try:
+            self.inset_combo.setCurrentIndex(idx)
+        finally:
+            self.inset_combo.blockSignals(False)
         self._on_visibility_toggled()
 
     def ensure_tab(self, key) -> _ChannelPage:
         """Backward-compatible alias for :meth:`ensure_page`."""
         return self.ensure_page(key)
+
+    def set_grid_visible(self, visible: bool) -> None:
+        """Forward the View → Gridlines toggle to EVERY channel/combo page's
+        ScopePlot (the main window walks ``tab.multichan_scope`` and calls this;
+        without it the experiment scope's grid never toggled).  Remembers the
+        state so a page created LATER (a new channel streaming in mid-run) also
+        gets it."""
+        self._grid_visible = bool(visible)
+        for page in self._pages.values():
+            setter = getattr(getattr(page, "scope", None), "set_grid_visible", None)
+            if callable(setter):
+                try:
+                    setter(self._grid_visible)
+                except Exception:
+                    pass
 
     def ensure_page(self, key) -> _ChannelPage:
         """Get/create the entry-list row + stacked-widget page for ``key``.
@@ -892,6 +1624,14 @@ class MultiChannelScope(QtWidgets.QWidget):
         if key in self._pages:
             return self._pages[key]
         page = _ChannelPage(key)
+        page._scope_parent = self    # so per-capture nav can emit captureChanged
+        # Apply the current gridlines state so a page created after the View →
+        # Gridlines toggle still shows the grid.
+        if self._grid_visible:
+            try:
+                page.scope.set_grid_visible(True)
+            except Exception:
+                pass
         self._pages[key] = page
         self._keys_in_order.append(key)
         self.content_stack.addWidget(page)
@@ -901,9 +1641,10 @@ class MultiChannelScope(QtWidgets.QWidget):
         # Auto-select the very first entry so the user never sees the
         # placeholder once captures start streaming. Subsequent
         # entries don't steal focus — that's
-        # :meth:`add_capture`'s job.
+        # :meth:`add_capture`'s job.  Programmatic so it doesn't read
+        # as a user pin.
         if self.entry_list.count() == 1:
-            self.entry_list.setCurrentRow(0)
+            self._select_entry_row(0)
         return page
 
     def add_pending(self, key) -> _ChannelPage:
@@ -939,13 +1680,35 @@ class MultiChannelScope(QtWidgets.QWidget):
                          axis_map=self._axis_map,
                          inset_visible=self.inset_enabled(),
                          inset_traces=set(self.inset_traces()),
-                         surface_area_um2=self._surface_area_um2)
-        # Focus the matching list row so the right-side stack auto-
-        # swaps. ``ensure_page`` already auto-focused the very first
-        # entry; subsequent captures pull the active selection along
-        # with them so the user doesn't have to manually click.
-        idx = self._keys_in_order.index(key)
-        self.entry_list.setCurrentRow(idx)
+                         surface_area_um2=self._effective_area_um2(),
+                         title_area_um2=self._surface_area_um2)
+        # This key is now the "latest" — what the Latest button jumps to.
+        self._latest_key = key
+        # Only pull the selection to the new capture when auto-follow is
+        # armed. If the user has pinned a DIFFERENT entry, leave their
+        # view put (operator: don't auto-jump to the new latest) — the
+        # row still appears in the list and its page fills in silently.
+        if self._entry_auto_follow:
+            idx = self._keys_in_order.index(key)
+            self._select_entry_row(idx)
+        # Sync the metrics table to the capture ACTUALLY ON SCREEN — but
+        # ONLY when this capture's page is the one currently displayed.
+        # In a multi-config sweep a capture can arrive for a channel the
+        # user ISN'T looking at (they pinned a completed channel while the
+        # next one ramps); without this guard the table showed that
+        # ramping channel's tiny early capture (e.g. 5 µA) while the plot
+        # stayed on the pinned high-amplitude one — every value mismatched
+        # (operator: "why are the plot values not matching the table").
+        # captureChanged → metrics_side.show_capture is the SINGLE table
+        # source now; ``_on_capture`` no longer pushes the raw capture.
+        if page is self.content_stack.currentWidget():
+            cap = page.current_capture()
+            if cap is not None:
+                try:
+                    self.captureChanged.emit(cap)
+                except Exception:
+                    pass
+        self._refresh_latest_btn()
 
     def set_surface_area_um2(self, area_um2: Optional[float]) -> None:
         """Set (or clear) the electrode surface area used for I_mon
@@ -967,9 +1730,20 @@ class MultiChannelScope(QtWidgets.QWidget):
         if new_area == self._surface_area_um2:
             return
         self._surface_area_um2 = new_area
+        # A/cm² is only offered when an area exists — refresh the unit
+        # combo's enabled/visible state (and fall back to µA if the area
+        # was cleared while density was selected).
+        self._refresh_imon_unit_combo()
         # Push the new presentation into every existing page so the
         # axis label + I_mon scaling update without waiting for the
         # next capture.
+        self._rerender_all_pages()
+
+    def _rerender_all_pages(self) -> None:
+        """Re-render every existing page with the current global toggles.
+        Used when a display-only setting changes mid-run (surface area, the
+        left-axis label option, the reference name) so the change takes
+        effect immediately instead of waiting for the next capture."""
         vis = self.visibility()
         for page in self._pages.values():
             try:
@@ -977,13 +1751,123 @@ class MultiChannelScope(QtWidgets.QWidget):
                     vis, axis_map=self._axis_map,
                     inset_visible=self.inset_enabled(),
                     inset_traces=set(self.inset_traces()),
-                    surface_area_um2=self._surface_area_um2)
+                    surface_area_um2=self._effective_area_um2(),
+                    title_area_um2=self._surface_area_um2)
             except Exception:
                 pass
 
+    def set_reference_label(self, name: Optional[str]) -> None:
+        """Set the reference-electrode name used in the "Potential vs <ref>
+        [V]" left-axis label (pushed per run from the Setup tab; falls back
+        to ``Ag|AgCl``).  The relabel is automatic, so a name change always
+        re-renders the affected pages."""
+        ref = (str(name).strip() if name else "") or "Ag|AgCl"
+        if ref == self._reference_label:
+            return
+        self._reference_label = ref
+        self._rerender_all_pages()
+
+    def reference_label(self) -> str:
+        """The reference-electrode name currently used for the potential-axis
+        label."""
+        return self._reference_label
+
+    def set_return_label(self, name: Optional[str]) -> None:
+        """Set the return / counter-electrode name used in the "Voltage vs
+        <return> [V]" left-axis label (pushed per run from the Setup tab;
+        falls back to ``Pt``).  The relabel is automatic, so a name change
+        always re-renders the affected pages."""
+        ret = (str(name).strip() if name else "") or "Pt"
+        if ret == self._return_label:
+            return
+        self._return_label = ret
+        self._rerender_all_pages()
+
+    def return_label(self) -> str:
+        """The return-electrode name currently used for the return-axis
+        label."""
+        return self._return_label
+
+    def set_reference_aware_labels(self, enabled: bool) -> None:
+        """Enable/disable the AUTOMATIC reference-aware left-axis relabel
+        ("Potential vs <ref> [V]" / "Voltage vs <return> [V]").  Disabled (→
+        plain "Voltage [V]") for a device with NO electrodes — the Plexon Test
+        Board — because it has no reference / return electrode to name
+        (operator: "If the Test Board is connected, the unit for the voltage
+        channels can only be Voltage [V]").  Re-renders on change."""
+        val = bool(enabled)
+        if val == getattr(self, "_reference_aware_labels", True):
+            return
+        self._reference_aware_labels = val
+        self._rerender_all_pages()
+
+    def reference_aware_labels(self) -> bool:
+        """Whether the reference-aware left-axis relabel is currently active."""
+        return self._reference_aware_labels
+
     def surface_area_um2(self) -> Optional[float]:
-        """Return the area currently in effect, or ``None`` for µA mode."""
+        """Return the RAW area set by the experiment tab (independent of the
+        unit choice), or ``None`` when unset."""
         return self._surface_area_um2
+
+    def _effective_area_um2(self) -> Optional[float]:
+        """The area to pass to the render layer: the raw area ONLY when the
+        operator picked A/cm² AND an area is set; ``None`` (→ µA) otherwise.
+        Keeps ``_surface_area_um2`` intact so switching back to density
+        doesn't need the area re-pushed."""
+        if self._imon_unit == "density" and self._surface_area_um2:
+            return self._surface_area_um2
+        return None
+
+    def _refresh_imon_unit_combo(self) -> None:
+        """Enable/disable the A/cm² item based on whether an area is set,
+        forcing µA when no area exists (operator: "Hide the A/cm² option if
+        there is no area inputted").  The density row is HIDDEN (0-height)
+        without an area so the dropdown offers µA only."""
+        combo = getattr(self, "imon_unit_combo", None)
+        if combo is None:
+            return
+        has_area = bool(self._surface_area_um2)
+        combo.blockSignals(True)
+        # Show/hide the density row via its model item (index 1).
+        view = combo.view()
+        try:
+            view.setRowHidden(1, not has_area)
+        except Exception:
+            pass
+        item = combo.model().item(1)
+        if item is not None:
+            item.setEnabled(has_area)
+        if not has_area and self._imon_unit == "density":
+            self._imon_unit = "uA"
+        combo.setCurrentIndex(0 if self._imon_unit == "uA" else 1)
+        combo.blockSignals(False)
+
+    def _on_imon_unit_changed(self, _idx: int) -> None:
+        """Operator picked µA vs A/cm² — restyle the I_mon axis + re-render
+        every page with the chosen presentation."""
+        combo = getattr(self, "imon_unit_combo", None)
+        if combo is None:
+            return
+        unit = combo.currentData()
+        # Guard: a disabled density pick (no area) snaps back to µA.
+        if unit == "density" and not self._surface_area_um2:
+            unit = "uA"
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._imon_unit = unit or "uA"
+        vis = self.visibility()
+        for page in self._pages.values():
+            try:
+                page.refresh_visibility(
+                    vis, axis_map=self._axis_map,
+                    inset_visible=self.inset_enabled(),
+                    inset_traces=set(self.inset_traces()),
+                    surface_area_um2=self._effective_area_um2(),
+                    title_area_um2=self._surface_area_um2)
+            except Exception:
+                pass
 
     def mark_completed(self, key):
         """Tag ``key``'s entry as finished — small ✓ at the end of
@@ -1000,12 +1884,41 @@ class MultiChannelScope(QtWidgets.QWidget):
             if item is not None:
                 item.setText(self._title(key))
 
+    def _reposition_inset_controls(self, *_) -> None:
+        """Mount the inset control on the ACTIVE page's view-controls row (far
+        right, next to Reset view); detach it (parented to self, hidden) when
+        the placeholder — or any non-page widget — is shown, so a page teardown
+        never deletes it (operator: "move the inset option in [reset view's
+        former] place")."""
+        ctrls = getattr(self, "_inset_controls", None)
+        if ctrls is None:
+            return
+        page = self.content_stack.currentWidget()
+        scope = getattr(page, "scope", None)
+        mount = getattr(scope, "mount_extra_control", None)
+        if callable(mount):
+            mount(ctrls)
+            ctrls.setVisible(True)
+        else:
+            ctrls.setParent(self)
+            ctrls.setVisible(False)
+
     def clear(self):
         """Drop every entry and reset to the placeholder view."""
         self._pages.clear()
         self._completed.clear()
         self._keys_in_order.clear()
         self.entry_list.clear()
+        # Reset follow state for the next run.
+        self._entry_auto_follow = True
+        self._latest_key = None
+        self._refresh_latest_btn()
+        # Detach the inset control back to self BEFORE tearing down pages, so a
+        # page that currently hosts it isn't deleted with the control attached.
+        # (setCurrentIndex(0) below then fires currentChanged → it stays detached
+        # + hidden on the placeholder.)
+        self._inset_controls.setParent(self)
+        self._inset_controls.setVisible(False)
         # Tear down every page widget except the placeholder at index
         # 0; the placeholder stays so a subsequent run can reuse it.
         while self.content_stack.count() > 1:
@@ -1016,10 +1929,12 @@ class MultiChannelScope(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- helpers
     def _trace_label(self, trace: str) -> str:
-        # QCheckBox text is plain (no HTML rendering). Use underscore-
-        # subscript notation that reads cleanly without markup. The rich
-        # variants are still used for the plot axis labels and headers.
-        return trace
+        # QCheckBox text is PLAIN (no HTML rendering — a <sub> tag would
+        # show as literal angle brackets).  So here we DROP the underscore
+        # rather than subscript it (operator: "… then remove the
+        # underscore"): "V_mon" -> "Vmon".  The legend (which DOES render
+        # HTML) subscripts instead — see module ``_subscript_trace_name``.
+        return trace.replace("_", "")
 
     def _title(self, key) -> str:
         """Tab title — accepts ``int`` (legacy CHnn) or ``str``
@@ -1037,22 +1952,79 @@ class MultiChannelScope(QtWidgets.QWidget):
                 vis, axis_map=self._axis_map,
                 inset_visible=self.inset_enabled(),
                 inset_traces=set(self.inset_traces()),
-                surface_area_um2=self._surface_area_um2)
+                surface_area_um2=self._effective_area_um2(),
+                title_area_um2=self._surface_area_um2)
 
     def _on_entry_changed(self, row: int) -> None:
-        """User picked a different list row — swap the stacked content.
+        """A list row became current — swap the stacked content.
 
         Stack widget index 0 is the placeholder; the page for list
         row ``i`` lives at stack index ``i + 1``. ``row == -1`` (no
         selection) falls back to the placeholder so the right pane
         reads as "no entry selected" instead of staying on whichever
         page was last visible.
+
+        **Follow handling:** when the change was USER-initiated (not the
+        programmatic auto-follow guard), selecting an entry that ISN'T
+        the latest pins the view there (follow OFF); selecting the latest
+        re-arms follow. Programmatic selections (auto-follow, first-entry
+        focus, the Latest button) leave the follow flag untouched.
         """
         if row < 0 or row >= len(self._keys_in_order):
             self.content_stack.setCurrentIndex(0)
             return
         # +1 because the placeholder occupies stack index 0.
         self.content_stack.setCurrentIndex(row + 1)
+        # Re-point the metrics table at the newly-shown page's capture so the
+        # numbers match the displayed waveform.
+        page = self._pages.get(self._keys_in_order[row])
+        if page is not None:
+            cap = page.current_capture()
+            if cap is not None:
+                try:
+                    self.captureChanged.emit(cap)
+                except Exception:
+                    pass
+        if not self._programmatic_select:
+            # User clicked a row.  Follow only if it IS the latest.
+            key = self._keys_in_order[row]
+            self._entry_auto_follow = (key == self._latest_key)
+            self._refresh_latest_btn()
+
+    def _select_entry_row(self, idx: int) -> None:
+        """Programmatically focus list row ``idx`` WITHOUT it counting as
+        a user pin — the ``_programmatic_select`` guard tells
+        ``_on_entry_changed`` to leave the follow flag alone."""
+        if idx < 0 or idx >= self.entry_list.count():
+            return
+        prev = self._programmatic_select
+        self._programmatic_select = True
+        try:
+            self.entry_list.setCurrentRow(idx)
+        finally:
+            self._programmatic_select = prev
+
+    def _jump_latest_entry(self) -> None:
+        """Latest button: re-arm auto-follow and jump to the most-recent
+        channel/combo."""
+        self._entry_auto_follow = True
+        if self._latest_key is not None and self._latest_key in self._pages:
+            try:
+                idx = self._keys_in_order.index(self._latest_key)
+            except ValueError:
+                idx = -1
+            if idx >= 0:
+                self._select_entry_row(idx)
+        self._refresh_latest_btn()
+
+    def _refresh_latest_btn(self) -> None:
+        """Enable the Latest button only when the view is pinned OFF the
+        latest entry (i.e. there is somewhere to jump back to)."""
+        btn = getattr(self, "_entry_latest_btn", None)
+        if btn is None:
+            return
+        btn.setEnabled(self._latest_key is not None
+                       and not self._entry_auto_follow)
 
     def _on_axis_changed(self, trace: str) -> None:
         """User picked a new option for the trace's dropdown.
@@ -1074,26 +2046,13 @@ class MultiChannelScope(QtWidgets.QWidget):
 
     def _on_inset_toggled(self, on: bool) -> None:
         """Inset checkbox toggled — show/hide the inset plot AND
-        enable/disable the multi-select dropdown next to it."""
-        self.inset_btn.setEnabled(bool(on))
+        enable/disable the single-select dropdown next to it."""
+        self.inset_combo.setEnabled(bool(on))
         self._on_visibility_toggled()
 
     def _on_inset_traces_changed(self, *_) -> None:
-        """A trace was checked / unchecked in the inset menu."""
-        self._refresh_inset_button_label()
+        """The inset trace selection changed in the combo."""
         self._on_visibility_toggled()
-
-    def _refresh_inset_button_label(self) -> None:
-        """Show the user the active inset selection in the button text.
-
-        Empty selection → ``"(pick traces)"`` so the button still
-        reads as actionable. Non-empty → comma-joined trace tags.
-        """
-        picked = self.inset_traces()
-        if not picked:
-            self.inset_btn.setText("(pick traces)")
-        else:
-            self.inset_btn.setText(", ".join(picked))
 
     # --------------------------------------------------------------- prefs
     def current_prefs(self) -> dict:
@@ -1107,6 +2066,7 @@ class MultiChannelScope(QtWidgets.QWidget):
             "axis_map": self.axis_map(),
             "inset_enabled": self.inset_enabled(),
             "inset_traces": self.inset_traces(),
+            "imon_unit": self._imon_unit,
         }
 
     def restore_prefs(self, p: dict) -> None:
@@ -1137,3 +2097,10 @@ class MultiChannelScope(QtWidgets.QWidget):
         traces = p.get("inset_traces")
         if isinstance(traces, (list, tuple, set)):
             self.set_inset_traces(traces)
+        unit = p.get("imon_unit")
+        if unit in ("uA", "density"):
+            self._imon_unit = unit
+            self._refresh_imon_unit_combo()
+        # Legacy prefs may carry "potential_axis_label" / "return_axis_label"
+        # from the removed checkboxes — the relabel is automatic now, so they
+        # are simply ignored.

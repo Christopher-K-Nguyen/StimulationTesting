@@ -197,8 +197,12 @@ class DeviceView(QtWidgets.QGroupBox):
         # Resize controls
         self.rows_spin = RepeatingSpinBox(); self.rows_spin.setRange(1, 32); self.rows_spin.setValue(4)
         self.cols_spin = RepeatingSpinBox(); self.cols_spin.setRange(1, 32); self.cols_spin.setValue(4)
-        self.rows_spin.valueChanged.connect(self._on_resize)
-        self.cols_spin.valueChanged.connect(self._on_resize)
+        # Commit on Enter/return/focus-out, NOT per keystroke (operator: "I
+        # want pressing enter/return or clicking out") — resizing the grid +
+        # emitting mappingChanged (which logs) shouldn't fire on every digit
+        # while typing a size (e.g. "16" would otherwise resize 1 → 16).
+        self.rows_spin.editingFinished.connect(self._on_resize)
+        self.cols_spin.editingFinished.connect(self._on_resize)
 
         size_row = QtWidgets.QHBoxLayout()
         size_row.addWidget(QtWidgets.QLabel("Rows:"))

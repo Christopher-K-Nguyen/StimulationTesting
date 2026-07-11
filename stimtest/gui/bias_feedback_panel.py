@@ -65,32 +65,52 @@ class BiasFeedbackPanel(QtWidgets.QGroupBox):
     #: to the LogPane (gotcha #29).
     feedbackChanged = QtCore.pyqtSignal()
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None,
+                 *, include_connector: bool = True):
+        """Build the closed-loop-bias config panel.
+
+        Parameters
+        ----------
+        parent :
+            Standard Qt parent.
+        include_connector :
+            When ``True`` (the default, used by the standalone-widget
+            tests), the panel embeds its own :class:`BiasConnector`
+            Connect/Disconnect row.  When ``False`` (how the experiment
+            tabs build it), the connector is omitted because the
+            INTERSTELLAR connection now lives in the Setup tab's
+            ConnectionPanel — this panel is then purely the per-run
+            feedback CONFIG + status, shown only once the operator has
+            connected INTERSTELLAR from Setup.
+        """
         super().__init__("Interpulse Bias Module (closed-loop)", parent)
         self.setToolTip(
-            "Optional closed-loop feedback that drives the STM32-applied "
-            "DC bias voltage to keep the return-electrode potential at a "
-            "configured setpoint between pulses.  The connector (top row) "
-            "shares the bias driver with every other experiment tab; the "
-            "feedback config below applies to THIS experiment only.  When "
-            "the master 'Enable feedback' checkbox is off, the bias module "
-            "is still usable as a manually-set DAC, just without the "
-            "closed loop.")
+            "Optional closed-loop feedback that drives the INTERSTELLAR-"
+            "applied DC bias voltage to keep the return-electrode potential "
+            "at a configured setpoint between pulses.  Connect INTERSTELLAR "
+            "from the Setup tab first; this config applies to THIS "
+            "experiment only.  When the master 'Enable feedback' checkbox "
+            "is off, the bias module is still usable as a manually-set DAC, "
+            "just without the closed loop.")
         self.setCheckable(False)
 
-        # ---- row 1: shared connector (host-delegated) -----------------
-        # Construct WITHOUT a host — set_bias_host() will wire it up
-        # after the experiment tab is added to MainWindow.  Until then
-        # the connector is in standalone mode but Connect is disabled
-        # via _enable_connector_for_host (below) so the operator can't
-        # accidentally open a parallel driver instance.
-        self._connector = BiasConnector(self, host=None)
-        self._connector.log.connect(self._on_connector_log)
-        # Until set_bias_host() runs, hide the Connect button — there's
-        # no host to delegate to, and we don't want to expose the
-        # standalone-mode path to operators (that's only for tests).
-        self._connector.connect_btn.setEnabled(False)
-        self._connector.simulate_check.setEnabled(False)
+        # ---- row 1 (optional): shared connector (host-delegated) ------
+        # Only built when include_connector=True.  The experiment tabs
+        # pass include_connector=False because INTERSTELLAR's
+        # Connect/Disconnect button lives in the Setup tab now; this
+        # keeps a single connection point instead of one per tab.
+        # ``self._connector`` is None when omitted, and every use below
+        # guards on that.
+        if include_connector:
+            # Construct WITHOUT a host — set_bias_host() wires it up
+            # after the widget is added to a host.  Connect stays
+            # disabled until then so no parallel driver can be opened.
+            self._connector = BiasConnector(self, host=None)
+            self._connector.log.connect(self._on_connector_log)
+            self._connector.connect_btn.setEnabled(False)
+            self._connector.simulate_check.setEnabled(False)
+        else:
+            self._connector = None
 
         # ---- row 2: master Enable checkbox + status badge ------------
         self.enable_check = QtWidgets.QCheckBox("Enable closed-loop feedback")
@@ -164,7 +184,7 @@ class BiasFeedbackPanel(QtWidgets.QGroupBox):
             "Start of the scope's MEASUrement gating window, in µs "
             "from the trigger.  Should be AFTER the post-pulse RC "
             "discharge settles.  Default 300 µs suits the standard "
-            "biphasic ~200 µs pulse at 100 Hz.")
+            "biphasic ~200 µs pulse at 100 pps.")
         self.gate_hi_spin = QtWidgets.QDoubleSpinBox()
         self.gate_hi_spin.setRange(-1000.0, 100000.0)
         self.gate_hi_spin.setSingleStep(10.0)
@@ -186,7 +206,10 @@ class BiasFeedbackPanel(QtWidgets.QGroupBox):
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
 
-        outer.addWidget(self._connector)
+        # The connector row is only present when this panel was built
+        # with include_connector=True (the tabs omit it — see __init__).
+        if self._connector is not None:
+            outer.addWidget(self._connector)
 
         row_enable = QtWidgets.QHBoxLayout()
         row_enable.addWidget(self.enable_check)
@@ -227,11 +250,15 @@ class BiasFeedbackPanel(QtWidgets.QGroupBox):
         """Plumb in the shared ConnectionPanel that owns the bias
         driver.  Called by MainWindow after tab construction.
 
-        Delegates to :meth:`BiasConnector.set_host` and re-enables
-        the Connect button so the operator can actually open the
-        driver from this tab.  Idempotent + safe with ``None`` to
-        detach (e.g. ConnectionPanel teardown during test cleanup).
+        When this panel embeds its own connector (include_connector=True)
+        this delegates to :meth:`BiasConnector.set_host` and re-enables
+        the Connect button.  When the connector was omitted (the tabs'
+        case — connection lives in Setup), this is a safe no-op: the tab
+        tracks the host itself for the runner-bind step.  Idempotent +
+        safe with ``None`` to detach.
         """
+        if self._connector is None:
+            return
         self._connector.set_host(host)
         is_attached = host is not None
         self._connector.connect_btn.setEnabled(is_attached)

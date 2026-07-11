@@ -408,6 +408,15 @@ def record_capture(capture, session) -> None:
     metrics = getattr(capture, "metrics", None)
     if metrics is None:
         return
+    # Defensive no-interpulse guard: an interpulse-less pattern has no idle
+    # rest window, so its "pre/post-pulse potential" is neighbouring-pulse
+    # data, not OCP.  ``_interpulse_potential_split`` already returns NaN for
+    # such patterns (skipped below), but guard here too so a caller supplying
+    # finite values can never poison the per-coating learned-OCP bin.
+    _pat = getattr(getattr(session, "test", None), "pattern", None)
+    if _pat is not None and hasattr(_pat, "has_interpulse_gap") \
+            and not _pat.has_interpulse_gap():
+        return
     pre = getattr(metrics, "return_pre_pulse_potential_v", float("nan"))
     post = getattr(metrics, "return_post_pulse_potential_v", float("nan"))
     # Cheap NaN check that avoids importing numpy here. The values
@@ -421,6 +430,13 @@ def record_capture(capture, session) -> None:
     extras = getattr(getattr(session, "test", None), "extras", None) or {}
     snap = extras.get("setup_snapshot") or {}
     if not isinstance(snap, dict):
+        return
+    # Operator opt-out: the Setup tab's "Remember return-electrode
+    # potential" toggle.  When off, skip recording entirely so the
+    # learned-OCP store doesn't accumulate data the operator doesn't
+    # trust.  Absent key (snapshots predating the toggle) defaults to
+    # True, preserving the historical always-record behaviour.
+    if not snap.get("remember_return_potential", True):
         return
     return_coating = snap.get("return_coating_short") or ""
     if not return_coating:
@@ -519,6 +535,41 @@ def learned_ocp_v(coating_name: str) -> Optional[float]:
     if len(values) < MIN_SAMPLES_FOR_LEARNED_OCP:
         return None
     return sum(values) / float(len(values))
+
+
+def learned_ocp_std_v(coating_name: str) -> Optional[float]:
+    """SAMPLE standard deviation of the recorded OCP for ``coating_name``.
+
+    Returns the ``ddof=1`` (Bessel-corrected) standard deviation of every
+    recorded ``v`` in the coating's bin, gated on the SAME
+    :data:`MIN_SAMPLES_FOR_LEARNED_OCP` threshold as
+    :func:`learned_ocp_v` so the "tested +X ± Y V" annotation only shows a
+    spread once there's enough data to trust the mean.  Returns ``None``
+    (not shown) below the threshold, and ``0.0`` for a degenerate bin of
+    identical values.  Pure-Python (no numpy) to match this module's
+    dependency-light convention.
+    """
+    key = canonical_key(coating_name)
+    if not key:
+        return None
+    data = _load_raw()
+    bin_list = (data.get("samples") or {}).get(key) or []
+    if not isinstance(bin_list, list):
+        return None
+    values: List[float] = []
+    for entry in bin_list:
+        try:
+            values.append(float(entry["v"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    n = len(values)
+    if n < MIN_SAMPLES_FOR_LEARNED_OCP:
+        return None
+    mean = sum(values) / float(n)
+    # ddof=1 sample variance; n >= MIN_SAMPLES_FOR_LEARNED_OCP (≥ 2) so the
+    # (n - 1) denominator is always safe.
+    var = sum((v - mean) ** 2 for v in values) / float(n - 1)
+    return var ** 0.5
 
 
 def all_bins() -> Dict[str, List[dict]]:

@@ -172,11 +172,18 @@ class Phase:
           * Speedbumps (N pulses at ``bump_count`` ratio): 0.5 of a
             fully-active phase (N pulses + N gaps, each duty-cycle).
 
-        The rest of the codebase uses ``charge_per_phase_nc`` from
-        ``PulsePattern`` to label captures; that's still based on
-        amplitude × width (peak·width) for traceability against the
-        MATLAB-era convention. Per-shape "effective charge" is
-        available from this property when needed.
+        This is the ANALYTIC continuous-shape estimate (``peak × width ×
+        duty``) and is used only for SELECTING the excitation phase (argmax
+        |charge|).  The charge the codebase REPORTS
+        (``PulsePattern.charge_per_phase_nc`` / ``net_charge_nc``) comes from
+        the IDEAL continuous integral (:func:`ideal_charge_nc` — trapezoidal,
+        unquantized), which equals this analytic value for a canonical shape
+        but ALSO correctly handles a non-canonical ``tau_us`` /
+        ``tail_zero_us`` / ``offset_ua`` that ``_shape_duty`` hardcodes.  The
+        DEVICE-EXACT staircase (``actual_phase_charges_nc``, 30/100 nA grid) is
+        used only to show the quantization ERROR in the test-parameters panel
+        (operator: "charge metrics use the ideal pattern; realistic only for
+        the error").
         """
         return (self.amplitude_ua * 1e-3 * self.width_us
                 * _shape_duty(self.shape, bump_count=self.bump_count))
@@ -389,6 +396,43 @@ def actual_charge_nc(phase: "Phase",
     dts = np.diff(times)
     Q_uA_us = float(np.sum(amps[:-1] * dts))
     return Q_uA_us * 1e-3   # µA·µs → nC
+
+
+def ideal_charge_nc(phase: "Phase",
+                    *, n_samples: int = _DEFAULT_CURVED_SAMPLES,
+                    ) -> float:
+    """Charge in nC for a single phase of the IDEAL (as-designed) waveform.
+
+    This is the true integral of the CONTINUOUS designed shape — NO device
+    30/100 nA current quantization AND the **trapezoidal** rule (which exactly
+    integrates the piecewise-linear ideal ramp), so a linear-increasing
+    1000 µA / 200 µs reads a clean **100.0 nC** (not the device staircase's
+    99.6).  It handles a non-canonical ``tau_us`` / ``tail_zero_us`` /
+    ``offset_ua`` via the breakpoints (unlike the analytic
+    ``peak × width × _shape_duty``, which hardcodes the canonical duty).
+
+    Operator: "For all charge metrics, use the ideal pattern.  Only use the
+    realistic when comparing the error in the test parameters."  So every
+    REPORTED charge metric (Q_ph, Q_inj, Q_net, cumulative charge) routes
+    through this; :func:`actual_charge_nc` (the device sample-and-hold
+    staircase on the quantized grid) is used ONLY to show the quantization
+    ERROR in the pattern-preview / test-parameters panel.
+    """
+    bps = shape_breakpoints(
+        amplitude_ua=phase.amplitude_ua, width_us=phase.width_us,
+        shape=phase.shape, bump_count=phase.bump_count,
+        tau_us=phase.tau_us, n_samples=n_samples,
+        tail_zero_us=getattr(phase, "tail_zero_us", 0.0),
+        offset_ua=getattr(phase, "offset_ua", 0.0),
+    )
+    if len(bps) < 2:
+        return 0.0
+    times = np.asarray([t for t, _ in bps], dtype=float)
+    amps = np.asarray([a for _, a in bps], dtype=float)
+    # Trapezoidal = the true integral of the continuous (piecewise-linear)
+    # ideal waveform.  NO current-step rounding — this is the IDEAL charge.
+    _trapz = getattr(np, "trapezoid", None) or np.trapz  # numpy 2.x renamed it
+    return float(_trapz(amps, times)) * 1e-3   # µA·µs → nC
 
 
 def solve_capacitive_balance(*,
@@ -1357,6 +1401,62 @@ class PulsePattern:
         return sum(p.width_us + p.delay_after_us for p in self.phases)
 
     @property
+    def interpulse_gap_us(self) -> float:
+        """Idle interpulse gap = repetition period − total pulse duration.
+
+        The pulse repeats every ``period = 1e6 / rate_hz`` µs; the pulse
+        itself occupies ``total_pulse_us`` (every phase width PLUS every
+        interphase delay AND the trailing discharge delay).  Whatever is left
+        over is the idle INTERPULSE window — the only stretch where the
+        electrode sits at its rest potential (OCP).
+
+        NOTE: this is distinct from the interphase / discharge delays.  A
+        pattern can have a non-zero discharge delay and STILL have zero
+        interpulse gap (the discharge delay is counted inside
+        ``total_pulse_us``).  ``validate()`` guarantees ``total_pulse_us ≤
+        period`` so the gap is never negative; a value at/near zero means
+        "no idle interpulse exists" (see :meth:`has_interpulse_gap`).
+        """
+        if self.rate_hz <= 0:
+            return 0.0
+        return 1e6 / self.rate_hz - self.total_pulse_us
+
+    def has_interpulse_gap(self, min_gap_us: float = 10.0) -> bool:
+        """True iff a TRUSTWORTHY idle interpulse window exists.
+
+        Used to guard every site that samples "the rest potential during the
+        interpulse" (E_ret / E_act OCP, pre-trigger baselines, AC-settle
+        flatness checks, learned-OCP recording).  When the repetition period
+        is fully occupied by the pulse (gap ≤ ``min_gap_us``), there is no idle
+        window — the "pre-pulse" / "post-discharge" samples are actually the
+        neighbouring pulse's active data, so any code that treats them as the
+        rest potential must instead decline (operator: "When there is no
+        interpulse delay, then E_ret or E_act are never expected to be near
+        zero during interpulse because there is no interpulse").
+
+        The 10 µs floor (≈ one settle time / one scope leading division) is a
+        practical minimum — ``auto_layout_for_pulse`` reserves ~1 division of
+        leading baseline that is only genuinely idle if the gap is at least
+        that wide.
+        """
+        return self.interpulse_gap_us > float(min_gap_us)
+
+    @property
+    def _excitation_index(self) -> int:
+        """Index of the phase carrying the largest |Q_ph|.
+
+        Selection uses the analytic per-phase ``charge_nc`` (peak × width ×
+        shape-duty) — unchanged from the historical behaviour, so every
+        existing caller of ``excitation_phase`` picks the same phase.  The
+        REPORTED charge of that phase (``charge_per_phase_nc``) is the
+        device-exact integral; only the SELECTION is analytic.
+        """
+        if not self.phases:
+            return -1
+        return max(range(len(self.phases)),
+                   key=lambda i: abs(self.phases[i].charge_nc))
+
+    @property
     def excitation_phase(self) -> Phase:
         """Phase carrying the largest |Q_ph| — the one that does the work.
 
@@ -1390,8 +1490,35 @@ class PulsePattern:
 
     @property
     def charge_per_phase_nc(self) -> float:
-        """|Q_ph| of the *excitation* phase, nanocoulombs."""
-        return abs(self.excitation_phase.charge_nc)
+        """|Q_ph| of the *excitation* phase, nanocoulombs — IDEAL pattern.
+
+        The reported per-phase charge is the true integral of the CONTINUOUS
+        as-designed waveform (:func:`ideal_charge_nc` — trapezoidal, NO device
+        30/100 nA quantization), so a linear-increasing 1000 µA / 200 µs reads
+        a clean **100.0 nC** rather than the device staircase's 99.6 (operator:
+        "For all charge metrics, use the ideal pattern.  Only use the realistic
+        when comparing the error in the test parameters").  It handles a
+        non-canonical ``tau_us`` / ``tail_zero_us`` / ``offset_ua`` via the
+        breakpoints (unlike the analytic ``peak × width × _shape_duty``).  Every
+        reported charge metric (Q_ph, Q_inj, Q_net, cumulative charge) routes
+        through the ideal integral; the DEVICE staircase
+        (``actual_phase_charges_nc``) is used ONLY to show the quantization
+        ERROR in the pattern-preview / test-parameters panel.  The excitation
+        phase is selected analytically (``_excitation_index``).
+        """
+        idx = self._excitation_index
+        if idx < 0:
+            return 0.0
+        q = self.ideal_phase_charges_nc()
+        return abs(q[idx]) if idx < len(q) else 0.0
+
+    def ideal_phase_charges_nc(self) -> List[float]:
+        """Per-phase charge (signed, nC) of the IDEAL continuous waveform — no
+        device current quantization, trapezoidal integral (see
+        :func:`ideal_charge_nc`).  The basis for every REPORTED charge metric.
+        """
+        n_samples = self.curved_sample_budget()
+        return [ideal_charge_nc(ph, n_samples=n_samples) for ph in self.phases]
 
     # ------------------------------------------------------------------
     # Time-domain rendering (used by the simulator and for plotting)
@@ -1777,8 +1904,18 @@ class PulsePattern:
     # ------------------------------------------------------------------
     @property
     def net_charge_nc(self) -> float:
-        """Sum of per-phase charges in nanocoulombs (signed). 0 = perfectly balanced."""
-        return float(sum(p.charge_nc for p in self.phases))
+        """Signed sum of per-phase charges, nanocoulombs — IDEAL pattern.
+
+        0 = perfectly charge-balanced on the as-designed waveform.  Uses the
+        IDEAL continuous integral (:meth:`ideal_phase_charges_nc`) per the
+        operator's "charge metrics use the ideal pattern" rule, so a symmetric
+        biphasic reads a clean 0.  The DEVICE-realistic residual (from the
+        30/100 nA quantization) is a separate quantity shown as the error in
+        the pattern-preview panel; ``auto_balance`` still minimizes the DEVICE
+        integral internally (``actual_phase_charges_nc``) so the delivered
+        charge is balanced — this reported metric is the ideal-waveform net.
+        """
+        return float(sum(self.ideal_phase_charges_nc()))
 
     def actual_phase_charges_nc(self, *, current_step_nA: int = 30,
                                 max_pairs: int = _PAT_MAX_PAIRS,
@@ -1791,6 +1928,31 @@ class PulsePattern:
         return [actual_charge_nc(ph, current_step_nA=current_step_nA,
                                   n_samples=n_samples)
                 for ph in self.phases]
+
+    # ------------------------------------------------------------------
+    # Current quantization grid
+    # ------------------------------------------------------------------
+    def device_current_step_nA(self) -> int:
+        """Current-quantization grid (nA) this pattern is rendered on.
+
+        Operator: "keep the current resolution at 0.1 µA for rectangular
+        shapes.  I do not trust the 30 nA resolution of the stimulator but
+        will use it for non-rectangular shapes."  A pattern whose phases
+        are ALL rectangular is rounded to the trusted 0.1 µA (100 nA)
+        grid; any non-rectangular (ramp / sine / bowtie / halfpipe /
+        speedbumps / exp / gaussian) phase drops to the device's native
+        30 nA resolution so the curve renders smoothly.  An empty pattern
+        defaults to the rectangular grid.
+
+        Used as the amplitude grid in :func:`build_pat_pairs` (the device
+        ``.pat``), the validation floor in :meth:`validate`, and the
+        charge-balance grid in :meth:`auto_balance`, so all three agree on
+        the resolution the device will actually receive.
+        """
+        from .config import STIM_CURRENT_STEP_RECT_NA, STIM_CURRENT_STEP_FINE_NA
+        all_rect = all(ph.shape == SHAPE_RECTANGULAR for ph in self.phases)
+        return (STIM_CURRENT_STEP_RECT_NA if all_rect
+                else STIM_CURRENT_STEP_FINE_NA)
 
     # ------------------------------------------------------------------
     # Hardware-side validation
@@ -1817,7 +1979,7 @@ class PulsePattern:
         """
         from .config import (
             STIM_MAX_AMPLITUDE_UA, STIM_TIME_RESOLUTION_US,
-            STIM_CURRENT_RESOLUTION_UA,
+            STIM_CURRENT_STEP_RECT_NA, STIM_CURRENT_STEP_FINE_NA,
         )
         if not self.phases:
             raise ValueError("Pattern has no phases — nothing to send to the device.")
@@ -1831,14 +1993,20 @@ class PulsePattern:
                     f"Phase {n}: amplitude {ph.amplitude_ua:+.2f} µA exceeds "
                     f"the {STIM_MAX_AMPLITUDE_UA:g} µA PlexStim limit.")
             # Reject sub-resolution amplitudes that aren't exactly zero —
-            # 0 is fine (e.g. a discharge phase) but 0.05 µA on a 0.1-µA
-            # device gets silently rounded and the user wouldn't know.
+            # 0 is fine (e.g. a discharge phase) but a value below this
+            # phase's current grid gets silently rounded and the user
+            # wouldn't know.  Floor is PER-SHAPE: 0.1 µA for a rectangular
+            # phase, 30 nA for a shaped one (operator: trust 0.1 µA for
+            # rectangular, the device's 30 nA only for non-rectangular).
+            _res_ua = ((STIM_CURRENT_STEP_RECT_NA
+                        if ph.shape == SHAPE_RECTANGULAR
+                        else STIM_CURRENT_STEP_FINE_NA) / 1000.0)
             if (ph.amplitude_ua != 0.0
-                    and abs(ph.amplitude_ua) < STIM_CURRENT_RESOLUTION_UA - 1e-9):
+                    and abs(ph.amplitude_ua) < _res_ua - 1e-9):
                 raise ValueError(
                     f"Phase {n}: amplitude {ph.amplitude_ua:+.3f} µA is "
-                    f"below the {STIM_CURRENT_RESOLUTION_UA} µA hardware "
-                    f"resolution.")
+                    f"below the {_res_ua:g} µA current resolution for a "
+                    f"{ph.shape} phase.")
             if ph.delay_after_us < 0:
                 raise ValueError(
                     f"Phase {n}: delay_after_us {ph.delay_after_us} µs "
@@ -1857,7 +2025,7 @@ class PulsePattern:
         if self.total_pulse_us > period_us + 1e-6:
             raise ValueError(
                 f"Pulse total ({self.total_pulse_us:.0f} µs) is longer than "
-                f"one period ({period_us:.0f} µs at {self.rate_hz:g} Hz). "
+                f"one period ({period_us:.0f} µs at {self.rate_hz:g} pps). "
                 f"Either lower the rate or shorten the phases / delays.")
         if self.repetitions < 0:
             raise ValueError(
@@ -1865,22 +2033,28 @@ class PulsePattern:
                 f"{self.repetitions}.")
 
     def auto_balance(self, adjust: str = "last_amp",
-                     *, current_step_nA: int = 30) -> "PulsePattern":
+                     *, current_step_nA: Optional[int] = None) -> "PulsePattern":
         """Return a copy in which the net charge is forced to EXACTLY
         zero against the device's quantization grids.
+
+        ``current_step_nA`` is the current grid the balance is computed
+        on; ``None`` (the default) derives it from the pattern's shape via
+        :meth:`device_current_step_nA` — 100 nA (0.1 µA) for an
+        all-rectangular pattern, 30 nA when any phase is shaped — so the
+        balance is computed on the SAME grid :func:`build_pat_pairs` will
+        render the device ``.pat`` on.  Pass an explicit value to override
+        (tests / special cases).
 
         ``adjust`` selects which knob is rewritten to absorb the imbalance:
 
         * ``"last_amp"`` — recompute the *amplitude* of the final phase
           so the sum of QUANTIZED phase charges is zero. The head
-          phases' amps are quantized to the device's ``current_step_nA``
-          grid (default 30 nA — the PlexStim 2.0 resolution) before the
-          balance is computed; the resulting last-phase amp is then
-          itself quantized to the same grid, with a ±1-step search to
+          phases' amps are quantized to the ``current_step_nA`` grid
+          before the balance is computed; the resulting last-phase amp is
+          then itself quantized to the same grid, with a ±1-step search to
           absorb any rounding residual. Result: the QUANTIZED sum is
           exactly zero whenever the grid permits, and within ½ step
-          otherwise (~30 nA × 1 µs ≈ 0.03 fC, well below the display
-          precision and therefore invisible).
+          otherwise.
         * ``"last_width"`` — recompute the *width* of the final phase
           on the 1 µs hardware grid using the same balance-against-
           quantized-head-then-search-for-residual pattern. Sign of the
@@ -1891,6 +2065,8 @@ class PulsePattern:
         Raises :class:`ValueError` if the adjustment can't reach balance
         (e.g. asking for ``"last_width"`` when the final amplitude is 0).
         """
+        if current_step_nA is None:
+            current_step_nA = self.device_current_step_nA()
         if not self.phases:
             return PulsePattern(phases=[], rate_hz=self.rate_hz,
                                 repetitions=self.repetitions)
@@ -2164,9 +2340,22 @@ def build_pat_pairs(pattern: "PulsePattern", *,
     return so any miscalculation surfaces here rather than as a
     silent-truncation on the device.
     """
+    from .config import STIM_CURRENT_STEP_RECT_NA, STIM_CURRENT_STEP_FINE_NA
     n_samples = pattern.curved_sample_budget(max_pairs=max_pairs)
     pairs: List[Tuple[int, int]] = []
     for ph in pattern.phases:
+        # Current-quantization grid this PHASE's amplitude is rounded to,
+        # keyed on its SHAPE (operator: "keep the current resolution at
+        # 0.1 µA for rectangular shapes … will use [30 nA] for
+        # non-rectangular shapes"): a rectangular phase lands on the
+        # trusted 0.1 µA (100 nA) grid; a shaped phase uses the device's
+        # native 30 nA so the curve renders smoothly.  Per-phase (not
+        # per-pattern) so a rectangular phase inside a mixed pulse — e.g.
+        # the rect cathodic of a rect+exp-decay cap-coupled pair — still
+        # gets the 0.1 µA grid.
+        _step_nA = (STIM_CURRENT_STEP_RECT_NA
+                    if ph.shape == SHAPE_RECTANGULAR
+                    else STIM_CURRENT_STEP_FINE_NA)
         # Skip phases whose duration is zero — nothing to play and
         # the firmware rejects "0 nA for 0 µs" pairs.
         if ph.width_us <= 0 and ph.delay_after_us <= 0:
@@ -2227,7 +2416,13 @@ def build_pat_pairs(pattern: "PulsePattern", *,
                     next_int = phase_target_us
                 next_int = max(cursor_int + 1, next_int)
                 duration_us = next_int - cursor_int
-                amp_nA = int(round(float(a_k) * 1000.0))
+                # Quantize to the pattern's current grid (0.1 µA for
+                # rectangular, 30 nA for shaped) rather than the raw 1 nA
+                # the .pat format allows — so a rectangular amplitude lands
+                # on the trusted 0.1 µA grid instead of an arbitrary value
+                # the operator doesn't trust the device to deliver.
+                amp_nA = (int(round(float(a_k) * 1000.0 / _step_nA))
+                          * _step_nA)
                 pairs.append((amp_nA, duration_us))
                 cursor_int = next_int
         # Inter-phase / discharge / post-phase delay — held at 0 nA.

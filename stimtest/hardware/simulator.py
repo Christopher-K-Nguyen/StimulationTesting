@@ -129,6 +129,15 @@ class SimulatedStimulator(Stimulator):
         self._running: Dict[int, bool] = {}
         self._is_open = False
 
+    @property
+    def is_open(self) -> bool:
+        # Track the real open/close state (the base property infers it
+        # from ``info.n_channels``, which the simulator keeps populated
+        # across close()).  The GUI's Start path keys re-init on this,
+        # so it must flip to False after close() — see CLAUDE.md gotcha
+        # on the cross-tab "stim stays closed" lifecycle.
+        return self._is_open
+
     # -- lifecycle --
     def open(self) -> None:
         self._is_open = True
@@ -310,6 +319,10 @@ class SimulatedOscilloscope(Oscilloscope):
             return float("nan")
         return float(np.mean(data[mask]))
 
+    def settle_one_acquisition(self, *, timeout_s=None):
+        """No-op for the simulator (no real averager or USB transfer)."""
+        return None
+
     # -- binding --
     def bind_stimulator(self, stim: SimulatedStimulator) -> None:
         """Tell the simulated scope where to read its 'real' stimulus from."""
@@ -369,9 +382,16 @@ class SimulatedOscilloscope(Oscilloscope):
         except Exception:
             vmon_v_per_v = 1.0
         v_mon = v_electrode * vmon_v_per_v
-        # Add a touch of measurement noise
+        # Add a touch of measurement noise.  Keep it SMALL (0.5 mV on the
+        # V_mon-output pin) — the real capture path averages 64× so its
+        # residual noise is sub-mV, and on the Default preset make_capture
+        # DIVIDES V_mon by 0.25 (×4), so a larger σ here would blow up to
+        # ~20 mV of electrode-referred noise and SWAMP the I·R access step at
+        # low amplitude (5 µA → ~20 mV IR), corrupting the single-sample
+        # ``v_ir`` the response classifier reads and mislabelling the healthy
+        # synthetic electrode "broken".
         rng = np.random.default_rng(0)
-        v_mon = v_mon + rng.normal(0.0, 5e-3, size=v_mon.size)
+        v_mon = v_mon + rng.normal(0.0, 5e-4, size=v_mon.size)
         i_meas = i_ua + rng.normal(0.0, 0.05, size=i_ua.size)
 
         # Crop to record_length samples around the pulse
@@ -382,14 +402,27 @@ class SimulatedOscilloscope(Oscilloscope):
             e_act = e_act[: self.record_length]
             e_ret = e_ret[: self.record_length]
 
+        # Build the channel map from whatever roles the operator
+        # actually wired.  V_mon / I_mon are mandatory; E_ret / E_act
+        # are OPTIONAL reference-electrode channels that many bench
+        # setups don't map (the Setup tab's alias config commonly
+        # carries only vmon/imon/trigger).  Hard-indexing
+        # ``channel_aliases["eret"]`` KeyError'd the whole capture in
+        # that case, which aborted the run before the first snapshot
+        # was saved — the "Continuous Pulsing saves nothing" bug (the
+        # real Tektronix path already tolerates this because it
+        # iterates the live scope channels rather than a fixed dict).
+        channels = {
+            self.channel_aliases["vmon"]: v_mon,
+            self.channel_aliases["imon"]: i_meas * 1e-6 / self._stim.info.imon_scaling_v_per_ua * 1e-3,  # arbitrary scaling
+        }
+        if "eret" in self.channel_aliases:
+            channels[self.channel_aliases["eret"]] = e_ret
+        if "eact" in self.channel_aliases:
+            channels[self.channel_aliases["eact"]] = e_act
         return ScopeAcquisition(
             time_us=t_us,
-            channels={
-                self.channel_aliases["vmon"]: v_mon,
-                self.channel_aliases["imon"]: i_meas * 1e-6 / self._stim.info.imon_scaling_v_per_ua * 1e-3,  # arbitrary scaling
-                self.channel_aliases["eret"]: e_ret,
-                self.channel_aliases["eact"]: e_act,
-            },
+            channels=channels,
             sample_period_us=self.sample_period_us,
             record_length=t_us.size,
             trigger_position_us=0.0,
