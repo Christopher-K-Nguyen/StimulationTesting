@@ -355,8 +355,36 @@ def ideal_current_ua(time_us: np.ndarray, pattern: PulsePattern,
 # ---------------------------------------------------------------------------
 # Driving voltage (V_d)
 # ---------------------------------------------------------------------------
+def pulse_region_mask(time_us: np.ndarray, pattern: PulsePattern,
+                      recovery_us: float = 0.0) -> np.ndarray:
+    """Boolean mask selecting the pulse: ``t <= total_pulse_us + recovery``.
+
+    Metrics like V_d are defined *during the pulse* (IEEE NER Fig. 3b),
+    but the scope record routinely runs far past it —
+    ``DEFAULT_RECORD_LENGTH`` is 20 000 points, so the pulse fills only
+    a fraction of the window and the rest is post-pulse tail. That tail
+    can carry a real transient (auto-discharge shorting at the end of
+    the period, the leading edge of the next pulse if the timebase is
+    "wide", or open-input noise) whose magnitude has nothing to do with
+    the driving voltage. Restricting the abs-max scan to the pulse
+    region keeps such a tail transient from masquerading as V_d.
+
+    The pre-pulse baseline (``t < 0``) is kept — it sits near 0 V and is
+    harmless — so only the tail is excluded. Matches the ``t = 0`` pulse
+    start convention already used by :func:`phase_windows`.
+    """
+    t = np.asarray(time_us, dtype=float)
+    upper = float(pattern.total_pulse_us) + float(recovery_us)
+    return t <= upper
+
+
 def driving_voltage_from_vmon(v_mon: np.ndarray) -> float:
-    """V_d = max |V_mon| over the whole pulse (per IEEE NER Fig. 3b)."""
+    """V_d = max |V_mon| (per IEEE NER Fig. 3b).
+
+    The caller is responsible for restricting ``v_mon`` to the pulse
+    region (see :func:`pulse_region_mask`) — this helper just takes the
+    abs-max of whatever it's given.
+    """
     if v_mon.size == 0:
         return float("nan")
     return float(np.max(np.abs(v_mon)))
@@ -2650,9 +2678,20 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # ----- 2. Driving voltage V_d -----------------------------------------
     # V_mon = E_act - E_ret straight off the stimulator's monitor output.
     # Always available; we use its abs-max as the baseline V_d estimate.
-    # DESPIKE first so a switching spike at small currents isn't reported as
-    # V_d (operator: "the spike does not mislead … the driving voltage").
-    v_d_vmon = driving_voltage_from_vmon(_despike(capture.v_mon_v, capture.time_us))
+    # DESPIKE so a switching spike at small currents isn't reported as V_d
+    # (operator: "the spike does not mislead … the driving voltage"), AND
+    # restrict the abs-max scan to the pulse region so a post-pulse tail
+    # transient (discharge / next-period / open-input, in the ~20 000-pt record
+    # tail) isn't reported as V_d either (which would corrupt C_d = Q_inj / V_d).
+    # Two complementary fixes combined (despike full trace FIRST — the median
+    # filter needs the contiguous time axis — then window to the pulse region).
+    roi = pulse_region_mask(capture.time_us, pat)
+    _v_despiked = _despike(capture.v_mon_v, capture.time_us)
+    if _v_despiked.size == capture.time_us.size:
+        v_mon_roi = _v_despiked[roi]
+    else:
+        v_mon_roi = _v_despiked
+    v_d_vmon = driving_voltage_from_vmon(v_mon_roi)
 
     # If the instrumentation amplifier is wired up we get the active and
     # return potentials separately, which gives a slightly cleaner V_d
@@ -2689,8 +2728,13 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     _has_eact = _eact_recorded and polarization_source != "vmon"
     active_trace = e_act if _has_eact else capture.v_mon_v
     if has_potentials and polarization_source != "vmon":
+        # Despike AND restrict to the pulse region (same as V_mon) so neither a
+        # switching spike nor a post-pulse tail transient on the
+        # instrumentation-amp traces can inflate V_d.  has_potentials guarantees
+        # e_act/e_ret are length ``_n`` == time_us == roi, so [roi] is safe.
         v_d = driving_voltage_from_potentials(
-            _despike(e_act, capture.time_us), _despike(e_ret, capture.time_us))
+            _despike(e_act, capture.time_us)[roi],
+            _despike(e_ret, capture.time_us)[roi])
         m.driving_voltage_v = max(v_d_vmon, v_d)
     else:
         m.driving_voltage_v = v_d_vmon

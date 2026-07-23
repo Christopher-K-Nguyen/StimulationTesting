@@ -36,6 +36,37 @@ def _synthetic_capture(amp_ua=200.0, r_a_kohm=2.0, c_dl_nf=60.0,
     return cap
 
 
+def test_vd_ignores_post_pulse_tail_transient():
+    """A transient in the post-pulse tail must not be reported as V_d.
+
+    Reproduces the CWRU "noise at the end" report: the scope record runs
+    well past the pulse and picks up a large tail transient. V_d is
+    defined during the pulse, so it should reflect the pulse's driving
+    voltage, not the tail spike (which would also corrupt C_d).
+    """
+    cap = _synthetic_capture()
+    m_clean = compute_metrics(cap, surface_area_um2=5000)
+    v_d_clean = m_clean.driving_voltage_v
+    assert np.isfinite(v_d_clean)
+
+    # Inject a huge spike into the post-pulse tail (t well past the last
+    # phase). total_pulse_us = 200+20+200+20 = 440 µs; the record runs to
+    # +200 µs of padding beyond that, so the last few samples are tail.
+    total_us = cap.pattern.total_pulse_us
+    tail = cap.time_us > total_us
+    assert tail.any(), "fixture must include a post-pulse tail region"
+    spike = 100.0 * (abs(v_d_clean) or 1.0)  # dwarf the real driving voltage
+    cap.v_mon_v[tail] = spike
+    if cap.e_act_v is not None:
+        cap.e_act_v[tail] = spike
+        cap.e_ret_v[tail] = -spike
+
+    m_tail = compute_metrics(cap, surface_area_um2=5000)
+    # V_d must be unchanged by the tail spike — not driven up toward it.
+    assert m_tail.driving_voltage_v == pytest.approx(v_d_clean, rel=1e-6)
+    assert m_tail.driving_voltage_v < spike / 10.0
+
+
 def test_charge_injection_units():
     pat = PulsePattern.biphasic(amplitude_ua=250, phase_width_us=200, polarity=-1)
     q_ph_nc, q_inj = charge_injection_mc_per_cm2(pat, surface_area_um2=5000)
