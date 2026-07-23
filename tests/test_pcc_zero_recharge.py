@@ -95,17 +95,21 @@ def qapp():
     return app
 
 
-def test_gui_pcc_lock_amplitude_zero_excitation_emits_zero_recharge(qapp):
+def _cap_panel(qapp, lock):
     from stimtest.gui.pattern_panel import (
         PatternControlPanel, BIPHASIC, ASYMMETRIC, ASYM_SHAPE_CAP)
     panel = PatternControlPanel()
     panel.phase_count.setCurrentText(BIPHASIC)
     panel.symmetry.setCurrentText(ASYMMETRIC)
     panel.polarity.setCurrentText("Cathodal-first")
-    idx = panel.asym_shape_combo.findData(ASYM_SHAPE_CAP)
-    panel.asym_shape_combo.setCurrentIndex(idx)
-    lock_idx = panel.cap_lock_combo.findData(LOCK_AMPLITUDE)
-    panel.cap_lock_combo.setCurrentIndex(lock_idx)
+    panel.asym_shape_combo.setCurrentIndex(
+        panel.asym_shape_combo.findData(ASYM_SHAPE_CAP))
+    panel.cap_lock_combo.setCurrentIndex(panel.cap_lock_combo.findData(lock))
+    return panel
+
+
+def test_gui_pcc_lock_amplitude_zero_excitation_emits_zero_recharge(qapp):
+    panel = _cap_panel(qapp, LOCK_AMPLITUDE)
     panel.phase_amp[1].setValue(230.0)        # locked recharge peak
     panel.phase_width[0].setValue(200.0)
     panel.phase_amp[0].setValue(0.0)          # excitation = 0 µA
@@ -114,3 +118,33 @@ def test_gui_pcc_lock_amplitude_zero_excitation_emits_zero_recharge(qapp):
     # excitation (phase 0) is 0 µA and the recharge (last phase) is too
     assert abs(p.phases[0].amplitude_ua) == 0.0
     assert abs(p.phases[-1].amplitude_ua) == 0.0
+
+
+def test_gui_pcc_lock_width_zero_excitation_DISPLAYS_zero_recharge(qapp):
+    """LOCK_WIDTH mode: the recharge AMPLITUDE spinbox is the greyed,
+    auto-derived knob.  With a 0-µA excitation it must SHOW 0 µA — not the
+    stale leftover the operator saw (+0.1 µA) — because the solver derives
+    a 0-µA peak and pattern() mirrors it back into the spinbox."""
+    panel = _cap_panel(qapp, LOCK_WIDTH)
+    panel.phase_amp[1].setValue(0.1)          # a stale leftover value
+    panel.phase_width[0].setValue(200.0)
+    panel.phase_width[1].setValue(400.0)
+    panel.phase_amp[0].setValue(0.0)          # excitation = 0 µA
+    p = panel.pattern()
+    assert panel.phase_amp[1].value() == 0.0          # DISPLAY is 0
+    assert abs(p.phases[-1].amplitude_ua) == 0.0      # and so is the pattern
+
+
+def test_gui_pcc_lock_width_derived_amplitude_is_live_not_stale(qapp):
+    """The derived-amplitude display tracks the solver on every edit (it
+    used to be stale): a non-zero excitation shows the real derived peak,
+    equal to the emitted recharge amplitude."""
+    panel = _cap_panel(qapp, LOCK_WIDTH)
+    panel.phase_width[0].setValue(200.0)
+    panel.phase_width[1].setValue(400.0)
+    panel.phase_amp[0].setValue(-50.0)
+    p = panel.pattern()
+    disp = abs(panel.phase_amp[1].value())
+    emitted = abs(p.phases[-1].amplitude_ua)
+    assert disp > 0.0
+    assert disp == pytest.approx(emitted, rel=1e-3)

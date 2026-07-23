@@ -3096,6 +3096,28 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         self._emit()
 
     @staticmethod
+    def _mirror_derived_spin(spin: QtWidgets.QDoubleSpinBox,
+                             value: float) -> None:
+        """Write a solver-derived value into a (greyed, read-only) spinbox
+        for DISPLAY only.
+
+        Signal-blocked so it can't recurse through ``valueChanged`` →
+        ``_emit`` (the same guard the τ mirror uses), and range-clamped so
+        an out-of-range derived value (e.g. a large saturated anodic width)
+        doesn't raise.  Used from the cap-coupled ``pattern()`` branch to
+        keep the auto-derived phase-2 knob showing the real value rather
+        than a stale leftover."""
+        try:
+            v = max(spin.minimum(), min(spin.maximum(), float(value)))
+        except (TypeError, ValueError):
+            return
+        spin.blockSignals(True)
+        try:
+            spin.setValue(v)
+        finally:
+            spin.blockSignals(False)
+
+    @staticmethod
     def _set_lock_state(w: QtWidgets.QDoubleSpinBox, locked: bool):
         """Visually mark a spinbox as auto-derived / read-only.
 
@@ -3387,6 +3409,24 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 # with the wrong signed-zero at 0 µA.
                 anodic_sign = float(self._wanted_phase_sign(1))
                 I_a_signed = anodic_sign * bal.anodic_amplitude_ua
+                # Mirror the solver's DERIVED phase-2 value back into the
+                # greyed-out (read-only) spinbox so the display reflects
+                # reality instead of a stale leftover.  In LOCK_WIDTH the
+                # AMPLITUDE is derived (→ ``phase_amp[1]``); in
+                # LOCK_AMPLITUDE the WIDTH is derived (→ ``phase_width[1]``).
+                # Signal-blocked + range-clamped, same as the τ mirror above.
+                # This is what makes a 0-µA excitation SHOW a 0-µA recharge
+                # (operator: "When the first phase is 0 µA, set the second
+                # phase of PCC to be 0 µA as well") — the solver returns a 0
+                # anodic amplitude for zero cathodic charge (gotcha #189),
+                # but without this mirror the greyed spinbox kept its old
+                # number (e.g. +0.1 µA).  The LOCK_AMPLITUDE branch leaves
+                # ``phase_amp[1]`` (the user's locked input) untouched.
+                if lock == LOCK_WIDTH:
+                    self._mirror_derived_spin(self.phase_amp[1], I_a_signed)
+                else:  # LOCK_AMPLITUDE — the WIDTH is the derived knob
+                    self._mirror_derived_spin(self.phase_width[1],
+                                              bal.anodic_width_us)
                 phases.append(Phase(
                     amplitude_ua=I_c_signed, width_us=t_c,
                     delay_after_us=iph,
