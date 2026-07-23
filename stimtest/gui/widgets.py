@@ -1443,12 +1443,25 @@ class ScopePlot(QtWidgets.QWidget):
             # label's horizontal centre on the line (pyqtgraph's default
             # pushes it to whichever side has room).  Both list entries cover
             # the near-vertical / near-horizontal orientations.
+            # OPAQUE background behind the label (operator: "I want the
+            # background of the x line label to be opaque so that the line does
+            # not interfere with the display").  Now that the label is CENTRED
+            # on the line, the dashed line runs straight THROUGH the text; an
+            # opaque fill matching the white scope plot blocks it so the label
+            # stays legible.
+            # Keep the label near the BOTTOM (by the x-axis) but OFFSET above
+            # it (operator: "I wanted an offset from the x-axis" — not moved to
+            # the top).  The centred anchor x=0.5 paired with the old anchor
+            # y=0.0 hung the label DOWNWARD and straddled the x-axis; anchor
+            # y=1.0 pins the label's BOTTOM edge to the position point so it
+            # sits ABOVE it, and position 0.05 places that point a small gap
+            # (~5 % of the plot height) above the x-axis.
             line = pg.InfiniteLine(
                 pos=x_us, angle=90, pen=pen,
                 label=str(label),
-                labelOpts={"position": 0.04, "color": _guide_color,
-                           "movable": False, "fill": (0, 0, 0, 0),
-                           "anchors": [(0.5, 0.0), (0.5, 0.0)]})
+                labelOpts={"position": 0.05, "color": _guide_color,
+                           "movable": False, "fill": (255, 255, 255, 255),
+                           "anchors": [(0.5, 1.0), (0.5, 1.0)]})
             # Variable-format the label (operator: "proper variable
             # formatting") — "Emc" → E with an upright "mc" subscript,
             # italic E.  pyqtgraph's InfiniteLine renders its label as PLAIN

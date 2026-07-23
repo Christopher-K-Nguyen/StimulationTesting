@@ -86,6 +86,8 @@ def test_epol_guides_centered_and_rendered(qapp):
     sp = ScopePlot(); sp.resize(1000, 400); sp.show(); qapp.processEvents()
     sp._plot.setXRange(-100, 700, padding=0)
     sp._plot.setYRange(-1, 1, padding=0); qapp.processEvents()
+    vb = sp._plot.getViewBox()
+    xaxis_y = vb.mapRectToScene(vb.boundingRect()).bottom()
     sp.set_epol_guides([("Emc", 350.0), ("Ema", 560.0)]); qapp.processEvents()
     items = sp._epol_guide_items
     assert len(items) == 2
@@ -94,7 +96,11 @@ def test_epol_guides_centered_and_rendered(qapp):
         # HTML rendered (tags stripped in the plain text, subscript present)
         assert ti.toPlainText() in ("Emc", "Ema")
         assert "vertical-align" in ti.toHtml().lower()
-        # label horizontally CENTERED on the line (within a few px)
         br = ti.mapToScene(ti.boundingRect()).boundingRect()
         lx = ln.getViewBox().mapViewToScene(pg.Point(ln.value(), 0)).x()
+        # label horizontally CENTERED on the line (within a few px)
         assert abs(br.center().x() - lx) < 3.0
+        # OPAQUE background so the dashed line can't show through the text
+        assert ln.label.fill.color().alpha() == 255
+        # OFFSET above the x-axis (a gap), not overlapping it
+        assert br.bottom() < xaxis_y - 2.0
