@@ -1465,17 +1465,19 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
                     dc = d - np.nanmedian(d)
                     dmx = float(np.nanmax(np.abs(dc)))
                     return dc / dmx * _rmax if dmx > 1e-30 else None
+                # SOLID lines (operator: "Make the traces for derivative and
+                # reciprocal solid lines, not dashed").
                 if "dvdt" in _dov:
                     _o = _norm_ov(_dedt)
                     if _o is not None:
                         ax_v.plot(time_us, _o, color="#7E2F8E", linewidth=1.1,
-                                  linestyle="--", label=r"d$V$/d$t$ (norm.)")
+                                  linestyle="-", label=r"d$V$/d$t$ (norm.)")
                 if "recip" in _dov:
                     _recip = 1.0 / np.where(np.abs(_dedt) < 1e-9, np.nan, _dedt)
                     _o = _norm_ov(_recip)
                     if _o is not None:
                         ax_v.plot(time_us, _o, color="#CC79A7", linewidth=1.0,
-                                  linestyle=":", label=r"1/(d$V$/d$t$) (norm.)")
+                                  linestyle="-", label=r"1/(d$V$/d$t$) (norm.)")
 
     # Current (or current density) on the right axis (MATLAB orange).
     # ``density`` selects the representation: A/cm² (saved-figure default)

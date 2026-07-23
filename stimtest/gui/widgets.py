@@ -466,19 +466,21 @@ def disable_plot_wheel_zoom(plot) -> None:
         pass
 
 
-def _epol_guide_label_html(label: str, color: str) -> str:
+def _epol_guide_label_html(label: str, color: str, pt: int = 12) -> str:
     """Variable-format an E_pol guide label for HTML rendering.
 
     ``"Emc"`` / ``"Ema"`` / ``"Emc1"`` → ``<i>E</i><sub>mc</sub>`` (italic
     variable + upright subscript), wrapped in a ``<span>`` carrying the guide
-    colour.  pyqtgraph's ``InfiniteLine`` renders its label as PLAIN text, so
-    ``set_epol_guides`` forces this HTML onto the underlying text item.
-    Matches the data-driven Emc/Ema marker typography (``plotting.
-    marker_label_html`` → ``gui.rich.var``)."""
+    colour AND ``font-size:{pt}pt`` so the guide label renders at the SAME size
+    as the metric-marker labels (operator: "make it the same font size as the
+    other labels" — pt defaults to ``ScopePlot._MARKER_PT``).  pyqtgraph's
+    ``InfiniteLine`` renders its label as PLAIN text, so ``set_epol_guides``
+    forces this HTML onto the underlying text item.  Matches the data-driven
+    Emc/Ema marker typography (``plotting.marker_label_html`` → ``gui.rich.var``)."""
     from .rich import var
     lab = str(label).strip()
     inner = var("E", lab[1:]) if lab[:1].upper() == "E" and len(lab) > 1 else lab
-    return f'<span style="color:{color}">{inner}</span>'
+    return f'<span style="color:{color};font-size:{int(pt)}pt">{inner}</span>'
 
 
 # ---------------------------------------------------------------------------
@@ -1469,7 +1471,8 @@ class ScopePlot(QtWidgets.QWidget):
             # with no ``{value}`` placeholder isn't re-formatted on view
             # changes, so the HTML sticks).
             try:
-                _html = _epol_guide_label_html(str(label), _guide_color)
+                _html = _epol_guide_label_html(str(label), _guide_color,
+                                               self._MARKER_PT)
                 line.label.textItem.setHtml(_html)
                 # setHtml changed the rendered width (italic E + subscript vs
                 # the plain "Emc" the anchor was first computed from), so

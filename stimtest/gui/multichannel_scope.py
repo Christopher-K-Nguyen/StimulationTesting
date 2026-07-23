@@ -874,12 +874,15 @@ class _ChannelPage(QtWidgets.QWidget):
                         dc = d - np.nanmedian(d)
                         dmx = float(np.nanmax(np.abs(dc)))
                         return dc / dmx * _rmax if dmx > 1e-30 else None
+                    # SOLID lines (operator: "Make the traces for derivative
+                    # and reciprocal solid lines, not dashed") — no style entry,
+                    # so set_traces draws them solid.  (The corrected E′act/E′ret
+                    # overlays STAY dashed via their own _corr_styles entries.)
                     if _dedt_axis != AXIS_NA or TRACE_DEDT in _inset_roles:
                         _o = _norm_overlay(_dedt)
                         if _o is not None:
                             k = self._trace_label(TRACE_DEDT)
                             traces[k] = _o; axis[k] = _dedt_axis
-                            _corr_styles[k] = "dash"
                     if (_recip_axis != AXIS_NA
                             or TRACE_RECIP_DEDT in _inset_roles):
                         _recip = 1.0 / np.where(np.abs(_dedt) < 1e-9,
@@ -888,7 +891,6 @@ class _ChannelPage(QtWidgets.QWidget):
                         if _o is not None:
                             k = self._trace_label(TRACE_RECIP_DEDT)
                             traces[k] = _o; axis[k] = _recip_axis
-                            _corr_styles[k] = "dash"
         # Cache the colour map on first build — it's constant for
         # the lifetime of this widget so rebuilding the dict on
         # every capture was pure overhead.  Includes the corrected
