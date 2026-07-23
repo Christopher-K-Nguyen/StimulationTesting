@@ -622,6 +622,33 @@ def bandwidth_mhz_for_model(model: str) -> Optional[int]:
 # Ordered from most-specific to least-specific so the first match wins.
 _SERIES: Sequence[TekSeriesSpec] = [
 
+    # ---- MSO / MDO / DPO — bench performance scopes, modern, EXT (AUX) -----
+    # Models: MSO/DPO 2000/3000/4000/5000, MDO 3000/4000 (4-digit naming,
+    # e.g. MSO4054, MDO3014, DPO4054B).  They share the modern TekVISA
+    # command surface with the TBS2000B / TBS1000C families — WFMOutpre
+    # preamble, percent HORizontal:POSition, TRIGger:A:* namespace,
+    # DATa:WIDth 2, HIRes + 2..512 averaging — so they reuse MODERN_CMDS
+    # verbatim.  Unlike the TBS basic scopes they DO have a real external
+    # trigger: the front/rear "Aux In" BNC, whose SCPI source token is
+    # ``AUX`` (already MODERN_CMDS.ext_trigger_scpi_source), so
+    # ``has_ext_trigger = True`` and the live EXT probe is skipped.  Channel
+    # count is NOT inferable from the model digits for these families (see
+    # channel_count_from_model), so the driver probes it live at connect.
+    # Record lengths span the deep-memory options common to these families;
+    # ``snap_record_length`` rounds a request to the nearest and the driver
+    # reads back what actually landed, so the exact set need only bracket
+    # the useful range.
+    TekSeriesSpec(
+        series_name     = "MSO/MDO/DPO",
+        pattern         = r"(?:MSO|MDO|DPO)\d{3,4}[A-Z]?",
+        commands        = MODERN_CMDS,
+        has_ext_trigger = True,
+        record_lengths  = (1_000, 10_000, 20_000, 100_000,
+                           1_000_000, 5_000_000, 10_000_000, 20_000_000),
+        bandwidth_options    = (_BW_FULL_GENERIC, _BW_TWENTY),
+        recommended_imon_bw  = _BW_TWENTY,
+    ),
+
     # ---- TBS2000/B — 4- and 2-channel, modern, NO EXT trigger -------------
     # Models: TBS2074B TBS2104B TBS2204B  TBS2072B TBS2102B TBS2202B
     # NUMAVg valid set confirmed on TBS2204B: 2, 4, 16, 32, 64, 128, 256, 512
@@ -685,7 +712,7 @@ _SERIES: Sequence[TekSeriesSpec] = [
     # Models: TBS1052B TBS1072B TBS1102B TBS1152B TBS1202B
     TekSeriesSpec(
         series_name     = "TBS1000B",
-        pattern         = r"TBS1\d{3}B",
+        pattern         = r"TBS1\d{3}B(?:-EDU)?",
         commands        = LEGACY_CMDS,
         has_ext_trigger = False,
         record_lengths  = (2_500,),
@@ -783,22 +810,41 @@ class TekModelSpec:
 # Public helpers
 # ---------------------------------------------------------------------------
 
-def channel_count_from_model(model: str) -> int:
-    """Return the channel count encoded in *model*, or 2 if unrecognisable.
+def channel_count_from_model(model: str) -> Optional[int]:
+    """Return the channel count encoded in *model*, or ``None`` if it can't
+    be inferred from the name alone.
 
-    Tektronix encodes the channel count as the last digit of the model number
-    (before any suffix letter).  Examples:
+    Only the **TBS / TDS / TPS** basic-scope families encode channel count as
+    the last digit of their 3–4-digit numeric block:
 
-    * ``TBS2074B`` → digit **4** → 4 channels
-    * ``TBS1072C`` → digit **2** → 2 channels
-    * ``TDS2004C`` → digit **4** → 4 channels
+    * ``TBS2074B`` → block ``2074`` → digit **4** → 4 channels
+    * ``TBS1072C`` → block ``1072`` → digit **2** → 2 channels
+    * ``TDS2004C`` → block ``2004`` → digit **4** → 4 channels
+
+    Within TBS / TDS / TPS the 4-channel members always end in ``4`` (…04, …14,
+    …24, …74); every other trailing digit denotes a 2-channel scope (``TDS210``
+    → 0, ``TDS1001B`` → 1 are both 2-channel).  So a last digit of 4 → 4, and
+    anything else in these families → 2.
+
+    **MSO / MDO / DPO** performance scopes use a different naming convention
+    where the trailing digit is NOT the channel count (``MSO4054`` is a
+    4-channel scope, and the 4/5/6-Series ``MSO58`` etc. break the rule
+    entirely).  For those — and for any unrecognised or empty string — this
+    returns ``None`` so the caller probes the channel count live
+    (:meth:`TektronixOscilloscope.probe_channel_count`) and falls back to 4 only
+    if the probe also fails, rather than silently guessing a wrong count that
+    would hide real channels on the Setup tab.
     """
-    m = re.search(r"(\d)(?:[A-Z]*)$", (model or "").strip().upper())
-    if m:
-        d = int(m.group(1))
-        if d in (2, 4):
-            return d
-    return 2
+    key = (model or "").strip().upper()
+    # Gate on the families where the trailing-digit convention actually holds.
+    if not re.match(r"(?:TBS|TDS|TPS)\d", key):
+        return None
+    m = re.search(r"(\d{3,4})", key)   # the model's numeric block
+    if not m:
+        return None
+    d = int(m.group(1)[-1])            # last digit of that block
+    # 4-channel members end in 4; all other TBS/TDS/TPS models are 2-channel.
+    return 4 if d == 4 else 2
 
 
 def _bandwidth_from_model(model: str) -> int:
@@ -866,6 +912,44 @@ def get_model_spec(model: str) -> Optional[TekModelSpec]:
         has_ext_trigger = series.has_ext_trigger,
         commands        = series.commands,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pure model → SCPI-dialect classification (no live scope)
+# ---------------------------------------------------------------------------
+#: The two canonical SCPI dialects, exposed as sentinels so callers can write
+#: ``select_dialect(model) is MODERN``.  They ARE the base command sets; a
+#: series may carry a lightly-customised copy (e.g. a restricted NUMAVg set),
+#: so :func:`select_dialect` classifies by preamble FAMILY and returns the base
+#: sentinel rather than the per-series object.
+MODERN = MODERN_CMDS
+LEGACY = LEGACY_CMDS
+
+
+def select_dialect(model: str) -> TekCommandSet:
+    """Classify a Tek model string to its SCPI dialect: :data:`MODERN` or
+    :data:`LEGACY`.
+
+    String-only path used when no live scope is present (dry runs, tests,
+    offline setup).  Maps the model to its series and reports which dialect
+    that series speaks:
+
+    * :data:`MODERN` — ``WFMOutpre`` preamble, percent ``HORizontal:POSition``,
+      ``TRIGger:A:*`` namespace: TBS1000C, TBS2000B/C, MSO/MDO/DPO.
+    * :data:`LEGACY` — ``WFMPre`` preamble, ``TRIGger:MAIn:*`` namespace:
+      TBS1000/B (+ ``-EDU``), TDS1000/2000/200, TPS2000.
+
+    An unknown or empty model falls back to :data:`LEGACY` — the conservative
+    subset every Tek basic scope understands, so a mis-identified scope
+    degrades gracefully instead of being sent modern-only SCPI it rejects.
+    The live driver prefers an on-connect probe
+    (:meth:`TektronixOscilloscope._probe_commands`) and uses this only as the
+    offline / fallback classifier.
+    """
+    spec = get_series_spec(model)
+    if spec is None:
+        return LEGACY
+    return MODERN if spec.commands.preamble == MODERN_CMDS.preamble else LEGACY
 
 
 def snap_record_length(n: int, model: str) -> int:

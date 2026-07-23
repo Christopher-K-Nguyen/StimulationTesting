@@ -139,9 +139,10 @@ def channel_count_from_model(model: str) -> Optional[int]:
 from ..config import DEFAULT_RECORD_LENGTH  # noqa: F401,E402
 
 
-from .tektronix_models import (  # noqa: E402
+from .tektronix_models import (  # noqa: F401,E402
     get_model_spec, snap_record_length,
     TekCommandSet, MODERN_CMDS, LEGACY_CMDS,
+    MODERN, LEGACY, select_dialect,
     channel_count_from_model as _channel_count_from_model,
 )
 
@@ -1443,7 +1444,12 @@ class TektronixOscilloscope(Oscilloscope):
         """
         if self._inst is None:
             return False
-        src_cmd = self._cmds.trig_edge_source
+        # This probe can run before open() has finalised the dialect (and on
+        # a bare test double built via __new__ that never set _cmds), so fall
+        # back to the modern edge-source command — the exact SCPI we're
+        # probing for. A legacy scope that lacks it simply echoes its channel
+        # source back and the probe returns False.
+        src_cmd = getattr(self, "_cmds", MODERN_CMDS).trig_edge_source
 
         def _strip_header(raw: str) -> str:
             """Pull just the source token out of a TRIGger?-style reply.
@@ -1466,8 +1472,12 @@ class TektronixOscilloscope(Oscilloscope):
                 return ""
             return raw.split()[-1].strip()
 
+        # Read/write the instrument DIRECTLY (not via self._q / self._w):
+        # this probe can run before open() has populated the serial-mode /
+        # logging state those wrappers need, and it already writes directly
+        # below. It's best-effort — any failure returns False.
         try:
-            prev_raw = self._q(f"{src_cmd}?").strip()
+            prev_raw = self._inst.query(f"{src_cmd}?").strip()
         except Exception:
             return False
         prev = _strip_header(prev_raw)
@@ -1479,7 +1489,7 @@ class TektronixOscilloscope(Oscilloscope):
                 pass
             self._inst.write(f"{src_cmd} EXT")
             try:
-                got_raw = self._q(f"{src_cmd}?").strip()
+                got_raw = self._inst.query(f"{src_cmd}?").strip()
             except Exception:
                 got_raw = ""
             got = _strip_header(got_raw).upper()
