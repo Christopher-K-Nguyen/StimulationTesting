@@ -85,6 +85,8 @@ def _all_markers(cap):
             sym = sp.opts.get("symbol")
             if sym is _w._hbar_symbol():
                 sym = "hbar"
+            elif sym is _w._vbar_symbol():
+                sym = "vbar"
             elif sym is _w._plus_symbol():
                 sym = "+"
             out.append((it.toPlainText(), x, sym))
@@ -131,12 +133,12 @@ def test_vd_at_end_of_largest_current_phase_for_asymmetric(qapp):
         f"V_d should sit at the end of phase 2 (~{win[1][1]}), got x={x}"
 
 
-def test_va_uses_hbar_vd_and_polarization_use_plus(qapp):
+def test_va_uses_hbar_vd_plus_and_polarization_vbar(qapp):
     """Operator glyph convention (latest): V_a keeps the horizontal-bar
-    glyph; V_d is now a "+" ("Change the driving voltage marker symbol
-    as a plus instead of a horizontal bar"); electrode polarization
-    stays a "+" labelled Emc (cathodic) / Ema (anodic).  V_d vs E_pol
-    disambiguate by colour + label."""
+    glyph; V_d is a "+"; electrode polarization is a VERTICAL bar ("vbar")
+    labelled Emc (cathodic) / Ema (anodic) ("Change the electrode polarization
+    marker as vertical bar instead of a plus symbol").  V_d vs E_pol
+    disambiguate by shape (+ vs |) + colour + label."""
     from stimtest.waveforms import PulsePattern
     p = PulsePattern.biphasic(amplitude_ua=80.0)
     cap = _capture(p, [(-80.0, -0.30), (80.0, 0.20)])
@@ -147,11 +149,11 @@ def test_va_uses_hbar_vd_and_polarization_use_plus(qapp):
         by_kind[head] = sym
     # access -> horizontal bar (HTML subscripts -> plain "Va1"/"Vd")
     assert by_kind.get("Va1") == "hbar", f"got {by_kind}"
-    # driving -> "+" (operator's plus request)
+    # driving -> "+"
     assert by_kind.get("Vd") == "+", f"got {by_kind}"
-    # polarization -> "+", cathodic phase = Emc, anodic phase = Ema
-    assert by_kind.get("Emc") == "+", f"got {by_kind}"
-    assert by_kind.get("Ema") == "+", f"got {by_kind}"
+    # polarization -> VERTICAL bar, cathodic phase = Emc, anodic phase = Ema
+    assert by_kind.get("Emc") == "vbar", f"got {by_kind}"
+    assert by_kind.get("Ema") == "vbar", f"got {by_kind}"
 
 
 def test_access_markers_include_leading_and_trailing(qapp):

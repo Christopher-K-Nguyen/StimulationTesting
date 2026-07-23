@@ -999,7 +999,7 @@ class _ChannelPage(QtWidgets.QWidget):
                 # polarization plus.
                 "driving":       (MARKER_COLOURS["driving"], "+"),
                 "driving_other": (MARKER_COLOURS["driving_other"], "hbar"),
-                "polar":         (MARKER_COLOURS["polar"], "+"),
+                "polar":         (MARKER_COLOURS["polar"], "vbar"),
                 "interphase":    (MARKER_COLOURS["interphase"], "o"),
                 "badclass":      (MARKER_COLOURS["badclass"], "x"),
             }
@@ -1016,13 +1016,10 @@ class _ChannelPage(QtWidgets.QWidget):
                 ))
             # The scope parks the legend clear of the waveform + these labels.
             self.scope.set_markers(_markers)
-            # Vertical guide lines at the EXPECTED E_pol locations (12 µs
-            # after each delayed phase) — a geometric reference so the
-            # operator can verify the measured Emc/Ema landed correctly,
-            # especially for smooth sine/gaussian pulses (operator request).
+            # No E_pol guide lines (operator: "remove the x line and their
+            # label") — clear any that a prior render drew.
             try:
-                from ..plotting import expected_epol_times_us
-                self.scope.set_epol_guides(expected_epol_times_us(cap))
+                self.scope.set_epol_guides([])
             except Exception:
                 pass
         except Exception:

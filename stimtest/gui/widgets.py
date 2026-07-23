@@ -275,6 +275,24 @@ def _plus_symbol():
     return _PLUS_PATH
 
 
+#: Cached VERTICAL-bar glyph — the electrode-polarization (Emc/Ema) marker
+#: (operator: "Change the electrode polarization marker as vertical bar instead
+#: of a plus symbol").  A single vertical line stroke, thickness = marker pen.
+_VBAR_PATH = None
+
+
+def _vbar_symbol():
+    """A short VERTICAL bar in the unit symbol box — the Emc/Ema polarization
+    glyph, stroked by the marker pen like the horizontal bar."""
+    global _VBAR_PATH
+    if _VBAR_PATH is None:
+        p = QtGui.QPainterPath()
+        p.moveTo(0.0, -0.5)
+        p.lineTo(0.0, 0.5)
+        _VBAR_PATH = p
+    return _VBAR_PATH
+
+
 # ---------------------------------------------------------------------------
 # Rotated axis-title widget
 # ---------------------------------------------------------------------------
@@ -1810,14 +1828,14 @@ class ScopePlot(QtWidgets.QWidget):
                     # + horizontal — so among otherwise-clear spots the
                     # CLOSEST wins and a tag is never flung across the plot.
                     _cy = 0.5 * (bb + bt)
-                    # The electrode-polarization tag (Emc / Ema — the ONLY
-                    # marker drawn with the "+" glyph) gets a DOUBLED proximity
-                    # pull so it stays right next to its marker (operator: "be
-                    # sure that the electrode polarization marker label is near
-                    # its marker").  Still below the trace-overlap (30×) and
-                    # label-overlap (90×) terms, so it prefers the CLOSEST
-                    # clear spot without ever sitting on the trace / another tag.
-                    _pw = 2.0 if _symbol == "+" else 1.0
+                    # The electrode-polarization tag (Emc / Ema — the marker
+                    # drawn with the "vbar" glyph, formerly "+") gets a DOUBLED
+                    # proximity pull so it stays right next to its marker
+                    # (operator: "be sure that the electrode polarization marker
+                    # label is near its marker").  Still below the trace-overlap
+                    # (30×) and label-overlap (90×) terms, so it prefers the
+                    # CLOSEST clear spot without ever sitting on the trace / tag.
+                    _pw = 2.0 if _symbol in ("vbar", "+") else 1.0
                     _gap_v = abs(_cy - _y) / y_span
                     _gap_h = max(0.0, bl - _x, _x - br) / x_span
                     score += _pw * 6.0 * _gap_v
@@ -1862,6 +1880,9 @@ class ScopePlot(QtWidgets.QWidget):
                 _brush = pg.mkBrush(_color)
                 if _symbol == "hbar":
                     sym = _hbar_symbol(); size = 11; pen_w = 2
+                elif _symbol == "vbar":
+                    # Electrode-polarization (Emc/Ema) VERTICAL bar (operator).
+                    sym = _vbar_symbol(); size = 11; pen_w = 2
                 elif _symbol == "+":
                     sym = _plus_symbol(); size = 9; pen_w = 2
                 elif _symbol == "o":

@@ -1544,7 +1544,10 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
             # horizontal bar").
             "driving":       (MARKER_COLOURS["driving"], "+"),
             "driving_other": (MARKER_COLOURS["driving_other"], "_"),  # bare bar
-            "polar":         (MARKER_COLOURS["polar"], "+"),
+            # Electrode polarization (Emc/Ema) — VERTICAL bar (operator:
+            # "Change the electrode polarization marker as vertical bar instead
+            # of a plus symbol"); matplotlib "|" is the vertical-line marker.
+            "polar":         (MARKER_COLOURS["polar"], "|"),
             "interphase":    (MARKER_COLOURS["interphase"], "o"),     # no label
             "badclass":      (MARKER_COLOURS["badclass"], "x"),
         }
