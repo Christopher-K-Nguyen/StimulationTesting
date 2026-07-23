@@ -586,6 +586,37 @@ def solve_capacitive_balance(*,
     N = EXP_DECAY_TAU_RATIO
     decay_factor = 1.0 - float(np.exp(-N))   # (1 − exp(−N)) ≈ 0.9933
 
+    # Zero cathodic charge → zero recharge.  With no charge to balance,
+    # the anodic phase collapses to 0 µA REGARDLESS of lock mode (operator:
+    # "When the first phase is 0 µA, set the second phase of PCC to be 0 µA
+    # as well").  ``LOCK_WIDTH`` already derives a 0-µA peak, but
+    # ``LOCK_AMPLITUDE`` would otherwise KEEP the user's locked peak (e.g.
+    # 230 µA) with a degenerate 0-width phase — so the recharge stayed live
+    # at 0 µA excitation.  Return a clean 0-µA anodic phase, keeping a
+    # sensible width so it stays well-formed (``PulsePattern.validate``
+    # rejects a 0-width phase): the locked width in ``LOCK_WIDTH`` mode,
+    # else the cathodic width (symmetric default).  ``Q <= 0`` also covers
+    # a 0-width cathodic (``tc == 0``).
+    if Q <= 0.0:
+        if lock == LOCK_WIDTH:
+            ta0 = max(1e-6, abs(float(locked_value)))
+        else:
+            ta0 = max(1e-6, tc)
+        if tau_override_us is not None and float(tau_override_us) > 0.0:
+            tau0 = float(tau_override_us)
+        else:
+            tau0 = ta0 / N
+        return CapacitiveBalance(
+            anodic_amplitude_ua=0.0,
+            anodic_width_us=ta0,
+            tau_us=tau0,
+            cathodic_charge_nc=0.0,
+            actual_anodic_charge_nc=0.0,
+            saturated=False,
+            flat_width_us=0.0,
+            infeasible=False,
+        )
+
     # Compose a budget for the iterative refinement so the solver's
     # actual_charge_nc() integrates over the SAME breakpoint grid
     # that ``_load_arbitrary`` will eventually write to the .pat.
