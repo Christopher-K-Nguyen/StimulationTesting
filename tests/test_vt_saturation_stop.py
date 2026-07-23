@@ -272,3 +272,78 @@ def test_ramp_never_retests_an_amplitude():
             for c in run.captures if not c.status.aborted
             and abs(c.pattern.excitation_phase.amplitude_ua) > 0.0]
     assert len(amps) == len(set(amps)), "an amplitude was tested twice"
+
+
+# ---- ESCALATION: reach max on a genuine plateau, spare a climber ----------
+
+def test_confirmed_plateau_fires_on_flat_six_window():
+    """The ESCALATION detector fires on a genuine 6-capture flat, near-limit,
+    increasing-amplitude window (a saturated electrode)."""
+    r = _runner()
+    caps = [_cap(700 + 6 * i, 0.575 + (0.002 if i % 2 else -0.002))
+            for i in range(6)]
+    assert r._epol_confirmed_plateau(caps) is True
+
+
+def test_confirmed_plateau_spares_a_rising_six_window():
+    """A RISING near-limit 6-window must NOT fire — the escalation ACTS on
+    detection, so it must not over-polarize a slow climber (the fast tier's
+    3-capture window could false-fire on noise; the 6-capture linear fit
+    cannot)."""
+    r = _runner()
+    caps = [_cap(700 + 10 * i, 0.545 + 0.006 * i) for i in range(6)]  # 0.545→0.575
+    assert r._epol_confirmed_plateau(caps) is False
+
+
+def test_plateau_below_band_escalates_toward_max():
+    """A saturating electrode whose E_pol plateaus BELOW the band (ratio ~0.92,
+    never genuinely crosses) reaches near MAX current — the operator's 'reach
+    max current, hardware-limited' — instead of noise-creeping to a random low
+    amplitude and reporting it as max Q_inj."""
+    def _plateau(amp):
+        return 0.55 * (1.0 - np.exp(-abs(amp) / 150.0))   # saturates at 0.55
+    r = _runner()
+    _drive(r, _plateau, seed=7)
+    run = r._run_one_configuration(Configuration.monopolar(1))
+    amps = [abs(c.pattern.excitation_phase.amplitude_ua)
+            for c in run.captures if not c.status.aborted]
+    assert max(amps) >= 900.0, max(amps)     # escalated toward the 1000 µA max
+    assert np.isfinite(run.max_q_inj)
+
+
+def test_single_noise_crossing_does_not_stop_the_ramp():
+    """2-CONSECUTIVE reached: a lone in-band capture (E_pol below the near edge
+    but noise-spiked over it ONCE) must NOT stop the ramp — the electrode is
+    still below the band, so it keeps climbing (exp_vt_max_anodal CH08 crept 34
+    captures because a single noise crossing at 774 µA falsely stopped it)."""
+    below = -0.55            # cathodic, near-edge is -0.58 (limit -0.6, tol 0.02)
+    seq = iter([below, below, -0.59, below, below, below])   # ONE spike over -0.58
+    r = _runner()
+
+    def _fake(config, pattern, idx):
+        amp = abs(float(pattern.excitation_phase.amplitude_ua))
+        c = Capture(index=idx, pattern=pattern)
+        try:
+            e = next(seq) if amp > 0 else 0.0
+        except StopIteration:
+            e = below
+        c.metrics.polarization_per_phase_v = [e, 0.0]
+        c.metrics.response_class = "normal"
+        c.metrics.charge_injection_mc_per_cm2 = amp / 100.0
+        c.time_us = np.zeros(4); c.v_mon_v = np.zeros(4); c.i_mon_ua = np.zeros(4)
+        return c
+    r._one_capture = _fake
+    r._record_capture_dose = lambda run, cap: None
+    r.bias_step_if_armed = lambda: None
+    r.apply_default_scope_view = lambda *a, **k: None
+    r.arm_bias_feedback = lambda: None
+    r.disarm_bias_feedback = lambda: None
+    r._seed_scope_scales = lambda *a, **k: None
+    r._emit = lambda ev: None
+    run = r._run_one_configuration(Configuration.monopolar(1))
+    # The single -0.59 spike (3rd real capture) must NOT have stopped the ramp:
+    # it kept going past that capture.
+    reached_caps = [c for c in run.captures
+                    if c.status.reached_potential_limit]
+    # The lone spike alone never confirms (needs 2 consecutive) → no stop on it.
+    assert len(run.captures) > 4, [len(run.captures)]

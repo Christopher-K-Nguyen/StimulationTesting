@@ -4957,9 +4957,17 @@ class VoltageTransientTab(_BaseExperimentTab):
     MODE_FIXED_QPH = "Fixed charge/phase"
     MODE_FIXED_QD = "Fixed charge density"
     MODE_MAX = "Maximum"
-    STRAT_INCR = "Fixed increment"
-    STRAT_REGR = "Adaptive (regression)"
+    # Speed parentheticals (operator) — ordered slowest → fastest below.
+    STRAT_INCR = "Fixed increment (slowest)"
+    STRAT_ADAPT = "Adaptive (fastest)"   # the full water-window-seeking controller
+    STRAT_REGRESSION = "Regression"      # PURE regression (efficiency not a goal)
     STRAT_PRED = "Predictive (ML)"
+    #: legacy display strings (pre-0.2.213) → current, for ``restore_prefs``
+    #: migration so an old stored value restores to the right combo item
+    #: instead of silently falling back to item 0.  ``STRAT_REGR`` is the old
+    #: hybrid label ("Adaptive (regression)" — the parenthetical was misleading
+    #: once regression became its own policy).
+    STRAT_REGR = "Adaptive (regression)"
 
     #: Lock-target options for the 3-way Fixed-Q_ph lock UI. Whichever
     #: parameter is locked is the one the runner / handlers AUTO-DERIVE
@@ -5147,14 +5155,22 @@ class VoltageTransientTab(_BaseExperimentTab):
         # ``self.STRAT_PRED`` to the ``addItems`` list and restore
         # the third tooltip bullet below.
         self.strategy_combo = QtWidgets.QComboBox()
-        self.strategy_combo.addItems([self.STRAT_INCR, self.STRAT_REGR])
+        # Ordered slowest → fastest (operator): Fixed increment, Regression,
+        # Adaptive.
+        self.strategy_combo.addItems(
+            [self.STRAT_INCR, self.STRAT_REGRESSION, self.STRAT_ADAPT])
         self.strategy_combo.currentTextChanged.connect(self._on_strategy_changed)
         self.strategy_combo.setToolTip(
             "Maximum-mode ramp algorithm.<br><br>"
-            "<b>Incremental</b> — fixed-step climb using "
-            "coarse / fine step sizes.<br>"
-            "<b>Regression</b> — fit V_d(I_stim) and project the "
-            "next step from the fit.")
+            "<b>Fixed increment</b> — fixed-step climb using coarse / fine "
+            "step sizes.<br>"
+            "<b>Adaptive</b> — water-window-seeking controller: regression + "
+            "local secant + fine-approach oscillation + plateau-to-max "
+            "escalation, tuned to reach max charge injection in few captures."
+            "<br>"
+            "<b>Regression</b> — PURE regression: fit E_pol(I_stim) and step "
+            "toward the projected crossover only (no efficiency heuristics) — "
+            "a clean, interpretable baseline; takes more captures.")
 
         # ----- ramp policy controls (Maximum mode) -----
         # Pattern shape comes from self.pattern_panel; start_ua is the
@@ -5777,7 +5793,10 @@ class VoltageTransientTab(_BaseExperimentTab):
         #   Adaptive / Pred  : max, safety_factor  (no coarse/fine)
         show = {
             self.STRAT_INCR: {"coarse_ua", "fine_ua", "max_ua"},
-            self.STRAT_REGR: {"max_ua", "safety_factor"},
+            self.STRAT_ADAPT: {"max_ua", "safety_factor"},
+            # Regression: max + the coarse BOOTSTRAP step (used before the fit
+            # has enough points); no safety_factor (that's an adaptive knob).
+            self.STRAT_REGRESSION: {"max_ua", "coarse_ua"},
             self.STRAT_PRED: {"max_ua", "safety_factor"},
         }.get(strat, {"coarse_ua", "fine_ua", "max_ua"})
         for key, (lab, w) in self._ramp_rows.items():
@@ -5802,6 +5821,18 @@ class VoltageTransientTab(_BaseExperimentTab):
         return out
 
     def restore_prefs(self, p: dict):
+        # Migrate legacy strategy labels (pre-0.2.213: the hybrid was
+        # "Adaptive (regression)", and the labels had no speed parenthetical) so
+        # an old stored value restores to the right combo item instead of
+        # silently falling back to item 0.
+        _legacy = {
+            self.STRAT_REGR: self.STRAT_ADAPT,   # "Adaptive (regression)"
+            "Adaptive": self.STRAT_ADAPT,        # brief 0.2.213 intermediate
+            "Fixed increment": self.STRAT_INCR,  # pre-parenthetical
+        }
+        if p and p.get("strategy_combo") in _legacy:
+            p = dict(p)
+            p["strategy_combo"] = _legacy[p["strategy_combo"]]
         super().restore_prefs(p)
         target = (p or {}).get("qph_lock_target", self.QPH_LOCK_QPH)
         if target == self.QPH_LOCK_CURRENT:
@@ -6107,6 +6138,22 @@ class VoltageTransientTab(_BaseExperimentTab):
                               fine_step_ua=self.fine_ua.value(),
                               max_ua=self.max_ua.value(),
                               strategy="increment",
+                              **self._failure_detection_kwargs())
+        if strat == self.STRAT_REGRESSION:
+            # PURE-regression policy: fit + step toward the projected crossover
+            # only (efficiency not a goal).  The coarse step is the pre-fit
+            # bootstrap probe; safety (band stop + back-off + base growth cap)
+            # still bounds it.
+            _coarse = (self.coarse_ua.value()
+                       if self.coarse_ua.value() > 0 else
+                       max(self.max_ua.value() * 0.05, 1.0))
+            self.log_pane.log(
+                f"Regression ramp (pure regression, efficiency not a goal): "
+                f"bootstrap probe ≈ {_coarse:.2f} µA.")
+            return RampPolicy(coarse_step_ua=_coarse,
+                              fine_step_ua=max(_coarse / 5.0, 0.5),
+                              max_ua=self.max_ua.value(),
+                              strategy="regression",
                               **self._failure_detection_kwargs())
         # Adaptive / Predictive — the runner does the regression and
         # picks where to jump next; we just hand it the start/max

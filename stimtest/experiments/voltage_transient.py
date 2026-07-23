@@ -222,6 +222,11 @@ class RampPolicy:
     safety_factor: float = 0.85       # multiplied into predictions once oscillation kicks in
     oscillation_threshold: int = 3    # # of prediction direction-reversals before safety kicks in
     min_points_for_regression: int = 2  # below this, adaptive uses the proportional SEED jump
+    # PURE-"Regression" policy (strategy="regression"): fraction of the
+    # regression-projected crossover DELTA to actually step (a safety undershoot
+    # so a single noisy fit doesn't over-drive).  Only used by the pure-
+    # regression step; the adaptive policy has its own dampening schedule.
+    regression_step_fraction: float = 0.9
     seed_fraction: float = 0.7        # pre-regression seed: jump to this fraction of the
                                       # linearly-projected limit amplitude (safe undershoot)
     # ZERO-START DAMPENING SCHEDULE (operator: "Change the safe steps as
@@ -322,6 +327,13 @@ class RampPolicy:
     # electrode reaches the band via bounded steps, never a fling.  The
     # per-capture band stop then catches the crossing at a bounded amplitude.
     snap_ceiling_max_ratio: float = 0.75
+    # 2-CONSECUTIVE band confirmation (operator: "require 2 consecutive in-band
+    # captures").  E_pol is noisy near the water window, so the reached / back-
+    # off stop fires only once the band condition holds on this many CONSECUTIVE
+    # captures — a lone noise spike then can't trip it (a false stop at a random
+    # amplitude / a garbage max-Q_inj from a +1.49 V spike).  1 = the old
+    # single-capture behaviour.
+    reached_min_consecutive: int = 2
     # BURIED-REGION √-BOUNDED LOOSENING (operator: "reach the maximum charge
     # injection capacity more efficiently").  The FLAT loosest tier (×2.5) is
     # calibrated for the worst PHYSICAL concave-up electrode (a QUADRATIC
@@ -903,6 +915,15 @@ class VoltageTransientExperiment(ExperimentRunner):
         # (no prior observed range to extrapolate from).
         self._seed_prev_amp_ua = None
         self._seed_prev_half_range = {}
+        # 2-CONSECUTIVE reached confirmation (operator: "require 2 consecutive
+        # in-band captures").  E_pol is NOISY near the water window, so a lone
+        # in-band capture must not trip a false STOP at a random creep amplitude
+        # (exp_vt_max_anodal CH08's +0.7827 crossing at 774 µA).  Only the
+        # reached STOP is 2-consecutive; the EXCEEDED back-off stays SINGLE-
+        # capture + prompt (delaying it over-polarizes a rising electrode — a
+        # safety regression; a lone exceeded spike is already excluded from
+        # max_q_inj, so it can't corrupt the ceiling).
+        _consec_in_band = 0
 
         # ----- main amplitude ramp ---------------------------------------
         # We ramp the stimulus amplitude upward from the pattern amplitude
@@ -1039,40 +1060,59 @@ class VoltageTransientExperiment(ExperimentRunner):
                 # decision so the flag can't disagree with the break reason.
                 compliance = cap.status.voltage_compliance
 
+                # 2-CONSECUTIVE band confirmation (operator: "require 2
+                # consecutive in-band captures").  Update the counters from the
+                # SINGLE-capture flags; the stop / back-off fire only once the
+                # band condition is CONFIRMED on ``reached_min_consecutive``
+                # consecutive captures, so a lone noise spike near the water
+                # window can't trip them (CH08's +0.7827 crossing at 774 µA;
+                # CH16's +1.49 V spike).  A single (unconfirmed) in-band /
+                # exceeded capture keeps the ramp climbing so the NEXT capture
+                # confirms or refutes it.
+                _min_consec = max(1, int(getattr(
+                    self.ramp, "reached_min_consecutive", 2)))
+                _single_exc = bool(cap.status.exceeded_potential_limit)
+                _single_in_band = bool(limit_hit) and not _single_exc
+                _consec_in_band = (_consec_in_band + 1) if _single_in_band else 0
+                _res = abs(getattr(self.ramp,
+                           "test_current_resolution_ua", 0.1)) or 0.1
+                _at_ceiling = amp >= float(self.ramp.max_ua) - _res
+
                 if compliance:
                     break
-                if limit_hit:
-                    # An OVERSHOOT (E_pol past the far edge) → back off and
-                    # RE-CAPTURE to land in-band instead of stopping on the
-                    # overshoot (operator, RECURRING + emphatic: "the maximum
-                    # VT testing is not continuing to DECREMENT the current if
-                    # it exceeds the potential limits"; "quitting too soon …
-                    # enough current to reduce").  Otherwise (a clean in-band
-                    # stop — reached the near edge but did NOT overshoot the
-                    # far edge) stop here as before.
+                if _single_exc:
+                    # EXCEEDED (E_pol past the far edge) → back off + RE-CAPTURE
+                    # to land in-band (operator: "the maximum VT testing is not
+                    # continuing to DECREMENT the current if it exceeds the
+                    # potential limits").  The back-off is SINGLE-CAPTURE (prompt),
+                    # NOT 2-consecutive: delaying it by a confirmation step let a
+                    # RISING electrode over-polarize further (test_vt_saturation_
+                    # stop: 0.978→1.058, and a slow climber to 1.104×) — a SAFETY
+                    # regression.  A noise-spike overshoot needs no confirmation
+                    # here: the exceeded capture is EXCLUDED from max_q_inj
+                    # (gotcha #104), so a lone spike can't corrupt the reported
+                    # ceiling, and the back-off steps DOWN (never a worse
+                    # overshoot).  The 2-consecutive confirmation applies to the
+                    # in-band STOP below (a false stop at a random creep amplitude
+                    # was the real noise problem — CH08's +0.7827 at 774 µA).
                     #
-                    # The bracket floor is the last below-band amplitude, or
-                    # 0 µA (always safe — 0 current → 0 polarization) when the
-                    # very first tested current already overshot (``last_safe_
-                    # amp is None`` on a non-zero-start ramp).  The room-to-
-                    # decrement test uses the 0.1 µA TESTING resolution, NOT
-                    # the 1 µA forward ``fine_step_ua`` — the bug the operator
-                    # kept hitting: a FINE-APPROACH overshoot lands ~1 µA above
-                    # the last safe amp, so the old ``> fine_step_ua`` (1 µA)
-                    # gate was FALSE and back-off was skipped, stopping the
-                    # ramp on the overshoot without ever decrementing.  Back-
-                    # off's own bracketing runs at 0.1 µA, so any ≥ 0.1 µA gap
-                    # can and must be decremented into.
+                    # Bracket floor = the last below-band amplitude, or 0 µA (0
+                    # current → 0 polarization) when the first tested current
+                    # already overshot.  Room test uses the 0.1 µA resolution.
                     _lo_amp = last_safe_amp if last_safe_amp is not None else 0.0
-                    _res = abs(getattr(self.ramp,
-                               "test_current_resolution_ua", 0.1)) or 0.1
                     if (self.ramp.backoff_on_overshoot
-                            and cap.status.exceeded_potential_limit
                             and (amp - _lo_amp) > _res):
                         capture_idx = self._backoff_to_band(
                             config, base_pattern, run,
                             lo_amp=_lo_amp, lo_cap=last_safe_cap,
                             hi_amp=amp, hi_cap=cap, capture_idx=capture_idx)
+                    break
+                if _consec_in_band >= _min_consec or (_single_in_band
+                                                      and _at_ceiling):
+                    # CONFIRMED in-band reached (2 consecutive) — a lone noisy
+                    # capture near the band can't trip a false stop.  OR a single
+                    # in-band capture AT THE CEILING (can't step higher to
+                    # confirm — accept it as hardware-limited).
                     break
 
                 # E_POL SATURATION near the water window — the electrode's
@@ -1105,9 +1145,13 @@ class VoltageTransientExperiment(ExperimentRunner):
                 # ramp.
 
                 # Below the band → this amplitude is safe; remember it as the
-                # back-off floor before stepping up.
-                last_safe_amp = amp
-                last_safe_cap = cap
+                # back-off floor before stepping up.  An UNCONFIRMED single
+                # in-band / exceeded capture is NOT a safe below-band floor, so
+                # it must not overwrite it (a noise spike's amplitude must not
+                # become the back-off floor).
+                if not (_single_in_band or _single_exc):
+                    last_safe_amp = amp
+                    last_safe_cap = cap
                 _delta = self._maybe_safety_probe(
                     self._next_step(cap, amp, run.captures), run.captures)
                 # SEED SAFETY CAP: while the polarization signal is still
@@ -1143,6 +1187,13 @@ class VoltageTransientExperiment(ExperimentRunner):
                     # kept only for the operator-facing log line.
                     _ratio = self._growth_ratio(run.captures)
                     _raw_ratio = self._worst_epol_ratio(run.captures)
+                    # The PURE-"Regression" policy keeps the BASE growth-cap
+                    # tier (a safety bound) but DISABLES the efficiency-oriented
+                    # √-loosening + concave-down loosening + snap-to-ceiling, so
+                    # the step stays regression-driven (operator: "only
+                    # regression is used and efficiency is not a goal").
+                    _is_regression = (self.ramp.strategy
+                                      or "").lower() == "regression"
                     _grow = None
                     for _thr, _g in getattr(self.ramp, "epol_growth_tiers",
                                             ((9.99, 1e9),)):
@@ -1159,7 +1210,8 @@ class VoltageTransientExperiment(ExperimentRunner):
                     # untouched, and the clamp keeps it ≥ the flat value.
                     _tiers = getattr(self.ramp, "epol_growth_tiers",
                                      ((0.20, 2.5),))
-                    if _grow is not None and _tiers and _ratio < _tiers[0][0]:
+                    if (_grow is not None and _tiers and _ratio < _tiers[0][0]
+                            and not _is_regression):
                         _T = float(getattr(self.ramp,
                                            "blind_target_next_ratio", 0.65))
                         _ceil = float(getattr(self.ramp,
@@ -1194,7 +1246,8 @@ class VoltageTransientExperiment(ExperimentRunner):
                     # (fast but never an unbounded fling).
                     _emerged = np.isfinite(_ratio) and _ratio >= _tiers[0][0]
                     _cd_ok = (self._epol_concave_down(run.captures)
-                              and _emerged and not _near_band)
+                              and _emerged and not _near_band
+                              and not _is_regression)
                     if _grow is not None and _cd_ok:
                         _cd = float(getattr(self.ramp,
                                             "concave_down_max_growth", 3.0))
@@ -1241,6 +1294,18 @@ class VoltageTransientExperiment(ExperimentRunner):
                                     f"{_delta:.1f} → {_pcap:.1f} µA "
                                     f"(growth guard).")))
                             _delta = _pcap
+                # CONFIRMATION STEP for an UNCONFIRMED single in-band capture
+                # (2-consecutive reached rule): RE-MEASURE at the SAME amplitude
+                # (the no-re-test nudge below bumps it a negligible +0.1 µA) so
+                # the NEXT capture confirms/refutes the crossing WITHOUT stepping
+                # further UP.  A same-amplitude re-measure distinguishes a
+                # genuine crossing (E_pol stays in-band ± noise) from a lone
+                # spike (E_pol reverts below), and does NOT push a STEEP low-Q
+                # electrode deeper toward the window.  (An exceeded capture
+                # already broke to the prompt back-off above; a ceiling in-band
+                # capture already broke as hardware-limited.)
+                if _single_in_band:
+                    _delta = 0.0
                 # Snap the tested amplitude to the 0.1 µA testing grid
                 # (operator: "current testing to have 0.1 µA resolution").
                 amp = self._snap_test_ua(amp + _delta)
@@ -2434,6 +2499,59 @@ class VoltageTransientExperiment(ExperimentRunner):
             return None                          # still climbing → let it climb
         return max(win, key=self._polarization_ratio)
 
+    #: ESCALATION plateau confirmation window — LONGER than the stop detector's
+    #: fast tier (``_SAT_FAST_N`` = 3) because the escalation ACTS (heads to
+    #: max) on the detection, so a false-fire OVERSHOOTS, whereas the stop's
+    #: false-fire only ends a hair early (conservative).  A rising electrode's
+    #: noisy 3-capture window can look flat by chance; a 6-capture LINEAR-FIT
+    #: slope can't (the noise averages out over the longer window).
+    _ESCALATE_WINDOW_N = 6
+
+    def _epol_confirmed_plateau(self, captures: List[Capture]) -> bool:
+        """CONSERVATIVE near-limit plateau confirmation for the ESCALATION
+        (stricter than :meth:`_epol_plateaued_near_limit`'s fast tier).
+
+        The escalation HEADS TO MAX on a positive detection, so a false-fire on
+        a noisy SLOW CLIMBER is an OVERSHOOT (test_vt_saturation_stop: the
+        crosser's 3-capture noisy window false-fired the fast tier → a ×1.15
+        step past the band).  Requires the last ``_ESCALATE_WINDOW_N`` normal,
+        not-yet-reached, non-decreasing-amplitude captures to be (a) NEAR the
+        limit (median ratio ≥ ``_SAT_MIN_RATIO``) and (b) FLAT by a robust
+        LINEAR-FIT slope over the amplitude window AND a flat median trend —
+        so a genuine saturation (CH08: 30 flat captures) escalates while a
+        rising climber (real slope over 6 captures, noise-averaged) does not.
+        """
+        n = int(self._ESCALATE_WINDOW_N)
+        caps = [c for c in captures
+                if not c.status.aborted
+                and getattr(c.metrics, "response_class", "normal") == "normal"
+                and abs(c.pattern.excitation_phase.amplitude_ua) > 0.0
+                and not c.status.reached_potential_limit
+                and not c.status.exceeded_potential_limit]
+        if len(caps) < n:
+            return False
+        win = caps[-n:]
+        amps = np.array([abs(c.pattern.excitation_phase.amplitude_ua)
+                         for c in win], dtype=float)
+        rr = np.array([self._polarization_ratio(c) for c in win], dtype=float)
+        if (not np.all(np.isfinite(rr))) or np.any(rr <= 0):
+            return False
+        if float(np.median(rr)) < self._SAT_MIN_RATIO:
+            return False                          # not near the limit yet
+        if amps[-1] <= amps[0]:
+            return False                          # amplitude must be increasing
+        dr = float(amps[-1] - amps[0])
+        if dr <= 0:
+            return False
+        # Robust FLAT test: the linear-fit slope × the amplitude span is the
+        # net ratio rise the trend predicts; the median half-vs-half trend is a
+        # second, noise-robust check.  Both below the plateau rise threshold.
+        slope = float(np.polyfit(amps, rr, 1)[0])
+        half = n // 2
+        net = float(np.median(rr[-half:]) - np.median(rr[:half]))
+        return (abs(slope) * dr < self._SAT_RISE_RATIO
+                and net < self._SAT_RISE_RATIO)
+
     # ------------------------------------------------------------------
     # Per-excursion trajectories — consider ALL electrode-polarization
     # locations when predicting the max-charge ceiling.
@@ -2897,6 +3015,15 @@ class VoltageTransientExperiment(ExperimentRunner):
             # A stepped ramp starting at 0 µA takes ITS OWN next step
             # (0 + coarse step) — handled naturally by the increment path.
             return self._next_step_increment(cap)
+        if strat == "regression":
+            # PURE-REGRESSION policy (operator: "let Regression be a different
+            # ramp policy, where ONLY regression is used and efficiency is not a
+            # goal").  Step selection is the regression projection ALONE — no
+            # local secant, distance-table oscillation, plateau escalation, or
+            # zero-start seed dampening (those are the "Adaptive" policy's
+            # efficiency machinery).  Safety (band stop + back-off + base E_pol
+            # growth cap) still bounds it in the run loop.
+            return self._next_step_regression(cap, current_amp_ua, captures)
 
         # "Start at 0 µA" (VT maximum): after the 0 µA BASELINE capture the
         # next capture is EXACTLY 1 µA for the adaptive / predictive
@@ -2907,6 +3034,35 @@ class VoltageTransientExperiment(ExperimentRunner):
         # regression climb from that first real measurement.
         if current_amp_ua <= 0.0:
             return 1.0
+
+        # PLATEAU ESCALATION → REACH MAX (operator: a saturating electrode
+        # whose E_pol has FLATLINED just below the band is hardware-limited,
+        # so "reach max current" instead of creeping).  The distance-table
+        # oscillate step (below) sizes from "distance to the limit", but a
+        # SATURATED electrode never closes that distance — E_pol is pinned
+        # flat, so the ramp creeps at the ~1.5 µA floor for 20-40 captures
+        # waiting for a NOISE fluctuation to cross (exp_vt_max_anodal CH08: 34
+        # captures, E_pol stuck at +0.7755 below the +0.78 near-edge).  When
+        # ``_epol_plateaued_near_limit`` confirms the plateau (a FLAT, near-
+        # limit, non-decreasing-amplitude window — NOT a slow climber, which
+        # shows a real rise and is spared), head toward max current.  This is
+        # NOT the rejected snap-to-max (gotcha #178): the step is returned as
+        # ``room`` but the run-loop E_pol growth cap + NEAR-BAND GUARD clamp it
+        # to the TIGHT tier (~×1.15), so it reaches max in a few bounded steps
+        # and the per-capture band stop + back-off catch any real crossing if
+        # the "plateau" was a slow approach — no unbounded fling / over-
+        # polarization.  Does NOT stop below the band (the removed saturation
+        # STOP did — gotcha #177); it reaches MAX, per "reach band or max".
+        # Uses the CONSERVATIVE ``_epol_confirmed_plateau`` (a 6-capture linear-
+        # fit), NOT the stop's fast tier — the escalation ACTS on detection, so
+        # a noisy climber's transient-flat 3-capture window must not false-fire
+        # it into a ×1.15 overshoot (test_vt_saturation_stop).
+        if self._epol_confirmed_plateau(captures):
+            _res = abs(getattr(self.ramp,
+                               "test_current_resolution_ua", 0.1)) or 0.1
+            room = float(self.ramp.max_ua) - current_amp_ua
+            if room > _res:
+                return room
 
         # R3 — DECISIVE near-crossover step (highest priority once close).
         # When an excursion is within ``_APPROACH_RATIO`` of its limit,
@@ -3183,6 +3339,41 @@ class VoltageTransientExperiment(ExperimentRunner):
         if worst >= self.ramp.fine_threshold_ratio:
             return self.ramp.fine_step_ua
         return self.ramp.coarse_step_ua
+
+    def _next_step_regression(self, cap: Capture, current_amp_ua: float,
+                              captures: List[Capture]) -> float:
+        """PURE-regression step — the "Regression" policy (operator: "let
+        Regression be a different ramp policy, where ONLY regression is used and
+        efficiency is not a goal").
+
+        Fit the E_pol-vs-current regression (:meth:`_predict_target_regression`
+        — the SAME poly1/2/3 + exp1 fit the adaptive policy uses, taking the
+        earliest per-excursion water-window crossover) and step toward the
+        projected crossover; COARSE-step to bootstrap until there are enough
+        points to fit.  DELIBERATELY omits the adaptive policy's efficiency
+        heuristics — the local secant, distance-table oscillation, plateau
+        escalation, and zero-start seed dampening — so this is a clean,
+        interpretable regression baseline (for validation / comparison), not a
+        capture-count-optimised controller.  A small undershoot fraction
+        (``regression_step_fraction``) on the projected step keeps a single
+        noisy fit from over-driving; the run-loop band stop + back-off + base
+        E_pol growth cap are the safety net (the efficiency-oriented growth
+        loosening / snap-to-ceiling are disabled for this policy in the run
+        loop, so the step is regression-driven end to end)."""
+        if current_amp_ua <= 0.0:
+            return 1.0
+        target = self._predict_target_regression(captures)
+        if (target is not None and np.isfinite(target)
+                and float(target) > current_amp_ua):
+            frac = float(getattr(self.ramp, "regression_step_fraction", 0.9))
+            frac = max(0.1, min(1.0, frac))
+            step = (float(target) - current_amp_ua) * frac
+            _res = abs(getattr(self.ramp,
+                       "test_current_resolution_ua", 0.1)) or 0.1
+            return float(max(step, _res))
+        # Not enough points to fit yet (or the projection is at/below the
+        # current amplitude) → a fixed COARSE probe step to gather more data.
+        return float(self.ramp.coarse_step_ua)
 
     # ----- regression engine -------------------------------------------
     # R² thresholds match the MATLAB ``changeCurrent_Fit.m`` heuristic:
