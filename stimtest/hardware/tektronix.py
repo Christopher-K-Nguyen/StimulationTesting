@@ -1275,6 +1275,24 @@ class TektronixOscilloscope(Oscilloscope):
         if self._inst is None:
             return spec.commands if spec is not None else MODERN_CMDS
 
+        # Known model → trust the DB command set; do NOT run a live dialect
+        # probe.  Mirrors the channel-count skip a few lines up: a spec means
+        # the dialect is already known, so probing wins nothing — and the
+        # ``WFMOutpre:NR_Pt?`` / ``WFMPre:NR_Pt?`` preamble probes are NOT
+        # reliable cold queries.  Queried right after connect (no DATa:SOUrce,
+        # no acquisition, so the output-preamble context is empty) a TBS2204B
+        # returns no response and the read blocks for the full VISA timeout
+        # (~10 s each), turning a cold connect into a multi-second stall and
+        # logging a spurious VI_ERROR_TMO.  Returning ``spec.commands`` also
+        # preserves the series-specific customisations (e.g. the TBS2000B
+        # NUMAVg set) that the probe-and-rebuild path would discard.
+        if spec is not None:
+            self._log(f"[scope] SCPI dialect: {spec.commands.preamble} / "
+                      f"{spec.commands.horiz_position_unit} "
+                      f"HORizontal:POSition (from model spec — live probe "
+                      f"skipped)")
+            return spec.commands
+
         # Helper: probe with logging so every command sent during the
         # connect handshake shows up in the log/.txt file.  Mirrors the
         # MATLAB connect-time printout where every fprintf and fgetl is
