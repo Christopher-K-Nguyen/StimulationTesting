@@ -718,23 +718,48 @@ def _localize_access_point(deriv_abs: np.ndarray, peak_idx: int,
     return min(upper, n - 1)
 
 
+#: Post-edge iR-extraction window (µs).  The linear fit sits CLOSE to the edge
+#: — starting ``_ACCESS_AFTER_START_US`` after the ``|dV/dt|`` peak (past the
+#: ~1 µs current-rise / switching transient) and spanning ``_ACCESS_AFTER_WIN_US``.
+_ACCESS_AFTER_START_US = 1.0
+_ACCESS_AFTER_WIN_US = 2.0
+
+
 def access_step_by_extrapolation(time_us, v, peak_idx: int, acc_idx: int,
                                  *, before_len: int = 40, before_gap: int = 10,
-                                 after_len: int = 30) -> float:
+                                 after_len: int = 30,
+                                 after_start_us: float = _ACCESS_AFTER_START_US,
+                                 after_win_us: float = _ACCESS_AFTER_WIN_US
+                                 ) -> float:
     """The IR STEP at a current edge, via linear extrapolation of V_mon on both
     sides of the edge back to the edge moment (the ``|dV/dt|`` peak).
 
     Fits the PRE-edge plateau (``[peak-before_gap-before_len : peak-before_gap]``)
-    and the POST-edge cap-ramp (``[acc : acc+after_len]``), extrapolates BOTH to
+    and a SHORT POST-edge window placed CLOSE to the edge, extrapolates BOTH to
     ``t[peak]``, and returns ``|v_after - v_before|`` — the pure IR jump with the
     linear cap ramp subtracted out (independent of the current source's finite
-    rise time and of the localizer's settling offset).  This is the SHARED
-    access-voltage method used by BOTH the experiment metrics
-    (:func:`access_voltage_and_resistance`) and the calibration R-extraction, so
-    they read access V identically (operator: "calibration should use the same
-    method for access points as the experiment").  Time units cancel (the
-    extrapolated value at a fixed ``t[peak]`` is the same in µs or s), so the
-    fit runs on ``time_us`` directly.  Returns NaN when a window is too short."""
+    rise time).
+
+    **The post-edge window is NEAR-EDGE + short** (``[peak + after_start_us :
+    + after_win_us]``, TIME-based so it's sample-rate-independent), NOT the
+    localizer's late settling point.  For a healthy electrode V after the edge
+    is ``iR + (I/C)·t`` — a LINEAR ramp — so a close or a late window
+    extrapolate to the same iR (unchanged, ~1 kΩ).  But a CAPACITIVE / high-Z
+    (leaky-capacitor) electrode has an EXPONENTIAL post-edge ramp that FLATTENS;
+    a LATE window fits that shallow tail and OVER-projects the extrapolation
+    back to the edge, inflating R_a (exp_vt_max_pcc: CH07 read ~20 kΩ at 6 µA
+    with no visible iR step).  Fitting the NEAR-EDGE constant-current slope
+    extracts the true small ohmic step instead (operator: "the access
+    resistance is being determined later than the actual iR drop … extract the
+    small ohmic step").  The despiked trace the caller passes rejects the
+    switching spike, so a close window is safe.  ``after_len`` / ``acc_idx``
+    are the legacy fallback when the time axis is unusable.
+
+    SHARED by BOTH the experiment metrics (:func:`access_voltage_and_resistance`)
+    and the calibration R-extraction (operator: "calibration should use the same
+    method for access points"); the test-board R+C is a pure LINEAR ramp so the
+    close window leaves calibration unchanged.  Returns NaN when a window is too
+    short."""
     v = np.asarray(v, dtype=float)
     t = np.asarray(time_us, dtype=float)
     n = v.size
@@ -742,14 +767,20 @@ def access_step_by_extrapolation(time_us, v, peak_idx: int, acc_idx: int,
     acc_idx = int(acc_idx)
     if n < 8 or t.size != n or not (0 <= peak_idx < acc_idx < n):
         return float("nan")
-    hi_end = min(acc_idx + after_len, n)
+    dt = float(np.median(np.diff(t))) if n > 1 else 0.0
+    if dt > 0 and np.isfinite(dt):
+        acc_start = peak_idx + max(1, int(round(after_start_us / dt)))
+        hi_end = min(acc_start + max(4, int(round(after_win_us / dt))), n)
+    else:                                    # unusable time axis → legacy window
+        acc_start = acc_idx
+        hi_end = min(acc_idx + after_len, n)
     lo_end = max(peak_idx - before_gap, 0)
     lo_start = max(lo_end - before_len, 0)
-    if hi_end - acc_idx < 4 or lo_end - lo_start < 4:
+    if acc_start >= n or hi_end - acc_start < 4 or lo_end - lo_start < 4:
         return float("nan")
     try:
-        sh, ih = np.polyfit(t[acc_idx:hi_end], v[acc_idx:hi_end], 1)   # post-edge
-        sl, il = np.polyfit(t[lo_start:lo_end], v[lo_start:lo_end], 1)  # pre-edge
+        sh, ih = np.polyfit(t[acc_start:hi_end], v[acc_start:hi_end], 1)  # post-edge
+        sl, il = np.polyfit(t[lo_start:lo_end], v[lo_start:lo_end], 1)    # pre-edge
         tp = float(t[peak_idx])
         return abs((sh * tp + ih) - (sl * tp + il))
     except Exception:
@@ -1958,6 +1989,104 @@ class ChargeTransferAnalysis:
     q_capacitive_nc: float = float("nan")
     q_faradaic_nc: float = float("nan")
     faradaic_fraction: float = float("nan")
+
+
+def active_potential_trace(capture):
+    """Return ``(E_array, kind)`` — the active-electrode POTENTIAL for
+    chronopotentiometry / RDC analysis.
+
+    Same active-trace selection the metrics + plot markers use (gotcha #87):
+      * ``e_act`` — E_act recorded directly (potential vs the reference);
+      * ``e_act_derived`` — E_act = V_mon + E_ret (the differential identity)
+        when only E_ret was digitised;
+      * ``v_mon`` — V_mon as a proxy (active vs return) when no electrode
+        potential is available — the common V_mon/I_mon-only case.
+    The ``kind`` drives the plot's x-axis label (vs reference vs monitor)."""
+    t = getattr(capture, "time_us", None)
+    n = int(getattr(t, "size", 0)) if t is not None else 0
+    e_act = getattr(capture, "e_act_v", None)
+    e_ret = getattr(capture, "e_ret_v", None)
+    v_mon = getattr(capture, "v_mon_v", None)
+    if e_act is not None and int(getattr(e_act, "size", 0)) == n and n:
+        return np.asarray(e_act, dtype=float), "e_act"
+    if (e_ret is not None and int(getattr(e_ret, "size", 0)) == n and n
+            and v_mon is not None and int(getattr(v_mon, "size", 0)) == n):
+        return (np.asarray(v_mon, dtype=float)
+                + np.asarray(e_ret, dtype=float)), "e_act_derived"
+    if v_mon is not None and int(getattr(v_mon, "size", 0)) == n and n:
+        return np.asarray(v_mon, dtype=float), "v_mon"
+    return np.zeros(0, dtype=float), "v_mon"
+
+
+@dataclass
+class RDCSegment:
+    """One phase's Reciprocal Derivative Chronopotentiometry curve (Musa et
+    al. 2010, IEEE EMBS): ``dt/dE`` plotted vs the electrode potential ``E``.
+
+    * ``potential_v`` — E (V), the x-axis (time-ordered over the phase body).
+    * ``dtde_ms_per_v`` — dt/dE (ms/V), the y-axis (= 1/(dE/dt); SIGNED, so a
+      cathodic phase sits below zero and an anodic phase above, matching the
+      paper's stacked anodic/cathodic curves).
+    A Faradaic reaction holds the potential (dE/dt → min) → a PEAK in |dt/dE|;
+    capacitive charging (steep dE/dt) → a FLAT low-|dt/dE| region.  The
+    leading iR-step + trailing current-reversal transients are excluded."""
+    phase_idx: int
+    polarity: str                      # 'cathodic' | 'anodic'
+    potential_v: np.ndarray
+    dtde_ms_per_v: np.ndarray
+
+
+def reciprocal_derivative_curve(capture, *, onset_us: Optional[float] = None,
+                                smooth_us: float = 4.0):
+    """Reciprocal Derivative Chronopotentiometry (Musa et al. 2010).
+
+    Returns ``(segments, trace_kind)`` — one :class:`RDCSegment` per
+    non-zero-amplitude phase and the potential-trace kind (for the axis
+    label, from :func:`active_potential_trace`).  ``dt/dE`` (ms/V) is computed
+    from the smoothed potential derivative (:func:`charge_transfer_dedt`),
+    restricted to each phase BODY (the leading iR step + trailing reversal
+    transient excluded — the paper drops the iR data for clarity), and plotted
+    against E.  Near-zero |dE/dt| (a genuine turning point) is dropped to NaN
+    so the reciprocal doesn't blow up to ±∞; real Faradaic peaks (small but
+    finite dE/dt) survive.  Empty list when the capture is unusable."""
+    segs: list = []
+    t = np.asarray(getattr(capture, "time_us", np.zeros(0)), dtype=float)
+    v, kind = active_potential_trace(capture)
+    pat = getattr(capture, "pattern", None)
+    if t.size < 8 or v.size != t.size or pat is None or not pat.phases:
+        return segs, kind
+    if onset_us is None:
+        try:
+            onset_us = pulse_onset_us(t, capture.i_mon_ua, v)
+        except Exception:
+            onset_us = 0.0
+    _, dedt = charge_transfer_dedt(t, v, pat, onset_us=onset_us)
+    try:
+        windows = phase_windows(t, pat, onset_us=onset_us)
+    except Exception:
+        return segs, kind
+    for i, ph in enumerate(pat.phases):
+        amp = float(ph.amplitude_ua)
+        if abs(amp) <= 0.0 or i >= len(windows):
+            continue
+        t0, t1 = float(windows[i].start_us), float(windows[i].end_us)
+        span = t1 - t0
+        if span <= 4.0:
+            continue
+        ir = max(_CT_IR_SKIP_US, 0.02 * span)          # skip the IR step
+        body = (t >= t0 + ir) & (t <= t1 - 0.02 * span)
+        if int(np.count_nonzero(body)) < 6:
+            continue
+        e_b = v[body]
+        d_b = dedt[body]                               # V/µs
+        # dt/dE in ms/V = 1/(dE/dt[V/µs]) × 1e-3.  NaN where dE/dt ≈ 0 (a
+        # turning point → reciprocal → ±∞); finite Faradaic peaks survive.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dtde = np.where(np.abs(d_b) < 1e-9, np.nan, 1e-3 / d_b)
+        polarity = "cathodic" if amp < 0 else "anodic"
+        segs.append(RDCSegment(phase_idx=i, polarity=polarity,
+                               potential_v=e_b, dtde_ms_per_v=dtde))
+    return segs, kind
 
 
 def charge_transfer_dedt(time_us, v_active, pattern, *, onset_us,

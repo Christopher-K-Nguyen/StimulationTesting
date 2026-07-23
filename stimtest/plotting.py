@@ -1888,6 +1888,108 @@ def plot_charge_transfer(capture, *, area_um2: Optional[float] = None,
     return fig
 
 
+def plot_reciprocal_derivative(capture, *,
+                               cathodic_limit_v: Optional[float] = None,
+                               anodic_limit_v: Optional[float] = None,
+                               reference_label: Optional[str] = None,
+                               onset_us: Optional[float] = None,
+                               fig: Optional[Figure] = None,
+                               show_grid: bool = True) -> Figure:
+    """Reciprocal Derivative Chronopotentiometry (RDC) view — Musa et al.
+    2010, *IEEE EMBS* (32nd Annual Int. Conf.), "Using reciprocal derivative
+    chronopotentiometry … to determine safe charge injection limits …".
+
+    Plots **dt/dE (ms/V) vs the electrode potential E (V)** for each phase of
+    the pulse.  The curve is qualitatively like a voltammetric i–E response:
+
+      * **Peaks** in |dt/dE| ⇒ Faradaic reactions (Pt oxide, H adsorption/
+        desorption, H₂/O₂ evolution) — the potential levels off (dE/dt → min)
+        at a reaction-specific potential.
+      * **Flat, low-|dt/dE|** regions ⇒ capacitive (double-layer) charging.
+
+    Cathodic-phase curves sit below zero, anodic above (the paper's stacked
+    convention).  The leading iR step + trailing current-reversal transients
+    are excluded.  Optional vertical dashed lines mark the water-window limits
+    (the safe charge-injection window) so the operator can read which regions
+    of the RDC curve fall outside it.
+    """
+    from .metrics import reciprocal_derivative_curve
+    if fig is None:
+        fig = plt.figure(figsize=_figsize_in(), dpi=SCREEN_DPI)
+    fig.clear()
+    ax = fig.add_subplot(111)
+    segs, kind = reciprocal_derivative_curve(capture, onset_us=onset_us)
+    if not segs:
+        ax.text(0.5, 0.5, "No reciprocal-derivative data\n"
+                "(needs a constant-current pulse capture)",
+                ha="center", va="center", fontsize=11, wrap=True)
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    _col = {"cathodic": MATLAB_COLORS[0], "anodic": MATLAB_COLORS[1]}
+    _seen: set = set()
+    _all_dt: list = []
+    for s in segs:
+        fin = np.isfinite(s.dtde_ms_per_v) & np.isfinite(s.potential_v)
+        if not np.any(fin):
+            continue
+        e, d = s.potential_v[fin], s.dtde_ms_per_v[fin]
+        _all_dt.append(d)
+        label = ("Cathodic phase" if s.polarity == "cathodic"
+                 else "Anodic phase")
+        ax.plot(e, d, color=_col.get(s.polarity, "black"), lw=1.3,
+                label=None if s.polarity in _seen else label)
+        _seen.add(s.polarity)
+        # Faint time-forward scan-direction arrow (start → end of the body).
+        if e.size >= 4:
+            i0, i1 = e.size // 3, 2 * e.size // 3
+            ax.annotate("", xy=(e[i1], d[i1]), xytext=(e[i0], d[i0]),
+                        arrowprops=dict(arrowstyle="->", color=_col.get(
+                            s.polarity, "black"), alpha=0.5, lw=1.0))
+    ax.axhline(0.0, color="black", lw=0.5)
+
+    # Water-window limits — the safe charge-injection window.
+    for lim, tag, col in ((cathodic_limit_v, "cathodic limit", "#7E2F8E"),
+                          (anodic_limit_v, "anodic limit", "#7E2F8E")):
+        if lim is not None and np.isfinite(lim):
+            ax.axvline(float(lim), color=col, lw=1.1, ls="--")
+            ax.annotate(f"{tag}\n{float(lim):+.2f} V",
+                        xy=(float(lim), 1.0), xycoords=("data", "axes fraction"),
+                        xytext=(0, -2), textcoords="offset points",
+                        ha="center", va="top", fontsize=8, color=col)
+
+    # Robust y-limits so a near-zero-dE/dt spike doesn't blow the scale.
+    if _all_dt:
+        alld = np.concatenate(_all_dt)
+        if alld.size:
+            hi = float(np.nanpercentile(np.abs(alld), 98)) or 1.0
+            ax.set_ylim(-1.15 * hi, 1.15 * hi)
+
+    if kind in ("e_act", "e_act_derived"):
+        ref = _resolve_reference_label(reference_label)
+        suffix = " (calculated)" if kind == "e_act_derived" else ""
+        xlabel = f"Potential vs {ref}{suffix} [V]"
+    else:
+        xlabel = "Voltage monitor (V$_{mon}$) [V]"
+    ax.set_xlabel(xlabel, fontsize=12, color="black")
+    ax.set_ylabel("dt/dE [ms/V]", fontsize=12, color="black")
+    ax.tick_params(axis="both", labelsize=11, colors="black")
+    for _sp in ax.spines.values():
+        _sp.set_color("black")
+    _grid(ax, show_grid)
+    ax.legend(loc="best", fontsize=9)
+    fig.text(0.5, 0.985,
+             "Reciprocal derivative chronopotentiometry (Musa et al. 2010)",
+             ha="center", va="top", fontsize=11, fontweight="bold")
+    fig.text(0.5, 0.955,
+             "peak → Faradaic reaction   ·   flat → capacitive   ·   "
+             "dashed = water-window limits",
+             ha="center", va="top", fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return fig
+
+
 def plot_overlay(captures_by_channel: Dict,
                  *, fig: Optional[Figure] = None,
                  channels_enabled: Optional[Set] = None,

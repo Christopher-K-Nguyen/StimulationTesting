@@ -24,4 +24,4 @@ window-title / About-text rename."""
 # sync with it. The Help menu's About / Check-for-updates dialogs
 # read this value too, so make sure the three locations agree
 # whenever you bump it.
-__version__ = "0.2.206"
+__version__ = "0.2.207"

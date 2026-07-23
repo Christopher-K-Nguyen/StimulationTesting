@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -465,6 +466,75 @@ def disable_plot_wheel_zoom(plot) -> None:
         pass
 
 
+def _epol_guide_label_html(label: str, color: str) -> str:
+    """Variable-format an E_pol guide label for HTML rendering.
+
+    ``"Emc"`` / ``"Ema"`` / ``"Emc1"`` → ``<i>E</i><sub>mc</sub>`` (italic
+    variable + upright subscript), wrapped in a ``<span>`` carrying the guide
+    colour.  pyqtgraph's ``InfiniteLine`` renders its label as PLAIN text, so
+    ``set_epol_guides`` forces this HTML onto the underlying text item.
+    Matches the data-driven Emc/Ema marker typography (``plotting.
+    marker_label_html`` → ``gui.rich.var``)."""
+    from .rich import var
+    lab = str(label).strip()
+    inner = var("E", lab[1:]) if lab[:1].upper() == "E" and len(lab) > 1 else lab
+    return f'<span style="color:{color}">{inner}</span>'
+
+
+# ---------------------------------------------------------------------------
+# Thousands grouping — SPACE separator (operator: "separate thousands with a
+# space instead of a comma"), copy-safe (operator: "do not let the formatting
+# of separators affect the value copied from tables for pasting").
+# ---------------------------------------------------------------------------
+_GROUP_SEP_RE = re.compile(r"(?<=\d) (?=\d)")  # a space BETWEEN two digits
+
+
+def _group_thousands(value: float, decimals: int = 0) -> str:
+    """Format a number with a SPACE thousands separator and a ``.`` decimal
+    point (e.g. ``10486`` → ``"10 486"``).  Uses Python's ``_`` grouping then
+    swaps in a space, so it round-trips through ``float()`` after
+    :func:`_strip_group_sep`.  ``nan`` → ``"nan"`` (callers usually pre-guard
+    with ``—``)."""
+    if value != value:                       # NaN
+        return "nan"
+    return f"{value:_.{decimals}f}".replace("_", " ")
+
+
+def _strip_group_sep(text: str) -> str:
+    """Remove the thousands-group separator (a space BETWEEN two digits) so a
+    copied cell pastes as a clean number — ``"10 486"`` → ``"10486"`` — while
+    genuine spaces before a unit (``"5.000 ms"``, ``"-0.2 V"``) survive."""
+    return _GROUP_SEP_RE.sub("", text)
+
+
+def _tz_abbrev(dt=None) -> str:
+    """Short LOCAL time-zone label (operator: "include the time zone").
+
+    The abbreviation when it's short (``MDT`` / ``EST`` / ``UTC``); Windows'
+    long ``%Z`` name (``Mountain Daylight Time``) is reduced to its initials
+    (``MDT``); otherwise the UTC offset (``UTC-06:00``)."""
+    now = (dt if (dt is not None and dt.tzinfo is not None)
+           else datetime.now().astimezone())
+    name = now.strftime("%Z")
+    if name and " " in name:                       # "Mountain Daylight Time"
+        ab = "".join(w[0] for w in name.split() if w[:1].isalpha()).upper()
+        if ab:
+            return ab
+    if name and 1 <= len(name) <= 6 and not any(c.isdigit() for c in name):
+        return name                                # already short: MDT / UTC
+    off = now.strftime("%z")                       # "-0600"
+    return f"UTC{off[:3]}:{off[3:]}" if len(off) == 5 else "UTC"
+
+
+def _wall_stamp(dt=None) -> str:
+    """``YYYY-MM-DD HH:MM:SS TZ`` — wall-clock time WITH the local time zone
+    (operator: "include the time zone" in the log-pane + update text).  Pass a
+    naive/aware ``datetime`` to stamp a specific moment (its local tz)."""
+    now = dt if dt is not None else datetime.now()
+    aware = now.astimezone() if now.tzinfo is None else now
+    return f"{aware.strftime('%Y-%m-%d %H:%M:%S')} {_tz_abbrev(aware)}"
+
+
 # ---------------------------------------------------------------------------
 # Spreadsheet copy / cut / paste support for QTableWidget
 # ---------------------------------------------------------------------------
@@ -546,7 +616,10 @@ class _SpreadsheetClipboardFilter(QtCore.QObject):
                     # Strip the placeholder "—" that the device-mapping
                     # table uses for empty cells so a paste round-trip
                     # doesn't propagate Unicode dashes into spreadsheets.
-                    cells.append("" if text == "—" else text)
+                    # Strip the thousands-group SPACE too (operator: "do not
+                    # let the formatting of separators affect the value copied
+                    # from tables") so "10 486" pastes as a clean number.
+                    cells.append("" if text == "—" else _strip_group_sep(text))
                 else:
                     cells.append("")
             rows.append("\t".join(cells))
@@ -1365,12 +1438,32 @@ class ScopePlot(QtWidgets.QWidget):
                 continue   # outside the framed window — don't clutter
             pen = pg.mkPen(color=_guide_color, width=1,
                            style=QtCore.Qt.PenStyle.DashLine)
+            # CENTER the label on the vertical line (operator: "Center the x
+            # line labels to the center") — ``anchors`` x = 0.5 puts the
+            # label's horizontal centre on the line (pyqtgraph's default
+            # pushes it to whichever side has room).  Both list entries cover
+            # the near-vertical / near-horizontal orientations.
             line = pg.InfiniteLine(
                 pos=x_us, angle=90, pen=pen,
                 label=str(label),
                 labelOpts={"position": 0.04, "color": _guide_color,
-                           "movable": False,
-                           "fill": (0, 0, 0, 0)})
+                           "movable": False, "fill": (0, 0, 0, 0),
+                           "anchors": [(0.5, 0.0), (0.5, 0.0)]})
+            # Variable-format the label (operator: "proper variable
+            # formatting") — "Emc" → E with an upright "mc" subscript,
+            # italic E.  pyqtgraph's InfiniteLine renders its label as PLAIN
+            # text, so force HTML on the underlying text item (a static label
+            # with no ``{value}`` placeholder isn't re-formatted on view
+            # changes, so the HTML sticks).
+            try:
+                _html = _epol_guide_label_html(str(label), _guide_color)
+                line.label.textItem.setHtml(_html)
+                # setHtml changed the rendered width (italic E + subscript vs
+                # the plain "Emc" the anchor was first computed from), so
+                # re-run the anchor placement to keep it centred on the line.
+                line.label.updatePosition()
+            except Exception:
+                pass
             # ignoreBounds so a guide near the edge can't expand the
             # auto-range and squash the waveform (same rule as the markers).
             self._plot.addItem(line, ignoreBounds=True)
@@ -2808,7 +2901,7 @@ class MetricTable(QtWidgets.QTableWidget):
         # pulse count (continuous-pulsing SP/CP/LP), so the row still
         # carries an identifier.
         if np.isfinite(m.n_pulses):
-            _first_row = (V("N", "pulse"), f"{m.n_pulses:,.0f}")
+            _first_row = (V("N", "pulse"), _group_thousands(m.n_pulses))
         else:
             _first_row = ("Capture #", str(c.index))
         # BAD / degenerate electrode (open / broken / capacitive): the access
@@ -2985,7 +3078,7 @@ class MetricTable(QtWidgets.QTableWidget):
         # auto-scaled nC / µC / mC.
         if np.isfinite(m.cumulative_n_pulses):
             rows.append(("Cumulative " + V("N", "pulse"),
-                         f"{m.cumulative_n_pulses:,.0f}"))
+                         _group_thousands(m.cumulative_n_pulses)))
         if np.isfinite(m.cumulative_charge_nc):
             rows.append(("Cumulative Q",
                          _fmt_cumulative_charge(m.cumulative_charge_nc)))
@@ -3344,7 +3437,7 @@ class LogPane(QtWidgets.QTextEdit):
         if (self._log_file_handle is not None
                 and _key not in self._log_created_paths):
             self._log_created_paths.add(_key)
-            _stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _stamp = _wall_stamp()
             _verb = ("reopened (appending)"
                      if (_existed_with_content and not replace) else "created")
             self._raw_append(f"===== PULSAR session log {_verb} {_stamp} =====")
@@ -3368,14 +3461,14 @@ class LogPane(QtWidgets.QTextEdit):
         """Stamp a wall-clock END banner into the log (operator: "be sure that
         the log file has the date and time of … ended").  Called when a run
         completes / the experiment finishes."""
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stamp = _wall_stamp()
         extra = f" — {note}" if note else ""
         self._raw_append(f"===== Session ended {stamp}{extra} =====")
 
     def mark_session_continued(self, reason: str = "") -> None:
         """Stamp a wall-clock CONTINUE banner into the log (operator: "when
         continuing with LP, add another date and time for continuing")."""
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stamp = _wall_stamp()
         tag = f" ({reason})" if reason else ""
         self._raw_append(f"===== Continuing{tag} {stamp} =====")
 
@@ -3398,7 +3491,7 @@ class LogPane(QtWidgets.QTextEdit):
         self._session_start_wall = datetime.now()
         self._tics.clear()
         if banner:
-            stamp = self._session_start_wall.strftime("%Y-%m-%d %H:%M:%S")
+            stamp = _wall_stamp(self._session_start_wall)
             self._raw_append(f"--- Session started {stamp} ---")
 
     def _ensure_session_started(self) -> None:
@@ -3505,7 +3598,7 @@ class LogPane(QtWidgets.QTextEdit):
         last :meth:`reset_clock`).  Used for BOTH the on-screen pane and the
         line-buffered on-disk .txt session log (same ``line`` feeds
         ``_raw_append``)."""
-        wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        wall = _wall_stamp()          # includes the local time zone
         return f"{wall} +{self._format_elapsed_hms(elapsed_s)}"
 
     def log_now(self, msg: str) -> None:
@@ -3539,16 +3632,16 @@ class LogPane(QtWidgets.QTextEdit):
         """(Re)compute the hanging-indent width from the current font.
 
         The indent equals the pixel width of a representative timestamp
-        prefix (``"[YYYY-MM-DD HH:MM:SS +H:MM:SS] "`` — wall-clock date/time
-        plus the run-relative elapsed) so a wrapped continuation line lands
-        right under the message text.  Called at construction and whenever the
-        font / DPI changes.  Keep this sample in lock-step with the prefix
-        built in :meth:`_line_timestamp`.
-        """
+        prefix (``"[YYYY-MM-DD HH:MM:SS TZ +H:MM:SS] "`` — wall-clock date/time,
+        local TIME ZONE, then the run-relative elapsed) so a wrapped
+        continuation line lands right under the message text.  Called at
+        construction and whenever the font / DPI changes.  Keep this sample in
+        lock-step with the prefix built in :meth:`_line_timestamp` — the ``TZ``
+        placeholder uses the real local abbreviation so its width matches."""
         try:
             self._hang_indent_px = float(
                 self.fontMetrics().horizontalAdvance(
-                    "[0000-00-00 00:00:00 +0:00:00] "))
+                    f"[0000-00-00 00:00:00 {_tz_abbrev()} +0:00:00] "))
         except Exception:
             self._hang_indent_px = 0.0
 

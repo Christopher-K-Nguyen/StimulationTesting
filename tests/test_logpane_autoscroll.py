@@ -150,16 +150,17 @@ def test_hang_indent_computed_positive(_app):
 
 
 def test_line_prefix_includes_wall_clock_date_and_time(_app):
-    """Operator: "include the date and time".  Every line's prefix carries the
-    wall-clock DATE + time of day AND the run-relative elapsed:
-    ``[YYYY-MM-DD HH:MM:SS +H:MM:SS] message``."""
+    """Operator: "include the date and time" + "include the time zone".  Every
+    line's prefix carries the wall-clock DATE + time of day, the local TIME
+    ZONE, AND the run-relative elapsed:
+    ``[YYYY-MM-DD HH:MM:SS TZ +H:MM:SS] message``."""
     import re
     pane = LogPane()
     pane.log("hello world")
     QtWidgets.QApplication.processEvents()
     text = pane.document().lastBlock().text()
     assert re.match(
-        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+\d+:\d{2}:\d{2}\] "
+        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ \+\d+:\d{2}:\d{2}\] "
         r"hello world$", text), text
     pane.deleteLater()
 

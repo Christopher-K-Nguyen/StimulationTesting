@@ -51,7 +51,8 @@ from ..persistence import (load_session_meta, load_session_npz,
                            load_picoscope, PICO_EXTENSIONS,
                            is_pulsar_session_xlsx)
 from ..plotting import (
-    plot_capture, plot_charge_transfer, plot_overlay, plot_picoscope,
+    plot_capture, plot_charge_transfer, plot_reciprocal_derivative,
+    plot_overlay, plot_picoscope,
     plot_qinj_vs_amplitude, plot_vd_vs_qinj,
     export_capture_plot, export_session_plots, export_session_summary_plots,
     SCREEN_DPI, WAVE_TYPES, _figsize_in,
@@ -632,6 +633,18 @@ class _PlotViewBar(QtWidgets.QWidget):
             "for the selected capture — Harris 2019 chronopotentiometry.")
         self.ct_check.toggled.connect(lambda *_: self._emit())
         lay.addWidget(self.ct_check)
+        # Reciprocal derivative chronopotentiometry (RDC) — Musa 2010.  Plots
+        # dt/dE vs the electrode potential E; peaks = Faradaic, flat =
+        # capacitive.  Swaps the normal capture plot, like the CT view; the two
+        # are mutually exclusive (both replace the main plot).
+        self.rdc_check = QtWidgets.QCheckBox("Reciprocal deriv. (RDC)")
+        self.rdc_check.setToolTip(
+            "Show the reciprocal-derivative (dt/dE vs potential) analysis for "
+            "the selected capture — Musa 2010; peaks mark Faradaic reactions, "
+            "flat regions capacitive charging.")
+        self.rdc_check.toggled.connect(self._on_rdc_toggled)
+        self.ct_check.toggled.connect(self._on_ct_toggled)
+        lay.addWidget(self.rdc_check)
         # dV/dt + 1/(dV/dt) as NORMALIZED-overlay option traces on the capture
         # plot (operator: "derivative and reciprocal of derivative as option
         # traces … normalized overlay").  Independent of the 3-panel view above.
@@ -689,8 +702,25 @@ class _PlotViewBar(QtWidgets.QWidget):
     def density(self) -> bool:
         return self.unit_combo.currentData() == "density"
 
+    def _on_ct_toggled(self, on: bool) -> None:
+        # CT and RDC both replace the main plot — keep them mutually exclusive.
+        if on and self.rdc_check.isChecked():
+            self.rdc_check.blockSignals(True)
+            self.rdc_check.setChecked(False)
+            self.rdc_check.blockSignals(False)
+
+    def _on_rdc_toggled(self, on: bool) -> None:
+        if on and self.ct_check.isChecked():
+            self.ct_check.blockSignals(True)
+            self.ct_check.setChecked(False)
+            self.ct_check.blockSignals(False)
+        self._emit()
+
     def charge_transfer(self) -> bool:
         return self.ct_check.isChecked()
+
+    def reciprocal_derivative(self) -> bool:
+        return self.rdc_check.isChecked()
 
     def deriv_overlays(self) -> set:
         s = set()
@@ -709,6 +739,7 @@ class _PlotViewBar(QtWidgets.QWidget):
                 "ry_min": self.ry_min.value(), "ry_max": self.ry_max.value(),
                 "density": self.density(),
                 "charge_transfer": self.charge_transfer(),
+                "reciprocal_derivative": self.reciprocal_derivative(),
                 "dvdt": self.dvdt_check.isChecked(),
                 "recip": self.recip_check.isChecked()}
 
@@ -727,6 +758,7 @@ class _PlotViewBar(QtWidgets.QWidget):
             self.ry_max.setValue(float(p.get("ry_max", 0.0)))
             self.unit_combo.setCurrentIndex(1 if p.get("density") else 0)
             self.ct_check.setChecked(bool(p.get("charge_transfer", False)))
+            self.rdc_check.setChecked(bool(p.get("reciprocal_derivative", False)))
             self.dvdt_check.setChecked(bool(p.get("dvdt", False)))
             self.recip_check.setChecked(bool(p.get("recip", False)))
         except Exception:
@@ -1546,6 +1578,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # electrode surface area (for C_dl) comes from the run.
             plot_charge_transfer(
                 cap, area_um2=getattr(run, "surface_area_um2", None),
+                fig=self.figure, show_grid=self._show_grid)
+        elif self.view_bar.reciprocal_derivative():
+            # Musa 2010 reciprocal-derivative (dt/dE vs E) view.  Water-window
+            # limits (safe charge-injection window) + reference label come from
+            # the session's coating props, drawn as vertical reference lines.
+            _coat = (session.test.extras or {}).get("coating_props") or {}
+            plot_reciprocal_derivative(
+                cap,
+                cathodic_limit_v=_coat.get("cathodic_limit_v"),
+                anodic_limit_v=_coat.get("anodic_limit_v"),
+                reference_label=getattr(session.test, "reference_electrode_label",
+                                        None),
                 fig=self.figure, show_grid=self._show_grid)
         else:
             plot_capture(cap, run, session, fig=self.figure,
@@ -2916,9 +2960,11 @@ def _run_cumulative_n_pulses(run: ChannelRun) -> float:
 
 
 def _fmt_pulses_or_dash(n: float) -> str:
-    """Comma-group a pulse count, or an em-dash when not recorded."""
+    """Space-group a pulse count (operator: "separate thousands with a space
+    instead of a comma"), or an em-dash when not recorded."""
     import math
-    return f"{n:,.0f}" if math.isfinite(n) else "—"
+    from .widgets import _group_thousands
+    return _group_thousands(n) if math.isfinite(n) else "—"
 
 
 def _fmt_charge_nc(q_nc: float) -> str:

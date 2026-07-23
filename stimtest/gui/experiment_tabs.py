@@ -92,7 +92,7 @@ from .pattern_panel import PatternControlPanel
 from .pattern_preview import PatternPreview
 from .repeating_spinbox import RepeatingDoubleSpinBox, RepeatingSpinBox
 from .staircase_plot import StaircasePlot
-from .widgets import LogPane, MetricTable
+from .widgets import LogPane, MetricTable, _group_thousands
 
 
 def _apply_channel_bandwidths(scope, aliases):
@@ -1702,14 +1702,17 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             frac = max(0.0, min(elapsed / dur, 1.0))
             self.run_progress_bar.setValue(int(round(frac * 100)))
             total_pulses = dur * rate
-            # Comma thousands separators mirror MATLAB ``addCommas``.
+            # SPACE thousands separators (operator: "separate thousands with a
+            # space instead of a comma").
             self.run_progress_label.setText(
-                f"{elapsed:,.1f} / {dur:,.0f} s   ·   "
-                f"({pulses:,.0f} / {total_pulses:,.0f} pulses)")
+                f"{_group_thousands(elapsed, 1)} / {_group_thousands(dur)} s"
+                f"   ·   ({_group_thousands(pulses)} / "
+                f"{_group_thousands(total_pulses)} pulses)")
         else:
             # Unbounded (Continuous Pulsing) — no total to divide by.
             self.run_progress_label.setText(
-                f"elapsed {elapsed:,.1f} s   ·   {pulses:,.0f} pulses")
+                f"elapsed {_group_thousands(elapsed, 1)} s   ·   "
+                f"{_group_thousands(pulses)} pulses")
 
     def _end_run_progress(self) -> None:
         try:

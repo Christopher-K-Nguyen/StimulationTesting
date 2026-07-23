@@ -51,7 +51,7 @@ def test_bounded_run_shows_fractional_bar_and_counts(qapp):
     assert tab.run_progress_bar.value() == 21          # 12.3/60 ≈ 20.5 %
     txt = tab.run_progress_label.text()
     assert "12.3 / 60 s" in txt
-    assert "615" in txt and "3,000" in txt             # pulses, comma-grouped
+    assert "615" in txt and "3 000" in txt             # pulses, SPACE-grouped
     tab._end_run_progress()
 
 
