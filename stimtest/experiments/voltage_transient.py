@@ -428,6 +428,11 @@ class VoltageTransientExperiment(ExperimentRunner):
             self.ramp.max_ua = min(float(self.ramp.max_ua), STIM_MAX_AMPLITUDE_UA)
         except Exception:
             self.ramp.max_ua = STIM_MAX_AMPLITUDE_UA
+        # STABLE copy of the policy excitation ceiling (post-rail-clamp).  Each
+        # configuration derives its own RECHARGE-AWARE ceiling from THIS value
+        # (not the possibly-already-lowered ``self.ramp.max_ua``) so a per-point
+        # asymmetry in a sweep is handled and the clamp never compounds.
+        self._policy_max_ua = float(self.ramp.max_ua)
         self.polarization_source = polarization_source
         self.configurations = configurations or [session.test.configuration]
         # Multi-parameter sweep axis. Each point transforms the session's
@@ -739,6 +744,41 @@ class VoltageTransientExperiment(ExperimentRunner):
                 message=f"Scope window auto-fit skipped: {e}"))
 
     # ------------------------------------------------------------------
+    def _recharge_aware_max_ua(self, base_pattern) -> float:
+        """The highest EXCITATION (phase-1) amplitude the ramp may target such
+        that EVERY phase of the amplitude-scaled pattern stays within the
+        PlexStim rail (``STIM_MAX_AMPLITUDE_UA``, 1000 µA).
+
+        The ramp scales the whole pattern by ``amp / |excitation|`` (see
+        ``_pattern_at_amplitude``), so an ASYMMETRIC pattern — most commonly a
+        cap-coupled **exp-decay recharge**, whose fast decay carries only ~20 %
+        of the charge a rectangle of the same peak would, forcing its PEAK to
+        several× the excitation to stay charge-balanced — drives the RECHARGE
+        phase into the rail at an EXCITATION amplitude well BELOW ``max_ua``.
+        Without capping there, the ramp steps past that point and the device
+        REJECTS the pattern ("Stimulator program error: Phase 2 amplitude
+        exceeds max" — the exp_vt_max_pcc failure: phase-2 = +1191 µA at
+        excitation −260 µA, ratio 4.58, so the rail is hit at excitation
+        ≈ 218 µA, not 1000 µA).
+
+        Returns ``min(policy_max_ua, rail / max_phase_ratio)`` where
+        ``max_phase_ratio`` = the largest ``|phase_i| / |excitation|`` over the
+        base pattern.  A symmetric / excitation-dominant pattern (ratio ≤ 1) or
+        a zero-amplitude template (``_pattern_at_amplitude`` rebuilds it with
+        equal-magnitude phases) is unaffected → returns the policy ceiling."""
+        base_ceiling = float(getattr(self, "_policy_max_ua", self.ramp.max_ua))
+        try:
+            phases = list(base_pattern.phases)
+            exc = abs(float(base_pattern.excitation_phase.amplitude_ua))
+            if exc <= 1e-12 or not phases:
+                return base_ceiling
+            ratio = max(abs(float(p.amplitude_ua)) / exc for p in phases)
+            if ratio <= 1.0 + 1e-9:
+                return base_ceiling
+            return min(base_ceiling, float(STIM_MAX_AMPLITUDE_UA) / ratio)
+        except Exception:
+            return base_ceiling
+
     def _run_one_configuration(self, config: Configuration,
                                base_pattern: Optional[PulsePattern] = None,
                                label: str = "") -> ChannelRun:
@@ -756,6 +796,23 @@ class VoltageTransientExperiment(ExperimentRunner):
         # plain single-config run.
         if base_pattern is None:
             base_pattern = self.session.test.pattern
+        # RECHARGE-AWARE excitation ceiling: cap the ramp so the largest phase
+        # (e.g. a cap-coupled exp-decay recharge, whose peak runs several× the
+        # excitation) can't be driven past the 1000 µA rail — the ramp then
+        # stops CLEANLY ("hardware-limited") at that excitation instead of
+        # overshooting and getting a device rejection (exp_vt_max_pcc).
+        # Derived from the STABLE _policy_max_ua so it's recomputed per config
+        # (per-sweep-point asymmetry) and never compounds.
+        _eff_max = self._recharge_aware_max_ua(base_pattern)
+        self.ramp.max_ua = _eff_max
+        if _eff_max < self._policy_max_ua - 1e-6:
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message=(f"Recharge-limited ceiling: excitation capped at "
+                         f"{_eff_max:.0f} µA — the recharge phase reaches the "
+                         f"{STIM_MAX_AMPLITUDE_UA:.0f} µA hardware rail there "
+                         f"(asymmetric / cap-coupled pattern), so the ramp can't "
+                         f"climb to {self._policy_max_ua:.0f} µA on this pulse.")))
         # CONTINUOUS-STIM extra safety flag (see RampPolicy.continuous_*): a
         # continuous sinusoid / KHFAC has no interpulse rest, so its ramp is
         # hard-capped gentler and stops if it's flying blind.
