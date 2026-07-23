@@ -23,7 +23,7 @@ from PyQt6 import QtWidgets
 
 from stimtest.gui.multichannel_scope import (
     MultiChannelScope, TRACE_DEDT, TRACE_RECIP_DEDT, ALL_TOGGLE_TRACES,
-    ALL_DERIV_TRACES)
+    ALL_DERIV_TRACES, _subscript_trace_name)
 
 _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
@@ -53,19 +53,28 @@ def _scope_curve_keys(mcs):
 
 
 def test_derivative_traces_are_toggle_options():
-    assert ALL_DERIV_TRACES == (TRACE_DEDT, TRACE_RECIP_DEDT)
+    # dV/dt is a toggle option; the RECIPROCAL was REMOVED from the LIVE
+    # experiment plot (operator: "Remove the reciprocal trace option in the
+    # experiment plot") — it stays in POLARIS only.
+    assert ALL_DERIV_TRACES == (TRACE_DEDT,)
     assert TRACE_DEDT in ALL_TOGGLE_TRACES
-    assert TRACE_RECIP_DEDT in ALL_TOGGLE_TRACES
+    assert TRACE_RECIP_DEDT not in ALL_TOGGLE_TRACES
+
+
+def test_dedt_legend_uses_differential_typography():
+    # Operator: "for the differential, keep the variable in italics, but keep
+    # the 'd' in normal font" — d upright, V/t italic.
+    assert _subscript_trace_name(TRACE_DEDT) == "d<i>V</i>/d<i>t</i>"
+    assert _subscript_trace_name(TRACE_RECIP_DEDT) == "1/(d<i>V</i>/d<i>t</i>)"
 
 
 def test_derivative_rows_exist_and_default_off():
     mcs = MultiChannelScope()
     mcs.add_capture(_cap(), "CH01")
     assert TRACE_DEDT in mcs.axis_combos
-    assert TRACE_RECIP_DEDT in mcs.axis_combos
+    assert TRACE_RECIP_DEDT not in mcs.axis_combos     # reciprocal removed
     vis = mcs.visibility()
     assert vis[TRACE_DEDT] is False        # off by default (N/A)
-    assert vis[TRACE_RECIP_DEDT] is False
 
 
 def test_dedt_overlay_renders_and_is_normalized():
@@ -75,7 +84,8 @@ def test_dedt_overlay_renders_and_is_normalized():
     _app.processEvents()
     assert mcs.visibility()[TRACE_DEDT] is True
     keys = _scope_curve_keys(mcs)
-    dedt_key = next((k for k in keys if "dV/dt" in k and "1/" not in k), None)
+    dedt_disp = _subscript_trace_name(TRACE_DEDT)       # the curve key
+    dedt_key = next((k for k in keys if k == dedt_disp), None)
     assert dedt_key is not None, keys
     # NORMALIZED: scaled to ~the V_mon amplitude (0.2 V), NOT the raw V/µs slope.
     for pg in mcs._pages.values():
@@ -86,15 +96,6 @@ def test_dedt_overlay_renders_and_is_normalized():
     mcs.axis_combos[TRACE_DEDT].setCurrentIndex(0)     # N/A → removed
     _app.processEvents()
     assert mcs.visibility()[TRACE_DEDT] is False
-
-
-def test_reciprocal_overlay_renders():
-    mcs = MultiChannelScope()
-    mcs.add_capture(_cap(), "CH01")
-    mcs.axis_combos[TRACE_RECIP_DEDT].setCurrentIndex(1)
-    _app.processEvents()
-    assert mcs.visibility()[TRACE_RECIP_DEDT] is True
-    assert any("1/(dV/dt)" in k for k in _scope_curve_keys(mcs))
 
 
 # --------------------------------------------------- POLARIS (matplotlib)

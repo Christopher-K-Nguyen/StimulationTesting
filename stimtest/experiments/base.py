@@ -3468,11 +3468,12 @@ class ExperimentRunner(ABC):
         # half-torn-down session.
         if self.stim is None:
             raise RuntimeError("preflight: stimulator is not connected.")
-        # A Stop/abort CLOSES the stimulator (gotcha #29b: "when you stop,
-        # abort + close; when you restart, initialize").  The GUI re-opens
-        # it on Start (``_reinit_stim_if_closed``), but if THIS run reached
-        # the runner with the device still closed — e.g. a code path that
-        # bypassed that GUI step — proceeding would fire a flood of
+        # The GUI reinitializes the stim on Start (gotcha #29b, revised:
+        # the hardware stays CONNECTED between runs and each Start does a
+        # fresh PS_InitAllStim via ``_reinit_stim_for_new_run``), but if
+        # THIS run reached the runner with the device still closed — e.g.
+        # a code path that bypassed that GUI step — proceeding would fire
+        # a flood of
         # "Communication to Stimulator failed" DLL errors (set_monitor_
         # channel, load_channel, …) on a dead handle (operator: "After I
         # aborted the experiment, I still get errors about the stimulator,

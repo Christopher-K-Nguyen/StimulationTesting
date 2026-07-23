@@ -373,3 +373,45 @@ def test_view_bar_prefs_round_trip(tmp_path):
     panel2.restore_prefs(saved)
     assert panel2.view_bar.density() is True
     assert panel2.view_bar.xrange() == pytest.approx((-10.0, 250.0))
+
+
+def test_filter_spikes_toggle_prefs_and_despike(tmp_path):
+    # Operator: "In POLARIS, add an option to filter the data; I am seeing
+    # frequent spikes of the same magnitude."  A median-despike toggle on the
+    # view bar; DISPLAY-ONLY (the stored capture is untouched).
+    pytest.importorskip("pyqtgraph")
+    pytest.importorskip("matplotlib")
+    from PyQt6 import QtWidgets
+    app = (QtWidgets.QApplication.instance()
+           or QtWidgets.QApplication(sys.argv))
+    from stimtest.gui.viewer import ViewerPanel, _despike_capture
+    panel = ViewerPanel()
+    vb = panel.view_bar
+    assert vb.filter_spikes() is False
+    assert vb.filter_win.isEnabled() is False          # window disabled until on
+    vb.filter_check.setChecked(True)
+    app.processEvents()
+    assert vb.filter_spikes() is True
+    assert vb.filter_win.isEnabled() is True
+    # prefs round-trip
+    vb.filter_win.setValue(8.0)
+    pr = vb.prefs()
+    assert pr["filter_spikes"] is True and pr["filter_window"] == 8.0
+    vb.filter_check.setChecked(False)
+    vb.restore(pr)
+    assert vb.filter_spikes() is True and vb.filter_window_us() == 8.0
+
+    # _despike_capture removes a narrow spike and leaves the ORIGINAL untouched
+    from stimtest.session import Capture
+    from stimtest.waveforms import PulsePattern
+    t = np.linspace(-50.0, 450.0, 2000)
+    v = np.zeros_like(t)
+    v[1000] = 2.0                                       # one tall switching spike
+    cap = Capture(index=0, pattern=PulsePattern.biphasic(50.0))
+    cap.time_us = t
+    cap.v_mon_v = v.copy()
+    cap.i_mon_ua = np.zeros_like(t)
+    out = _despike_capture(cap, 4.0)
+    assert out is not cap
+    assert float(np.max(np.abs(out.v_mon_v))) < 1.0    # spike rejected
+    assert float(np.max(np.abs(cap.v_mon_v))) == 2.0   # original preserved

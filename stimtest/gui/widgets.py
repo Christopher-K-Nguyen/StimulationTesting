@@ -1706,7 +1706,7 @@ class ScopePlot(QtWidgets.QWidget):
         # How many label-height/-width tiers a tag may escalate to clear a
         # cluster before it just accepts the least-bad spot (caps how far a
         # tag can fly from its glyph).
-        _MAX_LABEL_TIER = 6
+        _MAX_LABEL_TIER = 3
         plan = [None] * len(recs)
         placed_boxes = []   # (left, right, bottom, top) of placed tags
         for i in sorted(range(len(recs)), key=lambda i: recs[i][0]):
@@ -1778,7 +1778,7 @@ class ScopePlot(QtWidgets.QWidget):
                             # close tags tolerate a small overlap instead of
                             # escalating apart.  Readability (non-overlap)
                             # beats proximity for close markers.
-                            score += 6.0 + (ox / x_span) * (oy / y_span) * 90.0
+                            score += 3.0 + (ox / x_span) * (oy / y_span) * 90.0
                     # GRADED trace-intersection penalty — the more of the
                     # label box over the waveform, the worse, so the scorer
                     # picks the side that clips the trace LEAST.  This is what
@@ -1821,7 +1821,7 @@ class ScopePlot(QtWidgets.QWidget):
                     # first access voltage/resistance label is too far from
                     # the marker").  Trace-overlap is the correct, local
                     # signal; the bias was redundant + buggy.
-                    score += tier * 0.20                 # prefer the closest tier
+                    score += tier * 0.8                  # prefer the closest tier
                     # PROXIMITY: keep the label NEAR its marker (operator:
                     # "make sure the labels are near their markers").  Penalise
                     # the gap from the marker to the box — vertical (dominant)
@@ -1838,7 +1838,7 @@ class ScopePlot(QtWidgets.QWidget):
                     _pw = 2.0 if _symbol in ("vbar", "+") else 1.0
                     _gap_v = abs(_cy - _y) / y_span
                     _gap_h = max(0.0, bl - _x, _x - br) / x_span
-                    score += _pw * 6.0 * _gap_v
+                    score += _pw * 14.0 * _gap_v
                     # HORIZONTAL pull is stronger than vertical (operator:
                     # "improve the placement of labels" — a trailing access /
                     # driving tag was flying far to the RIGHT of its marker into
@@ -1846,7 +1846,7 @@ class ScopePlot(QtWidgets.QWidget):
                     # gap is almost always avoidable by placing the tag directly
                     # above / below).  Weighting gap_h higher keeps the tag in
                     # the marker's x-column unless that's genuinely blocked.
-                    score += _pw * 9.0 * _gap_h
+                    score += _pw * 18.0 * _gap_h
                     # QUADRATIC proximity — near the marker the linear terms
                     # above dominate (gentle, so trace-avoidance still picks
                     # the local clear side), but this grows STEEPLY with
@@ -1857,7 +1857,7 @@ class ScopePlot(QtWidgets.QWidget):
                     # trace penalty pushed the access tags far from their
                     # markers; the quadratic pull caps how far they can go so
                     # they stay near-but-off the trace instead).
-                    score += _pw * 34.0 * (_gap_v * _gap_v + _gap_h * _gap_h)
+                    score += _pw * 130.0 * (_gap_v * _gap_v + _gap_h * _gap_h)
                     if best_score is None or score < best_score:
                         best_score = score
                         best = (px, py, ax, ay, bl, br, bb, bt)
@@ -2832,6 +2832,18 @@ class _HtmlItemDelegate(QtWidgets.QStyledItemDelegate):
         doc = QtGui.QTextDocument()
         doc.setDefaultFont(option.font)
         doc.setHtml(text)
+        w = int(option.rect.width())
+        if w > 4:
+            # Wrap to the column width so the reported HEIGHT reflects the
+            # wrapped lines — matching paint(), which sets the same
+            # textWidth.  Without this the height was the SINGLE-line
+            # height, so a cell whose HTML wraps (e.g. "Cumulative
+            # N_pulse") had its 2nd line CLIPPED and only "Cumulative"
+            # showed (operator: "The cumulative number of pulses is not
+            # wrapping … make sure that the tables allow for text
+            # wrapping").  resizeRowsToContents() then grows the row.
+            doc.setTextWidth(w)
+            return QtCore.QSize(w, int(doc.size().height()) + 2)
         return QtCore.QSize(int(doc.idealWidth()) + 8,
                             int(doc.size().height()))
 

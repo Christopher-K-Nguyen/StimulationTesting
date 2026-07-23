@@ -91,3 +91,56 @@ def test_normal_capture_still_uses_epol_not_raw_vmon():
     c.metrics.polarization_per_phase_v = [-0.40, 0.20]   # SAFE E_pol (present)
     c.metrics.return_polarization_per_phase_v = []
     assert r._potential_limit_hit(c) is False    # uses E_pol (−0.40 > −0.58)
+
+
+def _runner_no_bad_stop():
+    pattern = PulsePattern.biphasic(amplitude_ua=10.0, polarity=1)
+    test = TestParameters(experiment="VT", pattern=pattern,
+                          configuration=Configuration.monopolar(1),
+                          array=ElectrodeArray.utah_4x4())
+    session = Session(notebook="t", subject="s", test=test)
+    stim = SimulatedStimulator(); stim.open()
+    scope = SimulatedOscilloscope(); scope.open()
+    return VoltageTransientExperiment(
+        session, stim, scope,
+        ramp=RampPolicy(strategy="adaptive", max_ua=1000.0,
+                        stop_on_bad_response=False),
+        cathodic_limit_v=-0.6, anodic_limit_v=0.8,
+        polarization_tolerance_v=0.02)
+
+
+def test_backstop_gated_off_when_bad_response_disabled():
+    """When the operator DISABLES bad-response detection, a bad-class
+    (empty-E_pol) capture must NOT trip the raw-V_mon water-window backstop.
+
+    exp_vt_max_anodal CH11: a LONE 'open' misclassification at 917 µA amid
+    normal +0.777 V neighbours cleared E_pol → the backstop fired ``exceeded``
+    → a spurious back-off → a FALSE "DAMAGED electrode" stop at 916 µA, below
+    both the +0.78 near-edge and the 1000 µA max.  With detection off the ramp
+    must ignore the glitch and run to compliance / max (gotcha #178 fallback).
+    """
+    r = _runner_no_bad_stop()
+    cap = _bad_capture(+1.31, rclass="open")     # raw V_mon well over +0.78
+    assert r._potential_limit_hit(cap) is False
+    assert r._potential_limit_exceeded(cap) is False
+
+
+def test_backstop_still_active_by_default():
+    """With bad-response detection ON (the default) the backstop STILL catches
+    a genuinely broken electrode — the CH02/CH03 safety is unchanged."""
+    r = _runner()                                 # default stop_on_bad_response=True
+    cap = _bad_capture(-1.31, rclass="broken")
+    assert r._potential_limit_hit(cap) is True
+    assert r._potential_limit_exceeded(cap) is True
+
+
+def test_cap_has_finite_epol_distinguishes_cleared_from_zero():
+    """The back-off damage guard: a bad-class capture (E_pol cleared) reports
+    NO finite E_pol, so its 0.0 polarization ratio can't be mistaken for a
+    genuine reading (which caused the false '0.00→0.97 rose' damage note)."""
+    r = _runner()
+    good = _bad_capture(-0.5, rclass="normal")
+    good.metrics.polarization_per_phase_v = [-0.5, 0.02]
+    bad = _bad_capture(-0.5, rclass="open")       # E_pol cleared to []
+    assert r._cap_has_finite_epol(good) is True
+    assert r._cap_has_finite_epol(bad) is False

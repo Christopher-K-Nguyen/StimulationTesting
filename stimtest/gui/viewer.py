@@ -665,6 +665,35 @@ class _PlotViewBar(QtWidgets.QWidget):
         # ``plotting._voltage_axis_label`` helper, matching the live PULSAR
         # plot.  The old "Potential axis" / "Voltage vs return" checkboxes are
         # gone.
+
+        sep5 = QtWidgets.QFrame()
+        sep5.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        lay.addWidget(sep5)
+        # Median DESPIKE filter for the displayed traces (operator: "In POLARIS,
+        # add an option to filter the data; I am seeing frequent spikes of the
+        # same magnitude").  The periodic switching artifacts (a sharp overshoot
+        # + a few µs of ringing at each phase boundary) are rejected by a median
+        # filter (metrics._despike) applied to the plotted traces + the marker
+        # reads.  DISPLAY-ONLY — the saved .npz is untouched.
+        self.filter_check = QtWidgets.QCheckBox("Filter spikes")
+        self.filter_check.setToolTip(
+            "Median-filter the displayed traces to reject the periodic "
+            "switching spikes / ringing.  Does NOT change the saved data.")
+        self.filter_check.toggled.connect(self._on_filter_toggled)
+        lay.addWidget(self.filter_check)
+        self.filter_win = QtWidgets.QDoubleSpinBox()
+        self.filter_win.setRange(1.0, 50.0)
+        self.filter_win.setValue(4.0)
+        self.filter_win.setSingleStep(1.0)
+        self.filter_win.setDecimals(1)
+        self.filter_win.setSuffix(" µs")
+        self.filter_win.setEnabled(False)
+        self.filter_win.setToolTip("Median-filter window (µs) — larger rejects "
+                                   "wider spikes but blurs fast edges.")
+        self.filter_win.editingFinished.connect(
+            lambda: self._emit() if self.filter_check.isChecked() else None)
+        lay.addWidget(self.filter_win)
+
         lay.addStretch(1)
         self._on_auto()
 
@@ -730,6 +759,16 @@ class _PlotViewBar(QtWidgets.QWidget):
             s.add("recip")
         return s
 
+    def _on_filter_toggled(self, on: bool) -> None:
+        self.filter_win.setEnabled(bool(on))
+        self._emit()
+
+    def filter_spikes(self) -> bool:
+        return self.filter_check.isChecked()
+
+    def filter_window_us(self) -> float:
+        return float(self.filter_win.value())
+
     def prefs(self) -> dict:
         return {"x_auto": self.x_auto.isChecked(),
                 "x_min": self.x_min.value(), "x_max": self.x_max.value(),
@@ -741,7 +780,9 @@ class _PlotViewBar(QtWidgets.QWidget):
                 "charge_transfer": self.charge_transfer(),
                 "reciprocal_derivative": self.reciprocal_derivative(),
                 "dvdt": self.dvdt_check.isChecked(),
-                "recip": self.recip_check.isChecked()}
+                "recip": self.recip_check.isChecked(),
+                "filter_spikes": self.filter_spikes(),
+                "filter_window": self.filter_window_us()}
 
     def restore(self, p: dict) -> None:
         if not isinstance(p, dict):
@@ -761,8 +802,32 @@ class _PlotViewBar(QtWidgets.QWidget):
             self.rdc_check.setChecked(bool(p.get("reciprocal_derivative", False)))
             self.dvdt_check.setChecked(bool(p.get("dvdt", False)))
             self.recip_check.setChecked(bool(p.get("recip", False)))
+            self.filter_win.setValue(float(p.get("filter_window", 4.0)))
+            self.filter_check.setChecked(bool(p.get("filter_spikes", False)))
+            self.filter_win.setEnabled(self.filter_check.isChecked())
         except Exception:
             pass
+
+
+def _despike_capture(cap, win_us: float):
+    """Return a shallow copy of ``cap`` with every displayed trace median-
+    filtered (metrics._despike) to reject the periodic switching spikes /
+    ringing (operator POLARIS "Filter spikes").  DISPLAY-ONLY — the stored
+    capture / saved .npz is untouched; the plot markers (re-derived from the
+    trace arrays by compute_metric_markers) then land on the settled trace
+    instead of a spike.  The metric TABLE keeps the stored values."""
+    import copy as _copy
+    from stimtest import metrics as _m
+    t = getattr(cap, "time_us", None)
+    out = _copy.copy(cap)
+    for _attr in ("v_mon_v", "i_mon_ua", "e_ret_v", "e_act_v"):
+        arr = getattr(cap, _attr, None)
+        if arr is not None and getattr(arr, "size", 0) >= 5:
+            try:
+                setattr(out, _attr, _m._despike(arr, t, win_us=float(win_us)))
+            except Exception:
+                pass
+    return out
 
 
 class ViewerPanel(QtWidgets.QWidget):
@@ -1573,11 +1638,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         run = session.runs[run_idx]
         cap = run.captures[cap_idx]
+        # Optional median DESPIKE of the DISPLAYED traces (operator "Filter
+        # spikes") — a shallow copy so the stored capture + metric table are
+        # untouched; the plot + its re-derived markers use the filtered arrays.
+        cap_plot = cap
+        if self.view_bar.filter_spikes():
+            cap_plot = _despike_capture(cap, self.view_bar.filter_window_us())
         if self.view_bar.charge_transfer():
             # Harris 2019 capacitive/Faradaic decomposition (dE/dt) view — the
             # electrode surface area (for C_dl) comes from the run.
             plot_charge_transfer(
-                cap, area_um2=getattr(run, "surface_area_um2", None),
+                cap_plot, area_um2=getattr(run, "surface_area_um2", None),
                 fig=self.figure, show_grid=self._show_grid)
         elif self.view_bar.reciprocal_derivative():
             # Musa 2010 reciprocal-derivative (dt/dE vs E) view.  Water-window
@@ -1585,14 +1656,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # the session's coating props, drawn as vertical reference lines.
             _coat = (session.test.extras or {}).get("coating_props") or {}
             plot_reciprocal_derivative(
-                cap,
+                cap_plot,
                 cathodic_limit_v=_coat.get("cathodic_limit_v"),
                 anodic_limit_v=_coat.get("anodic_limit_v"),
                 reference_label=getattr(session.test, "reference_electrode_label",
                                         None),
                 fig=self.figure, show_grid=self._show_grid)
         else:
-            plot_capture(cap, run, session, fig=self.figure,
+            plot_capture(cap_plot, run, session, fig=self.figure,
                          show_grid=self._show_grid,
                          density=self.view_bar.density(),
                          deriv_overlays=self.view_bar.deriv_overlays(),
@@ -1655,7 +1726,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     current_scale_mv_per_ua=self.pico_role_bar.current_scale())
                 run = sess.runs[0]
                 cap = run.captures[0]
-                plot_capture(cap, run, sess, fig=self.figure,
+                cap_plot = (_despike_capture(cap, self.view_bar.filter_window_us())
+                            if self.view_bar.filter_spikes() else cap)
+                plot_capture(cap_plot, run, sess, fig=self.figure,
                              show_grid=self._show_grid,
                              density=self.view_bar.density(),
                              potential_axis=True, return_axis=True)

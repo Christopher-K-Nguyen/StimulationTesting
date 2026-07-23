@@ -4700,7 +4700,31 @@ class TektronixOscilloscope(Oscilloscope):
                 except Exception:
                     _pct = None
             if _pct is not None and 0.0 <= float(_pct) <= 100.0:
-                _xz_pos = -(float(_pct) / 100.0) * float(npts) * float(xinc)
+                # The trigger percentage is defined relative to the FULL
+                # RECORD LENGTH — NOT the number of points the CURVe?
+                # transfer returned.  On the TBS2000 the transfer is
+                # frequently a PREFIX shorter than the record (the
+                # firmware's default DATa:STOP is < record length, and we
+                # deliberately don't pin DATa:STOP — gotcha #82), so
+                # ``npts = raw.size`` under-counts.  DATa:STARt stays 1
+                # (gotcha #82), so the returned array is samples
+                # ``[0 : npts-1]`` of the record and the trigger sits at
+                # absolute sample ``pct% × record_length`` within it.
+                # Multiplying by ``npts`` instead slid t=0 EARLY by
+                # ``(record_length − npts) × pct% × xinc`` — e.g. a 20000-pt
+                # record returned as 16624 pts at 20 % / 80 ns pushed the
+                # pulse onset to +55 µs instead of 0 (operator: "the
+                # waveform is no longer properly aligned at 0 µs … use the
+                # trigger percentage to properly shift the time").  Use the
+                # cached full record length (confirmed by query in
+                # ``set_record_length`` / ``_refresh_record_length``); fall
+                # back to ``npts`` only when it's unknown or (defensively)
+                # smaller than the transfer.
+                _rl_full = getattr(self, "_record_length", None)
+                _pts_ref = (float(_rl_full)
+                            if (_rl_full and float(_rl_full) >= npts)
+                            else float(npts))
+                _xz_pos = -(float(_pct) / 100.0) * _pts_ref * float(xinc)
                 # On the percent-position families (TBS2000*) this
                 # disagreement is EXPECTED on every capture — the
                 # firmware always reports XZEro = −record/2 while the
@@ -4717,13 +4741,15 @@ class TektronixOscilloscope(Oscilloscope):
                         f"[scope-time] XZEro readback "
                         f"({xzero*1e6:+.1f} µs) differs from the "
                         f"position-derived zero ({_xz_pos*1e6:+.1f} µs "
-                        f"= {float(_pct):.0f}% × {npts} pts × "
-                        f"{xinc*1e9:.1f} ns) — using position-derived "
-                        f"(TBS2000 reports −record/2 regardless of "
-                        f"position; expected, logged once per session).")
+                        f"= {float(_pct):.0f}% × {_pts_ref:.0f} record pts "
+                        f"× {xinc*1e9:.1f} ns; transfer returned {npts} pts)"
+                        f" — using position-derived (TBS2000 reports "
+                        f"−record/2 regardless of position; expected, "
+                        f"logged once per session).")
                     self._xzero_disagree_logged = True
                 xz_used = _xz_pos
-                used_method = f"P (position {float(_pct):.0f}% × record)"
+                used_method = (f"P (position {float(_pct):.0f}% × "
+                               f"{_pts_ref:.0f}-pt record)")
         elif abs(xzero) < 0.5 * xinc:
             # XZEro is effectively zero — either no pre-trigger
             # configured OR the legacy firmware quirk where XZEro=0

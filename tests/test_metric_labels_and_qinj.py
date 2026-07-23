@@ -82,3 +82,30 @@ def test_html_delegate_paints_theme_text_colour(_app):
     src = inspect.getsource(_HtmlItemDelegate.paint)
     assert "option.palette.color" in src
     assert "ColorRole.Text" in src
+
+
+# ---- HTML metric cells word-wrap (Cumulative N_pulse) ---------------------
+def test_html_delegate_sizehint_wraps_to_column_width():
+    """_HtmlItemDelegate.sizeHint must WRAP to the column width so a long HTML
+    label (e.g. "Cumulative N_pulse") reports its 2-line height instead of a
+    single line — else the 2nd line is clipped (operator: "The cumulative
+    number of pulses is not wrapping … make sure that the tables allow for
+    text wrapping")."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6 import QtWidgets, QtCore
+    from stimtest.gui.widgets import _HtmlItemDelegate
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    table = QtWidgets.QTableWidget(1, 1)
+    delg = _HtmlItemDelegate()
+    item = QtWidgets.QTableWidgetItem("Cumulative <i>N</i><sub>pulse</sub>")
+    table.setItem(0, 0, item)
+    idx = table.model().index(0, 0)
+    opt = QtWidgets.QStyleOptionViewItem()
+    opt.font = table.font()
+    opt.rect = QtCore.QRect(0, 0, 400, 20)          # WIDE → one line
+    h_wide = delg.sizeHint(opt, idx).height()
+    opt.rect = QtCore.QRect(0, 0, 64, 20)           # NARROW → must wrap
+    h_narrow = delg.sizeHint(opt, idx).height()
+    assert h_narrow > h_wide, (h_narrow, h_wide)

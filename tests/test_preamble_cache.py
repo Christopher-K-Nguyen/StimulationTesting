@@ -458,3 +458,70 @@ def test_horizontal_scale_skips_repeated_identical_request():
     assert a2 == a1
     scope.set_horizontal_scale(1e-4)              # different → writes
     assert scope._w.call_count > n1
+
+
+# ---------------------------------------------------------------------------
+# Method P: trigger% is relative to the FULL RECORD LENGTH, not the
+# transferred sample count (the +55 µs t=0-misalignment bug).
+# ---------------------------------------------------------------------------
+def test_method_p_uses_full_record_length_not_transferred_npts():
+    """t=0 = ``trigger% × RECORD LENGTH × XINcr`` — NOT ``× transferred npts``.
+
+    A 20000-pt record whose CURVe? returned only 16624 pts at 20 % / 80 ns
+    must put t=0 at ``-0.20 × 20000 × 80 ns = -320 µs``, NOT
+    ``-0.20 × 16624 × 80 ns = -266 µs`` — the bug that slid the pulse onset
+    to +55 µs (operator: "the waveform is no longer properly aligned at 0 µs
+    … use the trigger percentage to properly shift the time").
+    """
+    scope = _bare_tek_instance()
+    scope._expected_trigger_is_digital = False     # no 1.2 µs digital shift
+    scope._xzero_disagree_logged = True            # silence the one-shot log
+    scope._record_length = 20000                   # FULL record
+    scope._expected_horiz_position_pct = 20.0
+    scope._n_horiz_divs = 15.0
+    scope._data_width = 1
+    npts = 16624                                   # TRANSFER returned fewer
+    scope._preamble_cache["CH1"] = (
+        0.04, 0.0, 0.0,        # ymult, yoff, yzero
+        80e-9,                 # xinc = 80 ns
+        -800e-6,               # xzero (firmware −record/2 — ignored by Method P)
+        0.0,                   # pt_off
+        True, True)            # is_signed, is_big_endian
+    scope._cmds = MagicMock()
+    scope._cmds.use_data_source = True
+    scope._cmds.preamble = "WFMOutpre"
+    scope._cmds.horiz_position_unit = "percent"
+    scope._cmds.horiz_position = "HORizontal:POSition"
+    scope._inst = MagicMock()
+    scope._inst.query_binary_values = MagicMock(
+        return_value=np.zeros(npts, dtype=np.int8))
+
+    t_us, _v, _dt, n = scope._read_channel("CH1")
+    assert n == npts
+    assert t_us[0] == pytest.approx(-320.0, abs=1.0)   # record-length based
+    assert abs(t_us[0] - (-266.0)) > 40.0              # NOT the transferred-npts bug
+
+
+def test_method_p_falls_back_to_npts_when_record_length_unknown():
+    """With no cached record length, Method P uses the transferred npts (the
+    pre-fix behaviour) so nothing regresses when the full record is unknown."""
+    scope = _bare_tek_instance()
+    scope._expected_trigger_is_digital = False
+    scope._xzero_disagree_logged = True
+    scope._record_length = None                    # UNKNOWN
+    scope._expected_horiz_position_pct = 20.0
+    scope._n_horiz_divs = 15.0
+    scope._data_width = 1
+    npts = 16624
+    scope._preamble_cache["CH1"] = (
+        0.04, 0.0, 0.0, 80e-9, -800e-6, 0.0, True, True)
+    scope._cmds = MagicMock()
+    scope._cmds.use_data_source = True
+    scope._cmds.preamble = "WFMOutpre"
+    scope._cmds.horiz_position_unit = "percent"
+    scope._cmds.horiz_position = "HORizontal:POSition"
+    scope._inst = MagicMock()
+    scope._inst.query_binary_values = MagicMock(
+        return_value=np.zeros(npts, dtype=np.int8))
+    t_us, _v, _dt, n = scope._read_channel("CH1")
+    assert t_us[0] == pytest.approx(-266.0, abs=1.0)   # 0.20 × 16624 × 80 ns

@@ -1393,6 +1393,7 @@ class VoltageTransientExperiment(ExperimentRunner):
         # reference; a later re-capture at a LOWER amplitude with a HIGHER
         # ratio is non-monotonic → the overshoot degraded the surface.
         _prev_bo_amp, _prev_bo_ratio = hi_amp, r_hi
+        _prev_bo_valid = self._cap_has_finite_epol(hi_cap)
         self._emit(ExperimentEvent(
             kind="log", session=self.session, run=run,
             message=(f"{config.display_name()}: E_pol overshot the water "
@@ -1422,14 +1423,21 @@ class VoltageTransientExperiment(ExperimentRunner):
             if cap.status.aborted:
                 break
             _r_new = self._polarization_ratio(cap)
+            _new_valid = self._cap_has_finite_epol(cap)
             # DAMAGED-electrode detection: E_pol RISING as the current is
             # LOWERED (non-monotonic) means the overshoot degraded the
             # surface (pcc CH05: 60 µA @ 1.93 V → 30 µA @ 4.01 V).  The
             # back-off's monotonic assumption is broken, so regula-falsi would
             # thrash a ruined electrode — stop on the first such rise and
-            # accept the tightest SAFE side.
+            # accept the tightest SAFE side.  BOTH the reference and the
+            # current capture must have a REAL E_pol reading: a bad-class
+            # re-capture reports ratio 0.0 (E_pol cleared), which would make a
+            # normal 0.97 reading look like a huge non-monotonic rise → a
+            # FALSE damage stop (exp_vt_max_anodal CH11: a lone 'open' capture
+            # seeded _prev_bo_ratio = 0.00, then the next normal capture's
+            # 0.97 tripped "E_pol rose 0.00→0.97").
             _dmg = abs(getattr(self.ramp, "damage_ratio_rise", 0.15))
-            if (target < _prev_bo_amp
+            if (target < _prev_bo_amp and _prev_bo_valid and _new_valid
                     and _r_new > _prev_bo_ratio + _dmg):
                 note = (f"DAMAGED electrode: E_pol rose "
                         f"({_prev_bo_ratio:.2f}→{_r_new:.2f}) as current fell "
@@ -1445,7 +1453,11 @@ class VoltageTransientExperiment(ExperimentRunner):
                         and not lo_cap.status.reached_potential_limit):
                     lo_cap.status.reached_potential_limit = True
                 return capture_idx
-            _prev_bo_amp, _prev_bo_ratio = target, _r_new
+            # Advance the damage reference ONLY from a valid-E_pol capture so a
+            # transient bad-class re-capture can't poison the next comparison.
+            if _new_valid:
+                _prev_bo_amp, _prev_bo_ratio, _prev_bo_valid = (
+                    target, _r_new, True)
             if cap.status.exceeded_potential_limit:
                 hi_amp, hi_cap, r_hi = target, cap, _r_new
             elif limit_hit:
@@ -2049,6 +2061,20 @@ class VoltageTransientExperiment(ExperimentRunner):
         # electrode has little/no ohmic access drop (V_mon ≈ E_pol), and the
         # backstop is applied ONLY when E_pol is unavailable, so it NEVER
         # false-trips a normal electrode's IR drop (those use the E_pol check).
+        #
+        # GATED ON ``stop_on_bad_response``: the raw-V_mon backstop IS the
+        # bad-class water-window check, so it is coupled to the operator's
+        # master bad-response toggle.  When bad-response detection is OFF the
+        # operator has chosen to IGNORE bad-class captures and ramp to
+        # voltage-compliance / max current (gotcha #178 fallback), so a
+        # bad-class (empty-E_pol) capture must NOT trip a stop/back-off here
+        # either — otherwise a LONE TRANSIENT misclassification derails the
+        # ramp (exp_vt_max_anodal CH11: one 'open' capture at 917 µA amid
+        # normal +0.777 V neighbours cleared E_pol → this backstop fired
+        # ``exceeded`` → a spurious back-off → false "DAMAGED electrode" stop
+        # at 916 µA, below both the band and the 1000 µA max).
+        if not getattr(self.ramp, "stop_on_bad_response", True):
+            return False
         return self._raw_vmon_exceeds_window(cap, cath, anod)
 
     def _raw_vmon_exceeds_window(self, cap: Capture,
@@ -2092,7 +2118,12 @@ class VoltageTransientExperiment(ExperimentRunner):
             return any((v < cath_far or v > anod_far) for v in finite)
         # Bad-class capture (E_pol cleared) that OVERSHOT the far edge — same
         # raw-V_mon backstop as _potential_limit_hit (so max_q_inj EXCLUDES a
-        # broken over-ramp and the "Limit exceeded?" flag is honest).
+        # broken over-ramp and the "Limit exceeded?" flag is honest).  Gated on
+        # ``stop_on_bad_response`` for the same reason (see _potential_limit_hit)
+        # — a lone transient bad-class capture must not force a back-off when
+        # the operator has disabled bad-response detection.
+        if not getattr(self.ramp, "stop_on_bad_response", True):
+            return False
         return self._raw_vmon_exceeds_window(cap, cath_far, anod_far)
 
     def _polarization_ratio(self, cap: Capture) -> float:
@@ -2119,6 +2150,22 @@ class VoltageTransientExperiment(ExperimentRunner):
                 elif anod >= 1e-9:
                     worst = max(worst, v / anod)
         return worst
+
+    @staticmethod
+    def _cap_has_finite_epol(cap: Capture) -> bool:
+        """True iff the capture has at least one finite per-phase E_pol
+        (active OR return).  A bad-class capture clears its E_pol, so
+        :meth:`_polarization_ratio` returns 0.0 for it — indistinguishable
+        from a genuine 0 V polarization.  The back-off's damage detector
+        must NOT compare against such a capture (a NaN→0.0 seed makes a real
+        0.97 reading look like a huge "E_pol rose from 0.00" → false DAMAGED
+        stop — exp_vt_max_anodal CH11)."""
+        for series in (cap.metrics.polarization_per_phase_v,
+                       cap.metrics.return_polarization_per_phase_v):
+            for v in (series or []):
+                if np.isfinite(v):
+                    return True
+        return False
 
     def _worst_epol_ratio(self, captures: List[Capture]) -> float:
         """Worst-case ``|E_pol| / |limit|`` of the LATEST capture, clamped to

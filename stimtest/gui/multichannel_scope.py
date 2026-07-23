@@ -68,7 +68,12 @@ ALL_CORRECTED_TRACES = (TRACE_EACT_CORR, TRACE_ERET_CORR)
 # shape only, dashed) when toggled on (operator chose "normalized overlay").
 TRACE_DEDT = "dV/dt"
 TRACE_RECIP_DEDT = "1/(dV/dt)"
-ALL_DERIV_TRACES = (TRACE_DEDT, TRACE_RECIP_DEDT)
+# The RECIPROCAL 1/(dV/dt) overlay was REMOVED from the LIVE experiment plot
+# (operator: "Remove the reciprocal trace option in the experiment plot").  It
+# stays available in POLARIS (plotting.plot_capture deriv_overlays + the RDC
+# view).  ``TRACE_RECIP_DEDT`` is kept defined so the _refresh_traces guard +
+# the colour map don't KeyError; it's just no longer in the toggle/inset set.
+ALL_DERIV_TRACES = (TRACE_DEDT,)
 
 
 def _subscript_trace_name(trace: str) -> str:
@@ -79,6 +84,13 @@ def _subscript_trace_name(trace: str) -> str:
     V_mon, I_mon, E_ret, and E_act are not going to be with subscripts,
     then remove the underscore").  Names without an underscore pass
     through unchanged."""
+    # Differential: the operator ``d`` is UPRIGHT, the variable ITALIC
+    # (operator: "for the differential, keep the variable in italics, but keep
+    # the 'd' in normal font") — d<i>V</i>/d<i>t</i>, not <i>dV/dt</i>.
+    if trace == TRACE_DEDT:
+        return "d<i>V</i>/d<i>t</i>"
+    if trace == TRACE_RECIP_DEDT:
+        return "1/(d<i>V</i>/d<i>t</i>)"
     if "_" in trace:
         base, _, sub = trace.partition("_")
         return rich.var(base, sub)

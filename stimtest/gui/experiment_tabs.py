@@ -3680,77 +3680,50 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    def _reinit_stim_if_closed(self) -> bool:
-        """Re-initialize the SHARED stimulator on Start when it reports
-        closed OR when the previous run was STOPPED.
+    def _reinit_stim_for_new_run(self) -> bool:
+        """Re-initialize the SHARED stimulator at the start of EVERY run.
 
-        Two triggers:
+        Operator lifecycle (supersedes the old close-on-Stop design,
+        CLAUDE.md gotcha #29b): "Do not disconnect the stimulator and
+        oscilloscope when the experiment ends.  Do reinitialize the
+        stimulator when starting a new experiment."  So both the
+        stimulator AND the oscilloscope stay CONNECTED between runs
+        (neither is closed on Stop or on a normal completion — see
+        :meth:`stop_clicked` / :meth:`_on_finished`), and instead each
+        new experiment's Start reinitializes the STIMULATOR so it begins
+        from a clean device state.
 
-        1. **Device reports closed** (``is_open`` is False) — the SOURCE
-           OF TRUTH, NOT the per-tab flag.  A Stop/abort in a DIFFERENT
-           experiment tab closes the shared stimulator but only sets THAT
-           tab's flag, so keying on ``is_open`` makes ANY tab's Start
-           re-open a device any other tab closed.
-        2. **Previous run was Stopped** (``_stim_needs_init`` or
-           ``_stim_needs_close_after_run`` set) — even if the device
-           still reports OPEN (operator: "Reinitialize the stimulator
-           when pressing Start if the experiment has been Stopped").
-           This covers the cases the is_open check alone missed: the
-           Stop's deferred ``close()`` hasn't run yet (Start raced
-           ``_on_finished``) or it failed silently, leaving a stale
-           ``is_open == True``.  When the device is still open we
-           ``close()`` it FIRST so the ``open()`` is a clean reinit; the
-           driver's ``_is_open`` guard (gotcha #29c) means that's a
-           single ``PS_CloseAllStim`` + ``PS_InitAllStim``, not the
-           cascade.
+        ``stim.open()`` IS a full reinit: when the device is already open
+        the driver does a single ``PS_CloseAllStim`` + ``PS_InitAllStim``
+        (the ``_is_open`` guard keeps it to ONE close, gotcha #29c —
+        safe because no OTHER close fires in the lifecycle anymore); when
+        it reports closed (a crash, or a close from another tab) it just
+        inits.  ``PS_InitAllStim`` wipes the per-channel period / reps /
+        pattern-content caches (gotcha #38), so the runner's first
+        ``load_channel`` re-uploads — correct by construction.
 
-        A NORMAL end-of-run sets NEITHER flag, so back-to-back normal
-        runs skip re-init (the device stays open) — only a Stop forces it.
+        This is the SAME ``open()`` reinit the after-Stop path already
+        used; it simply fires on every Start now.  Cross-tab robustness
+        is automatic (the stim is shared, so ANY tab's Start reinitializes
+        whatever state a prior run in ANY tab left).
 
-        Returns True if a re-init was performed.  Raises ``RuntimeError``
-        on a genuine init failure (the caller's wrapper rolls back the
-        UI and surfaces the error to the operator).
+        Returns True (a reinit was attempted).  Raises ``RuntimeError``
+        when no stimulator object exists OR on a genuine init failure
+        (the caller's wrapper rolls back the UI and surfaces the error).
         """
         _stim_obj = getattr(self, "_stim", None)
-        try:
-            _stim_is_open = (bool(_stim_obj.is_open)
-                             if _stim_obj is not None else None)
-        except Exception:
-            _stim_is_open = None
-        _was_stopped = (bool(getattr(self, "_stim_needs_init", False))
-                        or bool(getattr(self, "_stim_needs_close_after_run",
-                                        False)))
-        _needs_init = ((_stim_is_open is False) or _was_stopped
-                       or (_stim_is_open is None
-                           and getattr(self, "_stim_needs_init", False)))
-        if not _needs_init:
-            # Already open and the last run ended normally — clear any
-            # stale per-tab flag so a later Start doesn't redundantly
-            # re-open an open device (which would re-trip the close
-            # cascade, gotcha #29c).
-            self._stim_needs_init = False
-            return False
-        _reason = ("a prior Stop/abort"
-                   if _was_stopped else
-                   "device reports closed — possibly a Stop in another "
-                   "experiment tab")
+        if _stim_obj is None:
+            # Operator never initialized it via ConnectionPanel.
+            raise RuntimeError(
+                "No stimulator object available — open the Setup tab → "
+                "Connection panel → Initialize stimulator before pressing "
+                "Start.")
         self.log_pane.log_now(
-            f"Re-initializing stimulator for new run ({_reason})…")
+            "Reinitializing stimulator for new experiment (PS_InitAllStim)…")
         try:
-            if _stim_obj is None:
-                # Operator never initialized it via ConnectionPanel.
-                raise RuntimeError(
-                    "No stimulator object available — open the Setup "
-                    "tab → Connection panel → Initialize stimulator "
-                    "before pressing Start.")
-            # If the device still reports OPEN after a Stop, close it
-            # first so open() lands on a quiet device (single
-            # close+init, per the _is_open guard).
-            if _stim_is_open:
-                try:
-                    _stim_obj.close()
-                except Exception:
-                    pass
+            # open() reinitializes an already-open device (single
+            # close+init via the driver's _is_open guard); on a closed
+            # device it just inits.
             _stim_obj.open()
             _serial = ""
             try:
@@ -3759,13 +3732,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             except Exception:
                 pass
             self.log_pane.log_now(
-                f"Stimulator re-initialized (PS_InitAllStim, S/N "
+                f"Stimulator reinitialized (PS_InitAllStim, S/N "
                 f"{_serial or 'unknown'}).")
             self._stim_needs_init = False
             self._stim_needs_close_after_run = False
         except Exception as _stim_init_err:
             raise RuntimeError(
-                f"Stimulator re-init failed: "
+                f"Stimulator reinit failed: "
                 f"{type(_stim_init_err).__name__}: {_stim_init_err}.  "
                 f"Power-cycle the stimulator + re-Initialize from the "
                 f"Connection panel.") from _stim_init_err
@@ -3833,15 +3806,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 f"⚠ Cable translation could NOT be applied: "
                 f"{type(_cm_err).__name__}: {_cm_err} — falling back to "
                 f"identity (device channel = Plexon channel).")
-        # ---- User-spec: re-init the stim if a prior Stop closed it
-        # Quote: "When you restart, initialize the stimulator."  We init
-        # HERE — before the scope setup — so the runner takes a fully-
-        # init'd stim and a failure aborts Start cleanly via the
-        # wrapper's except clause.  No-op on the normal end-of-run →
-        # next-Start path (device still open).  See
-        # :meth:`_reinit_stim_if_closed` for why this keys on the shared
-        # device's ``is_open`` rather than the per-tab flag.
-        self._reinit_stim_if_closed()
+        # ---- User-spec: reinitialize the stim for every new experiment
+        # Quote: "Do reinitialize the stimulator when starting a new
+        # experiment."  The stim + scope stay CONNECTED between runs
+        # (never closed on Stop / completion); each Start reinitializes
+        # the stim so it begins clean.  Done HERE — before the scope
+        # setup — so the runner takes a fully-init'd stim and a failure
+        # aborts Start cleanly via the wrapper's except clause.  See
+        # :meth:`_reinit_stim_for_new_run`.
+        self._reinit_stim_for_new_run()
         # ---- KHFAC discharge-as-short: (re-)enable the PlexStim auto-discharge
         # so the trailing discharge idle is a REAL passive short (charge drains
         # each cycle), not a floating 0-µA step.  Gated on the runner's pattern
@@ -4708,34 +4681,15 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             self._worker_thread = None
         self._worker = None
         self._runner = None
-        # ---- User-spec: close the stim if Stop was pressed -----
-        # ``_stim_needs_close_after_run`` is set in
-        # :meth:`stop_clicked`.  We do the close HERE — not in
-        # stop_clicked — so it happens AFTER ``wait()`` above
-        # has confirmed the runner thread is fully dead.
-        # Closing earlier would race the runner's last DLL call
-        # (it might still be in its finally-block ``stop_all``
-        # at the moment Stop was clicked, especially if the
-        # runner was deep in a slow USB-TMC scope read).  The
-        # ``_dll_lock`` would prevent a heap race, but the
-        # runner would still see its next call hit a closed
-        # device and raise — better to defer until it's gone.
-        # Marks ``_stim_needs_init`` so the next Start press
-        # re-initializes (see :meth:`_start_runner_body`).
-        if getattr(self, "_stim_needs_close_after_run", False):
-            try:
-                if getattr(self, "_stim", None) is not None:
-                    self._stim.close()
-                    self.log_pane.log(
-                        "Stimulator closed (PS_CloseAllStim) — "
-                        "next Start will re-initialize.")
-            except Exception as _close_err:
-                self.log_pane.log(
-                    f"Stimulator close failed (continuing — "
-                    f"next Start will still attempt re-init): "
-                    f"{type(_close_err).__name__}: {_close_err}")
-            self._stim_needs_close_after_run = False
-            self._stim_needs_init = True
+        # ---- User-spec: keep the stimulator + oscilloscope CONNECTED
+        # when the experiment ends (Stop or normal completion).  Neither
+        # is closed here — the operator wants the hardware to stay live
+        # between experiments; the NEXT Start reinitializes the stim
+        # (see :meth:`_reinit_stim_for_new_run`).  ``stop_clicked`` has
+        # already aborted any in-flight pulse (PS_AbortAll), so the
+        # device is quiet-but-open.  (Supersedes the old close-on-Stop —
+        # CLAUDE.md gotcha #29b.)  ``_stim_needs_init`` is left False; the
+        # unconditional Start-time reinit no longer depends on it.
         # If a sequential queue has more configs lined up, mark the
         # active channel as completed and chain to the next entry —
         # keeping the params locked across the gap so the user never
@@ -4919,49 +4873,29 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         if self._runner is not None:
             self._runner.abort()
             self.log_pane.log("Stop requested.")
-            # ---- User-spec: tear down the stim on Stop ----------
-            # Quote: "When you stop, abort stim and close the
-            # stimulator.  When you restart, initialize the
-            # stimulator."  Rationale: leaves the device in a
-            # FULLY CLEAN state between runs.  The next Start
-            # press re-initializes (see _start_runner_body).
-            # This sidesteps the close-while-pulsing
-            # HEAP_CORRUPTION (CLAUDE.md gotcha #31) at the
-            # source — by the time the runner calls reinit at
-            # the top of run(), the device is already aborted
-            # and closed, so reinit's open() lands on a fully
-            # quiet device.
+            # ---- User-spec: HALT the pulse but keep the device
+            # CONNECTED.  The operator wants the stimulator +
+            # oscilloscope to stay live between experiments; only the
+            # NEXT Start reinitializes the stim (see
+            # :meth:`_reinit_stim_for_new_run`).  So Stop aborts any
+            # in-flight pulse (PS_AbortAll) but does NOT close.
             #
-            # ``abort_all`` (= PS_AbortAll) is DLL-safe in ANY
-            # trigger mode and aborts a pulse already in flight,
-            # unlike ``stop_all`` which returns error 4 outside
-            # SOFT trigger mode.  The ``_dll_lock`` re-entrant
-            # mutex serializes us against any in-flight runner
-            # DLL call so we wait for the runner to release the
-            # lock before we touch the device.
-            #
-            # The actual ``close()`` happens later in
-            # :meth:`_on_finished` — AFTER the runner thread has
-            # fully exited (via ``_worker_thread.wait()``).
-            # Closing here would race the runner's next DLL call
-            # (it might still be inside ``_one_capture`` waiting
-            # on a slow USB-TMC read; on return it'll try to
-            # call ``stop_all`` in its finally, and a closed
-            # device would raise from inside the runner).  The
-            # flag ``_stim_needs_close_after_run`` carries the
-            # intent across the GUI / worker boundary.
+            # ``abort_all`` (= PS_AbortAll) is DLL-safe in ANY trigger
+            # mode and aborts a pulse already in flight, unlike
+            # ``stop_all`` which returns error 4 outside SOFT trigger
+            # mode.  The ``_dll_lock`` re-entrant mutex serializes us
+            # against any in-flight runner DLL call, so we wait for the
+            # runner to release the lock before we touch the device.
             try:
                 if getattr(self, "_stim", None) is not None:
                     self._stim.abort_all()
                     self.log_pane.log(
-                        "Stimulator aborted (PS_AbortAll).")
+                        "Stimulator aborted (PS_AbortAll) — device stays "
+                        "connected; next Start will reinitialize it.")
             except Exception as _e:
                 self.log_pane.log(
-                    f"Stimulator abort_all failed "
-                    f"(continuing — close will still fire after "
-                    f"the runner exits): "
+                    f"Stimulator abort_all failed (continuing): "
                     f"{type(_e).__name__}: {_e}")
-            self._stim_needs_close_after_run = True
 
     def pause_toggled(self, paused: bool):
         """Toggle pulsing on/off without ending the run.

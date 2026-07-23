@@ -1,16 +1,15 @@
-"""Re-initializing a SHARED stimulator that another tab closed.
+"""Reinitializing the SHARED stimulator at the start of EVERY run.
 
-Operator: "I am having issues with wanting to run a different experiment
-after I aborted one.  It seems that the stimulator stays closed and won't
-let another experiment run."
+Operator lifecycle (CLAUDE.md gotcha #29b, revised): "Do not disconnect
+the stimulator and oscilloscope when the experiment ends.  Do reinitialize
+the stimulator when starting a new experiment."
 
-Root cause: the GUI keyed the Start-time re-init on a PER-TAB
-``_stim_needs_init`` flag, but the stimulator object is SHARED across all
-experiment tabs.  Aborting in tab A closed the shared stim and set tab
-A's flag; tab B's flag stayed False, so tab B's Start skipped re-init and
-ran on a closed device.  The fix keys re-init on the device's own
-``is_open`` state (``_reinit_stim_if_closed``), so ANY tab's Start
-re-opens a device any other tab closed.
+So the stim + scope stay CONNECTED between runs (nothing is closed on Stop
+or on a normal completion), and each new experiment's Start reinitializes
+the STIMULATOR via ``_reinit_stim_for_new_run`` — a fresh ``PS_InitAllStim``
+(``stim.open()`` does a single close+init on an already-open device).  The
+stim is SHARED across every experiment tab, so ANY tab's Start reinitializes
+whatever state a prior run in ANY tab left.
 """
 from __future__ import annotations
 
@@ -41,85 +40,58 @@ def _two_tabs_sharing_one_stim(qapp):
     return w, tab_a, tab_b, stim, scope
 
 
-def test_other_tab_reopens_a_stim_closed_by_first_tab(qapp):
+def test_start_reinitializes_an_open_device(qapp):
+    # Every Start reinitializes the stim, even after a NORMAL run left it
+    # open.  The device ends up open + freshly initialized.
     w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
     try:
-        # Tab A aborts → its _on_finished closes the SHARED stim and sets
-        # ONLY tab A's flag.  Emulate that end state:
-        stim.close()
-        tab_a._stim_needs_init = True
-        # Tab B never knew — its flag is the default False.
-        tab_b._stim_needs_init = False
-        assert not stim.is_open
-
-        # Tab B's Start path must re-open the shared device anyway.
-        did = tab_b._reinit_stim_if_closed()
+        assert stim.is_open
+        opens_before = getattr(stim, "open_count", None)
+        did = tab_b._reinit_stim_for_new_run()
         assert did is True
-        assert stim.is_open, "tab B's Start must re-open the shared stim"
-    finally:
-        stim.close(); scope.close()
-
-
-def test_no_reinit_on_normal_back_to_back_run(qapp):
-    # A NORMAL end-of-run sets NEITHER Stop-flag, so the next Start on an
-    # already-open device must NOT re-open it (avoids the
-    # ps_close_all_stim cascade, gotcha #29c).
-    w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
-    try:
-        assert stim.is_open
-        tab_b._stim_needs_init = False
-        tab_b._stim_needs_close_after_run = False
-        did = tab_b._reinit_stim_if_closed()
-        assert did is False
-        assert stim.is_open
-        assert tab_b._stim_needs_init is False
-    finally:
-        stim.close(); scope.close()
-
-
-def test_stop_forces_reinit_even_when_device_reports_open(qapp):
-    """Operator: "Reinitialize the stimulator when pressing Start if the
-    experiment has been Stopped."  Even if the device still reports OPEN
-    (the Stop's deferred close raced Start or failed silently), a set
-    Stop-flag must force a clean close+open."""
-    w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
-    try:
-        assert stim.is_open
-        # Emulate Stop pressed but the close not yet reflected in is_open.
-        tab_b._stim_needs_close_after_run = True
-        did = tab_b._reinit_stim_if_closed()
-        assert did is True, "a Stop must force reinit even when is_open"
         assert stim.is_open, "reinit ends with the device open + ready"
-        # Both Stop-flags cleared so the NEXT (normal) Start won't reinit.
-        assert tab_b._stim_needs_close_after_run is False
-        assert tab_b._stim_needs_init is False
+        if opens_before is not None:
+            # A real reinit re-ran open() on the simulator.
+            assert stim.open_count > opens_before
     finally:
         stim.close(); scope.close()
 
 
-def test_stop_flag_via_needs_init_also_forces_reinit(qapp):
-    # The other Stop signal: _on_finished sets _stim_needs_init=True after
-    # closing on Stop.  If close left the device reporting open, that flag
-    # alone must still force the reinit.
-    w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
-    try:
-        assert stim.is_open
-        tab_b._stim_needs_init = True
-        assert tab_b._reinit_stim_if_closed() is True
-        assert stim.is_open
-        assert tab_b._stim_needs_init is False
-    finally:
-        stim.close(); scope.close()
-
-
-def test_closed_device_reopens_even_without_the_flag(qapp):
-    # The is_open state — not the flag — drives the decision.
+def test_start_reopens_a_closed_device(qapp):
+    # A device closed by a crash (or a close in another tab) is reopened.
     w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
     try:
         stim.close()
-        tab_b._stim_needs_init = False          # flag says "fine"
-        assert not stim.is_open                 # but device says "closed"
-        assert tab_b._reinit_stim_if_closed() is True
+        assert not stim.is_open
+        did = tab_b._reinit_stim_for_new_run()
+        assert did is True
+        assert stim.is_open, "tab B's Start must reopen the shared stim"
+    finally:
+        stim.close(); scope.close()
+
+
+def test_reinit_clears_legacy_stop_flags(qapp):
+    # The legacy per-tab Stop flags (kept for back-compat) are cleared by a
+    # reinit, so nothing downstream keys on stale state.
+    w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
+    try:
+        tab_b._stim_needs_init = True
+        tab_b._stim_needs_close_after_run = True
+        assert tab_b._reinit_stim_for_new_run() is True
+        assert tab_b._stim_needs_init is False
+        assert tab_b._stim_needs_close_after_run is False
         assert stim.is_open
+    finally:
+        stim.close(); scope.close()
+
+
+def test_reinit_without_a_stim_object_raises(qapp):
+    # Start with no stimulator initialized must raise a clear, actionable
+    # error (the caller's wrapper rolls back the UI).
+    w, tab_a, tab_b, stim, scope = _two_tabs_sharing_one_stim(qapp)
+    try:
+        tab_b._stim = None
+        with pytest.raises(RuntimeError):
+            tab_b._reinit_stim_for_new_run()
     finally:
         stim.close(); scope.close()
