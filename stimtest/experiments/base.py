@@ -848,12 +848,27 @@ class ExperimentRunner(ABC):
             DEPOLARIZATION_TIME_US = 12.0  # fall back to the canonical default
         else:
             from ..config import DEPOLARIZATION_TIME_US
+        # E_pol time delay: honour the GUI's custom value (Setup-tab "custom
+        # E_pol time delay" toggle) if the setup snapshot carries one, else the
+        # canonical 12 µs.  This is the delay compute_metrics uses for the
+        # operator TIME method (phase_end + depol).
+        import math as _math
+        _depol = DEPOLARIZATION_TIME_US
+        try:
+            _snap = self.session.test.extras.get("setup_snapshot", {}) or {}
+            _cand = _snap.get("depolarization_us", None)
+            if _cand is not None:
+                _cand = float(_cand)
+                if _math.isfinite(_cand) and _cand >= 0:
+                    _depol = _cand
+        except Exception:
+            _depol = DEPOLARIZATION_TIME_US
         self.session.test.extras.update({
             "stimulator_info": stim_info,
             "oscilloscope_info": scope_info,
             "channel_aliases": aliases,
             "coating_props": coating_props,
-            "depolarization_us": DEPOLARIZATION_TIME_US,
+            "depolarization_us": _depol,
         })
         # Task #57: capture reproducibility metadata once at runner
         # construction (PULSAR git hash + version, Python + package
@@ -1329,6 +1344,70 @@ class ExperimentRunner(ABC):
             for i, p in enumerate(base.phases)
         ]
         return replace(base, phases=new_phases)
+
+    def _epol_depol_us(self) -> float:
+        """The E_pol time delay (µs) to pass to ``compute_metrics`` for this
+        run — resolved once into ``test.extras['depolarization_us']`` by the
+        hardware-snapshot step (honouring the GUI's custom-delay toggle, else
+        the canonical 12 µs).  Every runner routes its ``compute_metrics``
+        call through this so the operator's chosen delay is applied
+        uniformly."""
+        from ..config import DEPOLARIZATION_TIME_US
+        try:
+            v = float(self.session.test.extras.get(
+                "depolarization_us", DEPOLARIZATION_TIME_US))
+            if v == v and v >= 0:      # finite (NaN != NaN) and non-negative
+                return v
+        except Exception:
+            pass
+        return float(DEPOLARIZATION_TIME_US)
+
+    # ---- burst-aware pulse-timing helpers (single source of truth) --------
+    @staticmethod
+    def _pulses_per_second(pattern) -> float:
+        """OVERALL pulses delivered per second for pulse-COUNT accounting —
+        ``rate_hz`` for an ordinary train, ``pulses_per_burst × burst_rate``
+        for a burst (N pulses every ``burst_period``, so the average is FAR
+        below the intra-burst ``rate_hz``).  Identity ``== rate_hz`` for every
+        non-burst pattern, so routing existing call sites through it is safe.
+        Prefer the ``effective_pulse_rate_hz`` property; fall back to a manual
+        derivation for a mock/legacy pattern that lacks it."""
+        eff = getattr(pattern, "effective_pulse_rate_hz", None)
+        if isinstance(eff, (int, float)) and eff > 0:
+            return float(eff)
+        try:
+            dev = float(getattr(pattern, "device_period_us", 0.0) or 0.0)
+            ppp = int(getattr(pattern, "pulses_per_period", 1) or 1)
+            if dev > 0:
+                return ppp * 1e6 / dev
+        except Exception:
+            pass
+        # Terminal fallback for a mock / duck-typed pattern — guarded too, so a
+        # non-numeric ``rate_hz`` degrades to 0 rather than raising into the
+        # runner's timing path (the docstring promises this graceful fallback).
+        try:
+            return float(getattr(pattern, "rate_hz", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _averager_fill_s(self, pattern, *, headroom_s: float = 0.0) -> float:
+        """Seconds for the scope averager to accumulate its ``n_avg`` pulse-
+        triggered frames = ``n_avg / overall_pulse_rate`` (+ optional
+        headroom).  For a burst this is LONGER than ``n_avg / rate_hz`` — the
+        trigger rate averaged over the inter-burst gaps is the OVERALL rate, so
+        keeping ``rate_hz`` under-waits and reads an incomplete average
+        (gotcha #32).  Identity to the old ``n_avg / rate_hz`` for a non-burst
+        pattern.  A missing / zero rate yields ``headroom_s`` (never 0-wait)."""
+        try:
+            navg = int(getattr(self.scope, "_expected_acq_navg", 0) or 0)
+        except Exception:
+            navg = 0
+        if navg <= 0:
+            navg = 8      # matches the runners' ``_expected_acq_navg or 8``
+        pps = self._pulses_per_second(pattern)
+        if pps <= 0:
+            return float(headroom_s)
+        return navg / pps + float(headroom_s)
 
     def load_zero_unused_channels(self, pattern, config,
                                   active_channels=None) -> None:

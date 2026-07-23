@@ -117,7 +117,11 @@ class ShortPulsingExperiment(ExperimentRunner):
                                        message=f"Stim load failed: {e}"))
             return ExperimentResult(session=self.session, aborted=True, error=str(e))
 
-        pulse_period_s = 1.0 / pattern.rate_hz
+        # Burst-aware per-triggered-pulse spacing: for a burst the averager
+        # fills at the OVERALL pulse rate (slower than rate_hz because of the
+        # inter-burst gaps), so ``navg × pulse_period_s`` waits long enough for
+        # a full average.  Identity ``== 1/rate_hz`` for a non-burst pattern.
+        pulse_period_s = 1.0 / max(self._pulses_per_second(pattern), 1e-9)
         navg = getattr(self.scope, "_expected_acq_navg", None) or 8
         v_mon_phys = self.scope.channel_aliases.get("vmon", "CH1")
         i_mon_phys = self.scope.channel_aliases.get("imon", "CH2")
@@ -148,7 +152,8 @@ class ShortPulsingExperiment(ExperimentRunner):
             self._smooth_acquisition(acq)
             cap = make_capture(snap_idx, pattern, acq, self.scope, self.stim,
                                cal=self.cal, channel=config.active)
-            compute_metrics(cap, run.surface_area_um2)
+            compute_metrics(cap, run.surface_area_um2,
+                            depol_us=self._epol_depol_us())
             # Feed the E_ret pre/post-pulse rest values into the electrode-
             # potential learning bin keyed by the return coating.  Silently
             # no-ops when the capture has no E_ret trace (NaN rest values)

@@ -226,6 +226,7 @@ ARBITRARY = "Arbitrary"
 SYMMETRIC = "Symmetric"
 ASYMMETRIC = "Asymmetric"
 
+
 # Arbitrary sub-mode entries
 ARB_FIXED = "Fixed"        # one shared period, N amplitude values
 ARB_VARIABLE = "Variable"  # N (amplitude, duration) pairs
@@ -1282,6 +1283,75 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "disabled while the value tracks the pulse width live.")
         self.interpulse_check.toggled.connect(self._on_interpulse_toggled)
 
+        # KHFAC discharge-as-short: REPLACE the existing trailing 0-µA
+        # discharge step with a real PlexStim auto-discharge SHORT (no time
+        # added).  Shown ONLY for a symmetric biphasic SINUSOIDAL pattern
+        # (KHFAC); ENABLED only when Discharge Mode (auto-discharge) is on AND
+        # a discharge delay exists.  When ON, pattern() stamps
+        # ``interpulse_discharge_us`` = the discharge duration → build_pat_pairs
+        # skips the 0-µA pair so the device idles + shorts it.
+        self.interpulse_discharge_check = QtWidgets.QCheckBox(
+            "Discharge between pulses (short, not 0 µA)")
+        self.interpulse_discharge_check.setChecked(False)
+        self.interpulse_discharge_check.setToolTip(
+            "Continuous-sinusoidal (KHFAC) only — enabled only when Discharge "
+            "Mode (auto-discharge) is On and a discharge delay is set.\n\n"
+            "REPLACES the existing 0-µA discharge step between pulses with a "
+            "REAL passive SHORT: the device idles the discharge duration "
+            "(no time added) and the PlexStim auto-discharge drains the "
+            "accumulated charge — real charge recovery / DC mitigation instead "
+            "of a floating 0-µA step.\n\n"
+            "The Ghazavi E_off / DC readout keeps computing (the discharge is "
+            "windowed out).")
+        self.interpulse_discharge_check.toggled.connect(self._emit)
+        self.interpulse_discharge_check.setVisible(False)
+
+        # ------ burst / pulse-train stimulation ------
+        # Group ``pulses_per_burst`` pulses (at the intra-burst ``rate_hz``)
+        # into a longer ``burst_period_us`` — burst stimulation (BurstDR /
+        # theta-burst).  The whole group is HIDDEN unless the embedding tab
+        # declares support (``set_burst_available`` — SP / CP / LP only; burst
+        # is meaningless for VT, which ramps a single pulse's amplitude).
+        # Availability flag; gated per experiment tab.  Starts False so a
+        # freshly-built panel (or a VT tab) never emits a burst pattern.
+        self._burst_available = False
+        self.burst_enable_check = QtWidgets.QCheckBox(
+            "Group pulses into bursts")
+        self.burst_enable_check.setChecked(False)
+        self.burst_enable_check.setToolTip(
+            "Burst stimulation: deliver a GROUP of pulses (at the pulse rate "
+            "above, the intra-burst rate) then idle for the rest of the burst "
+            "period, repeating every burst period.  When OFF, ordinary "
+            "continuous / periodic pulsing.")
+        self.burst_enable_check.toggled.connect(self._on_burst_enable_toggled)
+        # Pulses per burst — integer, ≥ 2 (1 = ordinary pulsing).
+        self.pulses_per_burst_spin = RepeatingSpinBox()
+        self.pulses_per_burst_spin.setRange(2, 999)
+        self.pulses_per_burst_spin.setValue(5)
+        self.pulses_per_burst_spin.setToolTip(
+            "Number of pulses delivered in each burst, at the intra-burst "
+            "pulse rate set above.")
+        # Burst period in MILLISECONDS (the burst repeats every this long).
+        # The whole burst (all N pulses) must fit inside this period.  Upper
+        # bound 125 000 ms = the PlexStim PS_SetPeriod ceiling (device_period).
+        # The MINIMUM is dynamically clamped to the burst span in
+        # ``_refresh_burst`` so the burst is always valid (span ≤ period).
+        self.burst_period_ms = self._dspin(
+            0.02, 125000.0, 25.0, step=1.0, decimals=3, suffix=" ms")
+        self.burst_period_ms.setToolTip(
+            "Burst period — the burst (all its pulses) repeats every this "
+            "long.  1000 / period(ms) = the burst repetition rate (Hz).  Must "
+            "be long enough to fit all the pulses in the burst.")
+        # Read-only italic readout: intra-rate, burst rate, inter-burst gap,
+        # overall pulses/second.  Turns into a red warning when the burst is
+        # too short to hold its pulses.
+        self.burst_readout = QtWidgets.QLabel("")
+        self.burst_readout.setWordWrap(True)
+        _brf = self.burst_readout.font(); _brf.setItalic(True)
+        self.burst_readout.setFont(_brf)
+        self.pulses_per_burst_spin.valueChanged.connect(self._emit)
+        self.burst_period_ms.valueChanged.connect(self._emit)
+
         # ------ charge-balance mode ------
         # Default to last-amp auto-balance per lab convention: when the
         # user enters asymmetric mode they almost always want the
@@ -1842,6 +1912,28 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         avg_w = QtWidgets.QWidget(); avg_w.setLayout(avg_row)
         delays.addRow("Average count", avg_w)
         outer.addLayout(delays)
+
+        # ------ burst / pulse-train group (below the timing form) ------
+        # Hidden by default; ``set_burst_available`` reveals it on SP/CP/LP.
+        self.burst_group = QtWidgets.QGroupBox("Burst stimulation (pulse train)")
+        _burst_form = QtWidgets.QFormLayout(self.burst_group)
+        _burst_form.setContentsMargins(8, 4, 8, 4)
+        _burst_form.setVerticalSpacing(4)
+        _burst_form.addRow(self.burst_enable_check)
+        _burst_form.addRow(
+            rich.field_label("Pulses per burst", rich.var("N", "burst")),
+            self.pulses_per_burst_spin)
+        _burst_form.addRow(
+            rich.field_label("Burst period", rich.var("T", "burst")),
+            self.burst_period_ms)
+        _burst_form.addRow(self.burst_readout)
+        self.burst_group.setVisible(False)
+        outer.addWidget(self.burst_group)
+        # KHFAC interpulse-discharge toggle (hidden unless a symmetric
+        # biphasic sinusoid is active — see _refresh_interpulse_discharge).
+        outer.addWidget(self.interpulse_discharge_check)
+        # Initial enabled-state (spins greyed until the box is ticked).
+        self._on_burst_enable_toggled(self.burst_enable_check.isChecked())
 
         # Auto-discharge mode toggle. Constructed here but laid out at
         # the BOTTOM of the panel (after the charge-balance row) per
@@ -3682,6 +3774,32 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         if warn_lbl is not None:
             warn_lbl.setText(warning_html)
             warn_lbl.setVisible(bool(warning_html))
+        # ---- Burst / pulse-train: stamp the burst fields (ONE place, after
+        # every branch built ``pat``).  Gated on availability + the enable box
+        # so a non-burst tab (or an unticked box) always yields an ordinary
+        # pattern (pulses_per_burst=1, burst_period_us=0).  ``scaled`` /
+        # ``auto_balance`` preserve these downstream (tested), and the runner
+        # honours ``device_period_us`` / ``build_burst_pat_pairs`` for them.
+        if self._burst_enabled():
+            n = int(self.pulses_per_burst_spin.value())
+            period_us = float(self.burst_period_ms.value()) * 1000.0
+            if n >= 2 and period_us > 0.0:
+                pat.pulses_per_burst = n
+                pat.burst_period_us = period_us
+        # ---- KHFAC discharge-as-short: REPLACE the existing trailing 0-µA
+        # discharge step with a real auto-discharge SHORT (operator: "do not
+        # add a 1 µs step … replace a 0-µA step between pulses as discharge …
+        # only when Discharge Mode is enabled").  No time is added — the field
+        # carries the EXISTING discharge duration (the last phase's delay), and
+        # build_pat_pairs skips its 0-µA pair so the device idles + shorts it.
+        if self._interpulse_discharge_enabled(pat):
+            try:
+                _disch = float(pat.phases[-1].delay_after_us) if pat.phases \
+                    else 0.0
+            except Exception:
+                _disch = 0.0
+            if _disch > 0:
+                pat.interpulse_discharge_us = _disch
         return pat
 
     # Minimum guaranteed dead-time between consecutive pulses (μs).
@@ -3798,6 +3916,29 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             lbl.setText("")
             lbl.setToolTip("")
             return
+        # BURST: the averager collects ``sweeps`` pulse-triggered frames at the
+        # OVERALL pulse rate (pulses_per_burst / burst_period), which is far
+        # slower than the intra-burst rate because of the inter-burst gaps — so
+        # base the estimate on the overall rate + show it as pps.
+        if self._burst_enabled():
+            n = int(self.pulses_per_burst_spin.value())
+            period_s = float(self.burst_period_ms.value()) / 1000.0
+            eff_rate = (n / period_s) if (n >= 2 and period_s > 0.0) else rate_hz
+            if eff_rate > 0.0:
+                t_s = sweeps / eff_rate
+                lead = f"{sweeps}" if is_avg else "1 sweep"
+                lbl.setText(
+                    f"{lead} ÷ {eff_rate:g} pps (overall) ≈ "
+                    f"{self._fmt_acq_time(t_s)} / capture")
+                lbl.setToolTip(
+                    "Approximate acquisition time per captured waveform "
+                    "(burst mode).<br>Estimate: "
+                    f"{'{} averaged sweeps'.format(self._acq_n_avg) if is_avg else 'single sweep (SAMPLE mode)'}"
+                    f" &divide; {eff_rate:g} pps overall pulse rate "
+                    f"({n} pulses / {float(self.burst_period_ms.value()):g} ms "
+                    "burst).<br>Overhead (trigger latency, transfer) is not "
+                    "included.")
+                return
         t_s = sweeps / rate_hz
         # Show the CALCULATION inline in terms of the CURRENTLY-SELECTED
         # rate unit (operator: "show the calculation" + "If the pulse rate
@@ -4005,6 +4146,175 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         self._refresh_rate_label()
         self._emit()
 
+    # --------------------------------------------------- burst / pulse-train
+    def set_burst_available(self, available: bool) -> None:
+        """Show / hide the burst group for the embedding experiment tab.
+
+        SP / CP / LP support burst stimulation; VT / PS do not (VT ramps a
+        single pulse's amplitude, so a burst is meaningless).  When hidden,
+        ``pattern()`` never stamps the burst fields even if a stale pref left
+        the enable box ticked, so a non-burst tab can't emit a burst."""
+        self._burst_available = bool(available)
+        grp = getattr(self, "burst_group", None)
+        if grp is not None:
+            grp.setVisible(self._burst_available)
+        self._refresh_burst()
+
+    def _on_burst_enable_toggled(self, checked: bool) -> None:
+        """Enable the pulses-per-burst + burst-period spins only when burst
+        mode is on; refresh the readout and re-emit so the preview + pattern
+        pick up the change."""
+        for w in (getattr(self, "pulses_per_burst_spin", None),
+                  getattr(self, "burst_period_ms", None)):
+            if w is not None:
+                w.setEnabled(checked)
+        self._refresh_burst()
+        self._emit()
+
+    def _burst_enabled(self) -> bool:
+        """True when this panel should emit a burst pattern — the tab supports
+        it AND the operator ticked the enable box.  All attr reads are
+        getattr-guarded: ``pattern()`` can fire via ``_on_mode_changed`` during
+        construction BEFORE the burst widgets / ``_burst_available`` exist."""
+        chk = getattr(self, "burst_enable_check", None)
+        return bool(getattr(self, "_burst_available", False)
+                    and chk is not None and chk.isChecked())
+
+    @staticmethod
+    def _pattern_is_khfac_shape(pat) -> bool:
+        """True for a continuous-sinusoidal (KHFAC) shape: exactly two phases,
+        BOTH sinusoidal.  Mode-agnostic (works whichever mode built ``pat``).
+        The interpulse discharge applies only to this regime."""
+        try:
+            phs = pat.phases
+            return len(phs) == 2 and all(
+                p.shape == SHAPE_SINUSOIDAL for p in phs)
+        except Exception:
+            return False
+
+    def _discharge_mode_on(self) -> bool:
+        """Discharge Mode = the PlexStim auto-discharge (``auto_discharge_combo``
+        On/Off).  getattr-guarded (may not exist yet / in a test stub → don't
+        block)."""
+        cb = getattr(self, "auto_discharge_combo", None)
+        if cb is None:
+            return True
+        try:
+            return bool(cb.currentData())
+        except Exception:
+            return True
+
+    def _interpulse_discharge_enabled(self, pat) -> bool:
+        """True when ``pattern()`` should render the trailing discharge as a
+        SHORT: the toggle is ticked, the pattern is a KHFAC sinusoid WITH a
+        trailing discharge delay to replace, AND Discharge Mode is on."""
+        chk = getattr(self, "interpulse_discharge_check", None)
+        if not (chk is not None and chk.isChecked()
+                and self._pattern_is_khfac_shape(pat)):
+            return False
+        try:
+            if float(pat.phases[-1].delay_after_us) <= 0:
+                return False          # no 0-µA step to replace
+        except Exception:
+            return False
+        return self._discharge_mode_on()
+
+    def _refresh_interpulse_discharge(self) -> None:
+        """SHOW the discharge-as-short toggle for a symmetric biphasic
+        sinusoidal pattern (KHFAC); ENABLE it only when Discharge Mode
+        (auto-discharge) is on AND a discharge delay exists to replace
+        (operator: "only enabled when the Discharge Mode is enabled").
+        getattr-guarded — may fire during construction before the widgets
+        exist."""
+        chk = getattr(self, "interpulse_discharge_check", None)
+        if chk is None:
+            return
+        try:
+            sym = getattr(self, "symmetry", None)
+            pc = getattr(self, "phase_count", None)
+            sc = getattr(self, "shape_combo", None)
+            show = (sym is not None and sym.currentText() == SYMMETRIC
+                    and pc is not None and pc.currentText() == BIPHASIC
+                    and sc is not None
+                    and sc.currentData() == SHAPE_SINUSOIDAL)
+        except Exception:
+            show = False
+        chk.setVisible(bool(show))
+        dchk = getattr(self, "discharge_check", None)
+        has_discharge = bool(dchk is not None and dchk.isChecked())
+        chk.setEnabled(bool(show and self._discharge_mode_on()
+                            and has_discharge))
+
+    def _refresh_burst(self) -> None:
+        """Clamp the burst-period MINIMUM to the burst span (so the burst is
+        always valid — all N pulses fit inside the period, mirroring the
+        ``_update_rate_max`` rate clamp) and render the italic burst summary
+        (intra-burst rate · burst rate · inter-burst gap · overall pulses/s).
+        Cleared when burst mode is off / unavailable."""
+        lbl = getattr(self, "burst_readout", None)
+        if lbl is None:
+            return
+        if not self._burst_enabled():
+            lbl.setText("")
+            lbl.setStyleSheet("")
+            return
+        try:
+            pat = self.pattern()
+        except Exception:
+            lbl.setText("")
+            return
+        if not pat.is_burst:
+            lbl.setText("")
+            lbl.setStyleSheet("")
+            return
+        # Clamp the period floor to the burst span so N pulses always fit
+        # (validate() would otherwise raise at run start).  Guard signals so
+        # the resulting value bump doesn't re-enter _emit; re-read after.
+        # CAP the floor at the spinbox MAX (= the 125 000 ms PS_SetPeriod
+        # ceiling) — a huge N × slow intra-rate can make the span exceed it,
+        # and letting setMinimum inflate the max would program a device period
+        # ABOVE the hardware limit.  When the span genuinely exceeds the max
+        # period the burst can't be validly programmed → warn (below).
+        _period_max_ms = float(self.burst_period_ms.maximum())
+        want_min_ms = min(max(0.02, pat.burst_span_us / 1000.0), _period_max_ms)
+        if abs(self.burst_period_ms.minimum() - want_min_ms) > 1e-9:
+            # SAVE/RESTORE the suspend flag (not an absolute reset) so a future
+            # caller that reaches _refresh_burst while already suspended isn't
+            # silently un-suspended mid-block.
+            _prev_suspend = self._suspend_signals
+            self._suspend_signals = True
+            try:
+                self.burst_period_ms.setMinimum(want_min_ms)
+            finally:
+                self._suspend_signals = _prev_suspend
+            try:
+                pat = self.pattern()   # value may have bumped up to the floor
+            except Exception:
+                return
+
+        def _fmt_us(us: float) -> str:
+            return (f"{us / 1000.0:.4g} ms" if abs(us) >= 1000.0
+                    else f"{us:.0f} µs")
+
+        # The span can still exceed the (capped) period when the burst is
+        # physically too long for the 125 s device ceiling — warn, since
+        # validate() will reject it at Start.
+        if pat.burst_span_us > pat.burst_period_us + 1e-6:
+            lbl.setStyleSheet("color: palette(bright-text);")
+            lbl.setText(
+                f"⚠ Burst too long for the device: {pat.pulses_per_burst} "
+                f"pulses span {_fmt_us(pat.burst_span_us)} but the maximum "
+                f"burst period is {_fmt_us(pat.burst_period_us)}.  Reduce the "
+                f"pulse count or raise the intra-burst rate.")
+            return
+
+        lbl.setStyleSheet("")
+        lbl.setText(
+            f"{pat.pulses_per_burst} pulses @ {pat.rate_hz:.4g} pps  ·  "
+            f"burst rate {pat.burst_rate_hz:.4g} /s  ·  inter-burst gap "
+            f"{_fmt_us(pat.inter_burst_gap_us)}  ·  "
+            f"{pat.effective_pulse_rate_hz:.4g} pps overall")
+
     def _refresh_rate_label(self) -> None:
         """Sync the rate-row label + spinbox suffix with the current
         (interpulse on/off, display unit) combination:
@@ -4151,6 +4461,9 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Tell the rest of the app (main window → sibling panels →
         # connection panel → device).
         self.autoDischargeToggled.emit(checked)
+        # Discharge Mode gates the "discharge between pulses (short)" toggle's
+        # enabled state — refresh it now that the mode changed.
+        self._refresh_interpulse_discharge()
 
     def set_auto_discharge_silent(self, checked: bool) -> None:
         """Programmatically update the discharge-mode dropdown state
@@ -4172,8 +4485,13 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             self.auto_discharge_combo.blockSignals(False)
         if checked:
             self._auto_discharge_warned = False
+        # Discharge Mode gates the discharge-as-short toggle's enabled state.
+        self._refresh_interpulse_discharge()
 
     def _emit(self, *_):
+        # Refresh the KHFAC interpulse-discharge toggle visibility on every
+        # change (incl. during suspend/restore) — cheap, side-effect-free.
+        self._refresh_interpulse_discharge()
         if self._suspend_signals:
             return
         # CONTINUOUS mode, FREQUENCY edited (the signal came from the rate
@@ -4212,6 +4530,9 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # Idempotent — clears the label in non-symmetric / non-linear
         # contexts so the form row doesn't leave a stale value.
         self._refresh_sym_slope_readout()
+        # Burst: clamp the burst-period floor to the span + refresh the burst
+        # readout BEFORE the emit so the emitted pattern reflects the clamp.
+        self._refresh_burst()
         self.patternChanged.emit(self.pattern())
         # Charge-balance warning is only meaningful when the user has
         # manual control over both phases — biphasic + asymmetric +
@@ -5001,6 +5322,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "interphase_on": self.interphase_check.isChecked(),
             "discharge_on": self.discharge_check.isChecked(),
             "interpulse_on": self.interpulse_check.isChecked(),
+            "interpulse_discharge_on": self.interpulse_discharge_check.isChecked(),
             # Arbitrary-pattern state — survives restart so a hand-built
             # waveform doesn't get wiped between sessions.
             "arb_mode": self.arb_mode.currentText(),
@@ -5038,6 +5360,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "sym_offset_ua": float(self.sym_offset_ua.value()),
             "sym_offset_enable": bool(self.sym_offset_enable_chk.isChecked()),
             "sym_tau_us": float(self.sym_tau_us.value()),
+            # Burst / pulse-train state (absent → OFF, so legacy prefs load as
+            # non-burst).  ``_burst_available`` (the per-tab gate) is NOT
+            # persisted — it's set by the embedding tab on construction.
+            "burst_enabled": bool(self.burst_enable_check.isChecked()),
+            "pulses_per_burst": int(self.pulses_per_burst_spin.value()),
+            "burst_period_ms": float(self.burst_period_ms.value()),
         }
 
     def _dump_arb_table(self) -> List[List[str]]:
@@ -5113,6 +5441,9 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             self.interpulse_check.setChecked(bool(p["interpulse_on"]))
         elif "no_interpulse" in p:
             self.interpulse_check.setChecked(not bool(p["no_interpulse"]))
+        if "interpulse_discharge_on" in p:
+            self.interpulse_discharge_check.setChecked(
+                bool(p["interpulse_discharge_on"]))
         # Arbitrary-pattern state — apply mode first so the column count
         # is right when the table is repopulated.
         if "arb_mode" in p: self.arb_mode.setCurrentText(p["arb_mode"])
@@ -5215,6 +5546,35 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # files are silently ignored — the Q_ph lock UI now lives in
         # the VT tab and persists there. Pre-existing pulse parameters
         # (amp, width) still load above.
+        # Burst / pulse-train — restore the value(s) first, then the enable
+        # toggle (signals blocked so a mid-session restore doesn't spam
+        # patternCommitted), then sync the enabled-state + readout explicitly.
+        # Absent keys (legacy prefs) → burst stays OFF.
+        if "pulses_per_burst" in p:
+            self.pulses_per_burst_spin.blockSignals(True)
+            try:
+                self.pulses_per_burst_spin.setValue(int(p["pulses_per_burst"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.pulses_per_burst_spin.blockSignals(False)
+        if "burst_period_ms" in p:
+            self.burst_period_ms.blockSignals(True)
+            try:
+                self.burst_period_ms.setValue(float(p["burst_period_ms"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.burst_period_ms.blockSignals(False)
+        if "burst_enabled" in p:
+            self.burst_enable_check.blockSignals(True)
+            try:
+                self.burst_enable_check.setChecked(bool(p["burst_enabled"]))
+            except Exception:
+                pass
+            finally:
+                self.burst_enable_check.blockSignals(False)
+        self._on_burst_enable_toggled(self.burst_enable_check.isChecked())
         self._on_mode_changed()
         self._on_balance_changed()
         # After restoring the amplitude + polarity, force the excitation

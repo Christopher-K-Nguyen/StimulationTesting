@@ -242,7 +242,10 @@ class LongPulsingExperiment(ExperimentRunner):
                                        message=f"Stim load failed: {e}"))
             return ExperimentResult(session=self.session, aborted=True, error=str(e))
 
-        pulse_period_s = 1.0 / pattern.rate_hz
+        # Burst-aware per-triggered-pulse spacing (== 1/rate_hz for a
+        # non-burst pattern); ``navg × pulse_period_s`` then waits long enough
+        # for a full average even when inter-burst gaps slow the trigger rate.
+        pulse_period_s = 1.0 / max(self._pulses_per_second(pattern), 1e-9)
         navg = getattr(self.scope, "_expected_acq_navg", None) or 8
         snap_interval = max(self.policy.capture_during_pulsing_every_s, 1e-3)
         char_interval = self.policy.characterize_every_s
@@ -533,7 +536,8 @@ class LongPulsingExperiment(ExperimentRunner):
         self._smooth_acquisition(acq)
         cap = make_capture(cap_idx, pattern, acq, self.scope, self.stim,
                            cal=self.cal, channel=int(ch))
-        compute_metrics(cap, ch_run.surface_area_um2)
+        compute_metrics(cap, ch_run.surface_area_um2,
+                        depol_us=self._epol_depol_us())
         # Precise-sampling columns: the cadence-grid target + the actual
         # pulsing-elapsed when THIS channel's grab landed.
         cap.metrics.scheduled_time_s = scheduled_s
@@ -673,6 +677,13 @@ class LongPulsingExperiment(ExperimentRunner):
         # ``RampPolicy.starting_ua = amplitude_ua * 0.2``.
         import dataclasses as _dc
         _char_pattern = self.session.test.pattern.scaled(self._CHAR_START_FRAC)
+        # Drift characterization is a plain SINGLE-PULSE VT amplitude ramp —
+        # strip any burst grouping so the sub-VT measures the electrode's
+        # single-pulse max-Q_inj response (not a burst-cadence ramp).  For a
+        # non-burst LP pattern this is a no-op.
+        if getattr(_char_pattern, "is_burst", False):
+            _char_pattern = _dc.replace(_char_pattern,
+                                        pulses_per_burst=1, burst_period_us=0.0)
         _char_test = _dc.replace(self.session.test, pattern=_char_pattern)
         char_session = Session(notebook=self.session.notebook,
                                subject=self.session.subject + f"_t{int(t_offset_s)}",

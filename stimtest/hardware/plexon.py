@@ -375,7 +375,7 @@ class PlexonStimulator(Stimulator):
             if res != self._PS_OK:
                 hint = ""
                 if self._error_means_locked(info_text):
-                    hint = (" Hint: the Plexon Sim-2 / Stimulator V2 "
+                    hint = (" Hint: the Plexon Stim-2 / Stimulator V2 "
                             "application appears to still be holding "
                             "the USB lock. Close it manually via Task "
                             "Manager (or run "
@@ -546,7 +546,13 @@ class PlexonStimulator(Stimulator):
         # off by 1000 — which made the device store a 20-second period
         # for a requested 50 Hz train. Use the float as-is so we keep
         # sub-ms precision for high-rate (>1 kHz) trains.
-        period_ms = 1e3 / pattern.rate_hz
+        #
+        # Burst-aware: the DEVICE period is the BURST period in burst mode,
+        # else the ordinary 1e6/rate.  ``device_period_us`` == 1e6/rate_hz
+        # for a non-burst pattern, so this is byte-identical for every
+        # existing (single-pulse) pattern; a burst programs the burst cycle
+        # here and the arb pattern below carries the N intra-burst pulses.
+        period_ms = pattern.device_period_us / 1000.0
         _ch = int(channel)
         _reps = int(pattern.repetitions)
         sig = self._content_signature(pattern)
@@ -678,7 +684,7 @@ class PlexonStimulator(Stimulator):
                     else STIM_CURRENT_STEP_FINE_NA)
             return int(round(float(ph.amplitude_ua) * 1000.0 / step)) * step
 
-        return tuple(
+        phase_sig = tuple(
             (_amp_nA(ph),
              round(ph.width_us, 3),
              round(ph.delay_after_us, 3),
@@ -689,6 +695,19 @@ class PlexonStimulator(Stimulator):
              round(getattr(ph, "offset_ua", 0.0), 3))
             for ph in pattern.phases
         )
+        # Burst grouping CHANGES the .pat content (N pulses + intra-burst
+        # gaps), and the intra-burst gap derives from rate_hz — so a burst
+        # signature must fold in both the pulse count and the gap, else a
+        # burst-parameter change would be missed by the content cache and
+        # the device would keep delivering the stale burst.  A non-burst
+        # pattern gets a constant ``(1,)`` marker, so every existing
+        # single-pulse signature is unchanged relative to itself.
+        if getattr(pattern, "pulses_per_burst", 1) > 1:
+            burst_sig = (int(pattern.pulses_per_burst),
+                         round(pattern.intra_burst_gap_us, 3))
+        else:
+            burst_sig = (1,)
+        return (burst_sig,) + phase_sig
 
     def loaded_channels(self) -> set:
         """Channels with a pattern currently loaded (PlexStim-side)."""
@@ -719,7 +738,7 @@ class PlexonStimulator(Stimulator):
         # every duration ≥ 1 µs, every amplitude in the documented
         # int32 nA range) so a bad pattern raises here rather than
         # silently truncating on the device.
-        from ..waveforms import build_pat_pairs, format_pat_lines
+        from ..waveforms import build_burst_pat_pairs, format_pat_lines
 
         # Signature covers ONLY the .pat content (phase tuple) — rate
         # and repetitions are programmed through PS_SetPeriod /
@@ -741,7 +760,10 @@ class PlexonStimulator(Stimulator):
             # amp (nA) / duration (µs) lines. ``build_pat_pairs``
             # constructs the pair list; ``format_pat_lines`` flattens
             # it to the line-oriented form the DLL expects.
-            pairs = build_pat_pairs(pattern)
+            # Burst-aware: build_burst_pat_pairs tiles the pulse N times
+            # (intra-burst gaps between) for a burst, and is exactly
+            # build_pat_pairs for a single-pulse pattern.
+            pairs = build_burst_pat_pairs(pattern)
             lines = format_pat_lines(pairs)
             content = "\n".join(lines) + "\n"
             # Flush + fsync after every write so the bytes are

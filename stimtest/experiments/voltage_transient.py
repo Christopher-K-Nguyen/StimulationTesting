@@ -1525,7 +1525,10 @@ class VoltageTransientExperiment(ExperimentRunner):
                 # truth after ``set_acquisition_mode``).
                 _navg = int(getattr(self.scope,
                                     "_expected_acq_navg", None) or 0)
-                _rate = float(getattr(pattern, "rate_hz", 0.0) or 0.0)
+                # Overall pulse rate (== rate_hz for a non-burst pattern; a
+                # burst reaches VT only via LP's _characterize sub-VT, which
+                # strips it — but stay burst-correct defensively).
+                _rate = self._pulses_per_second(pattern)
                 if _navg > 0 and _rate > 0:
                     # Headroom = 6 s (5 s for trigger latency / USB-TMC
                     # round-trip jitter + 1 s extra requested by the
@@ -1718,6 +1721,7 @@ class VoltageTransientExperiment(ExperimentRunner):
             failure_broken_z_mohm=(
                 None if _auto
                 else getattr(self.ramp, "bad_response_broken_z_kohm", 200.0) / 1000.0),
+            depol_us=self._epol_depol_us(),
         )
         # Number of pulses delivered for THIS capture = MEASURED pulsing
         # elapsed time (start_all → stop_all, covering the initial
@@ -1732,7 +1736,9 @@ class VoltageTransientExperiment(ExperimentRunner):
         # _record_capture_dose then falls back to the averaging count.
         if _pulse_t0 is not None and _pulse_t1 is not None:
             _elapsed = _pulse_t1 - _pulse_t0
-            _rate = float(getattr(pattern, "rate_hz", 0.0) or 0.0)
+            # OVERALL pulse rate (a burst delivers pulses_per_burst pulses per
+            # burst period, NOT rate_hz).  == rate_hz for a non-burst pattern.
+            _rate = self._pulses_per_second(pattern)
             if _elapsed > 0 and _rate > 0:
                 cap.metrics.n_pulses = float(round(_elapsed * _rate))
         # Push the E_ret pre/post-pulse rest values into the

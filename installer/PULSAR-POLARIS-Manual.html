@@ -391,9 +391,9 @@ before touching the bench.</div>
 <h3 id="intro-1-5-how-to-use-this-manual">1.5 &nbsp;How to use this manual</h3>
 <p>The sections that follow track the order of a real session. Sections&nbsp;2&ndash;4 cover installation and connecting
 the instruments; Sections&nbsp;5&ndash;6 cover configuring the electrode, oscilloscope, and pulse pattern;
-Sections&nbsp;7&ndash;8 describe the experiment types and how to run one; Section&nbsp;9 explains how to read the live
-plot and metrics; Sections&nbsp;10&ndash;11 cover stimulator verification and the output files. Section&nbsp;12 is a
-complete guide to the <b>POLARIS</b> viewer, Section&nbsp;13 is troubleshooting, and Section&nbsp;14 is a glossary of
+Sections&nbsp;7&ndash;9 describe the pulse pattern, the experiment types, and how to run one; Section&nbsp;10 explains how to read the live
+plot and metrics; Sections&nbsp;11&ndash;12 cover stimulator verification and the output files. Section&nbsp;13 is a
+complete guide to the <b>POLARIS</b> viewer, Section&nbsp;14 is troubleshooting, and Section&nbsp;15 is a glossary of
 every metric with its definition and the reference it comes from. If a term is unfamiliar the first time you meet it,
 the glossary is the place to look it up.</p>
 
@@ -646,10 +646,12 @@ never takes the wrong thing with it:</p>
     <code>%TEMP%</code>. On a standard <i>Program Files</i> install (read-only at runtime) these land in your home
     folder's <code>.stimtest\</code>.</td></tr>
 </table>
-<div class="warn"><b>Don't save session data inside OneDrive.</b> Choose a Save location that is <b>not</b> under a
-OneDrive-synced folder — e.g. <code>C:\PULSAR_data</code>. OneDrive can briefly lock a file mid-write, which surfaces
-as an <code>[WinError&nbsp;5] Access is denied</code> error exactly when PULSAR tries to save a <code>.npz</code> or
-<code>.xlsx</code>. Configuration files in <code>%APPDATA%</code> are unaffected.</div>
+<div class="warn"><b>Heads-up about OneDrive save locations.</b> Saving inside a OneDrive-synced folder <i>works</i>, but
+OneDrive can briefly lock a file mid-write while it syncs — which can surface, intermittently, as an
+<code>[WinError&nbsp;5] Access is denied</code> error exactly when PULSAR writes a <code>.npz</code> or
+<code>.xlsx</code>. If you hit that, simply retry the save, or point the Save location at a non-synced local folder
+(e.g. <code>C:\PULSAR_data</code>) to avoid it entirely. Configuration files in <code>%APPDATA%</code> are
+unaffected.</div>
 
 <h2 id="layout">4&nbsp;The PULSAR window</h2>
 <p>PULSAR is organized as one window with a <b>menu bar</b> across the top, a strip of <b>workflow tabs</b>
@@ -669,17 +671,15 @@ area from the log, so you can pull the log taller whenever you want more history
     <g font-family="Segoe UI,Arial,sans-serif" font-size="12">
       <rect x="12"  y="40" width="70"  height="26" rx="3" fill="#eef1f5" stroke="#dfe3ea"/>
       <text x="47"  y="57" text-anchor="middle" fill="#1a2230">Setup</text>
-      <rect x="84"  y="40" width="90"  height="26" rx="3" fill="#ffffff" stroke="#c9d0da" stroke-dasharray="3 3"/>
-      <text x="129" y="57" text-anchor="middle" fill="#5b6472">Verification</text>
-      <rect x="176" y="40" width="116" height="26" rx="3" fill="#eef1f5" stroke="#dfe3ea"/>
-      <text x="234" y="57" text-anchor="middle" fill="#1a2230">Test parameters</text>
-      <rect x="294" y="40" width="150" height="28" rx="3" fill="#ffffff" stroke="#E6B800" stroke-width="2"/>
-      <rect x="294" y="40" width="150" height="4"  fill="#E6B800"/>
-      <text x="369" y="58" text-anchor="middle" fill="#1a2230" font-weight="bold">Voltage Transient</text>
-      <rect x="446" y="40" width="76"  height="26" rx="3" fill="#eef1f5" stroke="#dfe3ea"/>
-      <text x="484" y="57" text-anchor="middle" fill="#1a2230">Results</text>
+      <rect x="88"  y="40" width="116" height="26" rx="3" fill="#eef1f5" stroke="#dfe3ea"/>
+      <text x="146" y="57" text-anchor="middle" fill="#1a2230">Test parameters</text>
+      <rect x="210" y="40" width="150" height="28" rx="3" fill="#ffffff" stroke="#E6B800" stroke-width="2"/>
+      <rect x="210" y="40" width="150" height="4"  fill="#E6B800"/>
+      <text x="285" y="58" text-anchor="middle" fill="#1a2230" font-weight="bold">Voltage Transient</text>
+      <rect x="366" y="40" width="76"  height="26" rx="3" fill="#eef1f5" stroke="#dfe3ea"/>
+      <text x="404" y="57" text-anchor="middle" fill="#1a2230">Results</text>
     </g>
-    <text x="369" y="80" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="10.5" fill="#5b6472">active experiment (one at a time)</text>
+    <text x="285" y="80" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="10.5" fill="#5b6472">active experiment tab (one at a time; Verification opens from the Run menu)</text>
 
     <!-- run-progress bar -->
     <rect x="158" y="90" width="570" height="18" rx="3" fill="#eef6fc" stroke="#0072B2"/>
@@ -715,30 +715,30 @@ area from the log, so you can pull the log taller whenever you want more history
     <text x="360" y="398" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#5b6472" text-anchor="middle">Time</text>
     <!-- Imon rectangular biphasic (cyan) -->
     <polyline points="178,266 236,266 236,318 300,318 300,214 364,214 364,266 544,266" fill="none" stroke="#00B4C8" stroke-width="1.6"/>
-    <!-- Vmon transient (gold) -->
-    <polyline points="178,262 236,262 238,308 300,286 302,222 364,244 366,262 544,262" fill="none" stroke="#E6B800" stroke-width="1.8"/>
-    <!-- markers -->
-    <line x1="228" y1="308" x2="248" y2="308" stroke="#B0143C" stroke-width="3"/>
-    <text x="252" y="312" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#B0143C">Va / Ra</text>
-    <line x1="290" y1="286" x2="310" y2="286" stroke="#1A56C4" stroke-width="3"/>
-    <text x="314" y="283" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#1A56C4">Vd</text>
-    <path d="M296,296 h12 M302,290 v12" stroke="#7A0AF0" stroke-width="2"/>
-    <text x="312" y="303" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#7A0AF0">Emc</text>
+    <!-- Vmon transient (gold): baseline, cathodic IR step then charging MORE
+         negative through the phase, anodic IR step then charging more
+         positive, then relax back to baseline (cf. Fig 9). -->
+    <polyline points="178,262 236,262 236,302 300,320 300,224 364,206 364,258 410,262 544,262" fill="none" stroke="#E6B800" stroke-width="1.8"/>
+    <!-- markers (illustrative subset; Fig 9 shows the full set) -->
+    <line x1="226" y1="302" x2="250" y2="302" stroke="#B0143C" stroke-width="3"/>
+    <text x="253" y="299" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#B0143C"><tspan font-style="italic">V</tspan><tspan font-size="7.5" dy="2">a</tspan><tspan dy="-2">/</tspan><tspan font-style="italic">R</tspan><tspan font-size="7.5" dy="2">a</tspan></text>
+    <path d="M294,320 h12 M300,314 v12" stroke="#1A56C4" stroke-width="2.4"/>
+    <text x="307" y="332" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#1A56C4"><tspan font-style="italic">V</tspan><tspan font-size="7.5" dy="2">d</tspan></text>
 
     <!-- metrics table -->
     <rect x="570" y="118" width="158" height="286" rx="4" fill="#ffffff" stroke="#dfe3ea"/>
     <rect x="570" y="118" width="158" height="22" fill="#0A0E1A"/>
     <text x="578" y="133" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#ffffff">Metric</text>
     <text x="720" y="133" text-anchor="end" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#ffffff">Value</text>
-    <g font-family="Segoe UI,Arial,sans-serif" font-size="10.5" fill="#1a2230">
-      <text x="578" y="158">N_pulse</text>
-      <text x="578" y="182">I_stim</text>
-      <text x="578" y="206">Va / Ra</text>
-      <text x="578" y="230">Vd</text>
-      <text x="578" y="254">Emc / Ema</text>
-      <text x="578" y="278">Q_ph</text>
-      <text x="578" y="302">Q_inj</text>
-      <text x="578" y="326">Response</text>
+    <g font-family="Segoe UI,Arial,sans-serif" font-size="10.5">
+      <text x="578" y="158" fill="#1a2230"><tspan font-style="italic">N</tspan><tspan font-size="8" dy="2">pulse</tspan></text><text x="720" y="158" text-anchor="end" fill="#1a2230">6,400</text>
+      <text x="578" y="182" fill="#1a2230"><tspan font-style="italic">I</tspan><tspan font-size="8" dy="2">stim</tspan><tspan dy="-2"> [µA]</tspan></text><text x="720" y="182" text-anchor="end" fill="#1a2230">&#8722;50.0</text>
+      <text x="578" y="206" fill="#1a2230"><tspan font-style="italic">V</tspan><tspan font-size="8" dy="2">a</tspan><tspan dy="-2"> [V]</tspan></text><text x="720" y="206" text-anchor="end" fill="#1a2230">0.19</text>
+      <text x="578" y="230" fill="#1a2230"><tspan font-style="italic">R</tspan><tspan font-size="8" dy="2">a</tspan><tspan dy="-2"> [k&#937;]</tspan></text><text x="720" y="230" text-anchor="end" fill="#1a2230">3.7</text>
+      <text x="578" y="254" fill="#1a2230"><tspan font-style="italic">V</tspan><tspan font-size="8" dy="2">d</tspan><tspan dy="-2"> [V]</tspan></text><text x="720" y="254" text-anchor="end" fill="#1a2230">0.42</text>
+      <text x="578" y="278" fill="#1a2230"><tspan font-style="italic">E</tspan><tspan font-size="8" dy="2">mc</tspan><tspan dy="-2"> [V]</tspan></text><text x="720" y="278" text-anchor="end" fill="#1a2230">&#8722;0.28</text>
+      <text x="578" y="302" fill="#1a2230"><tspan font-style="italic">Q</tspan><tspan font-size="8" dy="2">inj</tspan><tspan dy="-2"> [mC/cm&#178;]</tspan></text><text x="720" y="302" text-anchor="end" fill="#1a2230">0.31</text>
+      <text x="578" y="326" fill="#1a2230">Response</text><text x="720" y="326" text-anchor="end" fill="#1e7d4f">normal</text>
     </g>
     <g stroke="#eef1f5"><line x1="570" y1="166" x2="728" y2="166"/><line x1="570" y1="190" x2="728" y2="190"/><line x1="570" y1="214" x2="728" y2="214"/><line x1="570" y1="238" x2="728" y2="238"/><line x1="570" y1="262" x2="728" y2="262"/><line x1="570" y1="286" x2="728" y2="286"/><line x1="570" y1="310" x2="728" y2="310"/></g>
 
@@ -751,10 +751,13 @@ area from the log, so you can pull the log taller whenever you want more history
   <figcaption>Figure 3 — <b>The PULSAR main window.</b> Labelled regions:
     <ol>
       <li>Menu bar — File, Edit, Run, View, Window, Help, Admin.</li>
-      <li>Workflow tab strip — Setup, Test parameters, the active experiment, Results (Verification opens on demand).</li>
+      <li>Workflow tab strip — <b>Setup</b>, <b>Test parameters</b>, the <b>active experiment</b> tab, and <b>Results</b>.
+        These four are the standing tabs; <b>Verification</b> is not a permanent tab — it opens on demand from
+        <b>Run&nbsp;&#8594;&nbsp;Stimulator Verification</b> and closes when you leave it.</li>
       <li>Run-progress bar — elapsed / total time and channel-step progress.</li>
       <li>Trace-toggle column — show/hide each trace and pick its axis; channel/combo list with a Latest button.</li>
-      <li>Scope plot — Vmon / Imon with access, driving and polarization markers.</li>
+      <li>Scope plot — <i>V</i><sub>mon</sub> / <i>I</i><sub>mon</sub> with access (<i>V</i><sub>a</sub>/<i>R</i><sub>a</sub>)
+        and driving (<i>V</i><sub>d</sub>) markers (see Figure&nbsp;9 for the full marker set).</li>
       <li>Metrics table — the numeric values for the plotted capture.</li>
       <li>Log pane — every setting change and run event, mirrored to disk.</li>
     </ol>
@@ -914,7 +917,7 @@ controls unlock automatically.</div>
 <p>The connection controls live at the top of the <b>Setup</b> tab.</p>
 <h3 id="connect-4-1-stimulator">4.1 &nbsp;Stimulator</h3>
 <p>Press <b>Initialize</b>. On success the indicator turns green and the serial number / firmware are shown.</p>
-<div class="warn"><b>“No Plexon Stimulator is detected.”</b> Plexon's own <b>Sim‑2 / Stim‑2</b> application holds an
+<div class="warn"><b>“No Plexon Stimulator is detected.”</b> Plexon's own <b>Stim‑2</b> application holds an
 exclusive USB lock on the stimulator. Close it, then press Initialize again. Only one program can own the stimulator
 at a time — PULSAR also prevents a second PULSAR window from opening for the same reason.</div>
 <h3 id="connect-4-2-oscilloscope">4.2 &nbsp;Oscilloscope</h3>
@@ -1147,9 +1150,10 @@ stem is the notebook + session name (§6.1).</p>
     <b>User email</b> and/or texts the <b>User phone</b> (if a carrier is set). Requires SMTP credentials configured on
     the machine (environment variables or <code>~/.stimtest/email_config.json</code>); off by default.</td></tr>
 </table>
-<div class="tip"><b>Keep data off OneDrive.</b> Save experiment data to a folder that is <b>not</b> under OneDrive (e.g.
-<code>C:\PULSAR_data</code>). OneDrive can briefly lock files mid-write, which surfaces as an “Access is denied” error
-when saving.</div>
+<div class="tip"><b>OneDrive save locations.</b> Saving experiment data inside OneDrive works, but OneDrive can briefly
+lock files mid-write, which occasionally surfaces as an “Access is denied” error when saving. If that happens, retry —
+or choose a non-synced local folder (e.g. <code>C:\PULSAR_data</code>) to sidestep it. PULSAR also logs a one-line
+notice when your Save location is inside OneDrive, as a reminder.</div>
 
 <h3 id="setup-6-11-experiment-to-run">6.11&nbsp;Experiment to run</h3>
 <p>The <b>Experiment to run</b> group picks which experiment the Test-parameters page and the live view are configured
@@ -1171,7 +1175,7 @@ charge-balanced biphasic pulse — the anatomy the rest of this section refers b
 
 <figure class="svgfig">
   <svg viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img"
-       aria-label="Anatomy of a charge-balanced biphasic current pulse on a current-versus-time axis: a leading cathodic phase, interphase delay, trailing anodic phase, discharge delay, and interpulse gap, with equal shaded areas showing charge balance.">
+       aria-label="Anatomy of a charge-balanced biphasic current pulse on a current-versus-time axis: a leading cathodal phase, interphase delay, trailing anodal phase, discharge delay, and interpulse delay, with equal shaded areas showing charge balance.">
     <defs>
       <marker id="axar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
         <path d="M0,0 L7,3 L0,6 Z" fill="#1a2230"/>
@@ -1184,37 +1188,37 @@ charge-balanced biphasic pulse — the anatomy the rest of this section refers b
       </marker>
     </defs>
 
-    <!-- top note -->
-    <text x="360" y="30" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13.5" fill="#1a2230">|A&#8321;&#183;W&#8321;| = |A&#8322;&#183;W&#8322;|  &#8594;  charge&#8209;balanced (the two shaded areas are equal)</text>
+    <!-- top note: charge balance in i_ph / t_ph notation -->
+    <text x="360" y="30" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">|<tspan font-style="italic">i</tspan><tspan font-size="9.5" dy="3">ph,1</tspan><tspan dy="-3">&#183;</tspan><tspan font-style="italic">t</tspan><tspan font-size="9.5" dy="3">ph,1</tspan><tspan dy="-3">| = |</tspan><tspan font-style="italic">i</tspan><tspan font-size="9.5" dy="3">ph,2</tspan><tspan dy="-3">&#183;</tspan><tspan font-style="italic">t</tspan><tspan font-size="9.5" dy="3">ph,2</tspan><tspan dy="-3">|  &#8594;  charge&#8209;balanced (equal shaded areas)</tspan></text>
 
     <!-- y axis -->
     <line x1="56" y1="70" x2="56" y2="272" stroke="#1a2230" stroke-width="1.4" marker-end="url(#axar)"/>
-    <text x="62" y="86" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">+I (anodic)</text>
-    <text x="62" y="264" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">&#8722;I (cathodic)</text>
+    <text x="62" y="86" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">+<tspan font-style="italic">i</tspan> (anodal)</text>
+    <text x="62" y="264" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">&#8722;<tspan font-style="italic">i</tspan> (cathodal)</text>
 
     <!-- zero / time axis -->
     <line x1="48" y1="170" x2="700" y2="170" stroke="#1a2230" stroke-width="1.4" marker-end="url(#axar)"/>
     <text x="686" y="162" text-anchor="end" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">time &#8594;</text>
 
-    <!-- cathodic phase (leading, negative) -->
+    <!-- cathodal phase (leading, negative current) -->
     <path d="M122,170 L122,254 L192,254 L192,170 Z" fill="#00B4C8" fill-opacity="0.18" stroke="#0a7c8c" stroke-width="1.6"/>
     <!-- dashed shaped alternative inside the cathodic envelope -->
     <path d="M122,170 C145,282 169,282 192,170" fill="none" stroke="#5b6472" stroke-width="1.3" stroke-dasharray="4 3"/>
     <!-- A1 amplitude arrow -->
     <line x1="138" y1="172" x2="138" y2="252" stroke="#5b6472" stroke-width="1.1" marker-start="url(#dimS)" marker-end="url(#dimE)"/>
-    <text x="144" y="218" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">|A&#8321;|</text>
-    <!-- W1 width arrow -->
+    <text x="144" y="218" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">|<tspan font-style="italic">i</tspan><tspan font-size="9.5" dy="3">ph,1</tspan><tspan dy="-3">|</tspan></text>
+    <!-- t_ph,1 width arrow -->
     <line x1="122" y1="268" x2="192" y2="268" stroke="#5b6472" stroke-width="1.1" marker-start="url(#dimS)" marker-end="url(#dimE)"/>
-    <text x="157" y="283" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">W&#8321;</text>
+    <text x="157" y="283" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230"><tspan font-style="italic">t</tspan><tspan font-size="9.5" dy="3">ph,1</tspan></text>
 
-    <!-- anodic phase (trailing, positive) -->
+    <!-- anodal phase (trailing, positive current) -->
     <path d="M238,170 L238,128 L378,128 L378,170 Z" fill="#E6B800" fill-opacity="0.22" stroke="#9a7b00" stroke-width="1.6"/>
     <!-- A2 amplitude arrow -->
     <line x1="256" y1="168" x2="256" y2="130" stroke="#5b6472" stroke-width="1.1" marker-start="url(#dimS)" marker-end="url(#dimE)"/>
-    <text x="262" y="152" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">|A&#8322;|</text>
-    <!-- W2 width arrow -->
+    <text x="262" y="152" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">|<tspan font-style="italic">i</tspan><tspan font-size="9.5" dy="3">ph,2</tspan><tspan dy="-3">|</tspan></text>
+    <!-- t_ph,2 width arrow -->
     <line x1="238" y1="114" x2="378" y2="114" stroke="#5b6472" stroke-width="1.1" marker-start="url(#dimS)" marker-end="url(#dimE)"/>
-    <text x="308" y="108" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230">W&#8322;</text>
+    <text x="308" y="108" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1a2230"><tspan font-style="italic">t</tspan><tspan font-size="9.5" dy="3">ph,2</tspan></text>
 
     <!-- next pulse (faint) -->
     <path d="M566,170 L566,254 L636,254 L636,170 Z" fill="#00B4C8" fill-opacity="0.10" stroke="#0a7c8c" stroke-width="1.2" stroke-dasharray="3 3"/>
@@ -1232,17 +1236,21 @@ charge-balanced biphasic pulse — the anatomy the rest of this section refers b
       <line x1="378" y1="170" x2="378" y2="300"/><line x1="434" y1="170" x2="434" y2="300"/>
       <line x1="566" y1="170" x2="566" y2="300"/>
     </g>
-    <text x="215" y="324" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">interphase delay</text>
-    <text x="406" y="324" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">discharge delay</text>
-    <text x="500" y="324" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472">interpulse gap (period sets the rate)</text>
+    <text x="215" y="323" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="11.5" fill="#5b6472">interphase delay</text>
+    <text x="406" y="323" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="11.5" fill="#5b6472">discharge delay</text>
+    <text x="500" y="323" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="11.5" fill="#5b6472">interpulse delay</text>
+    <text x="500" y="336" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="9.5" fill="#8a93a0" font-style="italic">(one period = 1 / rate)</text>
   </svg>
-  <figcaption>Figure 6 — <b>Anatomy of a biphasic pulse.</b> A cathodal-first pulse: a leading <b>cathodic</b> phase
-    (amplitude <b>A&#8321;</b>, width <b>W&#8321;</b>), an <b>interphase delay</b>, a trailing <b>anodic</b> phase
-    (<b>A&#8322;</b>, <b>W&#8322;</b>), a <b>discharge delay</b>, then the <b>interpulse gap</b> before the next pulse.
-    The two shaded areas are equal, so the pattern is <b>charge&#8209;balanced</b> (|A&#8321;&#183;W&#8321;| =
-    |A&#8322;&#183;W&#8322;|). The dashed curve inside the cathodic phase shows that a non-rectangular shape
-    (sine / gaussian / ramp) simply <i>fills the same phase envelope</i> — the width and peak are unchanged; only the
-    contour, and hence the charge, differ.</figcaption>
+  <figcaption>Figure 6 — <b>Anatomy of a biphasic pulse.</b> A cathodal-first pulse: a leading <b>cathodal</b> phase
+    (amplitude <b><i>i</i><sub>ph,1</sub></b>, width <b><i>t</i><sub>ph,1</sub></b>), an <b>interphase delay</b>, a
+    trailing <b>anodal</b> phase (<b><i>i</i><sub>ph,2</sub></b>, <b><i>t</i><sub>ph,2</sub></b>), a
+    <b>discharge delay</b>, then the <b>interpulse delay</b> before the next pulse (one period sets the pulse rate).
+    The two shaded areas are equal, so the pattern is <b>charge&#8209;balanced</b>
+    (|<i>i</i><sub>ph,1</sub>&#183;<i>t</i><sub>ph,1</sub>| = |<i>i</i><sub>ph,2</sub>&#183;<i>t</i><sub>ph,2</sub>|).
+    The dashed curve inside the cathodal phase shows that a non-rectangular shape (sine / gaussian / ramp) simply
+    <i>fills the same phase envelope</i> — the width and peak are unchanged; only the contour, and hence the charge,
+    differ. Here <i>i</i><sub>ph,<i>n</i></sub> and <i>t</i><sub>ph,<i>n</i></sub> are the amplitude and width of
+    phase&nbsp;<i>n</i>.</figcaption>
 </figure>
 
 <h3 id="pattern-7-1-phase-count-symmetry-and-polarity">7.1&nbsp;Phase count, symmetry &amp; polarity</h3>
@@ -1280,8 +1288,8 @@ automatically.</p>
   <tr><td>Current — <b>shaped</b> phase</td><td><b>30&nbsp;nA</b></td><td>The PlexStim's native resolution — used only
     for non-rectangular phases so the curve renders smoothly.</td></tr>
 </table>
-<p>The resolution is chosen <b>per phase, by its shape</b>: a rectangular cathodic phase paired with an exp-decay
-anodic recharge still snaps the rectangle to 0.1&nbsp;µA while the curve uses 30&nbsp;nA. An amplitude below the
+<p>The resolution is chosen <b>per phase, by its shape</b>: a rectangular cathodal phase paired with an exp-decay
+anodal recharge still snaps the rectangle to 0.1&nbsp;µA while the curve uses 30&nbsp;nA. An amplitude below the
 applicable grid (that isn't exactly zero) is rejected before the pattern is sent to the device, so a value can never
 be silently rounded away.</p>
 <div class="warn"><b>Zero current + I<sub>mon</sub> trigger.</b> If the oscilloscope is triggered on the current
@@ -1296,21 +1304,26 @@ default; the other shapes trade peak-for-peak charge efficiency and are chosen f
 of each. The full catalogue:</p>
 <table>
   <tr><th>Shape</th><th>Contour across the phase</th></tr>
-  <tr><td><b>Rectangular</b></td><td>Constant current for the whole width (the flat-top pulse).</td></tr>
-  <tr><td><b>Linear increasing / decreasing</b></td><td>A straight ramp from 0 up to the peak, or from the peak down
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 4.0,4.0 46.0,4.0 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Rectangular</b></td><td>Constant current for the whole width (the flat-top pulse).</td></tr>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 44.1,4.7 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Linear increasing / decreasing</b></td><td>A straight ramp from 0 up to the peak, or from the peak down
     to 0.</td></tr>
-  <tr><td><b>Linear increasing&nbsp;&#8594;&nbsp;decreasing</b> / <b>decreasing&nbsp;&#8594;&nbsp;increasing</b></td>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 25.0,4.5 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Linear increasing&nbsp;&#8594;&nbsp;decreasing</b> / <b>decreasing&nbsp;&#8594;&nbsp;increasing</b></td>
     <td>Biphasic pairs that use mirrored ramp shapes on the two phases (one amplitude + one width, symmetric).</td></tr>
-  <tr><td><b>Sinusoidal</b></td><td>A half-sine — zero at both ends, peak at the middle.</td></tr>
-  <tr><td><b>Gaussian</b></td><td>A bell centred in the phase (&sigma;&nbsp;=&nbsp;W/5), tapered to zero at both ends —
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 5.8,17.9 7.9,15.4 9.8,13.3 11.9,11.1 13.8,9.3 15.9,7.5 17.9,6.2 20.0,5.1 21.9,4.4 24.0,4.0 26.0,4.0 28.1,4.4 30.0,5.1 32.1,6.2 34.1,7.5 36.2,9.3 38.1,11.1 40.2,13.3 42.1,15.4 44.2,17.9 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Sinusoidal</b></td><td>A half-sine — zero at both ends, peak at the middle.</td></tr>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 5.8,19.5 7.9,18.6 9.8,17.5 11.9,15.8 13.8,13.8 15.9,11.4 17.9,9.0 20.0,6.7 21.9,5.1 24.0,4.1 26.0,4.1 28.1,5.1 30.0,6.7 32.1,9.0 34.1,11.4 36.2,13.8 38.1,15.8 40.2,17.5 42.1,18.6 44.2,19.5 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Gaussian</b></td><td>A bell centred in the phase (&sigma;&nbsp;=&nbsp;W/5), tapered to zero at both ends —
     one of the more charge-efficient monophasic shapes.</td></tr>
-  <tr><td><b>Exponential increasing / decreasing</b></td><td>A rising or decaying exponential across the phase.</td></tr>
-  <tr><td><b>Exponential increasing&nbsp;&#8594;&nbsp;decreasing</b> / <b>decreasing&nbsp;&#8594;&nbsp;increasing</b></td>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 5.8,19.9 9.8,19.8 13.8,19.7 17.9,19.4 22.0,19.1 26.0,18.5 30.0,17.6 34.1,16.1 38.1,13.8 42.1,9.9 44.2,7.0 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Exponential increasing / decreasing</b></td><td>A rising or decaying exponential across the phase.</td></tr>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 6.8,19.8 9.7,19.6 12.7,19.1 15.6,18.3 18.5,16.6 21.4,13.2 24.3,6.5 25.7,6.5 28.6,13.2 31.5,16.6 34.4,18.3 37.3,19.1 40.3,19.6 43.2,19.8 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Exponential increasing&nbsp;&#8594;&nbsp;decreasing</b> / <b>decreasing&nbsp;&#8594;&nbsp;increasing</b></td>
     <td>Mirror-symmetric exponential pairs (a rising phase paired with a decaying phase at equal charge).</td></tr>
-  <tr><td><b>Speedbumps</b></td><td>A bi-level rectangular pattern of <i>N</i> sub-pulses alternating between the peak
+  <!-- Restricted (CWRU-only) pulse shapes are commented out below so they do NOT appear in the
+       public manual. installer/build.py strips the CWRU-ONLY:START / CWRU-ONLY:END delimiters
+       when it builds the CWRU manual variant, which reveals these rows. -->
+  <!-- CWRU-ONLY:START
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,20.0 4.0,12.0 10.0,12.0 10.0,4.0 16.0,4.0 16.0,12.0 22.0,12.0 22.0,4.0 28.0,4.0 28.0,12.0 34.0,12.0 34.0,4.0 40.0,4.0 40.0,12.0 46.0,12.0 46.0,20.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Speedbumps</b></td><td>A bi-level rectangular pattern of <i>N</i> sub-pulses alternating between the peak
     and half-peak.</td></tr>
-  <tr><td><b>Bowtie</b></td><td>A rectangle with a triangular notch cut out — peak at the ends, zero at the middle.</td></tr>
-  <tr><td><b>Halfpipe</b></td><td>A rectangle with a smooth sinusoidal notch cut out.</td></tr>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,4.0 4.0,4.5 24.0,19.5 26.0,19.5 46.0,4.5 46.0,4.0" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Bowtie</b></td><td>A rectangle with a triangular notch cut out (peak at the ends, zero at the middle).</td></tr>
+  <tr><td><svg viewBox="0 0 50 24" width="50" height="24" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle" aria-hidden="true"><line x1="4" y1="20" x2="46" y2="20" stroke="#c9d0da" stroke-width="1"/><polyline points="4.0,4.5 10.0,7.3 17.0,14.8 25.0,19.5 33.0,14.8 40.0,7.3 46.0,4.5" fill="none" stroke="#1a2230" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>&#160;<b>Halfpipe</b></td><td>A rectangle with a smooth sinusoidal notch cut out.</td></tr>
+  CWRU-ONLY:END -->
 </table>
 <p>Whatever the shape, it <b>fills the same phase envelope</b>: the width and the peak amplitude you set are the outer
 box, and the shape carries less charge than a rectangle of the same box (a half-sine carries 2/&pi;&nbsp;&asymp;&nbsp;64&nbsp;%,
@@ -1321,18 +1334,18 @@ a linear ramp 50&nbsp;%, and so on). PULSAR accounts for this automatically in t
 <p>In <b>Asymmetric</b> biphasic mode an <b>Asymmetric shape</b> row appears with three choices:</p>
 <ul>
   <li><b>Rectangular</b> — both phases are flat-top; you set each amplitude and width independently.</li>
-  <li><b>Pseudo-capacitively-coupled</b> — a rectangular cathodic phase paired with an exponential-decay anodic
+  <li><b>Pseudo-capacitively-coupled</b> — a rectangular cathodal phase paired with an exponential-decay anodal
   recharge, the profile a series capacitor produces <a href="#ref-cogan2008">Cogan 2008</a>. The charge-balance
   solver derives the recharge automatically (see &sect;7.4).</li>
-  <li><b>Mix and match</b> — pick each phase's shape independently from its own dropdown (e.g. an exp-decay cathodic
-  phase with a rectangular anodic phase). Charge balance still holds because the auto-balance arithmetic uses each
+  <li><b>Mix and match</b> — pick each phase's shape independently from its own dropdown (e.g. an exp-decay cathodal
+  phase with a rectangular anodal phase). Charge balance still holds because the auto-balance arithmetic uses each
   phase's shape.</li>
 </ul>
 
-<div class="note"><b>Restricted shapes &amp; the custom catalog.</b> A lab-specific build can mark certain shapes as
-<b>restricted</b>; those entries are hidden from the shape dropdowns until you log into the matching profile from the
-<b>Admin</b> menu (<b>Log In…</b>). A stock PULSAR install marks <i>no</i> shapes as restricted, so the full
-catalogue above is available without logging in. The <b>Admin</b> login additionally unlocks the custom catalog
+<div class="note"><b>Restricted shapes &amp; the custom catalog.</b> A lab-specific build (for example the CWRU build)
+can add <b>restricted</b> shapes; those entries are hidden from the shape dropdowns until you log into the matching
+profile from the <b>Admin</b> menu (<b>Log In…</b>). The shapes listed above are the ones available in a standard
+PULSAR install. The <b>Admin</b> login additionally unlocks the custom catalog
 (<b>Admin&nbsp;&#8594;&nbsp;Manage Custom Catalog</b>); everyday testing never requires it.</div>
 
 <h3 id="pattern-7-4-charge-balance-and-auto-balance">7.4&nbsp;Charge balance &amp; auto-balance</h3>
@@ -1356,18 +1369,18 @@ for you:</p>
 shaped), so the balance it computes is the balance the electrode actually receives.</p>
 
 <h4>The cap-coupled solve</h4>
-<p>The <b>Pseudo-capacitively-coupled</b> asymmetric shape has its own solver. Given the rectangular cathodic phase,
-it derives the exponential-decay anodic phase so the anodic charge magnitude <b>exactly matches</b> the cathodic:</p>
+<p>The <b>Pseudo-capacitively-coupled</b> asymmetric shape has its own solver. Given the rectangular cathodal phase,
+it derives the exponential-decay anodal phase so the anodic charge magnitude <b>exactly matches</b> the cathodic:</p>
 <ul>
-  <li><b>Lock width</b> — you pin the anodic width; the solver derives the peak amplitude and the decay time constant
+  <li><b>Lock width</b> — you pin the anodal width; the solver derives the peak amplitude and the decay time constant
   &tau;.</li>
-  <li><b>Lock amplitude</b> — you pin the anodic peak; the solver derives the width and &tau;.</li>
+  <li><b>Lock amplitude</b> — you pin the anodal peak; the solver derives the width and &tau;.</li>
   <li><b>&tau; mode</b> — <b>Auto-derive</b> ties &tau; to the geometry, or <b>Manual&nbsp;&tau;</b> lets you pin it
   (e.g. to match a measured electrode RC time constant, ~50–200&nbsp;µs for a typical microelectrode).</li>
 </ul>
 <p>If the ideal recharge would demand a peak above the stimulator's <b>1000&nbsp;µA</b> ceiling, the solver switches
 to a <b>flat-top-then-decay</b> shape (holds at 1000&nbsp;µA, then decays) that still balances the charge. If the
-anodic window is too short for any 1000&nbsp;µA recharge to deliver the required charge, the configuration is
+anodal window is too short for any 1000&nbsp;µA recharge to deliver the required charge, the configuration is
 <b>infeasible</b> and the panel warns and refuses to load it rather than sending an unbalanced pulse.</p>
 
 <h3 id="pattern-7-5-current-offset-pedestal">7.5&nbsp;Current offset (pedestal)</h3>
@@ -1379,7 +1392,7 @@ non-rectangular shapes, since a rectangle is already at its peak the whole time.
 <h3 id="pattern-7-6-interphase-and-discharge-delays">7.6&nbsp;Interphase &amp; discharge delays</h3>
 <p>Two zero-current gaps shape the timing of a pulse, each with its own checkbox and value:</p>
 <ul>
-  <li><b>Interphase delay</b> — a gap <i>between</i> phases (e.g. between the cathodic and anodic phases). It lets the
+  <li><b>Interphase delay</b> — a gap <i>between</i> phases (e.g. between the cathodal and anodal phases). It lets the
   cathodic charge accumulate at the interface before the reversal phase, improving stimulation efficiency, and it
   makes the trailing access step and the anodic polarization cleanly measurable.</li>
   <li><b>Discharge delay</b> — a gap <i>after</i> the last phase, before the stimulator shorts the electrode to
@@ -1497,7 +1510,7 @@ across frequency (<b>Galvanostatic EIS</b>).</p>
     <td>Lifetime <b>drift tracking</b>. Resumable after a crash.</td>
   </tr>
   <tr>
-    <td><b>Galvanostatic EIS</b></td>
+    <td><b>Galvanostatic Electrochemical Impedance Spectroscopy (EIS)</b></td>
     <td><b>Small‑signal</b> sinusoidal (or square) current, swept over frequency. No ramp.</td>
     <td><b>One</b> channel/combo.</td>
     <td>Complex <b>impedance</b> <i>Z</i>(<i>f</i>) — a <b>Bode</b> and <b>Nyquist</b> plot.</td>
@@ -1565,12 +1578,14 @@ damage <a href="#ref-cogan2008">(Cogan 2008)</a>, the whole point of the ramp is
     <text x="527" y="148" font-family="Segoe UI,Arial,sans-serif" font-size="11.5" fill="#1e7d4f">polarization reaches</text>
     <text x="527" y="162" font-family="Segoe UI,Arial,sans-serif" font-size="11.5" fill="#1e7d4f">the water window</text>
   </svg>
-  <figcaption>Figure 7 — <b></b> Diagram: the Voltage‑Transient adaptive ramp finding maximum charge‑injection capacity.
-    Electrode polarization <span style="color:#6a08d8">|<i>E</i><sub>mc</sub>|</span> rises along a saturating curve as
-    the stimulus current increases. The ramp takes a <span style="color:#0072B2">capture</span> at each amplitude,
-    predicts where the curve will cross the <span style="color:#c0392b">water‑window limit</span>, and jumps toward it —
-    taking large steps while far away and shrinking steps near the limit. The current whose polarization just reaches the
-    limit is the <span style="color:#1e7d4f">maximum charge‑injection capacity</span>.</figcaption>
+  <figcaption>Figure 7 — <b>Finding maximum charge-injection capacity (schematic).</b> A conceptual diagram of the
+    Voltage-Transient adaptive ramp; the polarization curve is an idealized saturating shape drawn to explain the
+    algorithm, <i>not</i> measured data. Electrode polarization <span style="color:#6a08d8">|<i>E</i><sub>mc</sub>|</span>
+    (the cathodic potential excursion) rises along a saturating curve as the stimulus current increases. The ramp takes a
+    <span style="color:#0072B2">capture</span> at each amplitude, predicts where the curve will cross the
+    <span style="color:#c0392b">water‑window limit</span>, and jumps toward it — taking large steps while far away and
+    shrinking steps near the limit. The current whose polarization just reaches the limit is the
+    <span style="color:#1e7d4f">maximum charge‑injection capacity</span>.</figcaption>
 </figure>
 
 <h4>How the ramp works</h4>
@@ -2031,8 +2046,8 @@ driving peak or an access plateau. Markers are drawn on the <b>active‑electrod
     <!-- axes -->
     <line x1="78" y1="46" x2="78" y2="348" stroke="#1a2230" stroke-width="1.5"/>
     <line x1="78" y1="348" x2="694" y2="348" stroke="#1a2230" stroke-width="1.5"/>
-    <text x="24" y="150" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#5b6472" transform="rotate(-90 24 150)" text-anchor="middle">Voltage monitor (V)</text>
-    <text x="386" y="382" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#5b6472" text-anchor="middle">Time (µs)</text>
+    <text x="24" y="150" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#5b6472" transform="rotate(-90 24 150)" text-anchor="middle">Voltage vs return (V)</text>
+    <text x="386" y="394" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#5b6472" text-anchor="middle">Time (µs)</text>
     <!-- baseline 0 V -->
     <line x1="78" y1="150" x2="694" y2="150" stroke="#dfe3ea" stroke-width="1.2" stroke-dasharray="5 4"/>
     <text x="72" y="154" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#5b6472" text-anchor="end">0&#160;V</text>
@@ -2044,41 +2059,45 @@ driving peak or an access plateau. Markers are drawn on the <b>active‑electrod
     <line x1="300" y1="150" x2="300" y2="286" stroke="#1A56C4" stroke-width="1" stroke-dasharray="3 3"/>
     <!-- ACCESS marker : horizontal bar (crimson) at the post-IR plateau -->
     <line x1="171" y1="214" x2="197" y2="214" stroke="#B0143C" stroke-width="3.4"/>
-    <text x="120" y="238" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#B0143C" font-weight="600">V</text>
-    <text x="131" y="242" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#B0143C" font-weight="600">a</text>
-    <text x="137" y="238" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#B0143C" font-weight="600">,&#160;R</text>
-    <text x="164" y="242" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#B0143C" font-weight="600">a</text>
+    <text x="120" y="238" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#B0143C" font-weight="600"><tspan font-style="italic">V</tspan><tspan font-size="9.5" dy="3">a</tspan><tspan dy="-3"> / </tspan><tspan font-style="italic">R</tspan><tspan font-size="9.5" dy="3">a</tspan></text>
     <text x="120" y="254" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#B0143C">access (IR step)</text>
     <!-- DRIVING marker : plus (cobalt) at the most-cathodic driving point -->
     <line x1="292" y1="286" x2="308" y2="286" stroke="#1A56C4" stroke-width="2.6"/>
     <line x1="300" y1="278" x2="300" y2="294" stroke="#1A56C4" stroke-width="2.6"/>
-    <text x="312" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1A56C4" font-weight="600">V</text>
-    <text x="323" y="302" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#1A56C4" font-weight="600">d</text>
-    <text x="330" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#1A56C4">(driving)</text>
+    <text x="312" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#1A56C4" font-weight="600"><tspan font-style="italic">V</tspan><tspan font-size="9.5" dy="3">d</tspan><tspan dy="-3" font-size="11" font-weight="400"> (driving)</tspan></text>
     <!-- POLARIZATION Emc : plus (violet) in the interphase recovery window -->
     <line x1="313" y1="192" x2="329" y2="192" stroke="#7A0AF0" stroke-width="2.6"/>
     <line x1="321" y1="184" x2="321" y2="200" stroke="#7A0AF0" stroke-width="2.6"/>
-    <text x="332" y="188" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#7A0AF0" font-weight="600">E</text>
-    <text x="343" y="192" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#7A0AF0" font-weight="600">mc</text>
+    <text x="332" y="188" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#7A0AF0" font-weight="600"><tspan font-style="italic">E</tspan><tspan font-size="9.5" dy="3">mc</tspan></text>
     <!-- POLARIZATION Ema : plus (violet) in the discharge recovery window -->
     <line x1="454" y1="140" x2="470" y2="140" stroke="#7A0AF0" stroke-width="2.6"/>
     <line x1="462" y1="132" x2="462" y2="148" stroke="#7A0AF0" stroke-width="2.6"/>
-    <text x="474" y="132" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#7A0AF0" font-weight="600">E</text>
-    <text x="485" y="136" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#7A0AF0" font-weight="600">ma</text>
-    <!-- phase labels along the bottom -->
-    <text x="129" y="366" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#5b6472" text-anchor="middle">pre‑pulse</text>
-    <text x="240" y="366" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#5b6472" text-anchor="middle">cathodic</text>
-    <text x="319" y="336" font-family="Segoe UI,Arial,sans-serif" font-size="10" fill="#5b6472" text-anchor="middle">iph</text>
-    <text x="389" y="366" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#5b6472" text-anchor="middle">anodic</text>
-    <text x="600" y="366" font-family="Segoe UI,Arial,sans-serif" font-size="11" fill="#5b6472" text-anchor="middle">recovery</text>
+    <text x="474" y="132" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#7A0AF0" font-weight="600"><tspan font-style="italic">E</tspan><tspan font-size="9.5" dy="3">ma</tspan></text>
+    <!-- region brackets below the axis so each label maps to its time span -->
+    <g stroke="#b8c0cc" stroke-width="1" fill="none">
+      <path d="M80,352 L80,357 L176,357 L176,352"/>     <!-- pre-pulse -->
+      <path d="M184,352 L184,357 L296,357 L296,352"/>   <!-- cathodal phase -->
+      <path d="M304,352 L304,357 L334,357 L334,352"/>   <!-- interphase -->
+      <path d="M342,352 L342,357 L438,357 L438,352"/>   <!-- anodal phase -->
+      <path d="M444,352 L444,357 L690,357 L690,352"/>   <!-- recovery -->
+    </g>
+    <g font-family="Segoe UI,Arial,sans-serif" fill="#5b6472" text-anchor="middle">
+      <text x="128" y="371" font-size="11">pre-pulse</text>
+      <text x="240" y="371" font-size="11">cathodal phase</text>
+      <text x="319" y="371" font-size="9.5">interphase</text>
+      <text x="390" y="371" font-size="11">anodal phase</text>
+      <text x="567" y="371" font-size="11">recovery</text>
+    </g>
   </svg>
-  <figcaption>Figure 9 — <b>reading a biphasic voltage transient.</b> A cathodal‑first biphasic pulse.
-    At the cathodic onset the voltage jumps by a sharp ohmic <b>access step</b> (<span style="color:#B0143C"><i>V</i><sub>a</sub> / <i>R</i><sub>a</sub></span>, crimson bar),
+  <figcaption>Figure 9 — <b>Reading a biphasic voltage transient.</b> A cathodal‑first biphasic pulse.
+    At the cathodal onset the voltage jumps by a sharp ohmic <b>access step</b> (<span style="color:#B0143C"><i>V</i><sub>a</sub> / <i>R</i><sub>a</sub></span>, crimson bar),
     then ramps by polarization to the most‑cathodic <b>driving point</b> (<span style="color:#1A56C4"><i>V</i><sub>d</sub></span>, cobalt +) at the phase end.
     When the current stops, the ohmic drop disappears and the remaining interface potential is the
-    <b>electrode polarization</b> — <span style="color:#7A0AF0"><i>E</i><sub>mc</sub></span> (max cathodic) read in the interphase window and
-    <span style="color:#7A0AF0"><i>E</i><sub>ma</sub></span> (max anodic) read after the anodic phase, both violet +.
-    Access uses a horizontal‑bar glyph; driving and polarization use + glyphs, distinguished by colour.</figcaption>
+    <b>electrode polarization</b> — <span style="color:#7A0AF0"><i>E</i><sub>mc</sub></span> (max cathodic excursion) read in the interphase window and
+    <span style="color:#7A0AF0"><i>E</i><sub>ma</sub></span> (max anodic excursion) read after the anodal phase, both violet +.
+    Access uses a horizontal‑bar glyph; driving and polarization use + glyphs, distinguished by colour. The trace is
+    <i>V</i><sub>mon</sub> (the voltage across the electrode, active vs return); markers ride the active‑electrode
+    potential <i>E</i><sub>act</sub> when it is recorded.</figcaption>
 </figure>
 
 <table>
@@ -2107,8 +2126,8 @@ driving peak or an access plateau. Markers are drawn on the <b>active‑electrod
     <td><b><i>E</i><sub>mc</sub> / <i>E</i><sub>ma</sub></b><br>electrode polarization</td>
     <td>+ · <span style="color:#7A0AF0"><b>violet</b></span></td>
     <td>The maximum cathodic (<i>E</i><sub>mc</sub>) and anodic (<i>E</i><sub>ma</sub>) interface
-      polarization, with the IR drop removed. A cathodic phase is labelled <i>E</i><sub>mc</sub>, an
-      anodic phase <i>E</i><sub>ma</sub> (a numeric suffix is added only when the same polarity repeats,
+      polarization, with the IR drop removed. A cathodal phase is labelled <i>E</i><sub>mc</sub>, an
+      anodal phase <i>E</i><sub>ma</sub> (a numeric suffix is added only when the same polarity repeats,
       e.g. a triphasic pulse). These are compared against the water‑window limits — see §10.6.</td>
   </tr>
   <tr>
@@ -2299,13 +2318,14 @@ via the Gamry‑DTA‑style workbook, review the per‑capture summary and raw d
 <h2 id="trouble">14&nbsp;Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Fix</th></tr>
-  <tr><td>“No Plexon Stimulator is detected”</td><td>Close Plexon <b>Sim‑2 / Stim‑2</b> (it holds the USB lock), then press
+  <tr><td>“No Plexon Stimulator is detected”</td><td>Close Plexon <b>Stim‑2</b> (it holds the USB lock), then press
     Initialize. Only one program can own the stimulator.</td></tr>
   <tr><td>Initialize hangs / window “Not Responding”</td><td>The stimulator init runs on a background thread and shows a hint after
-    ~15&nbsp;s. Close Sim‑2 and/or power‑cycle the stimulator, then retry.</td></tr>
+    ~15&nbsp;s. Close Stim‑2 and/or power‑cycle the stimulator, then retry.</td></tr>
   <tr><td>Scope “semaphore timeout” on Connect</td><td>Leftover USB claim from a prior crash — PULSAR auto‑retries; if it persists,
     power‑cycle the scope and replug USB.</td></tr>
-  <tr><td>“Access is denied” when saving</td><td>OneDrive lock — save to a non‑OneDrive folder (e.g. <code>C:\PULSAR_data</code>).</td></tr>
+  <tr><td>“Access is denied” when saving</td><td>Usually a transient OneDrive sync lock — retry the save, or point the Save
+    location at a non‑OneDrive folder (e.g. <code>C:\PULSAR_data</code>) to avoid it.</td></tr>
   <tr><td>Current reads absurd values / monitors look wrong</td><td>Re‑run <b>Verification</b> with a clean signal (or reset the
     calibration); PULSAR ignores an implausible saved monitor gain on load.</td></tr>
   <tr><td>A channel is flagged Open/Broken and the VT ramp stops early</td><td>That electrode's response has no measurable access
@@ -2317,21 +2337,227 @@ via the Gamry‑DTA‑style workbook, review the per‑capture summary and raw d
 session files). Include it when reporting a problem.</p>
 
 <h2 id="glossary">15&nbsp;Glossary of metrics</h2>
+<p>This glossary defines every metric PULSAR reports, using the <b>exact abbreviation</b> shown in the
+app. Units are carried in each metric‑table row label in square brackets (e.g. <i>I</i><sub>stim</sub>&nbsp;[µA],
+<i>Q</i><sub>ph</sub>&nbsp;[nC], <i>Q</i><sub>inj</sub>&nbsp;[mC/cm<sup>2</sup>]). The per‑capture <b>metric table</b>
+(and the POLARIS viewer) has <b>three view modes</b>, each showing a different subset: a <b>normal</b> functional‑electrode
+view, a focused <b>bad‑response</b> view (open / broken / capacitive), and a <b>KHFAC</b> view for continuous
+symmetric‑sinusoidal (kilohertz‑frequency AC) captures.</p>
+<div class="note"><b><i>E</i><sub>pol</sub> versus <i>E</i><sub>mc</sub>&nbsp;/&nbsp;<i>E</i><sub>ma</sub>.</b>
+The metric table abbreviates the general per‑phase electrode polarization as <b><i>E</i><sub>pol</sub></b> (rows
+&ldquo;<i>E</i><sub>pol</sub> active&rdquo; / &ldquo;<i>E</i><sub>pol</sub> return&rdquo;). <b><i>E</i><sub>mc</sub></b>
+(maximum <i>cathodic</i> excursion) and <b><i>E</i><sub>ma</sub></b> (maximum <i>anodic</i> excursion) are the
+polarity‑labelled entries of that same per‑phase series — they appear as the <b>plot markers</b> (a cathodal phase &rarr;
+<i>E</i><sub>mc</sub>, an anodal phase &rarr; <i>E</i><sub>ma</sub>) and as KHFAC table rows. The marker value is read
+straight from the stored per‑phase polarization, so the plot and the table can never disagree.</div>
+<p>Where an active/return instrumentation amplifier (<i>E</i><sub>act</sub>&nbsp;/&nbsp;<i>E</i><sub>ret</sub>) is
+recorded, per‑phase voltages split into &ldquo;active&rdquo; and &ldquo;return&rdquo; rows; without one, <i>V</i><sub>mon</sub>
+<i>is</i> the active‑vs‑return voltage, the &ldquo;active&rdquo; qualifier is dropped, and the per‑phase values are shown as a
+single comma‑joined list.</p>
 <table>
   <tr><th>Term</th><th>Definition</th></tr>
-  <tr><td>Access voltage / resistance (<i>V</i><sub>a</sub> / <i>R</i><sub>a</sub>)</td><td>The instantaneous ohmic (IR) drop at a current edge, and R = <i>V</i><sub>a</sub> / I —
-    the series (electrolyte + spreading) resistance.</td></tr>
-  <tr><td>Driving voltage (<i>V</i><sub>d</sub>)</td><td>The total voltage excursion of the driving phase (access + polarization) — the compliance
-    the stimulator must supply.</td></tr>
-  <tr><td>Electrode polarization (<i>E</i><sub>mc</sub> / <i>E</i><sub>ma</sub>)</td><td>The maximum cathodic / anodic interface potential (IR removed) — compared to
-    the water‑window limits.</td></tr>
-  <tr><td>Charge per phase (<i>Q</i><sub>ph</sub>)</td><td>The time‑integral of current over one phase (nC).</td></tr>
-  <tr><td>Charge‑injection capacity (<i>Q</i><sub>inj</sub>)</td><td><i>Q</i><sub>ph</sub> normalized by electrode area (mC/cm<sup>2</sup>). <b>max <i>Q</i><sub>inj</sub></b> is the largest value
-    reached before the water‑window limit — the headline result of a VT run.</td></tr>
-  <tr><td>Response class</td><td><i>normal</i> (functional), <i>capacitive</i> (purely capacitive), <i>open</i> (disconnected /
-    high‑impedance, no access step), <i>broken</i> (degraded, R‖C fit).</td></tr>
-  <tr><td>Water window</td><td>The potential range within which the electrode charges without irreversible electrolysis — the safety
-    boundary the VT ramp respects.</td></tr>
+
+  <tr><td colspan="2"><b>Stimulus &amp; charge</b></td></tr>
+  <tr><td>Stimulus current amplitude (<i>I</i><sub>stim</sub>) [µA]</td>
+    <td>The programmed excitation‑phase current amplitude of the pulse — the driving stimulus current. Read directly from the
+      pattern (not derived from the scope trace). Shown in the normal, bad‑response and KHFAC views.</td></tr>
+  <tr><td>Stimulus current density (<i>J</i><sub>stim</sub>) [A/cm<sup>2</sup>]</td>
+    <td>Stimulus current per geometric electrode area (<i>I</i><sub>stim</sub>&nbsp;&divide;&nbsp;area). Shown in the
+      per‑channel plot heading / exported‑figure subtitle when a surface area is configured; omitted for the Plexon Test
+      Board (no area). Not a metric‑table row.</td></tr>
+  <tr><td>Charge per phase (<i>Q</i><sub>ph</sub>) [nC]</td>
+    <td>Charge injected in the excitation phase — the <b>ideal</b> continuous (trapezoidal) integral of the programmed,
+      as‑designed current waveform over the phase, computed on the unquantized breakpoints (not the device staircase).
+      Shown in the normal, bad‑response and KHFAC views and in the exported SUMMARY.</td></tr>
+  <tr><td>Charge‑injection density (<i>Q</i><sub>inj</sub>) [mC/cm<sup>2</sup>]</td>
+    <td>Injected charge per unit geometric electrode area for the excitation phase = (<i>Q</i><sub>ph</sub>&nbsp;in&nbsp;nC)&nbsp;&divide;&nbsp;area.
+      NaN when no area is set. In plot headings it auto‑rescales to µC/cm<sup>2</sup> when it would round to 0.000&nbsp;mC/cm<sup>2</sup>.
+      Shown in the normal and KHFAC views and the plot heading.</td></tr>
+  <tr><td>Maximum charge‑injection capacity (max&nbsp;<i>Q</i><sub>inj</sub>) [mC/cm<sup>2</sup>]</td>
+    <td>The headline VT result — the largest <i>Q</i><sub>inj</sub> achieved across a run&rsquo;s captures before the
+      water‑window potential limit (or the hardware‑current ceiling) stopped the ramp. Computed over captures that are
+      <i>good</i> and did <i>not</i> overshoot the limit (over‑window captures are excluded). Shown in the POLARIS
+      run/channel summary.</td></tr>
+
+  <tr><td colspan="2"><b>Voltages &amp; potentials</b></td></tr>
+  <tr><td>Driving voltage (<i>V</i><sub>d</sub>) [V]</td>
+    <td>The voltage the stimulator must drive to deliver the pulse, per phase = |reference&nbsp;&minus;&nbsp;trace| sampled
+      ~1&nbsp;µs before the phase ends (the settled peak excursion, off the trailing access drop); the reference is the
+      pre‑pulse baseline (phase&nbsp;1) or the end‑of‑prior‑interphase level (later phases). It is the active‑vs‑return
+      driving potential (<i>V</i><sub>mon</sub>). Shown as a comma‑joined per‑phase list (splitting into <i>V</i><sub>d</sub>
+      active&nbsp;/&nbsp;<i>V</i><sub>d</sub> return with an instrumentation amp); the legacy scalar is max|<i>V</i><sub>mon</sub>|.
+      Drawn on the plot as the <i>V</i><sub>d</sub> (and <i>V</i><sub>d2</sub>, <i>V</i><sub>d3</sub>&hellip;) markers.</td></tr>
+  <tr><td>Access voltage (<i>V</i><sub>a</sub>) [V]</td>
+    <td>The instantaneous ohmic (IR) voltage step at each current edge — the pure IR jump when the current steps to or from
+      zero, with the capacitive cap‑ramp and source rise‑time subtracted out (pre‑edge and post‑edge linear fits extrapolated
+      to the |d<i>V</i>/d<i>t</i>| edge peak). One entry per access point — <b>leading and trailing</b> of each phase, so the
+      count depends on the pattern (an interphase delay adds a trailing‑phase‑1 and leading‑phase‑2 point; a discharge delay
+      adds a trailing point). Numbered <i>V</i><sub>a1</sub>&hellip;<i>V</i><sub>aN</sub> on the plot; active side on
+      <i>E</i><sub>act</sub>, return side on <i>E</i><sub>ret</sub> when recorded.</td></tr>
+  <tr><td>Access resistance (<i>R</i><sub>a</sub>) [kΩ]</td>
+    <td>The electrolyte + spreading (series/access) resistance at each current edge = <i>V</i><sub>a</sub>&nbsp;&divide;&nbsp;<i>I</i>
+      for that phase. Reported per access point (active and return); shown as the second line of each <i>V</i><sub>a</sub> plot
+      marker (<a href="#ref-cogan2008">Cogan 2008</a>).</td></tr>
+  <tr><td>Peak‑current access (<i>V</i><sub>a</sub>&nbsp;(peak&nbsp;I)&nbsp;/&nbsp;<i>R</i><sub>a</sub>&nbsp;(peak&nbsp;I)) [V]&nbsp;/&nbsp;[kΩ]</td>
+    <td>For smooth <b>shaped</b> phases (gaussian / sinusoidal) that have <i>no</i> current‑step edge, the access voltage and
+      resistance measured at <b>peak current</b> instead: <i>R</i><sub>a</sub>&nbsp;=&nbsp;least‑squares slope of <i>V</i> vs
+      <i>I</i> over the phase, <i>V</i><sub>a</sub>&nbsp;=&nbsp;|<i>R</i><sub>a</sub>|&middot;|<i>I</i><sub>peak</sub>|. A
+      separate measurement — it does <i>not</i> feed the <i>E</i><sub>pol</sub> / water‑window decision. Excludes rectangular,
+      pedestal‑offset and KHFAC phases.</td></tr>
+  <tr><td>Interphase / interpulse potential (<i>E</i><sub>ip</sub>) [V]</td>
+    <td>The settled inter‑pulse rest (open‑circuit) potential of the return/reference electrode — the mean of the
+      <i>E</i><sub>ret</sub> trace <i>outside</i> the active pulse (pre‑pulse baseline plus post‑discharge tail). Returns NaN
+      when the pattern has no idle interpulse gap (the period is fully occupied, so there is no true rest window). Shown in the
+      normal view and the SUMMARY.</td></tr>
+
+  <tr><td colspan="2"><b>Electrode polarization &amp; water window</b></td></tr>
+  <tr><td>Electrode polarization (<i>E</i><sub>pol</sub>) [V]</td>
+    <td>The per‑phase electrode polarization — the interface potential excursion driven by the phase, referenced past the ohmic
+      access drop (the &ldquo;operator&rdquo; method: a time sample at phase&nbsp;end&nbsp;+&nbsp;depolarization for phases with a
+      trailing delay, else |driving&nbsp;&minus;&nbsp;leading&nbsp;access|; NaN when undetermined). Measured on
+      <i>E</i><sub>act</sub> when recorded, else <i>V</i><sub>mon</sub>. This is the value the metric table shows and the
+      water‑window limit trip uses; the plot&rsquo;s <i>E</i><sub>mc</sub>/<i>E</i><sub>ma</sub> markers read the same series.
+      Shown per phase (active and return) in the normal view.</td></tr>
+  <tr><td>Maximum cathodic / anodic excursion (<i>E</i><sub>mc</sub>&nbsp;/&nbsp;<i>E</i><sub>ma</sub>) [V]</td>
+    <td>The maximum <b>cathodic</b> excursion (<i>E</i><sub>mc</sub>, most‑negative interface potential) and maximum
+      <b>anodic</b> excursion (<i>E</i><sub>ma</sub>, most‑positive), compared against the water‑window limits. For pulsed
+      patterns these are the cathodic/anodic entries of the per‑phase <i>E</i><sub>pol</sub> series (labelled by phase polarity,
+      with a suffix like <i>E</i><sub>mc1</sub>/<i>E</i><sub>mc2</sub> only when a polarity repeats); for KHFAC they are the
+      min/max of the de‑ohm&rsquo;d interface potential (Ghazavi). Drawn with the &ldquo;+&rdquo; plot glyph.</td></tr>
+  <tr><td>Water window</td>
+    <td>The potential range within which the electrode charges reversibly without irreversible electrolysis (the cathodic /
+      anodic potential limits, vs the reference electrode). The safety boundary the VT‑max ramp targets; the ramp stops when
+      <i>E</i><sub>pol</sub> lands within an acceptance band centered on the limit.</td></tr>
+  <tr><td>Limit reached? · Limit exceeded? [boolean]</td>
+    <td><b>Limit reached</b> = the polarization landed <i>within</i> &plusmn;tolerance of the water‑window limit (a clean stop).
+      <b>Limit exceeded</b> = it overshot <i>past</i> the band&rsquo;s far edge (an over‑window overshoot, excluded from
+      max&nbsp;<i>Q</i><sub>inj</sub>). Shown in every view.</td></tr>
+  <tr><td>Compliance exceeded? [boolean]</td>
+    <td>Whether the stimulator hit its &plusmn;9&nbsp;V voltage‑compliance limit delivering the programmed current (electrode/circuit
+      impedance too high for the current source; multi‑sample check on <i>V</i><sub>mon</sub>). Shown in every view.</td></tr>
+
+  <tr><td colspan="2"><b>Capacitance, impedance &amp; energy</b></td></tr>
+  <tr><td>Driving (charge‑storage) capacitance (<i>C</i><sub>d</sub>) [mF/cm<sup>2</sup>]</td>
+    <td>A charge‑per‑volt efficiency ratio (<i>not</i> a double‑layer capacitance): max&nbsp;<i>Q</i><sub>inj</sub>&nbsp;(mC/cm<sup>2</sup>)&nbsp;&divide;&nbsp;<i>V</i><sub>d</sub>&nbsp;(V)
+      = mF/cm<sup>2</sup> — the injected charge density delivered per volt across the whole active‑return driving circuit.
+      Shown in the normal view and the SUMMARY.</td></tr>
+  <tr><td>Driving impedance (<i>Z</i><sub>d</sub>) [kΩ]</td>
+    <td>The total impedance the stimulator drives into during the driving phase (access resistance + polarization) =
+      |<i>V</i><sub>d</sub>|&nbsp;&divide;&nbsp;|<i>I</i><sub>stim</sub>|. Shown in the normal view (when finite) and the
+      SUMMARY.</td></tr>
+  <tr><td>Driving energy [µJ, auto‑scaled pJ/nJ/µJ/mJ]</td>
+    <td>The electrical energy delivered to the electrode per pulse = &int;&nbsp;<i>V</i><sub>mon</sub>&middot;<i>I</i>&nbsp;d<i>t</i>
+      integrated over the whole pulse (all phase windows; passive gaps carry ~0 current). Uses the <b>ideal programmed</b>
+      current, not the measured <i>I</i><sub>mon</sub> (which carries switching spikes and turn‑on skew). Shown in the normal
+      view (when finite) and as SUMMARY column &ldquo;Energy&rdquo;.</td></tr>
+  <tr><td>Double‑layer capacitance (<i>C</i><sub>dl</sub>) [mF/cm<sup>2</sup>]</td>
+    <td>The electrode double‑layer capacitance from the constant‑d<i>E</i>/d<i>t</i> (purely capacitive) window of the driving
+      phase (Harris 2019 chronopotentiometry): <i>C</i><sub>dl</sub>&nbsp;=&nbsp;<i>I</i>&nbsp;/&nbsp;(<i>A</i>&middot;d<i>E</i>/d<i>t</i>).
+      Amplitude‑independent — the defensible areal capacitance. Shown in the normal view only, and only for a rectangular
+      (constant‑current) pulse on a functional electrode with a known area.</td></tr>
+  <tr><td>Faradaic charge fraction [%]</td>
+    <td>An approximate, first‑order estimate of the fraction of phase charge carried by Faradaic (redox) rather than
+      capacitive current: <i>Q</i><sub>faradaic</sub>&nbsp;/&nbsp;<i>Q</i><sub>total</sub>, with
+      <i>Q</i><sub>cap</sub>&nbsp;=&nbsp;<i>A</i>&middot;<i>C</i><sub>dl</sub>&middot;&Delta;<i>E</i><sub>pol</sub>. A galvanostatic
+      pulse cannot cleanly separate the two, so treat this as indicative. Shown in the normal view when finite.</td></tr>
+  <tr><td>Faradaic onset [µs (with V)]</td>
+    <td>The time (and potential) at which d<i>E</i>/d<i>t</i> first sustainedly dips below the capacitive baseline — where
+      Faradaic reactions begin diverting current. NaN for a ~purely capacitive phase (no resolvable onset). Shown in the normal
+      view when finite.</td></tr>
+  <tr><td>Effective capacitance (<i>C</i><sub>eff</sub>) [nF]</td>
+    <td>Effective capacitance <i>C</i><sub>eff</sub>&nbsp;=&nbsp;|<i>I</i>|&nbsp;/&nbsp;|d<i>V</i>/d<i>t</i>| from the linear
+      charging‑ramp slope. Reported <b>only</b> for a degenerate <i>capacitive</i> or <i>open</i> response, where there is no
+      separable resistive + Faradaic component so <i>I</i>/(d<i>V</i>/d<i>t</i>) is meaningful. NaN (and omitted) for a normal
+      mixed electrode, whose access / <i>E</i><sub>pol</sub> values are reported instead.</td></tr>
+  <tr><td>R&#8741;C fit capacitance (<i>C</i>) [nF]</td>
+    <td>For a <b>broken</b> (exponential) response, the capacitance from a parallel‑R&#8741;C fit
+      <i>V</i>&nbsp;=&nbsp;<i>V</i><sub>&infin;</sub>(1&minus;e<sup>&minus;<i>t</i>/&tau;</sup>), <i>C</i>&nbsp;=&nbsp;&tau;/<i>R</i>.
+      Labelled a bare <i>C</i> (not <i>C</i><sub>eff</sub>). Shown in the bad‑response view, per phase.</td></tr>
+  <tr><td>R&#8741;C fit resistance (<i>R</i>&nbsp;(R&#8741;C)) [kΩ]</td>
+    <td>For a broken electrode, the leakage/Faradaic resistance from the parallel‑R&#8741;C exponential fit,
+      <i>R</i>&nbsp;=&nbsp;<i>V</i><sub>&infin;</sub>/<i>I</i>. Shown in the bad‑response view, per phase.</td></tr>
+  <tr><td>R&#8741;C fit time constant (&tau;&nbsp;(R&#8741;C)) [µs]</td>
+    <td>The time constant &tau;&nbsp;=&nbsp;<i>RC</i> of the broken‑electrode parallel‑R&#8741;C exponential fit. Shown in the
+      bad‑response view, per phase.</td></tr>
+
+  <tr><td colspan="2"><b>Response classification &amp; electrode health</b></td></tr>
+  <tr><td>Response class (Response)</td>
+    <td>The electrode response category that decides which conditional metrics are reported: <i>normal</i> (functional
+      resistive + capacitive + Faradaic &rarr; access <i>V</i><sub>a</sub>/<i>R</i><sub>a</sub> + <i>E</i><sub>pol</sub>),
+      <i>capacitive</i> or <i>open</i> (a straight charging ramp, disconnected / high‑impedance, no access step &rarr;
+      <i>C</i><sub>eff</sub> only), or <i>broken</i> (an exponential response &rarr; R&#8741;C fit <i>R</i>, <i>C</i>, &tau;).
+      Shown UPPERCASE in the bad‑response view; a normal capture omits the row.</td></tr>
+  <tr><td>Access‑resistance drift (<i>R</i><sub>a</sub> drift: p / flag)</td>
+    <td>A per‑run electrode‑health test: a two‑sided Mann&ndash;Whitney&nbsp;U comparison of the recent <i>R</i><sub>a</sub>
+      window against the run&rsquo;s earlier <i>R</i><sub>a</sub> (0&nbsp;µA captures excluded). Flags when the p‑value is
+      significant <i>and</i> the median shift is physically meaningful — a signature of a degrading / broken electrode. Warn‑only
+      (an edge‑triggered log line; never stops the run).</td></tr>
+  <tr><td>Shannon <i>k</i>‑value &amp; tissue‑damage screen (Shannon <i>k</i>)</td>
+    <td>A tissue‑damage safety index, <i>k</i>&nbsp;=&nbsp;log<sub>10</sub>(charge density)&nbsp;+&nbsp;log<sub>10</sub>(charge&nbsp;per&nbsp;phase),
+      with <i>k</i>&nbsp;&asymp;&nbsp;1.5&ndash;2 the conventional damage threshold (<a href="#ref-shannon1992">Shannon 1992</a>).
+      Computed from <i>Q</i><sub>ph</sub> and <i>Q</i><sub>inj</sub> along with a damage classification (likely‑safe /
+      above‑Shannon / above macro‑ or micro‑electrode caps) and an optional NeurostimML second opinion. Guidance only — Shannon
+      misclassifies a substantial fraction of damaging stimulation as safe. Surfaced in POLARIS and the pre‑run damage warning.</td></tr>
+
+  <tr><td colspan="2"><b>Counts, cumulative dose &amp; timing</b></td></tr>
+  <tr><td>Number of pulses (<i>N</i><sub>pulse</sub>) [count]</td>
+    <td>The number of stimulation pulses delivered to acquire this capture = pulsing duration&nbsp;&times;&nbsp;pulse&nbsp;rate
+      (for an averaged acquisition, the averaging count). First row of every view; set by the discrete‑burst runners (VT, PS).
+      When NaN (continuous SP/CP/LP) the first row instead reads &ldquo;Capture&nbsp;#&rdquo; = the capture index.</td></tr>
+  <tr><td>Cumulative pulse count (Cumulative <i>N</i><sub>pulse</sub>) [count]</td>
+    <td>Total pulses delivered up to and including this capture, accumulating over the run&rsquo;s earlier captures (resets per
+      channel/combo). Shown in the normal view (VT/PS only).</td></tr>
+  <tr><td>Cumulative charge (Cumulative <i>Q</i>) [nC, auto‑scaled nC/µC/mC]</td>
+    <td>Cumulative cathodic charge delivered to the electrode so far = &Sigma;&nbsp;|<i>Q</i><sub>ph,i</sub>|&nbsp;&times;&nbsp;<i>N</i><sub>pulse,i</sub>
+      (resets per channel/combo). Shown in the normal view (VT/PS only).</td></tr>
+  <tr><td>Fixed (scheduled) sample time (Fixed Time) [s]</td>
+    <td>The cadence‑grid time (<i>n</i>&nbsp;&times;&nbsp;sampling&nbsp;interval, anchored at run start) this capture aimed for —
+      the precise‑timing reference the periodic sampler targets regardless of per‑capture duration. Populated for the periodic
+      runners (PS, LP); NaN for the adaptive VT ramp. Shown in the SUMMARY and POLARIS.</td></tr>
+  <tr><td>Elapsed (actual) sample time (Elapsed Time) [s]</td>
+    <td>The actual measured elapsed time (monotonic, anchored at run start; for LP, pulsing time with pauses excluded) when this
+      capture was taken — the counterpart to Fixed Time for reading scheduling jitter. Shown in the SUMMARY and POLARIS.</td></tr>
+  <tr><td>Time to complete channel/combo [s, shown m/h]</td>
+    <td>Wall‑clock time to complete a whole channel/combo run (finished&nbsp;&minus;&nbsp;started). Shown as the POLARIS
+      &ldquo;Time to complete&rdquo; row and the Gamry electrode‑sheet ELAPSED entry; NaN until the run finishes.</td></tr>
+
+  <tr><td colspan="2"><b>KHFAC continuous‑sinusoidal (kilohertz AC)</b></td></tr>
+  <tr><td>Pulse frequency [kHz]</td>
+    <td>The fundamental sinusoid frequency of a continuous‑sinusoidal (KHFAC) capture — the waveform&rsquo;s rate <i>is</i> its
+      frequency (labelled &ldquo;pulse frequency&rdquo;, not rate). Taken from the exact pattern rate. Shown in the KHFAC view.</td></tr>
+  <tr><td>Ghazavi access resistance (<i>R</i><sub>access</sub>) [kΩ]</td>
+    <td>For a continuous sinusoid, the access (electrolyte) resistance from the in‑phase least‑squares projection of the measured
+      electrode voltage onto the current (Ghazavi&nbsp;&amp;&nbsp;Cogan 2018, ideal‑capacitor assumption). The KHFAC
+      electrode‑health metric. Reported for the active and return electrodes.</td></tr>
+  <tr><td>Ghazavi access voltage (<i>V</i><sub>access</sub>) [V]</td>
+    <td>For a continuous sinusoid, the access‑voltage amplitude <i>V</i><sub>ro</sub>&nbsp;=&nbsp;<i>R</i><sub>access</sub>&middot;<i>I</i><sub>o</sub>
+      — the resistive iR‑drop amplitude at peak current. Active and return.</td></tr>
+  <tr><td>Ghazavi interface polarization amplitude (<i>E</i><sub>io</sub>) [V]</td>
+    <td>Half the peak‑to‑peak excursion of the de‑ohm&rsquo;d interface potential
+      <i>E</i><sub>i</sub>(<i>t</i>)&nbsp;=&nbsp;<i>V</i><sub>m</sub>&nbsp;&minus;&nbsp;<i>R</i><sub>access</sub>&middot;<i>I</i>
+      — the AC polarization amplitude of the electrode interface under continuous excitation
+      (<i>E</i><sub>io</sub>&nbsp;=&nbsp;&frac12;(<i>E</i><sub>ma</sub>&nbsp;&minus;&nbsp;<i>E</i><sub>mc</sub>)). Active and
+      return.</td></tr>
+  <tr><td>Ghazavi offset potential (<i>E</i><sub>off</sub>) [V]</td>
+    <td>The DC operating point of the interface under continuous excitation = the mean measured electrode potential over the
+      capture. Active and return. (<i>E</i><sub>mc</sub>&nbsp;=&nbsp;<i>E</i><sub>off</sub>&nbsp;&minus;&nbsp;<i>E</i><sub>io</sub>,
+      <i>E</i><sub>ma</sub>&nbsp;=&nbsp;<i>E</i><sub>off</sub>&nbsp;+&nbsp;<i>E</i><sub>io</sub>.)</td></tr>
+  <tr><td>Phase angle (&phi;<sub>Imon</sub> / &phi;<sub>Vmon</sub> / &phi;<sub>Eret</sub> / &phi;<sub>Eact</sub>) [&deg;]</td>
+    <td>The impedance/EIS phase angle of each voltage waveform relative to <i>I</i><sub>mon</sub> at the drive frequency
+      (single‑bin lock‑in): ~0&deg; purely resistive, &rarr;&minus;90&deg; purely capacitive (voltage lags current).
+      <i>I</i><sub>mon</sub> is the phase reference, so &phi;<sub>Imon</sub>&nbsp;=&nbsp;+0.0&deg; by definition. Shown in the
+      KHFAC view (the <i>I</i><sub>mon</sub> anchor plus the finite voltage‑trace rows).</td></tr>
+  <tr><td>Pulse rate / pulse period (Pulse rate [pps] / Pulse period)</td>
+    <td>The pulse repetition rate — pulses per second, labelled <b>pps</b> (never Hz for a pulse rate) — and its reciprocal
+      period (auto‑scaled µs/ms/s). Shown in the normal and KHFAC views.</td></tr>
+
+  <tr><td colspan="2"><b>Galvanostatic EIS (impedance spectroscopy)</b></td></tr>
+  <tr><td>Complex impedance point (<i>Z</i>: |<i>Z</i>|, &ang;<i>Z</i>, <i>Z</i><sub>real</sub>, <i>Z</i><sub>imag</sub>) [Ω, &deg;]</td>
+    <td>For the Galvanostatic EIS experiment, the complex electrode impedance <i>Z</i>(<i>f</i>) at this capture&rsquo;s probe
+      frequency (one capture per swept frequency, single‑bin lock‑in <i>Z</i>&nbsp;=&nbsp;<i>V</i>/<i>I</i>): the magnitude
+      |<i>Z</i>|&nbsp;[Ω], the phase &ang;<i>Z</i>&nbsp;[&deg;] (~0&deg; resistive, &rarr;&minus;90&deg; capacitive), and the
+      Nyquist coordinates <i>Z</i><sub>real</sub>&nbsp;/&nbsp;<i>Z</i><sub>imag</sub>&nbsp;[Ω]. Plotted on the Bode and Nyquist
+      sub‑tabs; NaN for non‑EIS experiments.</td></tr>
 </table>
 
 <h2 id="references">16&nbsp;References</h2>

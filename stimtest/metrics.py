@@ -1100,6 +1100,44 @@ def access_index_labels(pattern: PulsePattern, *,
     return labels
 
 
+def _phase_current_ends_near_zero(ph, frac: float = 0.1) -> bool:
+    """True if the phase's current tapers to ~0 at its END, leaving no
+    trailing IR (access) step to read.
+
+    Exp-decay and linear-decreasing phases START at their peak (a clean
+    LEADING access) but ramp to ~0, so their trailing edge carries no
+    current step (sine / gaussian taper at both ends).  For such a phase,
+    with NO interphase / discharge delay after it there is also no trailing
+    IR step to extrapolate.  The caller (operator method) then reads E_pol
+    at the FLATTEST point (min |dV/dt|) near the phase end instead — where
+    the current has decayed so V is the settled interface polarization with
+    no ohmic drop (operator: "for exp-decay or linear-decreasing phases
+    there is no trailing access voltage … let the end of the phase be the
+    electrode polarization … use the absolute minimum of the derivative in
+    that phase to pinpoint the electrode polarization").
+
+    A non-zero ``offset_ua`` floor makes the current end at the floor (a
+    real current-off step at the phase boundary), so this returns False and
+    E_pol stays computable.  Data-driven off the shape's rendered
+    breakpoints so it tracks the actual contour rather than a hard-coded
+    shape list."""
+    from .waveforms import shape_breakpoints
+    try:
+        bps = shape_breakpoints(
+            amplitude_ua=float(ph.amplitude_ua), width_us=float(ph.width_us),
+            shape=ph.shape, bump_count=int(getattr(ph, "bump_count", 3)),
+            tau_us=float(getattr(ph, "tau_us", 0.0)),
+            offset_ua=float(getattr(ph, "offset_ua", 0.0)))
+    except Exception:
+        return False
+    if not bps:
+        return False
+    peak = max((abs(a) for (_, a) in bps), default=0.0)
+    if peak <= 0:
+        return False
+    return abs(bps[-1][1]) < frac * peak
+
+
 def polarization_per_phase(
     time_us: np.ndarray, e_trace: np.ndarray, pattern: PulsePattern,
     *, depol_us: float = DEPOLARIZATION_TIME_US,
@@ -1212,6 +1250,35 @@ def polarization_per_phase(
         dpp = driving_per_phase or []
         lap = leading_access_per_phase or []
         tap = trailing_epol_per_phase or []
+        # Despiked trace (median filter) for the settled-value read below.
+        _ds_full = _despike(e_trace, time_us)
+
+        def _epol_min_derivative(phase_idx: int) -> float:
+            """E_pol for a phase whose current tapers to ~0 at its end: the
+            settled voltage at the FLATTEST point (min |dV/dt|) in the LATTER
+            half of the phase, where the current has decayed so V is the
+            interface polarization with no ohmic drop (operator: "let the end
+            of the phase be the electrode polarization … use the absolute
+            minimum of the derivative in that phase to pinpoint it" — the same
+            flat-point read used for the ending-interphase potential).  The
+            latter-half restriction keeps a mid-phase inflection (IR falling
+            while polarization rises) from masquerading as the settled point."""
+            cursor = float(onset_us)
+            for kk, phk in enumerate(pattern.phases):
+                if kk == phase_idx:
+                    t_start = cursor
+                    t_end = cursor + phk.width_us
+                    t_lo = t_start + 0.5 * phk.width_us
+                    idxs = np.nonzero(
+                        (time_us >= t_lo) & (time_us <= t_end))[0]
+                    if idxs.size < 4:
+                        return _time_sample(phase_idx)
+                    seg = _ds_full[idxs]
+                    dv = np.abs(np.gradient(seg))
+                    return float(seg[int(np.argmin(dv))])
+                cursor += phk.width_us + phk.delay_after_us
+            return float("nan")
+
         res: List[float] = []
         for k, ph in enumerate(pattern.phases):
             d_k = float(ph.delay_after_us)
@@ -1222,7 +1289,18 @@ def polarization_per_phase(
                 tv = tap[k] if k < len(tap) else float("nan")
                 res.append(float(tv) if np.isfinite(tv) else _time_sample(k))
                 continue
-            # (3)/(4) delay-less: needs a clean leading access.
+            # (3a) a phase whose current TAPERS TO ~0 at its end (exp-decay,
+            # linear-decreasing without a current offset) has no trailing IR
+            # step — but its END *is* the polarization (current ~0 → no ohmic
+            # drop): read the settled voltage at the flattest point (min
+            # |dV/dt|) in the phase, regardless of the leading access
+            # (operator: "let the end of the phase be the electrode
+            # polarization … use the absolute minimum of the derivative").
+            if _phase_current_ends_near_zero(ph):
+                res.append(_epol_min_derivative(k))
+                continue
+            # (3)/(4) delay-less flat/constant-ending phase: needs a clean
+            # leading access to subtract the (constant) ohmic drop.
             has_lead = (k == 0) or (pattern.phases[k - 1].delay_after_us > 0)
             d = dpp[k] if k < len(dpp) else float("nan")
             la = lap[k] if k < len(lap) else float("nan")
@@ -1990,8 +2068,17 @@ def is_continuous_sinusoidal(pattern) -> bool:
             return False                      # same polarity → not biphasic
         if abs(phs[0].width_us - phs[1].width_us) > 1e-6:
             return False                      # unequal widths → asymmetric
-        if abs(phs[0].delay_after_us) > 1e-6 or abs(phs[1].delay_after_us) > 1e-6:
-            return False                      # interphase / discharge delay
+        if abs(phs[0].delay_after_us) > 1e-6:
+            return False                      # interphase delay → not continuous
+        # The TRAILING (phase-2) discharge delay is allowed ONLY when it's
+        # rendered as an auto-discharge SHORT (``interpulse_discharge_us`` > 0):
+        # the sinusoid is still continuous, the brief inter-cycle short is
+        # windowed out of the Ghazavi E_off, so the KHFAC / DC analysis keeps
+        # applying (operator: "replace a 0-µA step … keep the analysis").  A
+        # plain floating discharge step still disqualifies (not continuous).
+        _ipd = float(getattr(pattern, "interpulse_discharge_us", 0.0) or 0.0)
+        if abs(phs[1].delay_after_us) > 1e-6 and _ipd <= 0:
+            return False                      # floating discharge → not continuous
         if pattern.has_interpulse_gap():
             return False                      # idle interpulse → not continuous
     except Exception:
@@ -2001,7 +2088,8 @@ def is_continuous_sinusoidal(pattern) -> bool:
 
 def ghazavi_polarization(v_m: np.ndarray, i_mon_ua: np.ndarray,
                          time_us: Optional[np.ndarray] = None,
-                         *, rate_hz: Optional[float] = None):
+                         *, rate_hz: Optional[float] = None,
+                         robust: bool = False):
     """Electrode polarization from a continuous sinusoidal voltage transient —
     port of Ghazavi & Cogan (2018) §2.3.
 
@@ -2072,9 +2160,25 @@ def ghazavi_polarization(v_m: np.ndarray, i_mon_ua: np.ndarray,
     # ×1e3 → kΩ  (V/µA = 1e6 Ω = 1e3 kΩ).
     r_v_per_ua = float(np.sum(v_ac * i_ac) / denom)
     e_i = v - r_v_per_ua * i_ac               # interface potential, DC retained
-    out["e_mc_v"] = float(np.min(e_i))
-    out["e_ma_v"] = float(np.max(e_i))
-    out["e_off_v"] = float(np.mean(e_i))
+    # WINDOW OUT the 1 µs interpulse-discharge transient (operator: "keep KHFAC
+    # analysis, window it out").  A real auto-discharge short each cycle drives
+    # E_i briefly toward equilibrium + can throw a switching spike — a rare
+    # (~0.5 % of samples) OUTLIER vs the sinusoid, which is dense near its
+    # peaks.  MAD-clip rejects it, so E_off (mean) isn't biased and E_mc/E_ma
+    # (min/max) aren't set by a switching spike — the sinusoid peaks (many
+    # samples) survive the clip untouched.  Gated: only when ``robust`` (a
+    # discharge is present), so a plain continuous sinusoid is byte-unchanged.
+    e_stat = e_i
+    if robust and e_i.size >= 16:
+        med = float(np.median(e_i))
+        mad = float(np.median(np.abs(e_i - med)))
+        if mad > 0:
+            keep = np.abs(e_i - med) <= 6.0 * 1.4826 * mad
+            if np.count_nonzero(keep) >= 16:
+                e_stat = e_i[keep]
+    out["e_mc_v"] = float(np.min(e_stat))
+    out["e_ma_v"] = float(np.max(e_stat))
+    out["e_off_v"] = float(np.mean(e_stat))
     out["e_io_v"] = 0.5 * (out["e_ma_v"] - out["e_mc_v"])
     out["r_access_kohm"] = abs(r_v_per_ua) * 1e3
     # ACCESS VOLTAGE amplitude V_ro = R_access · I_o (Ghazavi eq 4, = their
@@ -2390,7 +2494,8 @@ def complex_impedance(v_mon: np.ndarray, i_mon_ua: np.ndarray,
 
 def recompute_capture_metrics(capture: Capture, surface_area_um2: float,
                               *, class_override=None,
-                              polarization_source: str = "auto") -> CaptureMetrics:
+                              polarization_source: str = "auto",
+                              depol_us: Optional[float] = None) -> CaptureMetrics:
     """Re-run :func:`compute_metrics` for a capture, optionally FORCING the
     response class (POLARIS "Good / Broken / Open" override — operator: "setting
     the channel/combo as Good/Broken/Open (the appropriate metrics are to be
@@ -2401,10 +2506,18 @@ def recompute_capture_metrics(capture: Capture, surface_area_um2: float,
     chosen class — Good keeps access V/R + E_pol (C_eff cleared), Broken fits
     the parallel R‖C (R, C, τ) and suppresses access/E_pol, Open/Capacitive
     report the linear C_eff and suppress access/E_pol.  Mutates + returns
-    ``capture.metrics``."""
+    ``capture.metrics``.
+
+    ``depol_us`` defaults to the value already stored on ``capture.metrics``
+    (so a POLARIS re-classify keeps the run's E_pol time delay), falling back
+    to the canonical 12 µs for legacy captures."""
+    if depol_us is None:
+        prev = getattr(capture, "metrics", None)
+        depol_us = float(getattr(prev, "depolarization_us", DEPOLARIZATION_TIME_US)
+                         or DEPOLARIZATION_TIME_US)
     return compute_metrics(capture, surface_area_um2,
                            polarization_source=polarization_source,
-                           force_class=class_override)
+                           force_class=class_override, depol_us=depol_us)
 
 
 def compute_metrics(capture: Capture, surface_area_um2: float,
@@ -2412,7 +2525,8 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
                     force_class: Optional[str] = None,
                     failure_open_z_mohm: Optional[float] = None,
                     failure_broken_z_mohm: Optional[float] = None,
-                    failure_min_current_ua: float = 0.0) -> CaptureMetrics:
+                    failure_min_current_ua: float = 0.0,
+                    depol_us: float = DEPOLARIZATION_TIME_US) -> CaptureMetrics:
     """Populate ``capture.metrics`` from its raw traces.
 
     Orchestrates every per-capture analysis: charge injection, driving
@@ -2439,6 +2553,12 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     """
     pat = capture.pattern
     m = CaptureMetrics()
+    # Record the E_pol time delay used, so the plot markers + POLARIS read the
+    # SAME value the polarization was computed with (operator-configurable).
+    try:
+        m.depolarization_us = float(depol_us)
+    except (TypeError, ValueError):
+        m.depolarization_us = DEPOLARIZATION_TIME_US
 
     # ----- 1. Charge math -------------------------------------------------
     # Q_ph and Q_inj depend only on the *pattern* and surface area, never
@@ -2681,7 +2801,7 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # agree.
     m.polarization_per_phase_v = polarization_per_phase(
         capture.time_us, active_trace, pat, method="operator",
-        onset_us=onset_us,
+        depol_us=depol_us, onset_us=onset_us,
         driving_per_phase=m.active_driving_voltage_per_phase_v,
         leading_access_per_phase=_lead_mags(m.access_voltage_per_phase_v),
         trailing_epol_per_phase=_trail_epol(active_trace, access_idx),
@@ -2689,7 +2809,8 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # RETURN E_pol only when a separate E_ret trace is recorded.
     if _has_eret:
         m.return_polarization_per_phase_v = polarization_per_phase(
-            capture.time_us, e_ret, pat, method="operator", onset_us=onset_us,
+            capture.time_us, e_ret, pat, method="operator",
+            depol_us=depol_us, onset_us=onset_us,
             driving_per_phase=m.return_driving_voltage_per_phase_v,
             leading_access_per_phase=_lead_mags(
                 m.return_access_voltage_per_phase_v),
@@ -2709,9 +2830,13 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # biphasic symmetric sinusoidal … with no interphase, discharge, and
     # interpulse delays").
     if is_continuous_sinusoidal(pat):
+        # Window out the 1 µs interpulse-discharge transient (robust E_off /
+        # extrema) only when the pattern actually carries one — a plain
+        # continuous sinusoid stays byte-identical.
+        _robust_khfac = float(getattr(pat, "interpulse_discharge_us", 0.0)) > 0
         g = ghazavi_polarization(
             active_trace, capture.i_mon_ua, capture.time_us,
-            rate_hz=getattr(pat, "rate_hz", None))
+            rate_hz=getattr(pat, "rate_hz", None), robust=_robust_khfac)
         m.polarization_method = "sinusoidal"
         m.ghazavi_e_mc_v = g["e_mc_v"]
         m.ghazavi_e_ma_v = g["e_ma_v"]
@@ -2727,7 +2852,7 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
         if _has_eret:
             g_ret = ghazavi_polarization(
                 e_ret, capture.i_mon_ua, capture.time_us,
-                rate_hz=getattr(pat, "rate_hz", None))
+                rate_hz=getattr(pat, "rate_hz", None), robust=_robust_khfac)
             m.ghazavi_return_e_mc_v = g_ret["e_mc_v"]
             m.ghazavi_return_e_ma_v = g_ret["e_ma_v"]
             m.ghazavi_return_e_io_v = g_ret["e_io_v"]

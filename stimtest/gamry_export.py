@@ -115,6 +115,26 @@ def _meta_row(ws, row: int, tag: str, kind: str, value: str, comment: str = "") 
     return row + 1
 
 
+def _burst_meta_tuples(p) -> list:
+    """Extra preamble rows describing the burst structure — empty for an
+    ordinary (non-burst) pattern.  ``(tag, kind, value, comment)`` tuples so
+    both the xlsx (``_meta_row``) and the .DTA text writers can consume them.
+    The plain ``RATE`` row (relabelled 'Intra-burst pulse rate' in burst mode)
+    stays the intra-burst pulse rate; these add the grouping."""
+    if not getattr(p, "is_burst", False):
+        return []
+    return [
+        ("PULSESPB", "QUANT", _fmt_int(p.pulses_per_burst),
+         "Pulses per burst"),
+        ("BURSTPER", "QUANT", _fmt(p.burst_period_us * 1e-6),
+         "Burst period (s)"),
+        ("BURSTRATE", "QUANT", _fmt(p.burst_rate_hz),
+         "Burst repetition rate (bursts/s)"),
+        ("OVERALLRATE", "QUANT", _fmt(p.effective_pulse_rate_hz),
+         "Overall pulse rate (pps)"),
+    ]
+
+
 def _section_header(ws, row: int, name: str) -> int:
     c = ws.cell(row=row, column=1, value=name)
     c.font = BOLD
@@ -257,7 +277,10 @@ def _write_parameters_sheet(wb: Workbook, session: Session) -> None:
                     "Cathodal-first" if p.polarity == -1 else "Anodal-first",
                     "Sign of excitation phase")
     row = _meta_row(ws, row, "RATE", "QUANT", _fmt(p.rate_hz),
-                    "Pulse repetition rate (pps)")
+                    "Intra-burst pulse rate (pps)" if getattr(p, "is_burst", False)
+                    else "Pulse repetition rate (pps)")
+    for _tag, _kind, _val, _cm in _burst_meta_tuples(p):
+        row = _meta_row(ws, row, _tag, _kind, _val, _cm)
     row = _meta_row(ws, row, "REPS", "QUANT", _fmt_int(p.repetitions),
                     "Repetitions per train (0 = infinite)")
     for i, ph in enumerate(p.phases, start=1):
@@ -969,7 +992,10 @@ def _write_electrode_sheet(wb: Workbook, session: Session, run: ChannelRun,
                     ("Monophasic" if p.num_phases == 1 else "Biphasic"),
                     "Pulse pattern")
     row = _meta_row(ws, row, "RATE", "QUANT", _fmt(p.rate_hz),
-                    "Repetition rate (pps)")
+                    "Intra-burst pulse rate (pps)" if getattr(p, "is_burst", False)
+                    else "Repetition rate (pps)")
+    for _tag, _kind, _val, _cm in _burst_meta_tuples(p):
+        row = _meta_row(ws, row, _tag, _kind, _val, _cm)
     for k, ph in enumerate(p.phases, start=1):
         row = _meta_row(ws, row, f"AMP{k}", "QUANT", _fmt(ph.amplitude_ua),
                         f"Phase {k} amplitude (uA)")
@@ -1152,8 +1178,10 @@ def _dta_write(f, session: Session, run: ChannelRun, channel_id: str,
          "Pulse polarity"),
         ("PATTERN", "LABEL",
          "Triphasic" if p.is_triphasic else "Biphasic", "Pulse pattern"),
-        ("RATE", "QUANT", _fmt(p.rate_hz), "Repetition rate (pps)"),
-    ]
+        ("RATE", "QUANT", _fmt(p.rate_hz),
+         "Intra-burst pulse rate (pps)" if getattr(p, "is_burst", False)
+         else "Repetition rate (pps)"),
+    ] + _burst_meta_tuples(p)
     for tag, kind, val, comment in rows:
         f.write(f"{tag}\t{kind}\t{val}\t{comment}\n")
     for k, ph in enumerate(p.phases, start=1):

@@ -72,6 +72,22 @@ def test_camera_service_enumerate_returns_list(qapp):
         assert isinstance(is_default, bool)
 
 
+def test_disable_camera_env_var_short_circuits_qtmm(qapp, monkeypatch):
+    """``PULSAR_DISABLE_CAMERA=1`` makes ``_ensure_qtmm`` return False BEFORE
+    any ``QMediaDevices.videoInputs()`` call, so a bad camera / driver can't
+    hang the GUI thread at startup.  With it set, enumeration returns [] and no
+    QtMultimedia device scan runs."""
+    from stimtest.gui.camera import camera_service
+    svc = camera_service()
+    monkeypatch.setenv("PULSAR_DISABLE_CAMERA", "1")
+    svc._qtmm_imported = False            # re-evaluate the gate (fresh-start sim)
+    try:
+        assert svc._ensure_qtmm() is False
+        assert svc.enumerate_devices() == []
+    finally:
+        svc._qtmm_imported = False        # let later tests re-import cleanly
+
+
 def test_camera_service_snapshot_with_no_camera_is_safe(qapp):
     """Calling ``take_snapshot`` before ``connect_to`` succeeds must
     not raise — the status message tells the user to connect first."""

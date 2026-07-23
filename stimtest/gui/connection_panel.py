@@ -206,6 +206,23 @@ class ConnectionPanel(QtWidgets.QGroupBox):
     # background thread back to the GUI thread. Carries the opened
     # Oscilloscope on success, or an Exception on failure.
     _scopeConnectResult = QtCore.pyqtSignal(object)
+    # Internal signal for marshalling the scope-DETECTION result from the
+    # background enumeration thread back to the GUI thread.  Carries a
+    # dict describing what VISA enumeration found.  The enumeration runs
+    # OFF the GUI thread with a hard timeout because
+    # ``pyvisa.ResourceManager().list_resources()`` on the NI-VISA
+    # backend can BLOCK INDEFINITELY when the VISA layer is wedged (a
+    # stale USB-TMC claim from a crashed process, a scope on the in-box
+    # Microsoft usbtmc driver rather than NI-VISA's, or NI-VISA mid-scan)
+    # — running it synchronously on the GUI thread froze PULSAR at
+    # startup for as long as NI-VISA hung.  See ``_SCOPE_DETECT_TIMEOUT_S``.
+    _scopeDetectResult = QtCore.pyqtSignal(object)
+    # Hard per-run budget for the whole scope-detection enumeration.  A
+    # wedged NI-VISA ``list_resources()`` never returns, so we cap the
+    # wait and report "detection timed out" rather than blocking.  The
+    # daemon enumeration thread is abandoned (it dies with the process);
+    # the GUI never waits on it.
+    _SCOPE_DETECT_TIMEOUT_S = 6.0
     # Fires whenever scope connection state flips. Setup tab listens
     # so it can blank out the channel-mapping rows when no scope is up.
     scopeConnected = QtCore.pyqtSignal(bool)
@@ -362,6 +379,11 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.scope_detect_dot = self._make_dot(_DOT_OFF)
         self.scope_detect_dot.setToolTip("Oscilloscope detection: not yet checked.")
         self.scope_detect_text = _make_label("Oscilloscope detection pending…")
+        # Guard so repeated refresh calls (hot-plug bursts, tab re-entry)
+        # don't stack multiple enumeration threads while one is still
+        # running — important because a wedged NI-VISA enumeration leaks
+        # its daemon thread, and we don't want to leak one per refresh.
+        self._scope_detect_in_flight = False
         self.scope_dot = self._make_dot(_DOT_OFF)
         # Description label — empty until Connect succeeds and fills
         # it with make + model + VISA resource. Cleared on Disconnect.
@@ -686,7 +708,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             # concurrent init; just remind the user how to clear a stall.
             self.log.emit(
                 "Stimulator initialization already in progress — if it's "
-                "stuck, close the Plexon Sim-2 / Stim-2 application and "
+                "stuck, close the Plexon Stim-2 application and "
                 "power-cycle the stimulator, then retry.")
             return
         if self._stim is not None:
@@ -774,7 +796,7 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             return   # init already finished — nothing to warn about
         self.log.emit(
             "Stimulator initialization is taking longer than expected. "
-            "This almost always means the Plexon Sim-2 / Stim-2 "
+            "This almost always means the Plexon Stim-2 "
             "application is holding the USB lock. Close it (via Task "
             "Manager if needed), then power-cycle the stimulator. The "
             "window stays responsive — you can retry once it's cleared.")
@@ -1179,7 +1201,13 @@ class ConnectionPanel(QtWidgets.QGroupBox):
                 result = exc
             # Emit the signal — PyQt6 signals are thread-safe and will
             # deliver the payload on the GUI thread via the event queue.
-            self._stimDetectResult.emit(result)
+            # Guard against the panel's C++ object having been deleted
+            # while the probe ran (a short-lived widget / test torn down
+            # mid-probe): emitting on a deleted QObject raises RuntimeError.
+            try:
+                self._stimDetectResult.emit(result)
+            except RuntimeError:
+                pass
         threading.Thread(target=_thread, daemon=True).start()
 
     @QtCore.pyqtSlot(object)
@@ -1213,89 +1241,186 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         self.stim_detect_dot.setToolTip(tip)
         self.stim_detect_text.setToolTip(tip)
 
+    # Vendor-ID prefixes for VISA USB resources.
+    # NI-VISA returns hex:  "USB0::0x0699::0x03C7::SERIAL::INSTR"
+    # pyvisa-py returns decimal: "USB0::1689::967::SERIAL::0::INSTR"
+    # Include both forms so detection works with either backend.
+    _SCOPE_VENDOR_IDS = (
+        "0x0699", "1689",   # Tektronix (hex / decimal)
+        "0x0957", "2391",   # Keysight / Agilent
+        "0x0AAD", "2733",   # Rohde & Schwarz
+    )
+
     def _refresh_scope_detection_indicator(self):
         """Light up the scope detection dot from the VISA resource list.
 
-        Tries pyvisa's ``ResourceManager.list_resources()`` to see if
-        anything is on the USB-TMC / VISA bus. We don't *open* any
-        resource here (that would block the panel and may steal a
-        device the user is about to talk to from the bench); we just
-        look at descriptors. Heuristic: anything matching a known
-        scope vendor ID (Tek = ``0x0699``, Keysight = ``0x0957``,
-        R&S = ``0x0AAD``) is treated as "scope detected". A bare
-        VISA runtime with no matching device → amber. No VISA at
-        all → grey.
+        The actual ``pyvisa.ResourceManager().list_resources()`` call
+        runs **on a daemon thread with a hard timeout**
+        (:data:`_SCOPE_DETECT_TIMEOUT_S`).  This is deliberate: the
+        NI-VISA backend's ``list_resources()`` can **block
+        indefinitely** when the VISA layer is wedged (a stale USB-TMC
+        claim left by a crashed process, a scope bound to the in-box
+        Microsoft ``usbtmc`` driver instead of NI-VISA, or NI-VISA
+        mid-scan).  Running it synchronously on the GUI thread — as the
+        old code did, via ``singleShot(0)`` at startup — froze PULSAR's
+        launch for the entire time NI-VISA hung.  Now the panel renders
+        immediately, shows a "checking…" state, and resolves the dot
+        when the bounded enumeration returns (or times out).
+
+        We don't *open* any resource here (that would block and could
+        steal a device the user is about to talk to from the bench); we
+        just look at descriptors.  Heuristic: anything matching a known
+        scope vendor ID (Tek ``0x0699``, Keysight ``0x0957``, R&S
+        ``0x0AAD``) is "scope detected".  A VISA runtime with resources
+        but no scope → amber; none → grey; enumeration timed out → amber
+        with a distinct message so the user knows it wasn't a clean
+        "no scope" answer.
+        """
+        # Skip if an enumeration is already running — a wedged NI-VISA
+        # call leaks its daemon thread, so we must not stack one per
+        # refresh (hot-plug bursts / tab re-entry can fire this rapidly).
+        if getattr(self, "_scope_detect_in_flight", False):
+            return
+        # Immediate "checking…" state so the panel never looks frozen.
+        self._set_dot(self.scope_detect_dot, _DOT_WARN)
+        self.scope_detect_text.setText("Oscilloscope detection…")
+
+        # Wire the result signal exactly once (UniqueConnection — same
+        # idempotent pattern as the stim detect probe).
+        try:
+            self._scopeDetectResult.disconnect(self._on_scope_detect_result)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self._scopeDetectResult.connect(
+                self._on_scope_detect_result,
+                QtCore.Qt.ConnectionType.UniqueConnection)
+        except TypeError:
+            pass
+
+        self._scope_detect_in_flight = True
+        import threading
+
+        def _thread():
+            result = self._enumerate_scopes_bounded(
+                self._SCOPE_DETECT_TIMEOUT_S)
+            # PyQt6 signals are thread-safe; the payload is delivered on
+            # the GUI thread via the event queue.  Guard against the panel's
+            # C++ object having been deleted while we were enumerating (a
+            # short-lived widget / test torn down mid-probe — likely because
+            # this enumeration can take up to _SCOPE_DETECT_TIMEOUT_S when
+            # VISA is wedged): emitting on a deleted QObject raises
+            # RuntimeError.
+            try:
+                self._scopeDetectResult.emit(result)
+            except RuntimeError:
+                pass
+        threading.Thread(target=_thread, daemon=True).start()
+
+    @classmethod
+    def _enumerate_scopes_bounded(cls, budget_s: float) -> dict:
+        """Enumerate VISA resources across backends within ``budget_s``.
+
+        Returns a plain dict (marshalled to the GUI thread):
+        ``{"no_visa": bool, "resources": tuple, "timed_out": bool,
+        "error": str|None}``.  Never raises.  Each backend's
+        ``list_resources()`` runs in its own daemon thread so a backend
+        that hangs (NI-VISA when wedged) is abandoned at the deadline
+        instead of blocking the whole probe.
         """
         try:
-            import pyvisa
-        except Exception as e:
+            import pyvisa  # noqa: F401
+        except Exception as e:  # pragma: no cover - env dependent
+            return {"no_visa": True, "resources": (), "timed_out": False,
+                    "error": str(e)}
+
+        import time
+        deadline = time.monotonic() + max(0.5, float(budget_s))
+        resources: tuple = ()
+        fallback: tuple = ()
+        timed_out = False
+        for backend in ("@py", ""):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            res, hit_timeout = cls._list_resources_with_timeout(
+                backend, remaining)
+            if hit_timeout:
+                # This backend wedged; note it and try the next one only
+                # if there's budget left (the outer loop re-checks).
+                timed_out = True
+                continue
+            if not res:
+                continue
+            # Prefer the backend that actually finds a scope. @py may see
+            # only a serial COM port while NI-VISA sees the USB-TMC scope
+            # (or vice-versa when NI-VISA is wedged).
+            if any(vid in r for r in res for vid in cls._SCOPE_VENDOR_IDS):
+                resources = res
+                timed_out = False
+                break
+            if not fallback:
+                fallback = res
+        if not resources:
+            resources = fallback
+        return {"no_visa": False, "resources": tuple(resources),
+                "timed_out": timed_out, "error": None}
+
+    @classmethod
+    def _list_resources_with_timeout(cls, backend: str, timeout_s: float):
+        """Run one backend's ``list_resources()`` in a daemon thread and
+        wait at most ``timeout_s``.  Returns ``(resources, timed_out)``.
+        A hung enumeration leaves its daemon thread running (it dies with
+        the process); we never join it past the deadline."""
+        import pyvisa
+        import warnings
+        import threading
+        box: dict = {"res": (), "done": False}
+
+        def _run():
+            try:
+                # ``list_resources()`` MUST be inside catch_warnings — the
+                # pyvisa-py TCPIP discovery UserWarnings fire during
+                # enumeration, not during ResourceManager construction.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    rm = (pyvisa.ResourceManager(backend) if backend
+                          else pyvisa.ResourceManager())
+                    box["res"] = tuple(rm.list_resources())
+            except Exception:
+                box["res"] = ()
+            finally:
+                box["done"] = True
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(max(0.1, float(timeout_s)))
+        if not box["done"]:
+            return (), True   # wedged — abandon this backend
+        return box["res"], False
+
+    @QtCore.pyqtSlot(object)
+    def _on_scope_detect_result(self, result):
+        """Apply the bounded-enumeration result on the GUI thread."""
+        self._scope_detect_in_flight = False
+        if not isinstance(result, dict):
+            result = {"no_visa": False, "resources": (),
+                      "timed_out": False, "error": None}
+        if result.get("no_visa"):
             self._set_dot(self.scope_detect_dot, _DOT_OFF)
             text = "VISA backend not available"
-            tip = (f"Could not import pyvisa: {e}\n\n"
+            tip = (f"Could not import pyvisa: {result.get('error')}\n\n"
                    "Install the pyvisa runtime (NI-VISA, TekVISA, or the "
                    "bundled pyvisa-py) before connecting a scope.")
             self.scope_detect_text.setText(text)
             self.scope_detect_dot.setToolTip(tip)
             self.scope_detect_text.setToolTip(tip)
             return
-        # Vendor-ID prefixes for VISA USB resources.
-        # NI-VISA returns hex:  "USB0::0x0699::0x03C7::SERIAL::INSTR"
-        # pyvisa-py returns decimal: "USB0::1689::967::SERIAL::0::INSTR"
-        # Include both forms so detection works with either backend.
-        scope_vendor_ids = (
-            "0x0699", "1689",   # Tektronix (hex / decimal)
-            "0x0957", "2391",   # Keysight / Agilent
-            "0x0AAD", "2733",   # Rohde & Schwarz
-        )
-        try:
-            import warnings
-            resources = ()
-            fallback = ()
-            for backend in ("@py", ""):
-                try:
-                    # ``list_resources()`` MUST be inside the
-                    # catch_warnings block — the pyvisa-py TCPIP discovery
-                    # UserWarnings ("limited to the default interface" /
-                    # "requires the zeroconf package") fire during
-                    # enumeration, NOT during ResourceManager construction.
-                    # The old code only wrapped the constructor, so those
-                    # warnings leaked to the console at every startup probe.
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        rm = (pyvisa.ResourceManager(backend) if backend
-                              else pyvisa.ResourceManager())
-                        res = rm.list_resources()
-                except Exception:
-                    continue
-                if not res:
-                    continue
-                # Prefer the backend that actually finds a scope. The @py
-                # (pyvisa-py) backend may enumerate only a serial COM port
-                # (e.g. ASRL3::INSTR) while NI-VISA (the default backend) is
-                # the one that sees the USB-TMC scope. Breaking on the first
-                # backend with ANY resource would lock onto @py's COM port
-                # and never reach NI-VISA -> "Oscilloscope not detected"
-                # even though NI-VISA can see it.
-                if any(vid in r for r in res for vid in scope_vendor_ids):
-                    resources = res
-                    break
-                if not fallback:
-                    fallback = res
-            if not resources:
-                resources = fallback
-        except Exception as e:
-            self._set_dot(self.scope_detect_dot, _DOT_OFF)
-            text = "Oscilloscope not detected"
-            tip = (f"VISA resource enumeration failed: {e}\n\n"
-                   "On a clean machine without NI-VISA the bundled "
-                   "pyvisa-py backend may not enumerate USB-TMC devices "
-                   "until libusb is installed.")
-            self.scope_detect_text.setText(text)
-            self.scope_detect_dot.setToolTip(tip)
-            self.scope_detect_text.setToolTip(tip)
-            return
+        resources = tuple(result.get("resources") or ())
+        timed_out = bool(result.get("timed_out"))
         scope_resources = [r for r in resources
-                           if any(vid in r for vid in scope_vendor_ids)]
+                           if any(vid in r for vid in self._SCOPE_VENDOR_IDS)]
         if scope_resources:
             self._set_dot(self.scope_detect_dot, _DOT_OK)
             # Show the VISA address inline so the user can see it
@@ -1322,6 +1447,25 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             else:
                 self.scope_resource.setCurrentText(primary)
             self.scope_resource.blockSignals(False)
+        elif timed_out:
+            # A backend (typically NI-VISA) did not answer within the
+            # budget — the VISA layer is wedged.  Amber + a distinct
+            # message so the user knows this is NOT a clean "no scope"
+            # answer and Connect may still work (or may need a reboot).
+            self._set_dot(self.scope_detect_dot, _DOT_WARN)
+            text = "Oscilloscope detection timed out"
+            tip = (
+                "VISA resource enumeration did not finish within "
+                f"{self._SCOPE_DETECT_TIMEOUT_S:.0f}s — the VISA layer is "
+                "wedged (a common cause is a stale USB-TMC claim left by a "
+                "previous crashed session, or the scope being bound to the "
+                "in-box Microsoft usbtmc driver rather than NI-VISA).\n\n"
+                "Startup was NOT blocked by this. You can still click "
+                "Initialize to try connecting; if it also hangs, reboot "
+                "the PC (clears the stale claim) or power-cycle the scope "
+                "and replug USB.")
+            if resources:
+                tip += "\n\nResources seen so far:\n  " + "\n  ".join(resources)
         elif resources:
             # VISA backend works but nothing scope-shaped is on the bus.
             self._set_dot(self.scope_detect_dot, _DOT_WARN)

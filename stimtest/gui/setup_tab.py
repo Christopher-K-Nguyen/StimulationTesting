@@ -1202,6 +1202,36 @@ class SetupTab(QtWidgets.QWidget):
             # setValue) no longer false-fires this "user edited" handler.
             sp.editingFinished.connect(self._on_limits_user_edited)
 
+        # ----- custom electrode-polarization time delay (operator) -----------
+        # A checkbox to TOGGLE whether the user inputs a custom E_pol time
+        # delay (the settling window after each phase before the interface
+        # potential is read for the operator TIME method, phase_end + depol).
+        # Unchecked = the canonical DEPOLARIZATION_TIME_US (12 µs); checked =
+        # the spinbox value.  compute_metrics uses it for E_pol, and the plot
+        # markers / POLARIS follow (it's stored per capture).
+        from ..config import DEPOLARIZATION_TIME_US as _DEPOL_DEFAULT
+        self._depol_default_us = float(_DEPOL_DEFAULT)
+        self.depol_custom_chk = QtWidgets.QCheckBox(
+            "Custom E_pol time delay")
+        self.depol_custom_chk.setToolTip(
+            "Override the electrode-polarization time delay used by the "
+            "operator TIME method (E_pol sampled at phase_end + delay, for a "
+            "phase with an interphase / discharge recovery window).\n\n"
+            f"Unchecked → the canonical {self._depol_default_us:g} µs "
+            "(IEEE NER / MATLAB).  Checked → your value below.")
+        self.depol_delay_us = RepeatingDoubleSpinBox()
+        self.depol_delay_us.setRange(0.0, 1000.0)
+        self.depol_delay_us.setDecimals(1)
+        self.depol_delay_us.setSingleStep(1.0)
+        self.depol_delay_us.setSuffix(" µs")
+        self.depol_delay_us.setValue(self._depol_default_us)
+        self.depol_delay_us.setToolTip(
+            "Electrode-polarization time delay (µs) after each phase end. "
+            "Only used when the checkbox to its left is ticked.")
+        self.depol_custom_chk.toggled.connect(self._on_depol_custom_toggled)
+        self.depol_delay_us.editingFinished.connect(self._on_depol_delay_edited)
+        self._update_depol_delay_enabled()
+
         # Oscilloscope channel mapping — inverted from the legacy
         # design: rows are the four scope channels, the dropdown picks
         # which waveform role the channel carries. ``self._role_combos``
@@ -1753,6 +1783,16 @@ class SetupTab(QtWidgets.QWidget):
         lim_v.addLayout(lim_bot)      # …then Tolerance
         lim_w = QtWidgets.QWidget(); lim_w.setLayout(lim_v)
         dev_form.addRow(self._lbl("Potential limits:"), lim_w)
+
+        # E_pol time delay: [x] Custom  [ 12.0 µs ]  (checkbox gates the spin)
+        depol_row = QtWidgets.QHBoxLayout()
+        depol_row.setContentsMargins(0, 0, 0, 0)
+        depol_row.setSpacing(6)
+        depol_row.addWidget(self.depol_custom_chk)
+        depol_row.addWidget(self.depol_delay_us)
+        depol_row.addStretch(1)
+        depol_w = QtWidgets.QWidget(); depol_w.setLayout(depol_row)
+        dev_form.addRow(self._lbl("E_pol time delay:"), depol_w)
 
         # Environment + Gas sparging directly under Tolerance so
         # the user reads the full electrochemistry context as one
@@ -4208,6 +4248,36 @@ class SetupTab(QtWidgets.QWidget):
                 float(self.anodic_limit_v.value()),
                 float(self.polarization_tol_v.value()))
 
+    # ------------------------------------------- E_pol time delay (operator)
+    def current_depolarization_us(self) -> float:
+        """The E_pol time delay (µs) to use for the operator TIME method —
+        the user's spinbox value when the "Custom E_pol time delay" box is
+        ticked, else the canonical ``DEPOLARIZATION_TIME_US`` (12 µs)."""
+        if self.depol_custom_chk.isChecked():
+            return float(self.depol_delay_us.value())
+        return float(self._depol_default_us)
+
+    def _update_depol_delay_enabled(self) -> None:
+        self.depol_delay_us.setEnabled(self.depol_custom_chk.isChecked())
+
+    def _on_depol_custom_toggled(self, on: bool) -> None:
+        self._update_depol_delay_enabled()
+        if on:
+            self.settingChanged.emit(
+                f"E_pol time delay = {self.depol_delay_us.value():g} µs "
+                "(custom)")
+        else:
+            self.settingChanged.emit(
+                f"E_pol time delay = {self._depol_default_us:g} µs (default)")
+
+    def _on_depol_delay_edited(self) -> None:
+        # Commit on Enter/return/focus-out (operator rule — a value edit with a
+        # user-visible side effect must not fire per keystroke).
+        if self.depol_custom_chk.isChecked():
+            self.settingChanged.emit(
+                f"E_pol time delay = {self.depol_delay_us.value():g} µs "
+                "(custom)")
+
     # ------------------------------------------------------------- export
     def setup_snapshot(self) -> dict:
         """Curated dict of setup-tab values for the XLSX export.
@@ -4319,6 +4389,10 @@ class SetupTab(QtWidgets.QWidget):
             "cathodic_limit_v": cathodic_v,
             "anodic_limit_v": anodic_v,
             "polarization_tolerance_v": tol_v,
+            # E_pol time delay (µs) for the operator TIME method — the custom
+            # value when the toggle is on, else the canonical 12 µs.  The
+            # runner reads this from the snapshot into compute_metrics.
+            "depolarization_us": self.current_depolarization_us(),
             # Per-channel role assignment — both views are useful in
             # the export. Per-channel keeps insertion order (CH1, CH2,
             # ...); role-keyed is the inverted lookup.
@@ -4387,6 +4461,9 @@ class SetupTab(QtWidgets.QWidget):
             "acq_n_avg": self._current_n_avg(),
             "horiz_scaling": self.current_horizontal_scaling(),
             "ext_trigger": self.ext_trigger_check.isChecked(),
+            # Custom E_pol time delay toggle + value (operator).
+            "depol_custom": bool(self.depol_custom_chk.isChecked()),
+            "depol_delay_us": float(self.depol_delay_us.value()),
             # ``trig_slope`` removed — see :meth:`current_prefs` for why.
             "scope_has_ext": self._scope_has_ext,
             "device": self.device_combo.currentText(),
@@ -4858,6 +4935,26 @@ class SetupTab(QtWidgets.QWidget):
                     self.acq_navg_spin.setValue(n)
             except (TypeError, ValueError):
                 pass
+        # Custom E_pol time delay — restore the value first, then the toggle
+        # (block signals so the restore doesn't emit a ``settingChanged`` /
+        # false-log during prefs load), then sync the enabled state.
+        if "depol_delay_us" in p:
+            try:
+                self.depol_delay_us.blockSignals(True)
+                self.depol_delay_us.setValue(float(p["depol_delay_us"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.depol_delay_us.blockSignals(False)
+        if "depol_custom" in p:
+            try:
+                self.depol_custom_chk.blockSignals(True)
+                self.depol_custom_chk.setChecked(bool(p["depol_custom"]))
+            except Exception:
+                pass
+            finally:
+                self.depol_custom_chk.blockSignals(False)
+        self._update_depol_delay_enabled()
         # NOTE: ``scope_has_ext`` from prefs is *intentionally not*
         # restored here.  Doing so would show the EXT toggle before
         # any scope had a chance to confirm its model — e.g. an

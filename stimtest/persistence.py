@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from .config import DEPOLARIZATION_TIME_US
 from .session import Capture, ChannelRun, Session
 
 
@@ -248,6 +249,11 @@ def _pattern_dict(p) -> Dict[str, Any]:
     return {
         "rate_hz": p.rate_hz,
         "repetitions": p.repetitions,
+        # Burst grouping (defaults = ordinary single-pulse; legacy .npz
+        # without these keys load as non-burst).
+        "pulses_per_burst": getattr(p, "pulses_per_burst", 1),
+        "burst_period_us": getattr(p, "burst_period_us", 0.0),
+        "interpulse_discharge_us": getattr(p, "interpulse_discharge_us", 0.0),
         "phases": [asdict(ph) for ph in p.phases],
     }
 
@@ -366,6 +372,9 @@ def load_session_npz(path: Path | str) -> "Session":
         phases=[Phase(**ph) for ph in p["phases"]],
         rate_hz=p.get("rate_hz", 50.0),
         repetitions=p.get("repetitions", 0),
+        pulses_per_burst=int(p.get("pulses_per_burst", 1)),
+        burst_period_us=float(p.get("burst_period_us", 0.0)),
+        interpulse_discharge_us=float(p.get("interpulse_discharge_us", 0.0)),
     )
 
     # ----- array -----
@@ -462,6 +471,12 @@ def load_session_npz(path: Path | str) -> "Session":
                 phases=[Phase(**ph) for ph in cap_pat_d["phases"]],
                 rate_hz=cap_pat_d.get("rate_hz", pattern.rate_hz),
                 repetitions=cap_pat_d.get("repetitions", 0),
+                pulses_per_burst=int(cap_pat_d.get(
+                    "pulses_per_burst", pattern.pulses_per_burst)),
+                burst_period_us=float(cap_pat_d.get(
+                    "burst_period_us", pattern.burst_period_us)),
+                interpulse_discharge_us=float(cap_pat_d.get(
+                    "interpulse_discharge_us", pattern.interpulse_discharge_us)),
             )
 
             metrics_d = cap_meta.get("metrics", {})
@@ -573,6 +588,10 @@ def load_session_npz(path: Path | str) -> "Session":
                 # legacy archives lack the keys so default "pulsed" / NaN.
                 polarization_method=metrics_d.get(
                     "polarization_method", "pulsed"),
+                # Operator-configurable E_pol time delay (µs) the metrics were
+                # computed with — legacy npz default to the canonical 12 µs.
+                depolarization_us=metrics_d.get(
+                    "depolarization_us", DEPOLARIZATION_TIME_US),
                 ghazavi_e_mc_v=metrics_d.get("ghazavi_e_mc_v", float("nan")),
                 ghazavi_e_ma_v=metrics_d.get("ghazavi_e_ma_v", float("nan")),
                 ghazavi_e_io_v=metrics_d.get("ghazavi_e_io_v", float("nan")),

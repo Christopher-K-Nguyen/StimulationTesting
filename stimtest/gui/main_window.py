@@ -1304,9 +1304,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if not lines:
                 return "\t(no phases)"
             rate = float(getattr(pat, "rate_hz", 0.0) or 0.0)
+            _burst = bool(getattr(pat, "is_burst", False))
             if rate > 0:
-                # "pps" (pulses per second), NOT "Hz" (operator).
-                lines.append(f"\tRate: {rate:g} pps")
+                # "pps" (pulses per second), NOT "Hz" (operator).  In burst
+                # mode the pulse rate IS the intra-burst rate — label it so.
+                lines.append(
+                    f"\t{'Intra-burst rate' if _burst else 'Rate'}: {rate:g} pps")
+            if _burst:
+                # The overall burst structure (N pulses / burst period).  The
+                # burst REPETITION rate is bursts/s (not a pulse rate → not pps).
+                lines.append(
+                    f"\tBurst: {pat.pulses_per_burst} pulses / "
+                    f"{pat.burst_period_us:.0f} µs "
+                    f"(burst rate {pat.burst_rate_hz:g} /s, inter-burst gap "
+                    f"{pat.inter_burst_gap_us:.0f} µs, "
+                    f"{pat.effective_pulse_rate_hz:g} pps overall)")
             return "\n".join(lines)
         except Exception:
             return f"\t{pat!r}"
@@ -1788,6 +1800,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.statusBar().showMessage(f"Save path not usable: {e}")
                     return
         self.save_dir = p
+        # Non-blocking OneDrive notice (operator: "do not tell the user not
+        # to save to OneDrive, just warn them").  OneDrive can briefly lock
+        # a file mid-write, which surfaces as a transient WinError 5 when a
+        # .npz/.xlsx is written.  Saving there is ALLOWED — this only logs a
+        # one-line heads-up, once per distinct OneDrive folder per session.
+        self._maybe_warn_onedrive_save_dir(p)
         for tab in self._experiment_tabs():
             tab.set_save_dir(p)
         # Forward to the embedded Viewer too — without this, changing
@@ -1811,6 +1829,62 @@ class MainWindow(QtWidgets.QMainWindow):
         # session fields (see ``SetupTab.current_log_filename``).
         self.log_pane.set_log_file(p / self.setup_tab.current_log_filename())
         self.statusBar().showMessage(f"Save path: {p}")
+
+    @staticmethod
+    def _is_onedrive_path(p: "Path") -> bool:
+        """True if ``p`` is inside a OneDrive-synced folder.
+
+        Prefers the OS-provided ``OneDrive*`` environment variables
+        (the authoritative sync roots), and falls back to a
+        case-insensitive ``OneDrive`` path component so a mapped or
+        non-standard root is still recognised.  Never raises."""
+        import os
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        try:
+            for var in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+                root = os.environ.get(var)
+                if not root:
+                    continue
+                try:
+                    root_p = Path(root).expanduser().resolve()
+                except Exception:
+                    continue
+                try:
+                    rp.relative_to(root_p)
+                    return True
+                except (ValueError, RuntimeError):
+                    pass
+            # Fallback: a literal "onedrive" component anywhere in the path.
+            return any(part.lower().startswith("onedrive")
+                       for part in rp.parts)
+        except Exception:
+            return False
+
+    def _maybe_warn_onedrive_save_dir(self, p: "Path"):
+        """Log a single non-blocking heads-up when the Save location is
+        under OneDrive.  De-duped per distinct folder so it never nags."""
+        try:
+            if not self._is_onedrive_path(p):
+                return
+            key = str(p).lower()
+            warned = getattr(self, "_onedrive_warned_paths", None)
+            if warned is None:
+                warned = set()
+                self._onedrive_warned_paths = warned
+            if key in warned:
+                return
+            warned.add(key)
+            self.log_pane.log(
+                "Note: the Save location is inside OneDrive. Saving works, "
+                "but OneDrive can briefly lock a file mid-sync — if a save "
+                "ever fails with 'Access is denied', just retry, or pick a "
+                "non-synced local folder (e.g. C:\\PULSAR_data).")
+        except Exception:
+            # A logging convenience must never break the save-path change.
+            pass
 
     def _on_log_filename_changed(self, filename: str):
         """Notebook / session field edited — repoint the log mirror.

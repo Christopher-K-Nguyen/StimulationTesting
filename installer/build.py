@@ -209,6 +209,13 @@ def preflight() -> None:
 
 def run_pyinstaller(clean: bool) -> None:
     if clean:
+        # ``--clean`` wipes ONLY the PyInstaller work dirs (build/ + dist/).
+        # ``installer/Output/`` is DELIBERATELY NOT in this set — it is an
+        # APPEND-ONLY version archive (operator: "include all versions of the
+        # generated installers"): every ``PULSAR-Setup-<v>.exe`` is retained
+        # across builds so Output keeps the full installer history, while only
+        # the version-LESS delivery ZIPs (+ README / whitelist) are overwritten
+        # to hold the LATEST build.  NEVER add "Output" to this clean list.
         for sub in ("build", "dist"):
             p = ROOT / "installer" / sub
             if p.exists():
@@ -643,6 +650,24 @@ def package_release(app_version: str, out_dir: Path) -> None:
               f"it.  Regenerate the manual before a real release.")
     manual_part = [MANUAL_HTML] if MANUAL_HTML.is_file() else []
 
+    # CWRU manual variant: the source manual keeps the CWRU-only restricted
+    # shapes (Speedbumps / Bowtie / Halfpipe) commented out inside a
+    # ``<!-- CWRU-ONLY:START … CWRU-ONLY:END -->`` block, so the PUBLIC manual
+    # never shows them.  For the CWRU ZIP we strip just the two delimiter
+    # strings, which reveals those rows.  No-op (identical to public) if the
+    # markers aren't present, so it's safe across manual revisions.
+    def _cwru_manual() -> list:
+        if not (cwru_exe.exists() and MANUAL_HTML.is_file()):
+            return manual_part
+        src = MANUAL_HTML.read_text(encoding="utf-8")
+        cwru_src = (src.replace("<!-- CWRU-ONLY:START", "")
+                       .replace("CWRU-ONLY:END -->", ""))
+        if cwru_src == src:
+            return manual_part  # no markers — same file
+        cwru_manual = out_dir / "PULSAR-POLARIS-Manual.html"
+        cwru_manual.write_text(cwru_src, encoding="utf-8", newline="\n")
+        return [cwru_manual]
+
     if pub_exe.exists():
         # Version-LESS ZIP name (operator: keep the OneDrive link stable across
         # releases) — the version is inside, on the installer .exe + README.
@@ -658,7 +683,7 @@ def package_release(app_version: str, out_dir: Path) -> None:
             app_version, pub_hash or "(public build not produced)", cwru_hash,
             cwru_exe.stat().st_size / 1e6, today.isoformat()), encoding="utf-8")
         zc = out_dir / "PULSAR-CWRU.zip"
-        members = [cwru_exe, readme, wl] + manual_part
+        members = [cwru_exe, readme, wl] + _cwru_manual()
         _make_zip(zc, members)
         print(f"[package] {zc.name}  ({zc.stat().st_size/1e6:.0f} MB): "
               + ", ".join(Path(m).name for m in members))
@@ -794,9 +819,25 @@ def main() -> int:
     if not args.skip_package and out.exists():
         package_release(app_version, out)
     if out.exists():
-        for setup in sorted(out.glob("*.exe")):
-            size_mb = setup.stat().st_size / 1e6
-            print(f"  installer: {setup} ({size_mb:.1f} MB)")
+        # Output/ is an APPEND-ONLY version archive (operator: "include all
+        # versions of the generated installers"); the version-LESS ZIPs hold
+        # the LATEST build.  Report the two distinctly so it's clear the old
+        # installers are retained on purpose.
+        setups = sorted(out.glob("PULSAR-Setup-*.exe"))
+        if setups:
+            print(f"\n[archive] Output/ retains {len(setups)} installer "
+                  f"version(s) (append-only history):")
+            for setup in setups:
+                mark = "   ← this build" if f"-{app_version}" in setup.name \
+                    else ""
+                print(f"    {setup.name:<40} "
+                      f"({setup.stat().st_size/1e6:5.0f} MB){mark}")
+        zips = sorted(out.glob("*.zip"))
+        if zips:
+            print(f"[latest]  delivery ZIP(s) (version-less, now hold "
+                  f"v{app_version}):")
+            for z in zips:
+                print(f"    {z.name:<40} ({z.stat().st_size/1e6:5.0f} MB)")
     return 0
 
 

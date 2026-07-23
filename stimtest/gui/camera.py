@@ -421,6 +421,20 @@ class CameraService(QtCore.QObject):
     def _ensure_qtmm(self) -> bool:
         if self._qtmm_imported:
             return True
+        # ESCAPE HATCH — ``PULSAR_DISABLE_CAMERA=1`` skips ALL camera /
+        # QtMultimedia access.  A camera or its driver in a bad state can make
+        # the FFmpeg backend's ``QMediaDevices.videoInputs()`` HANG the GUI
+        # thread at startup (blank window / "Not Responding" right after the
+        # ``qt.multimedia.ffmpeg`` line).  Every camera entry point
+        # (:meth:`enumerate_devices`, :meth:`connect_to`) gates on
+        # ``_ensure_qtmm``, so returning False here short-circuits them all
+        # BEFORE any ``videoInputs()`` call — the operator can launch and run
+        # experiments without the camera.  Set the env var, relaunch; unset it
+        # (and fix / unplug the camera) to restore the camera feature.
+        import os as _os
+        if _os.environ.get("PULSAR_DISABLE_CAMERA"):
+            self._emit_status("Camera disabled (PULSAR_DISABLE_CAMERA set).")
+            return False
         try:
             from PyQt6 import QtMultimedia  # noqa: F401
             from PyQt6 import QtMultimediaWidgets  # noqa: F401

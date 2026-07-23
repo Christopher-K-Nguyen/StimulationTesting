@@ -228,7 +228,10 @@ class ProgressiveStressExperiment(ExperimentRunner):
                 else:
                     next_pattern = None
 
-                pulse_period_s = 1.0 / pattern.rate_hz
+                # Burst-aware per-triggered-pulse spacing (== 1/rate_hz for a
+                # non-burst pattern; PS isn't a burst-wired tab but stays
+                # uniform with SP/LP).
+                pulse_period_s = 1.0 / max(self._pulses_per_second(pattern), 1e-9)
                 navg = getattr(self.scope, "_expected_acq_navg", None) or 8
                 step_start = time.monotonic()
                 interval = max(self.policy.sampling_period_s, 1e-3)
@@ -273,7 +276,8 @@ class ProgressiveStressExperiment(ExperimentRunner):
                         self._smooth_acquisition(acq)
                         cap = make_capture(idx, pattern, acq, self.scope, self.stim,
                                            cal=self.cal, channel=config.active)
-                        compute_metrics(cap, surface_area)
+                        compute_metrics(cap, surface_area,
+                                        depol_us=self._epol_depol_us())
                         # Feed E_ret pre/post-pulse rest values into
                         # the electrode-potential learning bin. No-ops
                         # when E_ret wasn't recorded, when the session

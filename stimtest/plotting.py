@@ -519,6 +519,23 @@ def _place_marker_labels_mpl(ax, fig, reqs, traces, *,
 # ---------------------------------------------------------------------------
 # Cursor / annotation pickers
 # ---------------------------------------------------------------------------
+def _capture_depol_us(capture: Capture) -> float:
+    """The E_pol time delay (µs) this capture's metrics were computed with —
+    ``capture.metrics.depolarization_us`` (operator-configurable), falling back
+    to the canonical ``config.DEPOLARIZATION_TIME_US`` (12 µs) for a legacy
+    capture / a capture with no metrics.  Keeps every marker + guide aligned
+    to the SAME delay the value was computed with."""
+    from .config import DEPOLARIZATION_TIME_US
+    try:
+        v = float(getattr(capture.metrics, "depolarization_us",
+                          DEPOLARIZATION_TIME_US))
+        if np.isfinite(v) and v >= 0:
+            return v
+    except Exception:
+        pass
+    return float(DEPOLARIZATION_TIME_US)
+
+
 def _phase_end_times_us(capture: Capture) -> List[Tuple[str, float]]:
     """End-of-phase sample times (µs) — used for cursors on the plot.
 
@@ -527,8 +544,8 @@ def _phase_end_times_us(capture: Capture) -> List[Tuple[str, float]]:
     structure: end of each phase, plus a depolarization-time-after-phase
     sample. ``DEPOLARIZATION_TIME_US`` from ``config.py`` is the offset.
     """
-    from .config import DEPOLARIZATION_TIME_US
     from .metrics import pulse_onset_us
+    depol = _capture_depol_us(capture)
     out: List[Tuple[str, float]] = []
     # Anchor the chain at the DETECTED pulse onset, not t=0.  The time
     # axis is trigger-relative: with the I_mon-trigger fallback the
@@ -540,7 +557,7 @@ def _phase_end_times_us(capture: Capture) -> List[Tuple[str, float]]:
                             capture.v_mon_v)
     for k, ph in enumerate(capture.pattern.phases, start=1):
         cursor += ph.width_us
-        out.append((f"Epol{k}", cursor + DEPOLARIZATION_TIME_US))
+        out.append((f"Epol{k}", cursor + depol))
         cursor += ph.delay_after_us
     return out
 
@@ -565,8 +582,8 @@ def expected_epol_times_us(capture: Capture) -> List[Tuple[str, float]]:
     The label mirrors the marker convention: cathodal phase → ``Emc``,
     anodal → ``Ema`` (with a numeric suffix when a polarity repeats).
     """
-    from .config import DEPOLARIZATION_TIME_US
     from .metrics import pulse_onset_us
+    depol = _capture_depol_us(capture)
     # NO guide for a BAD response (broken / open / capacitive).  A bad
     # electrode has NO meaningful electrode polarization, so compute_metrics
     # cleared access/E_pol and compute_metric_markers draws ONLY the bad-class
@@ -616,7 +633,7 @@ def expected_epol_times_us(capture: Capture) -> List[Tuple[str, float]]:
         # Only phases with a trailing delay get a guide — that's where a
         # quiet interpulse/interphase window exists to sample E_pol.
         if float(getattr(ph, "delay_after_us", 0.0)) > 0.0:
-            out.append((tags[k], float(cursor + DEPOLARIZATION_TIME_US)))
+            out.append((tags[k], float(cursor + depol)))
         cursor += ph.delay_after_us
     return out
 
@@ -690,9 +707,9 @@ def compute_metric_markers(capture: Capture) -> List[dict]:
     data-driven).  Returns ``[]`` when there's no usable V_mon trace /
     pattern.
     """
-    from .config import DEPOLARIZATION_TIME_US
     from .metrics import (pulse_onset_us, access_voltage_and_resistance,
                           access_index_labels, _despike)
+    DEPOLARIZATION_TIME_US = _capture_depol_us(capture)
     out: List[dict] = []
     t = np.asarray(capture.time_us, dtype=float)
     v = (np.asarray(capture.v_mon_v, dtype=float)

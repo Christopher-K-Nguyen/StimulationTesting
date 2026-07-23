@@ -271,6 +271,13 @@ class CaptureMetrics:
     #: water-window limit + VT-max ramp find max charge injection unchanged,
     #: and the ``ghazavi_*`` fields below carry the decomposition.
     polarization_method: str = "pulsed"
+    #: Depolarization time delay (µs) used by the operator E_pol TIME method
+    #: (``phase_end + depol``) — the settling window after a phase before the
+    #: interface potential is read.  Default = ``config.DEPOLARIZATION_TIME_US``
+    #: (12 µs, IEEE NER / MATLAB); the operator can override it per run via the
+    #: Setup-tab "custom E_pol time delay" toggle.  Stored per capture so the
+    #: plot markers + POLARIS use the SAME delay the value was computed with.
+    depolarization_us: float = 12.0
     #: Ghazavi max cathodic (E_mc) / max anodic (E_ma) electrode-potential
     #: excursions (V) from the sinusoidal phase decomposition — the KHFAC
     #: analogue of the pulsed E_mc/E_ma.  ``E_mc = E_off − E_io``,

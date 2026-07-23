@@ -253,6 +253,11 @@ class PatternPreview(QtWidgets.QWidget):
     #: pulse only so the extra tiles don't clutter the labels.
     N_PULSES_DRAWN = 21
 
+    #: In BURST mode each tiled unit is a whole burst (itself a mini-train of
+    #: N pulses), so we cap the number of BURSTS drawn to keep the total
+    #: point count bounded (N_PULSES_DRAWN // pulses_per_burst, ≤ this).
+    N_BURSTS_DRAWN = 3
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(self.MIN_HEIGHT)
@@ -678,33 +683,67 @@ class PatternPreview(QtWidgets.QWidget):
         # concatenating tiles end-to-end gives a continuous train.
         # A small left/right tail pads zero baseline beyond the
         # outermost pulses so the user sees a clean baseline run-in.
-        period_us = (1e6 / pattern.rate_hz) if pattern.rate_hz > 0 else 0.0
-        interpulse_us = max(period_us - pattern.total_pulse_us, 0.0)
-        # Cache the cadence geometry for the "Cadence" view button (frames
-        # several consecutive pulses so pulse-to-pulse spacing / back-to-back
-        # no-interpulse-delay pulsing is visible in one click).
-        self._last_period_us = period_us
-        self._last_total_pulse_us = float(pattern.total_pulse_us)
-        # ``tile_post_us`` MUST equal ``interpulse_us`` so each tile
-        # spans exactly one period and adjacent tiles butt up cleanly.
-        # Earlier this used ``max(interpulse_us, 24.0)`` to give a
-        # hint of baseline at very-fast rates, but that pushed each
-        # tile 24 µs past the period when the user disabled the
-        # interpulse delay (interpulse_us = 0), which made the next
-        # tile's active phases overlap the previous tile's tail —
-        # the actual staircase rendered phantom samples in the gap.
-        tile_post_us = interpulse_us
-        # Outer (leading-edge) baseline: still gets a small floor so
-        # the very leftmost pulse doesn't start flush against the
-        # plot edge. This is OUTSIDE the tile chain, so it doesn't
-        # cause overlap.
-        side_pad = max(interpulse_us, 24.0)
+        # BURST detection.  In burst mode the repeating UNIT is a whole
+        # burst (``pulses_per_burst`` pulses spaced at the intra-burst period)
+        # and the TILE STRIDE is the burst period (== device_period_us); the
+        # WITHIN-burst pulse spacing is the intra-burst period.  A non-burst
+        # pattern keeps the "one pulse per period" model unchanged.
+        is_burst = bool(getattr(pattern, "is_burst", False))
+        if is_burst:
+            n_pulses_in_burst = int(pattern.pulses_per_burst)
+            # Cap the pulses DRAWN (shared by the Desired curve AND the Actual
+            # staircase so the two never disagree on pulse count) — a
+            # pathological 999-pulse burst can't blow the point budget.
+            draw_pulses = min(n_pulses_in_burst, int(self.N_PULSES_DRAWN))
+            intra_period_us = pattern.intra_burst_period_us   # == 1e6/rate_hz
+            burst_span_us = pattern.burst_span_us
+            inter_gap_us = pattern.inter_burst_gap_us
+            period_us = pattern.device_period_us              # tile stride
+            interpulse_us = inter_gap_us
+            tile_post_us = inter_gap_us
+            side_pad = max(inter_gap_us, 24.0)
+            self._last_period_us = period_us
+            self._last_total_pulse_us = float(burst_span_us)
+            # Bound the drawn point count: each burst is itself a mini-train,
+            # so cap the number of BURSTS tiled (N_PULSES_DRAWN total pulses).
+            n_bursts = max(1, min(self.N_BURSTS_DRAWN,
+                                  self.N_PULSES_DRAWN // max(1, n_pulses_in_burst)))
+            n_left = n_bursts // 2
+            n_right = n_bursts - n_left - 1
+            offsets = [k * period_us for k in range(-n_left, n_right + 1)]
+        else:
+            n_pulses_in_burst = 1
+            draw_pulses = 1
+            intra_period_us = 0.0
+            burst_span_us = 0.0
+            inter_gap_us = 0.0
+            period_us = (1e6 / pattern.rate_hz) if pattern.rate_hz > 0 else 0.0
+            interpulse_us = max(period_us - pattern.total_pulse_us, 0.0)
+            # Cache the cadence geometry for the "Cadence" view button (frames
+            # several consecutive pulses so pulse-to-pulse spacing / back-to-
+            # back no-interpulse-delay pulsing is visible in one click).
+            self._last_period_us = period_us
+            self._last_total_pulse_us = float(pattern.total_pulse_us)
+            # ``tile_post_us`` MUST equal ``interpulse_us`` so each tile
+            # spans exactly one period and adjacent tiles butt up cleanly.
+            # Earlier this used ``max(interpulse_us, 24.0)`` to give a
+            # hint of baseline at very-fast rates, but that pushed each
+            # tile 24 µs past the period when the user disabled the
+            # interpulse delay (interpulse_us = 0), which made the next
+            # tile's active phases overlap the previous tile's tail —
+            # the actual staircase rendered phantom samples in the gap.
+            tile_post_us = interpulse_us
+            # Outer (leading-edge) baseline: still gets a small floor so
+            # the very leftmost pulse doesn't start flush against the
+            # plot edge. This is OUTSIDE the tile chain, so it doesn't
+            # cause overlap.
+            side_pad = max(interpulse_us, 24.0)
 
-        N = max(1, int(self.N_PULSES_DRAWN))
-        n_left = N // 2
-        n_right = N - n_left - 1
-        # Pulse-centre offsets in time (-period, 0, +period for N=3).
-        offsets = [k * period_us for k in range(-n_left, n_right + 1)]
+            N = max(1, int(self.N_PULSES_DRAWN))
+            n_left = N // 2
+            n_right = N - n_left - 1
+            # Pulse-centre offsets in time (-period, 0, +period for N=3).
+            offsets = [k * period_us for k in range(-n_left, n_right + 1)]
 
         def _tile(t_one: np.ndarray, i_one: np.ndarray
                   ) -> Tuple[np.ndarray, np.ndarray]:
@@ -733,18 +772,44 @@ class PatternPreview(QtWidgets.QWidget):
         # full N-pulse train this is the difference between an 8 M
         # point dataset (sluggish to draw and rebuild) and a ~180 k
         # point dataset (effectively instant).
-        t_one_des, i_one_des = pattern.to_timeseries_desired(
+        t_one_pulse, i_one_pulse = pattern.to_timeseries_desired(
             t_pre_us=0.0, t_post_us=0.0, sample_period_us=0.05,
         )
-        # Tail samples: append the trailing interpulse gap as 2 points
-        # at y=0. The first point repeats the active region's last
-        # time so pyqtgraph drops a clean vertical / continuation line
-        # there; the second point sits at the period boundary.
-        if t_one_des.size:
-            tail_t = np.array([t_one_des[-1], pattern.total_pulse_us + tile_post_us])
-            tail_i = np.array([0.0, 0.0])
-            t_one_des = np.concatenate([t_one_des, tail_t])
-            i_one_des = np.concatenate([i_one_des, tail_i])
+        if is_burst and t_one_pulse.size:
+            # BURST UNIT = ``pulses_per_burst`` copies of the pulse spaced at
+            # the intra-burst period, each followed by a 2-point zero-gap tail;
+            # the LAST tail extends to the burst period (device_period) so the
+            # unit ends EXACTLY at the stride and adjacent bursts butt cleanly
+            # (the tile-span invariant).  Gaps stay 2-point tails for perf.
+            # ``draw_pulses`` (capped in the geometry block, shared with the
+            # Actual staircase) bounds the point budget.  Truncation only
+            # happens for a single-burst draw (n_bursts == 1), where the
+            # trailing flat still runs out to the burst period so the default
+            # view frames it correctly.
+            parts_t: list[np.ndarray] = []
+            parts_i: list[np.ndarray] = []
+            for k in range(draw_pulses):
+                off = k * intra_period_us
+                parts_t.append(t_one_pulse + off)
+                parts_i.append(i_one_pulse)
+                gap_end = ((k + 1) * intra_period_us
+                           if k < draw_pulses - 1 else period_us)
+                parts_t.append(np.array([t_one_pulse[-1] + off, gap_end]))
+                parts_i.append(np.array([0.0, 0.0]))
+            t_one_des = np.concatenate(parts_t)
+            i_one_des = np.concatenate(parts_i)
+        else:
+            t_one_des, i_one_des = t_one_pulse, i_one_pulse
+            # Tail samples: append the trailing interpulse gap as 2 points
+            # at y=0. The first point repeats the active region's last
+            # time so pyqtgraph drops a clean vertical / continuation line
+            # there; the second point sits at the period boundary.
+            if t_one_des.size:
+                tail_t = np.array(
+                    [t_one_des[-1], pattern.total_pulse_us + tile_post_us])
+                tail_i = np.array([0.0, 0.0])
+                t_one_des = np.concatenate([t_one_des, tail_t])
+                i_one_des = np.concatenate([i_one_des, tail_i])
         t_des, i_des = _tile(t_one_des, i_one_des)
         # For all-rectangular patterns the Actual staircase is
         # *identical* to the Desired curve — drawing both just doubles
@@ -764,8 +829,17 @@ class PatternPreview(QtWidgets.QWidget):
             # segment with an implicit vertical jump at the next
             # breakpoint. Same per-tile + ``_tile`` repetition as the
             # Desired pass.
+            # For a burst truncated to ``draw_pulses`` (N > N_PULSES_DRAWN),
+            # feed the Actual staircase a pattern with the SAME reduced pulse
+            # count so it doesn't render all N while the Desired shows only
+            # draw_pulses (the two must agree on pulse count).
+            _act_pattern = pattern
+            if is_burst and draw_pulses < n_pulses_in_burst:
+                import dataclasses as _dc
+                _act_pattern = _dc.replace(pattern,
+                                           pulses_per_burst=draw_pulses)
             t_one_act, i_one_act = self._actual_staircase_xy(
-                pattern, 0.0, tile_post_us)
+                _act_pattern, 0.0, tile_post_us)
             t_act, i_act = _tile(t_one_act, i_one_act)
             self.curve_actual.setData(t_act, i_act)
             self._legend.setVisible(True)
@@ -1025,7 +1099,11 @@ class PatternPreview(QtWidgets.QWidget):
         # default zoom.
         last_dd = pattern.phases[-1].delay_after_us if pattern.phases else 0.0
         # ``>= 1`` avoids "0 µs" labels for sub-resolution discharge times.
-        if last_dd >= 1.0:
+        # SKIPPED for a burst: the single-pulse discharge/interpulse band
+        # annotations + their diagonal-leader placement matrix assume ONE
+        # pulse per period; the burst curve itself shows the intra/inter-burst
+        # gaps, and a burst caption (below) states the grouping.
+        if last_dd >= 1.0 and not is_burst:
             dd_pen = pg.mkPen("#fb8c00", width=3,
                               style=QtCore.Qt.PenStyle.SolidLine)
             # Phase N ends at ``total_pulse_us - last_dd``; the
@@ -1128,7 +1206,7 @@ class PatternPreview(QtWidgets.QWidget):
                 skip_arrow=skip_arrow,
             )
 
-        if interpulse_us >= 1.0:
+        if interpulse_us >= 1.0 and not is_burst:
             # Width 3 — visibly thicker than the 2-px Desired/Actual
             # traces so it reads as the "this is the gap" marker, but
             # not as dominant as the prior 5-px ridge.
@@ -1298,6 +1376,29 @@ class PatternPreview(QtWidgets.QWidget):
         _max_dev_err = max(_dev_errs) if _dev_errs else 0.0
         _dev_note = (f" &nbsp;&nbsp; device Δ ≤ {_max_dev_err * 100:.2f}%"
                      if _max_dev_err > 5e-4 else "")
+        if is_burst:
+            # Intra-burst pulse rate (pps) + the burst grouping.  The BURST
+            # repetition rate is bursts/second (not a pulse rate → "/s", not
+            # pps, per the pps-label convention).
+            _timing_html = (
+                f" &nbsp;&nbsp; intra-burst rate = {pattern.rate_hz:g} {rich.PPS}"
+                f" &nbsp;&nbsp; burst = {pattern.pulses_per_burst} pulses / "
+                f"{self._format_time(pattern.burst_period_us)}"
+                f" &nbsp;&nbsp; burst rate = {pattern.burst_rate_hz:g} /s"
+                f" &nbsp;&nbsp; inter-burst gap = "
+                f"{self._format_time(pattern.inter_burst_gap_us)}"
+                f" &nbsp;&nbsp; {pattern.effective_pulse_rate_hz:g} "
+                f"{rich.PPS} overall"
+                f" &nbsp;&nbsp; pulse = "
+                f"{self._format_time(pattern.total_pulse_us)}"
+            )
+        else:
+            _timing_html = (
+                f" &nbsp;&nbsp; rate = {pattern.rate_hz:g} {rich.PPS}"
+                f" &nbsp;&nbsp; period = {self._format_time(period_us)}"
+                f" &nbsp;&nbsp; pulse = "
+                f"{self._format_time(pattern.total_pulse_us)}"
+            )
         summary = (
             f"{rich.var('Q', 'ph')} = "
             + " | ".join(f"{q:+.1f} {rich.NC}" for q in q_phase_nc_logical)
@@ -1305,9 +1406,7 @@ class PatternPreview(QtWidgets.QWidget):
               f"{q_net_pc:+.2f} {rich.PC}"
               f" ({imbalance_pct:.3f}%)"
             + _dev_note
-            + f" &nbsp;&nbsp; rate = {pattern.rate_hz:g} {rich.PPS}"
-            + f" &nbsp;&nbsp; period = {self._format_time(period_us)}"
-            + f" &nbsp;&nbsp; pulse = {self._format_time(pattern.total_pulse_us)}"
+            + _timing_html
         )
 
         # Always display the per-phase charges, net charge,
@@ -1341,13 +1440,22 @@ class PatternPreview(QtWidgets.QWidget):
         # at 150 µs so the interpulse annotation (anchored ≤25 µs into
         # the gap with text ≤80 µs further right) fits comfortably
         # inside the default view even on short total-pulse patterns.
-        peek = max(30.0, pattern.total_pulse_us * 0.15)
-        if interpulse_us >= 1.0:
-            peek = max(peek, 150.0)
-        self._default_x_range = (
-            -peek,
-            float(pattern.total_pulse_us + peek),
-        )
+        if is_burst:
+            # Frame ONE full burst (all N pulses) + a capped peek into the
+            # inter-burst gap so both the grouping AND the gap read (operator:
+            # "the default view should frame one burst … showing at least one
+            # burst").
+            peek = max(30.0, burst_span_us * 0.05)
+            right = burst_span_us + min(inter_gap_us, burst_span_us * 0.3) + peek
+            self._default_x_range = (-peek, float(right))
+        else:
+            peek = max(30.0, pattern.total_pulse_us * 0.15)
+            if interpulse_us >= 1.0:
+                peek = max(peek, 150.0)
+            self._default_x_range = (
+                -peek,
+                float(pattern.total_pulse_us + peek),
+            )
         self.plot.setXRange(*self._default_x_range, padding=0.0)
         self._update_scrollbar_from_view()
         self._update_scroll_y_from_view()
@@ -1436,7 +1544,7 @@ class PatternPreview(QtWidgets.QWidget):
         exceeds the 499-pair cap) so an oversized pattern still
         renders a best-effort staircase instead of an empty plot.
         """
-        from ..waveforms import build_pat_pairs
+        from ..waveforms import build_burst_pat_pairs
 
         times: list[float] = []
         amps: list[float] = []
@@ -1446,7 +1554,12 @@ class PatternPreview(QtWidgets.QWidget):
         amps.extend([0.0, 0.0])
 
         try:
-            pairs = build_pat_pairs(pattern)
+            # Burst-aware: returns exactly ``build_pat_pairs`` for a non-burst
+            # pattern, and the N-pulse burst (with intra-burst gap pairs, no
+            # trailing gap) for a burst — so one burst renders as one
+            # staircase ending at burst_span; the ``t_post`` baseline then
+            # extends by the inter-burst gap to the burst period.
+            pairs = build_burst_pat_pairs(pattern)
         except Exception:
             # Oversized or otherwise rejected pattern. Fall back to
             # the shape-breakpoint path so the user still sees an

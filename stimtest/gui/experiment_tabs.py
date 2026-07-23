@@ -949,6 +949,12 @@ class _BaseExperimentTab(QtWidgets.QWidget):
     #: with MULTIPOLAR_SINGLE.
     MULTIPOLAR_NO_REPEAT = False
 
+    #: True for tabs that support BURST / pulse-train stimulation (group N
+    #: pulses into a longer burst period).  Reveals the pattern-panel burst
+    #: group.  SP / CP / LP set this True; VT (ramps a single pulse's
+    #: amplitude) / PS / EIS leave it False (burst is meaningless there).
+    SUPPORTS_BURST = False
+
     #: Short tag identifying the experiment in log-pane lines (subclasses
     #: override).  Multiple tabs carry same-named widgets (duration, max
     #: current, …), so every param log line is prefixed with this tag.
@@ -1111,6 +1117,12 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             pass
         self.log_pane = LogPane()
         self.pattern_panel = PatternControlPanel(title="Pulse pattern")
+        # Reveal the burst / pulse-train group only on tabs that support it
+        # (SP / CP / LP).  ``self.SUPPORTS_BURST`` resolves via MRO to the
+        # subclass override even here in the base __init__ (same mechanism as
+        # ``self.SINGLE_CONFIG`` below).  Guarded for test stubs.
+        if hasattr(self.pattern_panel, "set_burst_available"):
+            self.pattern_panel.set_burst_available(self.SUPPORTS_BURST)
         self.pattern_preview = PatternPreview()
         # Coalesce rapid pattern-changed bursts (typing into amplitude /
         # width spinboxes fires patternChanged on every keystroke; the
@@ -1562,6 +1574,19 @@ class _BaseExperimentTab(QtWidgets.QWidget):
     # (no total).  Ramp experiments (VT / PS) leave it HIDDEN and rely
     # on the status-bar channel progress instead — they have no fixed
     # duration to fill a bar against.
+    def _effective_pulse_rate_hz(self) -> float:
+        """Overall pulses-per-second of the current pattern for duration↔pulses
+        conversion + the run-progress count.  A BURST delivers
+        ``pulses_per_burst`` pulses per ``burst_period`` — far below the
+        intra-burst ``rate_hz`` — so the 'pulses' duration unit means DELIVERED
+        pulses.  Identity ``== rate_hz`` for an ordinary (non-burst) pattern."""
+        try:
+            pat = self.pattern_panel.pattern()
+            return max(float(getattr(pat, "effective_pulse_rate_hz", None)
+                             or pat.rate_hz), 1e-6)
+        except Exception:
+            return 1e-6
+
     def _build_run_progress(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         lay = QtWidgets.QHBoxLayout(w)
@@ -3810,6 +3835,29 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # :meth:`_reinit_stim_if_closed` for why this keys on the shared
         # device's ``is_open`` rather than the per-tab flag.
         self._reinit_stim_if_closed()
+        # ---- KHFAC discharge-as-short: (re-)enable the PlexStim auto-discharge
+        # so the trailing discharge idle is a REAL passive short (charge drains
+        # each cycle), not a floating 0-µA step.  Gated on the runner's pattern
+        # carrying ``interpulse_discharge_us > 0`` (operator's toggle, which
+        # itself requires Discharge Mode on).  No period change — build_pat_pairs
+        # skipped the discharge 0-µA pair so the device idles + shorts it.
+        # Best-effort — a failure logs but never blocks Start (the run still
+        # delivers the sinusoid; only the short is lost).
+        try:
+            _pat = getattr(getattr(runner, "session", None), "test", None)
+            _ipd = float(getattr(getattr(_pat, "pattern", None),
+                                 "interpulse_discharge_us", 0.0) or 0.0)
+            if _ipd > 0 and self._stim is not None \
+                    and hasattr(self._stim, "set_auto_discharge"):
+                self._stim.set_auto_discharge(True)
+                self.log_pane.log(
+                    f"KHFAC interpulse discharge: auto-discharge ENABLED — the "
+                    f"{_ipd:g} µs interpulse gap passively shorts the electrode "
+                    f"each cycle (charge recovery / DC mitigation).")
+        except Exception as _ipd_err:
+            self.log_pane.log(
+                f"⚠ Could not enable auto-discharge for the interpulse "
+                f"discharge: {type(_ipd_err).__name__}: {_ipd_err}.")
         # Reset the log pane's elapsed-time clock so every line emitted
         # for this run counts from "Start clicked" — mirroring the
         # MATLAB convention where each script begins with ``tic``. The
@@ -4261,7 +4309,13 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # None and the bar stays hidden (they use the status-bar channel
         # progress instead).  Pulse rate comes from the active pattern.
         try:
-            _rate = float(runner.session.test.pattern.rate_hz)
+            _pat = runner.session.test.pattern
+            # OVERALL pulse rate for the delivered-pulse count — a burst
+            # delivers pulses_per_burst pulses per burst period, so the raw
+            # intra-burst rate_hz over-counts.  == rate_hz for a non-burst
+            # pattern (the ``effective_pulse_rate_hz`` property handles both).
+            _rate = float(getattr(_pat, "effective_pulse_rate_hz",
+                                  None) or _pat.rate_hz)
             _dur = getattr(getattr(runner, "policy", None),
                            "duration_s", None)
             # VT (adaptive amplitude ramp, no fixed duration) exposes a list
@@ -6030,6 +6084,9 @@ class VoltageTransientTab(_BaseExperimentTab):
 # ---------------------------------------------------------------------------
 class ShortPulsingTab(_BaseExperimentTab):
     LOG_TAG = "SP"
+    #: SP supports burst / pulse-train stimulation (ContinuousPulsingTab
+    #: subclasses SP so it inherits this automatically).
+    SUPPORTS_BURST = True
     PARAM_LOG_WIDGETS = (
         ("duration", "duration"),
         ("duration_unit", "duration unit"),
@@ -6257,7 +6314,7 @@ class ShortPulsingTab(_BaseExperimentTab):
         contract as :meth:`LongPulsingTab._convert_spinbox_value`."""
         if from_unit == to_unit:
             return
-        rate_hz = max(self.pattern_panel.pattern().rate_hz, 1e-6)
+        rate_hz = self._effective_pulse_rate_hz()
         cur = float(spin.value())
         if from_unit == self.UNIT_S and to_unit == self.UNIT_P:
             new_val = round(cur * rate_hz)
@@ -6312,7 +6369,7 @@ class ShortPulsingTab(_BaseExperimentTab):
 
     def _to_seconds(self, value: float, unit: str) -> float:
         if unit == self.UNIT_P:
-            rate = max(self.pattern_panel.pattern().rate_hz, 1e-6)
+            rate = self._effective_pulse_rate_hz()
             return value / rate
         return float(value)
 
@@ -6577,6 +6634,8 @@ class ContinuousPulsingTab(ShortPulsingTab):
 # ---------------------------------------------------------------------------
 class LongPulsingTab(_BaseExperimentTab):
     LOG_TAG = "LP"
+    #: LP supports burst / pulse-train stimulation.
+    SUPPORTS_BURST = True
     PARAM_LOG_WIDGETS = (
         ("duration", "duration"),
         ("duration_unit", "duration unit"),
@@ -6855,7 +6914,7 @@ class LongPulsingTab(_BaseExperimentTab):
         that might re-trip the unit machinery."""
         if from_unit == to_unit:
             return
-        rate_hz = max(self.pattern_panel.pattern().rate_hz, 1e-6)
+        rate_hz = self._effective_pulse_rate_hz()
         cur = float(spin.value())
         if from_unit == self.UNIT_S and to_unit == self.UNIT_P:
             new_val = round(cur * rate_hz)
@@ -6906,7 +6965,7 @@ class LongPulsingTab(_BaseExperimentTab):
 
     def _to_seconds(self, value: float, unit: str) -> float:
         if unit == self.UNIT_P:
-            rate = max(self.pattern_panel.pattern().rate_hz, 1e-6)
+            rate = self._effective_pulse_rate_hz()
             return value / rate
         return value
 

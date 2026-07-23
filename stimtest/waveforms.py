@@ -73,6 +73,24 @@ PHASE_SHAPES = (
     SHAPE_GAUSSIAN,
 )
 
+#: Shapes whose DEVICE sample-and-hold uses the segment MIDPOINT amplitude
+#: ``(a_k + a_{k+1}) / 2`` instead of the left value ``a_k`` (operator: a
+#: continuous sinusoid "looks like a little long flat step between pulses").
+#: A smooth zero-endpoint curve sampled with a LEFT-hold dwells at its
+#: leading ``(0, 0)`` breakpoint — one flat-zero step at the start of every
+#: half-sine — which at the mid-pulse and period-boundary zero-crossings
+#: stacks into a visible flat step, breaking the seamless KHFAC waveform.
+#: The MIDPOINT (trapezoidal) hold steps THROUGH the crossing (−A·sin(π·½/n)
+#: → +A·sin(π·½/n)) with no flat dwell and is symmetric about the peak — it
+#: is also the more accurate discrete integral.  Scoped to SINUSOIDAL only:
+#: it is the symmetric, inherently charge-balanced KHFAC case (the
+#: cap-coupled solver, which tunes an EXP_DECAY recharge, is untouched).
+#: ``actual_charge_nc`` reads this SAME set so the device charge model stays
+#: byte-consistent with the emitted ``.pat`` pairs.  Extend deliberately —
+#: any shape added here also shifts the cap-coupled balance if it's ever
+#: used as a recharge phase.
+MIDPOINT_HOLD_SHAPES = frozenset({SHAPE_SINUSOIDAL})
+
 #: Decay-completion ratio: t_a = N · τ. With N=5, exp(-N) = 0.0067 so
 #: the exp-decay reaches ~0.7 % of peak by the end of the anodic phase
 #: — visually indistinguishable from a clean cap discharge. Used by
@@ -387,14 +405,22 @@ def actual_charge_nc(phase: "Phase",
     times = np.asarray([t for t, _ in bps], dtype=float)
     amps = np.asarray([a for _, a in bps], dtype=float)
     step_ua = float(current_step_nA) * 1e-3 if current_step_nA else 0.0
-    if step_ua > 0:
-        amps = np.round(amps / step_ua) * step_ua
-    # Sample-and-hold integration: aₖ is held over (tₖ, tₖ₊₁), so
-    # the integral is Σ aₖ · (tₖ₊₁ − tₖ) — left-Riemann sum on the
-    # staircase. Matches what the PlexStim variable-pattern player
-    # delivers to the electrode.
     dts = np.diff(times)
-    Q_uA_us = float(np.sum(amps[:-1] * dts))
+    # Which amplitude the device HOLDS over each segment (tₖ, tₖ₊₁) must
+    # match :func:`build_pat_pairs` EXACTLY: the segment MIDPOINT
+    # ``(aₖ + aₖ₊₁)/2`` for a MIDPOINT_HOLD_SHAPES curve (sinusoidal — so the
+    # staircase steps through the zero-crossings, no leading flat-zero step),
+    # else the LEFT value ``aₖ`` (left-Riemann — the historical rule every
+    # other shape + the cap-coupled solver rely on).  Quantize the HELD value
+    # (NOT the raw endpoints) so the reported device charge equals the
+    # integral of the emitted .pat staircase.
+    if phase.shape in MIDPOINT_HOLD_SHAPES:
+        held = 0.5 * (amps[:-1] + amps[1:])
+    else:
+        held = amps[:-1]
+    if step_ua > 0:
+        held = np.round(held / step_ua) * step_ua
+    Q_uA_us = float(np.sum(held * dts))
     return Q_uA_us * 1e-3   # µA·µs → nC
 
 
@@ -1211,10 +1237,47 @@ def shape_breakpoints(*, amplitude_ua: float, width_us: float,
 
 @dataclass
 class PulsePattern:
-    """A complete stimulus pulse pattern (one pulse, repeated at ``rate_hz``)."""
+    """A complete stimulus pulse pattern.
+
+    Ordinarily this is ONE pulse repeated at ``rate_hz`` (continuous
+    pulsing).  With **burst stimulation** enabled (``pulses_per_burst >
+    1`` and ``burst_period_us > 0``) it is one *burst* — a group of
+    ``pulses_per_burst`` pulses delivered at the ``rate_hz``
+    intra-burst rate — repeated every ``burst_period_us``.  The
+    inter-burst gap is whatever is left of the burst period after the
+    burst's pulses have played (see :meth:`inter_burst_gap_us`).  This
+    is the standard *burst* paradigm (BurstDR, theta-burst): ``rate_hz``
+    is the intra-burst frequency, ``pulses_per_burst`` the pulses per
+    burst, and ``1e6 / burst_period_us`` the burst frequency."""
     phases: List[Phase] = field(default_factory=list)
     rate_hz: float = 50.0
     repetitions: int = 0   # 0 = infinite (Plexon convention)
+    # ---- Burst grouping (optional; defaults = ordinary single-pulse) ----
+    #: Pulses per burst.  1 (the default) = ordinary continuous pulsing —
+    #: every burst-aware property/method below degrades to the single-pulse
+    #: behaviour so existing patterns are byte-identical.
+    pulses_per_burst: int = 1
+    #: Burst cycle duration (µs) — the "longer period" the operator sets.
+    #: Only meaningful when ``pulses_per_burst > 1``.  0 = not a burst.
+    burst_period_us: float = 0.0
+    #: When > 0, the pattern's EXISTING trailing DISCHARGE (the last phase's
+    #: ``delay_after_us``) is rendered as a REAL auto-discharge SHORT instead of
+    #: a floating 0-µA ``.pat`` step (operator: "do NOT add a 1 µs step … REPLACE
+    #: a 0-µA step between pulses as discharge … only when Discharge Mode is
+    #: enabled").  Mechanics: ``build_pat_pairs`` SKIPS the trailing ``(0,
+    #: discharge)`` pair, so the device plays only the pulse then IDLES for the
+    #: remainder of the (UNCHANGED) ``device_period_us`` — and the PlexStim
+    #: auto-discharge (Discharge Mode) passively SHORTS that idle, draining
+    #: accumulated charge (real recovery / DC mitigation) instead of leaving it
+    #: floating.  NO time is added: the period is still ``1e6/rate_hz`` and the
+    #: discharge stays counted in ``total_pulse_us`` (so the rate pinning +
+    #: idle math are consistent).  The VALUE = the discharge duration (for the
+    #: Ghazavi windowing + logging).  0 = off (default; byte-identical).  The
+    #: GUI toggle sets it only for a continuous-sinusoid (KHFAC) with a
+    #: discharge AND Discharge Mode on; ``is_continuous_sinusoidal`` tolerates
+    #: the trailing discharge when this is > 0 (rendered as a short + windowed
+    #: out) so the Ghazavi E_off / DC readout keeps computing.
+    interpulse_discharge_us: float = 0.0
 
     # ------------------------------------------------------------------
     # Constructors
@@ -1399,6 +1462,93 @@ class PulsePattern:
     @property
     def total_pulse_us(self) -> float:
         return sum(p.width_us + p.delay_after_us for p in self.phases)
+
+    # ---------------------- burst-stimulation helpers --------------------
+    @property
+    def is_burst(self) -> bool:
+        """True when this pattern is a burst (``pulses_per_burst`` pulses
+        grouped into a longer ``burst_period_us``)."""
+        return self.pulses_per_burst > 1 and self.burst_period_us > 0.0
+
+    @property
+    def intra_burst_period_us(self) -> float:
+        """Spacing between consecutive pulses WITHIN a burst =
+        ``1e6 / rate_hz`` (in non-burst mode this is just the ordinary
+        repetition period)."""
+        return 1e6 / self.rate_hz if self.rate_hz > 0 else 0.0
+
+    @property
+    def intra_burst_gap_us(self) -> float:
+        """Idle gap between pulses within a burst = intra-burst period −
+        pulse length.  Same idea as :meth:`interpulse_gap_us`, but inside
+        a burst."""
+        return max(0.0, self.intra_burst_period_us - self.total_pulse_us)
+
+    @property
+    def burst_span_us(self) -> float:
+        """Time from the first pulse's start to the last pulse's end in a
+        burst = ``(N−1)·intra_period + total_pulse``.  Non-burst →
+        ``total_pulse_us``."""
+        if self.pulses_per_burst <= 1:
+            return self.total_pulse_us
+        return ((self.pulses_per_burst - 1) * self.intra_burst_period_us
+                + self.total_pulse_us)
+
+    @property
+    def inter_burst_gap_us(self) -> float:
+        """Idle time between bursts = burst period − burst span.  0 for a
+        non-burst pattern (or a burst whose period exactly fits its span)."""
+        if not self.is_burst:
+            return 0.0
+        return max(0.0, self.burst_period_us - self.burst_span_us)
+
+    @property
+    def burst_rate_hz(self) -> float:
+        """Burst repetition frequency = ``1e6 / burst_period_us`` (0 if not
+        a burst)."""
+        if not self.is_burst:
+            return 0.0
+        return 1e6 / self.burst_period_us
+
+    @property
+    def device_period_us(self) -> float:
+        """The period the device (``PS_SetPeriod``) is programmed with: the
+        BURST period in burst mode, else the ordinary ``1e6 / rate_hz``.
+
+        The interpulse discharge does NOT extend the period — it REPLACES the
+        existing trailing-discharge 0-µA ``.pat`` step with device-period idle
+        time (auto-discharge short), so the period is unchanged (operator: "do
+        not add a 1 µs step … replace a 0-µA step between pulses as
+        discharge")."""
+        if self.is_burst:
+            return self.burst_period_us
+        return 1e6 / self.rate_hz if self.rate_hz > 0 else 0.0
+
+    @property
+    def pulses_per_period(self) -> int:
+        """Pulses delivered per device period: ``pulses_per_burst`` in burst
+        mode, else 1.  Used for pulse-count / dose accounting."""
+        return self.pulses_per_burst if self.is_burst else 1
+
+    @property
+    def effective_pulse_rate_hz(self) -> float:
+        """Overall pulses delivered PER SECOND — the figure to use for any
+        pulse-COUNT / dose accounting (n_pulses = elapsed × this).
+
+        * Ordinary train → ``rate_hz`` (the pulse repetition rate).
+        * Burst → ``pulses_per_burst × burst_rate_hz`` = N pulses every
+          ``burst_period_us`` (the intra-burst ``rate_hz`` is NOT the overall
+          rate — a burst delivers N pulses then idles for the inter-burst
+          gap, so the average is far lower).
+
+        Distinct from ``rate_hz`` (the INTRA-burst / repetition rate used for
+        the device pulse timing) and ``burst_rate_hz`` (bursts per second).
+        Callers that count pulses over wall-clock time (runner ``n_pulses``,
+        the run-progress bar, SP/LP duration↔pulses conversions) MUST use
+        this, not ``rate_hz``, so a burst reports the true delivered dose."""
+        if self.is_burst:
+            return self.pulses_per_period / (self.burst_period_us * 1e-6)
+        return self.rate_hz
 
     @property
     def interpulse_gap_us(self) -> float:
@@ -1833,6 +1983,9 @@ class PulsePattern:
             phases=[p.scaled(factor) for p in self.phases],
             rate_hz=self.rate_hz,
             repetitions=self.repetitions,
+            pulses_per_burst=self.pulses_per_burst,
+            burst_period_us=self.burst_period_us,
+            interpulse_discharge_us=self.interpulse_discharge_us,
         )
         return new
 
@@ -2031,6 +2184,30 @@ class PulsePattern:
             raise ValueError(
                 f"repetitions must be ≥ 0 (0 = infinite), got "
                 f"{self.repetitions}.")
+        # ---- interpulse auto-discharge check ----
+        d = float(self.interpulse_discharge_us)
+        if not np.isfinite(d) or d < 0:
+            raise ValueError(
+                f"interpulse_discharge_us must be finite and ≥ 0, got "
+                f"{self.interpulse_discharge_us}.")
+        # ---- burst-stimulation checks ----
+        if self.pulses_per_burst < 1:
+            raise ValueError(
+                f"pulses_per_burst must be ≥ 1 (1 = ordinary pulsing), "
+                f"got {self.pulses_per_burst}.")
+        if self.pulses_per_burst > 1:
+            if self.burst_period_us <= 0:
+                raise ValueError(
+                    "Burst mode (pulses_per_burst > 1) needs a positive "
+                    "burst period.")
+            if self.burst_period_us < self.burst_span_us - 1e-6:
+                raise ValueError(
+                    f"Burst span ({self.burst_span_us:.0f} µs = "
+                    f"{self.pulses_per_burst} pulses at {self.rate_hz:g} pps "
+                    f"intra-burst) is longer than the burst period "
+                    f"({self.burst_period_us:.0f} µs). Increase the burst "
+                    f"period, reduce the pulses per burst, or raise the "
+                    f"intra-burst rate.")
 
     def auto_balance(self, adjust: str = "last_amp",
                      *, current_step_nA: Optional[int] = None) -> "PulsePattern":
@@ -2069,7 +2246,10 @@ class PulsePattern:
             current_step_nA = self.device_current_step_nA()
         if not self.phases:
             return PulsePattern(phases=[], rate_hz=self.rate_hz,
-                                repetitions=self.repetitions)
+                                repetitions=self.repetitions,
+                                pulses_per_burst=self.pulses_per_burst,
+                                burst_period_us=self.burst_period_us,
+                                interpulse_discharge_us=self.interpulse_discharge_us)
         head = self.phases[:-1]
         last = self.phases[-1]
         # Quantize the HEAD phase amplitudes to the device current
@@ -2306,7 +2486,10 @@ class PulsePattern:
             raise ValueError(f"Unknown adjust mode {adjust!r}")
         return PulsePattern(phases=[*head, new_last],
                             rate_hz=self.rate_hz,
-                            repetitions=self.repetitions)
+                            repetitions=self.repetitions,
+                            pulses_per_burst=self.pulses_per_burst,
+                            burst_period_us=self.burst_period_us,
+                            interpulse_discharge_us=self.interpulse_discharge_us)
 
 
 # ---------------------------------------------------------------------------
@@ -2401,9 +2584,18 @@ def build_pat_pairs(pattern: "PulsePattern", *,
             # Each segment still respects the ≥ 1 µs hardware minimum.
             cursor_int = 0   # cumulative integer-µs time within this phase
             phase_target_us = int(round(float(ph.width_us)))
+            # MIDPOINT hold for a smooth zero-endpoint curve (sinusoidal):
+            # hold ``(a_k + a_{k+1})/2`` so the staircase steps THROUGH the
+            # zero-crossings instead of dwelling one flat-zero step at each
+            # half-sine's leading ``(0,0)`` breakpoint (operator: seamless
+            # between pulses).  LEFT hold (``a_k``) for every other shape —
+            # the cap-coupled EXP_DECAY solver + all existing charge balance
+            # depend on it.  ``MIDPOINT_HOLD_SHAPES`` is the SAME gate
+            # ``actual_charge_nc`` uses, so the charge model matches the pairs.
+            _midpoint = ph.shape in MIDPOINT_HOLD_SHAPES
             for k in range(len(bps) - 1):
                 t_k, a_k = bps[k]
-                t_next, _ = bps[k + 1]
+                t_next, a_next = bps[k + 1]
                 # Snap the segment's end-time to the integer µs grid using
                 # the cumulative running float-time. Floor below by
                 # cursor_int + 1 so each pair takes at least 1 µs (the
@@ -2421,15 +2613,64 @@ def build_pat_pairs(pattern: "PulsePattern", *,
                 # the .pat format allows — so a rectangular amplitude lands
                 # on the trusted 0.1 µA grid instead of an arbitrary value
                 # the operator doesn't trust the device to deliver.
-                amp_nA = (int(round(float(a_k) * 1000.0 / _step_nA))
+                a_hold = 0.5 * (float(a_k) + float(a_next)) if _midpoint \
+                    else float(a_k)
+                amp_nA = (int(round(a_hold * 1000.0 / _step_nA))
                           * _step_nA)
                 pairs.append((amp_nA, duration_us))
                 cursor_int = next_int
         # Inter-phase / discharge / post-phase delay — held at 0 nA.
         # Skip when delay_after_us is 0; some firmware revs reject
         # "0 nA for 0 µs" pairs. Round up to the 1 µs hardware grid.
-        if ph.delay_after_us > 0:
+        #
+        # ALSO skip the TRAILING discharge pair when ``interpulse_discharge_us``
+        # replaces it with a device-idle auto-discharge SHORT (operator:
+        # "replace a 0-µA step between pulses as discharge").  The device then
+        # plays only the pulse and IDLES the discharge for the rest of
+        # ``device_period_us`` (unchanged — no added time); the PlexStim
+        # auto-discharge (Discharge Mode) shorts that idle → a REAL discharge,
+        # not a floating 0-µA step.  ONLY the LAST phase's delay (the
+        # discharge) is skipped — interphase delays between phases still render.
+        _skip_discharge = (ph is pattern.phases[-1]
+                           and float(getattr(pattern,
+                                             "interpulse_discharge_us", 0.0)) > 0)
+        if ph.delay_after_us > 0 and not _skip_discharge:
             pairs.append((0, max(1, int(round(ph.delay_after_us)))))
+    validate_pat_pairs(pairs, max_pairs=max_pairs)
+    return pairs
+
+
+def build_burst_pat_pairs(pattern: "PulsePattern", *,
+                          max_pairs: int = _PAT_MAX_PAIRS,
+                          ) -> List[Tuple[int, int]]:
+    """Build the ``.pat`` (amp_nA, duration_µs) pairs for ONE BURST.
+
+    In burst mode the device arb pattern IS the whole burst: the single
+    pulse tiled ``pulses_per_burst`` times, spaced at the intra-burst
+    period — a zero-current gap of ``intra_burst_gap_us`` between
+    consecutive pulses.  There is deliberately NO trailing inter-burst
+    gap in the pairs; the device period (``device_period_us`` = the
+    burst period) inserts that automatically, exactly as a single-pulse
+    pattern leaves the interpulse gap to the device period.
+
+    A non-burst pattern (``pulses_per_burst == 1``) returns exactly
+    :func:`build_pat_pairs`, so existing callers are unaffected.  Raises
+    ``ValueError`` (via :func:`validate_pat_pairs`) when the tiled burst
+    exceeds the SDK point cap — the operator's cue to reduce the pulses
+    per burst or simplify a shaped pulse.
+    """
+    if pattern.pulses_per_burst <= 1:
+        return build_pat_pairs(pattern, max_pairs=max_pairs)
+    n = int(pattern.pulses_per_burst)
+    # Budget each pulse so N copies (plus N-1 gap pairs) fit the cap.
+    per_pulse_budget = max(2, (max_pairs - (n - 1)) // n)
+    single = build_pat_pairs(pattern, max_pairs=per_pulse_budget)
+    gap_us = int(round(pattern.intra_burst_gap_us))
+    pairs: List[Tuple[int, int]] = []
+    for i in range(n):
+        pairs.extend(single)
+        if i < n - 1 and gap_us > 0:
+            pairs.append((0, gap_us))
     validate_pat_pairs(pairs, max_pairs=max_pairs)
     return pairs
 

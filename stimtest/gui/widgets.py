@@ -3130,16 +3130,17 @@ class LogPane(QtWidgets.QTextEdit):
     monospace / autoscroll / disk-mirror behaviour is otherwise
     identical.
 
-    **Time format** mirrors the MATLAB reference scripts
-    (``getEndTime.m`` + the ``runPulsing.m`` / ``PlexStimTek.m``
-    fprintf patterns): every line is prefixed with elapsed time
-    ``[H:MM:SS]`` since the most recent :meth:`reset_clock` call,
-    not the wall-clock time of day. A one-line banner with the
-    wall-clock start is emitted at clock-reset so the user can still
-    correlate with other logs. Pair with :meth:`tic` / :meth:`toc`
-    for explicit timed sub-operations — the auto-scaled unit
-    selector (``us`` / ``ms`` / ``s`` / ``min`` / ``h``) matches the
-    MATLAB ``getEndTime.m`` thresholds exactly.
+    **Time format** — every line is prefixed with the WALL-CLOCK date +
+    time of day AND the run-relative elapsed since the most recent
+    :meth:`reset_clock` call:
+    ``[YYYY-MM-DD HH:MM:SS +H:MM:SS] message`` (operator: "include the
+    date and time" — the elapsed alone can't tell you WHEN a line
+    happened).  The elapsed ``+H:MM:SS`` mirrors the MATLAB ``tic`` /
+    ``getEndTime.m`` convention; the wall-clock date/time lets the log
+    correlate with other sources (scope timestamps, the system journal).
+    Pair with :meth:`tic` / :meth:`toc` for explicit timed sub-operations
+    — the auto-scaled unit selector (``us`` / ``ms`` / ``s`` / ``min`` /
+    ``h``) matches the MATLAB ``getEndTime.m`` thresholds exactly.
     """
 
     #: In-memory FIFO cap (lines kept in the pane; the on-disk log is
@@ -3493,8 +3494,19 @@ class LogPane(QtWidgets.QTextEdit):
     def log(self, msg: str) -> None:
         self._ensure_session_started()
         elapsed = time.monotonic() - (self._session_start or 0.0)
-        line = f"[{self._format_elapsed_hms(elapsed)}] {msg}"
+        line = f"[{self._line_timestamp(elapsed)}] {msg}"
         self._raw_append(line)
+
+    def _line_timestamp(self, elapsed_s: float) -> str:
+        """The per-line timestamp: the WALL-CLOCK date + time of day, then the
+        run-relative elapsed (operator: "include the date and time" — the
+        elapsed alone can't tell you WHEN a line happened).  Format
+        ``YYYY-MM-DD HH:MM:SS +H:MM:SS`` (the ``+`` marks the elapsed since the
+        last :meth:`reset_clock`).  Used for BOTH the on-screen pane and the
+        line-buffered on-disk .txt session log (same ``line`` feeds
+        ``_raw_append``)."""
+        wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"{wall} +{self._format_elapsed_hms(elapsed_s)}"
 
     def log_now(self, msg: str) -> None:
         """Like :meth:`log` but force the GUI to repaint immediately.
@@ -3526,14 +3538,17 @@ class LogPane(QtWidgets.QTextEdit):
     def _recompute_hang_indent(self) -> None:
         """(Re)compute the hanging-indent width from the current font.
 
-        The indent equals the pixel width of a representative
-        single-digit-hour timestamp prefix (``"[0:00:00] "``) so a
-        wrapped continuation line lands right under the message text.
-        Called at construction and whenever the font / DPI changes.
+        The indent equals the pixel width of a representative timestamp
+        prefix (``"[YYYY-MM-DD HH:MM:SS +H:MM:SS] "`` — wall-clock date/time
+        plus the run-relative elapsed) so a wrapped continuation line lands
+        right under the message text.  Called at construction and whenever the
+        font / DPI changes.  Keep this sample in lock-step with the prefix
+        built in :meth:`_line_timestamp`.
         """
         try:
             self._hang_indent_px = float(
-                self.fontMetrics().horizontalAdvance("[0:00:00] "))
+                self.fontMetrics().horizontalAdvance(
+                    "[0000-00-00 00:00:00 +0:00:00] "))
         except Exception:
             self._hang_indent_px = 0.0
 

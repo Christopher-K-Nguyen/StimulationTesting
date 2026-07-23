@@ -149,6 +149,21 @@ def test_hang_indent_computed_positive(_app):
     pane.deleteLater()
 
 
+def test_line_prefix_includes_wall_clock_date_and_time(_app):
+    """Operator: "include the date and time".  Every line's prefix carries the
+    wall-clock DATE + time of day AND the run-relative elapsed:
+    ``[YYYY-MM-DD HH:MM:SS +H:MM:SS] message``."""
+    import re
+    pane = LogPane()
+    pane.log("hello world")
+    QtWidgets.QApplication.processEvents()
+    text = pane.document().lastBlock().text()
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+\d+:\d{2}:\d{2}\] "
+        r"hello world$", text), text
+    pane.deleteLater()
+
+
 def test_every_block_gets_hanging_indent(_app):
     pane = _make_pane()
     pane.log("a short line")
