@@ -124,6 +124,16 @@ set "PULSAR_VERSION=unknown"
 for /f tokens^=2^ delims^=^" %%v in ('findstr /b /c:"__version__" "%~dp0stimtest\__init__.py" 2^>nul') do set "PULSAR_VERSION=%%v"
 set "PULSAR_UPDATED=unknown"
 for %%f in ("%~dp0stimtest\__init__.py") do set "PULSAR_UPDATED=%%~tf"
+REM   Append the local TIME ZONE (operator: "include the time zone").  The
+REM   file mtime %%~tf is local time with no zone; derive a DST-aware
+REM   abbreviation the same way the GUI log pane does (initials of the
+REM   Daylight/Standard name, e.g. "Mountain Daylight Time" -> "MDT"), via a
+REM   short PowerShell call.  Silently skipped if PowerShell is unavailable.
+REM   (foreach, NOT a pipe — a "|" inside the for/f backtick needs fragile
+REM   escaping that silently swallowed the result.)
+set "PULSAR_TZ="
+for /f "usebackq delims=" %%z in (`powershell -NoProfile -Command "$t=[TimeZoneInfo]::Local;$n=if((Get-Date).IsDaylightSavingTime()){$t.DaylightName}else{$t.StandardName};if($n.Contains(' ')){$a='';foreach($w in $n.Split(' ')){if($w.Length){$a+=$w.Substring(0,1)}};$a}else{$n}" 2^>nul`) do set "PULSAR_TZ=%%z"
+if defined PULSAR_TZ set "PULSAR_UPDATED=%PULSAR_UPDATED% %PULSAR_TZ%"
 echo.
 echo ==================================================================
 echo   PULSAR version %PULSAR_VERSION%   ^(code updated %PULSAR_UPDATED%^)

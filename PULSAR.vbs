@@ -74,7 +74,7 @@ LauncherLog "Script dir: " & scriptDir
 ' from the file — no Python spawn.  The GUI title bar shows the same
 ' version live; logging it here gives a per-launch record for this
 ' windowless path, which has no console banner like PULSAR.bat's.
-LauncherLog "PULSAR version: " & ReadInitVersion() & "  (code updated " & InitFileMTime() & ")"
+LauncherLog "PULSAR version: " & ReadInitVersion() & "  (code updated " & InitFileMTime() & TzSuffix() & ")"
 
 ' --- Probe each candidate Python version for PyQt6 -----------------
 '
@@ -246,4 +246,30 @@ Function InitFileMTime()
     Err.Clear
     On Error Goto 0
     InitFileMTime = r
+End Function
+
+' TzSuffix — " UTC+/-HH:MM" for the CURRENT (DST-adjusted) local time zone,
+' read from WMI (operator: "include the time zone").  The console launcher
+' PULSAR.bat shows the abbreviation (e.g. "MDT"); this silent launcher logs the
+' equivalent UTC offset via WMI so there is NO PowerShell shell-out (which
+' would flash a window and need fragile quoting).  Empty string on any error.
+Function TzSuffix()
+    On Error Resume Next
+    TzSuffix = ""
+    Dim wmi, cs, m, hh, mm, sgn
+    m = ""
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    For Each cs In wmi.ExecQuery("SELECT CurrentTimeZone FROM Win32_ComputerSystem")
+        m = cs.CurrentTimeZone
+    Next
+    If IsNumeric(m) Then
+        If m < 0 Then sgn = "-" Else sgn = "+"
+        m = Abs(m)
+        hh = m \ 60
+        mm = m Mod 60
+        TzSuffix = " UTC" & sgn & Right("0" & hh, 2) & ":" & Right("0" & mm, 2)
+    End If
+    If Err.Number <> 0 Then TzSuffix = ""
+    Err.Clear
+    On Error Goto 0
 End Function
