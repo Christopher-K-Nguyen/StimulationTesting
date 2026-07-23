@@ -330,6 +330,56 @@ class VoltageTransientExperiment(ExperimentRunner):
                                 aborted=self.aborted)
 
     # ------------------------------------------------------------------
+    def _fit_scope_window(self) -> None:
+        """Size the scope's horizontal window to the pulse before the run.
+
+        Delegates to the driver's ``auto_layout_for_pulse`` so the
+        record spans roughly the pulse plus a small margin instead of
+        running far past it into a post-pulse tail. On scopes without an
+        EXT-trigger input (e.g. the 2-channel TBS1072C) that tail is
+        where an averaged edge-triggered record smears into "noise"; a
+        tight window removes it rather than depending on the operator
+        picking a narrow timebase by hand.
+
+        Best-effort: no-op on backends that don't expose the helper
+        (the simulator), and a failed SCPI write is logged, never fatal.
+        The digital-delay pre-trigger is fixed at 1 µs to match the lab's
+        Plexon sync wiring.
+        """
+        fit = getattr(self.scope, "auto_layout_for_pulse", None)
+        if not callable(fit):
+            return  # backend without horizontal auto-layout (e.g. sim)
+
+        # Size to the WIDEST pulse across the sweep: asymmetric points
+        # lengthen the recharge phase, so fitting to the longest keeps
+        # every point inside the window.
+        totals: List[float] = []
+        for pt in self.sweep_points:
+            try:
+                totals.append(pattern_for_sweep_point(
+                    self.session.test.pattern, pt).total_pulse_us)
+            except Exception:
+                continue
+        total_us = (max(totals) if totals
+                    else self.session.test.pattern.total_pulse_us)
+        ext = bool(getattr(self.scope.info, "has_ext_trigger", True))
+        try:
+            scale_s, pos_pct = fit(
+                phase1_us=total_us, interphase_us=0.0,
+                phase2_us=0.0, discharge_us=0.0,
+                digital_delay_us=1.0, ext_trigger=ext)
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message=(
+                    f"Scope window fit to pulse ({total_us:.0f} µs): "
+                    f"{scale_s * 1e6:.1f} µs/div, trigger @ {pos_pct:.1f}% "
+                    f"({'EXT sync' if ext else 'edge / no EXT input'}).")))
+        except Exception as e:
+            self._emit(ExperimentEvent(
+                kind="log", session=self.session,
+                message=f"Scope window auto-fit skipped: {e}"))
+
+    # ------------------------------------------------------------------
     def _run_one_configuration(self, config: Configuration,
                                base_pattern: Optional[PulsePattern] = None,
                                label: str = "") -> ChannelRun:

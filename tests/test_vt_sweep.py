@@ -119,6 +119,54 @@ def test_vt_no_sweep_matches_single_run():
 # ---------------------------------------------------------------------------
 # Persistence round-trip of the run label
 # ---------------------------------------------------------------------------
+def test_fit_scope_window_uses_1us_delay_and_widest_pulse():
+    """_fit_scope_window sizes to the widest sweep pulse, delay fixed at 1 µs."""
+    session, _config = _make_session()
+    stim = SimulatedStimulator(); stim.open()
+    scope = SimulatedOscilloscope(); scope.open()
+
+    calls = []
+
+    def fake_fit(**kw):
+        calls.append(kw)
+        return (50e-6, 30.0)  # (scale_s, position_pct)
+
+    # The simulator has no auto_layout_for_pulse; attach a recorder and
+    # tell it there's no EXT input (the TBS1072C case).
+    scope.auto_layout_for_pulse = fake_fit
+    scope.info.has_ext_trigger = False
+
+    base_total = session.test.pattern.total_pulse_us
+    runner = VoltageTransientExperiment(
+        session, stim, scope,
+        sweep_points=[
+            SweepPoint(rate_hz=50, label="sym"),
+            SweepPoint(rate_hz=50, width_ratio=3.0, label="asym3x"),  # widest
+        ],
+    )
+    runner._fit_scope_window()
+
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["digital_delay_us"] == 1.0
+    assert kw["ext_trigger"] is False
+    # Asymmetric point widens the recharge phase, so the fitted pulse
+    # width must exceed the symmetric base total.
+    assert kw["phase1_us"] > base_total
+    stim.close(); scope.close()
+
+
+def test_fit_scope_window_noop_without_helper():
+    """On a backend lacking auto_layout_for_pulse (the sim), it's a no-op."""
+    session, _config = _make_session()
+    stim = SimulatedStimulator(); stim.open()
+    scope = SimulatedOscilloscope(); scope.open()
+    assert not hasattr(scope, "auto_layout_for_pulse")
+    runner = VoltageTransientExperiment(session, stim, scope)
+    runner._fit_scope_window()  # must not raise
+    stim.close(); scope.close()
+
+
 def test_run_label_round_trips_through_npz(tmp_path):
     from stimtest.persistence import load_session_npz, save_session_npz
 
