@@ -2,13 +2,13 @@
 
 Operator (comparing to old MATLAB captures on a TBS1104B): the TBS2204B has a
 different SEC/DIV grid (1-2-4 vs 1-2.5-5) AND 15 divisions vs 10, so the same
-pulse frames a different — often TIGHTER — capture window.  The scope FLOORS
-off-grid SEC/DIV writes to its native grid (verified live on the bench), so
-the achievable windows are coarse (…600, 1500, 3000 µs on 15 divs).  The
-operator chose the WIDER (MATLAB-style) window, implemented by lowering the
-minimum-fill floor from 0.30 to 0.25 (``_AUTO_FIT_MIN_FILL``): a 400 µs pulse
-now takes the 1500 µs step instead of dropping to 600 µs, while a 700 µs pulse
-still rejects the near-empty 3000 µs step and stays at 1500 µs.
+pulse frames a different capture window.  The scope FLOORS off-grid SEC/DIV
+writes to its native grid (verified live on the bench), so the achievable
+windows are coarse (…600, 1500, 3000 µs on 15 divs).  Operator #8 redefined
+the two modes as GRID-STEP: TIGHT = the closest (smallest) SEC/DIV whose window
+still fully contains the pulse (+ ≥1 div lead); WIDE (default) = ONE grid
+increment larger.  So a 400 µs pulse → tight 600 µs / wide 1500 µs; a 700 µs
+pulse → tight 1500 µs / wide 3000 µs.
 """
 from __future__ import annotations
 
@@ -51,24 +51,26 @@ def _tbs2204b():
     return 15, MODERN_CMDS
 
 
-def test_default_min_fill_is_025():
-    from stimtest.hardware.tektronix import TektronixOscilloscope
-    assert TektronixOscilloscope._AUTO_FIT_MIN_FILL == 0.25
+def test_default_mode_is_wide():
+    # A fresh scope (no set_horizontal_fit_mode) frames at the WIDE window.
+    divs, cmds = _tbs2204b()
+    span, _scale = _span_us(divs, cmds, 200, 0, 200, 0)   # 400 µs biphasic
+    assert span == 1500                                    # wide = 1500 (not tight 600)
 
 
 @pytest.mark.parametrize(
     "p1,iph,p2,dd, expected_span_us",
     [
-        # 200/200 biphasic (the operator's exp_vt pattern, totalPulse 400):
-        # was 600 µs at the old 0.30 floor; now the wider 1500 µs step.
+        # DEFAULT = WIDE (one grid step larger than the tightest that fits).
+        # 200/200 biphasic (totalPulse 400): tight 600 → wide 1500 µs.
         (200, 0, 200, 0, 1500),
-        # 200/100/200/200 (totalPulse 700): stays 1500 µs — must NOT jump to
-        # the near-empty 3000 µs step (fill 0.233 < 0.25).
-        (200, 100, 200, 200, 1500),
-        # 200/100/200 (totalPulse 500): 1500 µs.
+        # 200/100/200/200 (totalPulse 700): tight 1500 → wide 3000 µs (operator
+        # #8: wide is one grid increment larger than tight, even if the pulse
+        # then fills less of the screen).
+        (200, 100, 200, 200, 3000),
+        # 200/100/200 (totalPulse 500): tight 600 → wide 1500 µs.
         (200, 100, 200, 0, 1500),
-        # A short 100/100 biphasic (totalPulse 200): tight 600 µs is correct
-        # (200/(100·15)=0.133 < 0.25 rejects 100 µs/div; 40 µs/div fills 0.33).
+        # A short 100/100 biphasic (totalPulse 200): tight 300 → wide 600 µs.
         (100, 0, 100, 0, 600),
     ],
 )

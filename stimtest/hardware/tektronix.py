@@ -63,6 +63,7 @@ Acquisition flow
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -79,6 +80,38 @@ from .base import fmt_elapsed as _fmt_elapsed  # noqa: E402,F401
 # in calibration.py / experiment_tabs.py) keep working without
 # touching every callsite.  Definitive copy lives in
 # :mod:`stimtest.hardware.base`.
+
+
+#: Standalone LONG numeric tokens (≥ 7 digits, optional decimal) in a scope
+#: response — e.g. the ``200000000`` sample-rate field in a ``WFMOutpre?``
+#: reply — reformatted to compact scientific notation for the LOG display only
+#: (operator #4).  The lookbehind/lookahead keep it from touching already-
+#: scientific fields (``160.0000E-9``), short numbers (``20000``, ``16624``),
+#: signs, or numbers embedded in words.
+_LOG_LONG_NUM_RE = re.compile(r'(?<![\d.eE+-])(\d{7,}(?:\.\d+)?)(?![\d.eE])')
+
+
+def _sci_notation_long_numbers(text: str) -> str:
+    """Reformat standalone long numeric tokens in a SCPI response string to
+    compact scientific notation (``200000000`` → ``2.0E+8``) for readability
+    in the scope command log (operator #4: "use scientific notation for long
+    values").  Only the LOGGED copy is reformatted — the returned response the
+    driver parses is untouched.  Already-scientific / short / non-numeric
+    fields pass through unchanged."""
+    def _repl(m: "re.Match") -> str:
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            return m.group(1)
+        mant, exp = f"{v:.4E}".split("E")
+        mant = mant.rstrip("0").rstrip(".")
+        if "." not in mant:
+            mant += ".0"
+        return f"{mant}E{int(exp):+d}"
+    try:
+        return _LOG_LONG_NUM_RE.sub(_repl, text)
+    except Exception:
+        return text
 
 
 def _frange_incl(start: float, stop: float, step: float) -> list:
@@ -1190,7 +1223,8 @@ class TektronixOscilloscope(Oscilloscope):
             t0 = time.perf_counter()
             resp = self._inst.query(cmd).strip()
             dt = time.perf_counter() - t0
-            self._log(f"[scope] > {cmd}   < {resp}   ({_fmt_elapsed(dt)})")
+            self._log(f"[scope] > {cmd}   < {_sci_notation_long_numbers(resp)}"
+                      f"   ({_fmt_elapsed(dt)})")
             self._track_query_latency(cmd, dt)
             return resp
         # Serial path — validate + retry on empty / garbled / timeout.  An
@@ -1206,7 +1240,8 @@ class TektronixOscilloscope(Oscilloscope):
                 if resp:
                     _suffix = (f", attempt {_attempt + 1}/"
                                f"{_SERIAL_QUERY_RETRIES}" if _attempt else "")
-                    self._log(f"[scope] > {cmd}   < {resp}   "
+                    self._log(f"[scope] > {cmd}   < "
+                              f"{_sci_notation_long_numbers(resp)}   "
                               f"({_fmt_elapsed(dt)}{_suffix})")
                     self._track_query_latency(cmd, dt)
                     return resp
@@ -2928,44 +2963,38 @@ class TektronixOscilloscope(Oscilloscope):
         )
     )
 
-    #: Minimum fraction of the (real) screen the pulse must fill for
-    #: ``auto_layout_for_pulse`` to accept a candidate timebase.  MATLAB
-    #: ``setOscillocopeView.m`` used 0.30 on a 10-division TBS1104B; the
-    #: bench TBS2204B is a 15-division / 1-2-4-grid scope whose coarse SEC/DIV
-    #: grid can't land near MATLAB's windows (achievable spans on 15 divs are
-    #: …600, 1500, 3000 µs — nothing between).  At 0.30 a 400 µs pulse falls
-    #: just under the wider 100 µs/div step (27 % fill) and drops to the tight
-    #: 40 µs/div → 600 µs window; the operator wants the WIDER MATLAB-like
-    #: window (more post-pulse recovery), so the floor is 0.25 — it lets the
-    #: 400 µs pulse take the 1500 µs step, yet still rejects the near-empty
-    #: 3000 µs step for a 700 µs pulse (fill 0.233 < 0.25).  Don't raise this
-    #: back to 0.30 without re-checking the 400 µs case, and don't drop it to
-    #: 0.20 (that over-widens the 700 µs pattern to 3000 µs).  See
-    #: ``tests/test_auto_layout_window.py``.  This is the DEFAULT (= WIDE); the
-    #: operator can pick WIDE vs TIGHT from the Setup tab, which calls
-    #: :meth:`set_horizontal_fit_mode` to override the per-instance value below.
-    _AUTO_FIT_MIN_FILL: float = 0.25
-    #: Fill floors for the operator-selectable horizontal-scaling modes
-    #: (Setup → Oscilloscope → "Horizontal window").  LOWER fill = WIDER window
-    #: (more post-pulse recovery); HIGHER fill = TIGHTER (the pulse fills more
-    #: of the screen).
-    _HORIZ_FIT_WIDE: float = 0.25
-    _HORIZ_FIT_TIGHT: float = 0.45
+    #: Horizontal-window fit mode (operator #8, Setup → Oscilloscope →
+    #: "Horizontal window"):  ``"tight"`` = the closest (smallest) grid SEC/DIV
+    #: whose window still fully contains the pulse without clipping it (+ ≥1 div
+    #: leading baseline); ``"wide"`` (default) = ONE grid increment larger.
+    #: Set per-instance by :meth:`set_horizontal_fit_mode`; ``auto_layout_for_pulse``
+    #: reads it via ``getattr(self, "_horiz_fit_mode", "wide")``.  (Superseded
+    #: the earlier minimum-fill-fraction floors ``_AUTO_FIT_MIN_FILL`` /
+    #: ``_HORIZ_FIT_WIDE`` / ``_HORIZ_FIT_TIGHT``; see gotcha §5 / #8.)  On the
+    #: 15-div 1-2-4 grid the achievable spans are …600, 1500, 3000 µs, so a
+    #: 400 µs pulse frames tight 600 / wide 1500 µs, a 700 µs pulse tight 1500 /
+    #: wide 3000 µs.  Tests: ``tests/test_auto_layout_window.py``,
+    #: ``tests/test_horiz_scaling_mode.py``.
+    _horiz_fit_mode: str = "wide"
 
     def set_horizontal_fit_mode(self, mode: str) -> None:
-        """Select the auto-fit horizontal-window preference used by
-        :meth:`auto_layout_for_pulse`: ``"wide"`` (default — more post-pulse
-        recovery, MATLAB-like) or ``"tight"`` (the pulse fills more of the
-        screen).  Stored per-instance and read back by ``auto_layout_for_pulse``
-        via ``_auto_fit_min_fill`` (falls back to the ``_AUTO_FIT_MIN_FILL``
-        class default when never set)."""
+        """Select the horizontal-window preference used by
+        :meth:`auto_layout_for_pulse` (operator #8):
+
+        * ``"tight"`` — the CLOSEST (smallest) grid SEC/DIV whose window still
+          fully contains the pulse without clipping it (+ ≥1 division of
+          leading baseline).
+        * ``"wide"`` (default) — ONE grid increment larger than tight (more
+          post-pulse recovery room).
+
+        Stored per-instance as ``_horiz_fit_mode`` and read back by
+        ``auto_layout_for_pulse`` (defaults to ``"wide"`` when never set)."""
         m = str(mode or "").strip().lower()
-        self._auto_fit_min_fill = (self._HORIZ_FIT_TIGHT
-                                   if m.startswith("tight")
-                                   else self._HORIZ_FIT_WIDE)
+        self._horiz_fit_mode = "tight" if m.startswith("tight") else "wide"
         try:
-            self._log(f"[scope] horizontal window: {'tight' if m.startswith('tight') else 'wide'} "
-                      f"(fill floor {self._auto_fit_min_fill:.2f})")
+            self._log(f"[scope] horizontal window: {self._horiz_fit_mode} "
+                      f"(tight = closest scale without clipping; "
+                      f"wide = one grid step larger)")
         except Exception:
             pass
 
@@ -3009,30 +3038,21 @@ class TektronixOscilloscope(Oscilloscope):
 
           1. Pulse width = phase1 + interphase + phase2 + discharge
              (the full active window, matching MATLAB's ``totalPulse``).
-          2. Iterate the candidate timebases largest→smallest; pick the
-             WIDEST entry where the pulse still fills at least
-             ``_AUTO_FIT_MIN_FILL`` (0.25) of the actual screen
-             (``totalPulse / (n_horiz_divs × scale) ≥ 0.25``).  30 % was
-             the MATLAB ``setOscillocopeView.m`` value, but MATLAB ran on a
-             10-division / 1-2.5-5-grid TBS1104B; the bench TBS2204B is a
-             15-division / 1-2-4-grid scope, and on that coarser grid a
-             pulse that fills just under 30 % of the wider step (e.g. a
-             400 µs pulse at 100 µs/div ≈ 27 %) would drop to the tight
-             next-finer step (40 µs/div → 600 µs window) instead of taking
-             the wider MATLAB-like window (100 µs/div → 1500 µs).  The
-             operator chose the WIDER window (more post-pulse recovery), so
-             the floor is 0.25 — enough to let a 400 µs pulse take the
-             1500 µs step, while still rejecting the near-empty 3000 µs step
-             for a 700 µs pulse (which the literal 10-div rule would have
-             wrongly selected).  The window can only be a grid span (the
-             scope FLOORS off-grid SEC/DIV writes to its 1-2-4 grid —
-             verified live), so the achievable windows are coarse
-             (…, 600, 1500, 3000 µs on 15 divs); this rule picks the widest
-             acceptable one.
-          3. Pre-trigger offset:
-               * fill ≥ 0.4 → 3 divisions before the pulse start
-               * fill <  0.4 → 4 divisions (more leading baseline so a
-                              skinny pulse isn't crammed against the edge)
+          2. Pick the timebase by GRID STEP (operator #8): the window can only
+             be a grid span (the scope FLOORS off-grid SEC/DIV writes to its
+             1-2-4 / 1-2.5-5 grid — verified live), so the achievable windows
+             are coarse (…, 600, 1500, 3000 µs on 15 divs).  TIGHT = the
+             closest (smallest) grid SEC/DIV whose window still fully contains
+             the pulse without clipping it (+ ≥1 division of leading baseline,
+             i.e. ``sec_per_div ≥ totalPulse / (n_horiz_divs − 1)``); WIDE
+             (default, ``_horiz_fit_mode``) = ONE grid increment larger.  So a
+             400 µs pulse frames tight 600 / wide 1500 µs; a 700 µs pulse tight
+             1500 / wide 3000 µs.
+          3. Pre-trigger offset: allocate the NON-pulse part of the window
+             ~1/4 to the leading (pre-trigger) baseline and ~3/4 to the
+             post-pulse tail (``offset_divs = max(1.0, free_divs × 0.25)``),
+             floored at 1 division so the leading edge isn't jammed against
+             the trigger marker.
           4. **EXT trigger only**: add ``digital_delay_us`` to the position
              offset because the Plexon digital sync fires that many µs
              *before* the first phase begins.  When the trigger source is
@@ -3065,26 +3085,27 @@ class TektronixOscilloscope(Oscilloscope):
         )
 
         # --- 1. Pick timebase -------------------------------------------
-        # Iterate widest→narrowest, pick the WIDEST scale where the pulse
-        # still fills ≥ _AUTO_FIT_MIN_FILL of the actual screen.  Candidate
+        # TIGHT = the CLOSEST (smallest) grid SEC/DIV whose window still fully
+        # contains the pulse without clipping it (+ ≥1 division of leading
+        # baseline); WIDE = ONE grid increment larger (operator #8).  Candidate
         # list is dialect-specific (see ``_horiz_scale_candidates_s``) — the
-        # TBS2204B knob is 1-2-4, the TBS1000B knob is 1-2.5-5, and each
-        # would round the other's grid silently.  If the pulse is so narrow
-        # that even the narrowest candidate can't reach the fill floor the
-        # loop exhausts and we stay at the narrowest entry.  (The scope
-        # FLOORS off-grid SEC/DIV to its native grid — verified live — so
-        # the achievable windows are coarse, e.g. …600/1500/3000 µs on
-        # 15 divs; this picks the widest acceptable one.)
-        candidates = self._horiz_scale_candidates_s
-        scale_s = candidates[0]
-        fract = 0.0
-        for cand_s in candidates:
-            scale_us = cand_s * 1e6
-            fract = pulse_width_us / (scale_us * float(self._n_horiz_divs))
-            if fract >= getattr(self, "_auto_fit_min_fill",
-                                self._AUTO_FIT_MIN_FILL):
-                scale_s = cand_s
-                break
+        # TBS2204B knob is 1-2-4, the TBS1000B knob is 1-2.5-5; the scope FLOORS
+        # off-grid SEC/DIV writes to its native grid (verified live), so the
+        # achievable windows are coarse (…600/1500/3000 µs on 15 divs).  The
+        # window must hold the pulse PLUS ≥1 div of leading baseline:
+        #   (n_div − 1)·sec_per_div ≥ pulse_width → sec_per_div ≥ pw/(n_div−1).
+        candidates = self._horiz_scale_candidates_s          # widest → narrowest
+        asc = sorted(candidates)                             # narrowest → widest
+        n_div = float(self._n_horiz_divs)
+        min_scale_s = (pulse_width_us / 1e6) / max(1.0, n_div - 1.0)
+        tight_s = next((c for c in asc if c >= min_scale_s), asc[-1])
+        mode = getattr(self, "_horiz_fit_mode", "wide")
+        if mode == "tight":
+            scale_s = tight_s
+        else:                                                # WIDE = one step up
+            ti = asc.index(tight_s)
+            scale_s = asc[ti + 1] if ti + 1 < len(asc) else tight_s
+        fract = pulse_width_us / (scale_s * 1e6 * n_div)
 
         # --- 2. Pre-trigger offset (divisions) --------------------------
         # SHORT pre-pulse interpulse, LONGER post-pulse interpulse
