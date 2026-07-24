@@ -60,7 +60,7 @@
 ; tree without re-running build.py) using whatever version the
 ; codebase had at the time this file was last edited.
 #ifndef AppVersion
-    #define AppVersion "0.2.213"
+    #define AppVersion "0.2.218"
 #endif
 #define AppPublisher "Solzbacher Lab, University of Utah"
 ; Launcher .exe filenames — intentionally NOT renamed so existing
