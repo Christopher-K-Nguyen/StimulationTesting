@@ -1319,6 +1319,11 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # Parameters and Experiment sub-tabs.
         left_inner = QtWidgets.QWidget()
         left = QtWidgets.QVBoxLayout(left_inner)
+        # Tighten inter-group spacing so the stacked parameter groups don't
+        # read as mostly empty space (operator #1: "remove the vertical
+        # space between inputs").
+        left.setContentsMargins(4, 4, 4, 4)
+        left.setSpacing(2)
         left.addWidget(params_box)
         # Camera capture controls (periodic snapshot + video recording)
         # — applies to whatever experiment this tab runs.  Triggered
@@ -1347,6 +1352,24 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # disabled) and otherwise hides it until INTERSTELLAR connects.
         self._refresh_bias_visibility()
         left.addStretch(1)
+        # Trim each parameter group's internal title-to-content margins
+        # (Qt's default ~11 px) so the first/last rows hug the title/border —
+        # the bulk of the vertical air the operator flagged (#1) is this
+        # per-group chrome.  Also drop any raw-QFormLayout row gap (a plain
+        # QFormLayout defaults to ~6 px; make_form forms are already tight).
+        for _i in range(left.count()):
+            _it = left.itemAt(_i)
+            _w = _it.widget() if _it is not None else None
+            if isinstance(_w, QtWidgets.QGroupBox):
+                _gl = _w.layout()
+                if _gl is not None:
+                    _m = _gl.contentsMargins()
+                    _gl.setContentsMargins(_m.left(), 2, _m.right(), 2)
+                    if _gl.spacing() > 2:
+                        _gl.setSpacing(2)
+                for _sub in _w.findChildren(QtWidgets.QFormLayout):
+                    if _sub.verticalSpacing() > 2:
+                        _sub.setVerticalSpacing(2)
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_inner)
         left_scroll.setWidgetResizable(True)
@@ -1356,6 +1379,37 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         # clip if the splitter shrinks the column too much. Pin a hard
         # floor so the user can't drag the divider into a useless state.
         left_scroll.setMinimumWidth(420)
+
+        # ---- Pattern preview → own scroll pane + drag-resizable border ----
+        # Operator #7: give the pulse-pattern preview its own scrollbar and a
+        # stretchable (splitter) border, like the experiment plot/inset
+        # splitter.  Each tab adds ``self.pattern_preview`` to its params_box;
+        # lift it OUT into its own QScrollArea and put a VERTICAL splitter
+        # between the controls (top) and the preview (bottom), so the operator
+        # can drag to resize the preview's height and the preview scrolls
+        # independently of the form.  Tabs without a pattern preview (EIS —
+        # ``pattern_preview`` exists but was never added, so its parent is
+        # None) keep the plain scroll column.
+        _preview = getattr(self, "pattern_preview", None)
+        if _preview is not None and _preview.parent() is not None:
+            _preview.setParent(None)
+            preview_scroll = QtWidgets.QScrollArea()
+            preview_scroll.setWidget(_preview)
+            preview_scroll.setWidgetResizable(True)
+            preview_scroll.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            preview_scroll.setMinimumHeight(140)
+            left_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+            left_split.addWidget(left_scroll)      # controls (form only now)
+            left_split.addWidget(preview_scroll)   # preview, own scrollbar
+            left_split.setStretchFactor(0, 3)      # controls get the room by default
+            left_split.setStretchFactor(1, 2)
+            left_split.setCollapsible(0, False)    # never collapse the controls
+            left_split.setCollapsible(1, True)     # preview can be dragged shut
+            self._params_preview_split = left_split
+            _left_col = left_split
+        else:
+            _left_col = left_scroll
 
         # Right column: channel-selection hint, then a vertical splitter
         # between the grid and the combo panel so either can grow.
@@ -1393,7 +1447,7 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         right_scroll.setMinimumWidth(280)
 
         h_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        h_split.addWidget(left_scroll)
+        h_split.addWidget(_left_col)
         h_split.addWidget(right_scroll)
         h_split.setStretchFactor(0, 1)
         h_split.setStretchFactor(1, 2)

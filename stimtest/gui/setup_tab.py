@@ -1913,6 +1913,13 @@ class SetupTab(QtWidgets.QWidget):
         # ---------------- left column container ----------------
         left_w = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left_w)
+        # Tighten the inter-group spacing so the stacked group boxes don't
+        # read as mostly empty space (operator #1: "remove the vertical
+        # space between inputs").  The within-form row gap is already 2 px
+        # (rich.make_form); the removable air is the group-box chrome, so
+        # squeeze the gaps BETWEEN groups hard.
+        lv.setContentsMargins(6, 4, 6, 4)
+        lv.setSpacing(2)
         # Hardware (Connection) panel sits at the very top of Setup so
         # the user can connect/disconnect without leaving this tab.
         if self._connection_panel is not None:
@@ -1926,6 +1933,28 @@ class SetupTab(QtWidgets.QWidget):
         lv.addWidget(acq_box)
         lv.addWidget(exp_box)
         lv.addStretch(1)
+        # Trim each group box's internal title-to-content margins (Qt's
+        # default ~11 px reserves space for the title AND adds slack below
+        # it) so the first row sits close under its title and the last row
+        # close to the bottom border — the bulk of the vertical air the
+        # operator flagged (#1) is this per-group chrome, not the row gaps.
+        self._compact_group_boxes = [
+            _gb for _gb in (
+                (hw_box if self._connection_panel is not None else None),
+                sess_box, dev_box, scope_box, acq_box, exp_box,
+            ) if _gb is not None
+        ]
+        for _gb in self._compact_group_boxes:
+            _gl = _gb.layout()
+            if _gl is not None:
+                _m = _gl.contentsMargins()
+                _gl.setContentsMargins(_m.left(), 2, _m.right(), 2)
+                if _gl.spacing() > 2:
+                    _gl.setSpacing(2)
+        # Squeeze the row-to-row gap inside every Setup form to 1 px (from
+        # make_form's default 2) — the last cheap vertical air left.
+        for _f in (sess_form, dev_form, acq_form, exp_form, sf):
+            _f.setVerticalSpacing(1)
         # Held so the run-lock can disable the INNER form (inputs +
         # Hardware panel) while leaving the scroll area itself enabled —
         # otherwise the operator can't scroll/read Setup during a run

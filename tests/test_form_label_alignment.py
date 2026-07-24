@@ -79,3 +79,26 @@ def test_scope_mapping_table_is_not_forced_to_the_shared_width():
         assert all(lab.minimumWidth() < shared for lab in ch_labels)
     finally:
         w.close()
+
+
+def test_setup_forms_have_tight_vertical_spacing():
+    """Operator #1: "remove the vertical space between inputs."  The stacked
+    Setup forms use a 1-px row gap, and each group box hugs its title/border
+    (top+bottom content margins <= 2)."""
+    app, w, tab = _setup_tab()
+    try:
+        for form in tab._label_align_forms:                 # sess/dev/acq/exp
+            assert form.verticalSpacing() <= 1, form.verticalSpacing()
+        # Every stacked group box's inner layout hugs the title (top) and
+        # bottom border — the per-group chrome is where the removable air
+        # lived.  (Only the top-level Setup groups are tightened; nested
+        # group boxes inside the connection panel keep their own margins.)
+        for box in tab._compact_group_boxes:
+            lay = box.layout()
+            if lay is None:
+                continue
+            m = lay.contentsMargins()
+            assert m.top() <= 2, (box.title(), m.top())
+            assert m.bottom() <= 2, (box.title(), m.bottom())
+    finally:
+        w.close()
