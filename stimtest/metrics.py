@@ -681,7 +681,8 @@ def _find_n_peaks(deriv_abs: np.ndarray, n_target: int,
 def _localize_access_point(deriv_abs: np.ndarray, peak_idx: int,
                            fit_len: int = 50, walk_len: int = 30,
                            dev_thresh: float = 1.0,
-                           max_seconds: float = 0.5) -> int:
+                           max_seconds: float = 0.5,
+                           max_walk_len: Optional[int] = None) -> int:
     """Given a derivative peak, find where the curve first departs from a
     linear fit by ``dev_thresh`` (relative). Vectorised port of the
     ``getAccess.m`` linear-fit deviation search (lines 230–280).
@@ -703,6 +704,10 @@ def _localize_access_point(deriv_abs: np.ndarray, peak_idx: int,
     slope, intercept = np.polyfit(xs, ys, 1)
 
     upper = n - 50
+    # Keep the settling/marker sample AT the current transition — never walk
+    # deep into the phase where the electrode polarization lives (operator).
+    if max_walk_len is not None and max_walk_len > 0:
+        upper = min(upper, peak_idx + int(max_walk_len))
     start = peak_idx + 1
     if upper <= start:
         return min(start, n - 1)
@@ -723,6 +728,21 @@ def _localize_access_point(deriv_abs: np.ndarray, peak_idx: int,
 #: ~1 µs current-rise / switching transient) and spanning ``_ACCESS_AFTER_WIN_US``.
 _ACCESS_AFTER_START_US = 1.0
 _ACCESS_AFTER_WIN_US = 2.0
+
+#: The access step is the FAST ohmic jump AT the current transition, so an
+#: access point is localized in a TIGHT window around the pattern-derived edge
+#: time — never a distant mid-phase / post-polarization |dV/dt| feature, and
+#: the settling/marker sample never walks deep into the phase where the
+#: electrode polarization (E_mc/E_ma) lives (operator: "Va/Ra cannot be after
+#: the electrode polarization … the access voltage is localized around
+#: vertical rises/falls from the current pattern").
+#:  * ``_ACCESS_EDGE_SEARCH_US`` — half-window (µs) around each expected
+#:    current-edge time for the |dV/dt| peak search.  Comfortably covers the
+#:    onset-detection skew (~1-2 µs) while excluding far peaks.
+#:  * ``_ACCESS_SETTLE_MAX_US`` — max forward walk (µs) from the edge to the
+#:    settling/marker sample, so the marker stays AT the vertical transition.
+_ACCESS_EDGE_SEARCH_US = 12.0
+_ACCESS_SETTLE_MAX_US = 15.0
 
 
 def access_step_by_extrapolation(time_us, v, peak_idx: int, acc_idx: int,
@@ -949,6 +969,14 @@ def access_voltage_and_resistance(
         exp_idx = [int(np.clip(np.searchsorted(time_us, et), 0, sz - 1))
                    for et in exp_t]
         N = len(exp_idx)
+        # Sample interval → the tight edge-search half-window + the settling
+        # walk cap (in samples), so the access point stays AT the vertical
+        # current transition (operator #10).
+        _dt = float(np.median(np.diff(time_us))) if time_us.size > 1 else 0.0
+        edge_w = (max(1, int(round(_ACCESS_EDGE_SEARCH_US / _dt)))
+                  if _dt > 0 else sz)
+        settle_len = (max(4, int(round(_ACCESS_SETTLE_MAX_US / _dt)))
+                      if _dt > 0 else None)
         for i, b in enumerate(exp_idx):
             if i > 0:
                 lo = (exp_idx[i - 1] + b) // 2
@@ -962,6 +990,16 @@ def access_voltage_and_resistance(
                 hi = b + max(gap // 2, 1)
             lo = int(max(0, min(lo, sz - 2)))
             hi = int(max(lo + 1, min(hi, sz)))
+            # NARROW the peak search to a tight window around the pattern's
+            # expected current-edge time — the access step is the fast ohmic
+            # jump AT the transition, not a distant mid-phase / post-E_pol
+            # |dV/dt| feature (operator: "the access voltage is localized
+            # around vertical rises/falls from the current pattern").  Falls
+            # back to the wider midpoint region if the narrow window degenerates.
+            nlo = int(max(lo, b - edge_w))
+            nhi = int(min(hi, b + edge_w + 1))
+            if nhi - nlo >= 1:
+                lo, hi = nlo, nhi
             local = deriv_abs[lo:hi]
             if local.size == 0:
                 _b = int(min(max(b, 0), sz - 1))
@@ -969,7 +1007,8 @@ def access_voltage_and_resistance(
                 peak_idx.append(_b)
                 continue
             peak_local = lo + int(np.argmax(local))
-            access_idx.append(_localize_access_point(deriv_abs, peak_local))
+            access_idx.append(_localize_access_point(
+                deriv_abs, peak_local, max_walk_len=settle_len))
             peak_idx.append(peak_local)
 
     # Pad if we're short (best-effort fallback)
