@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -412,6 +412,30 @@ class RampPolicy:
     bad_response_broken_z_kohm: float = 200.0   # |V|/|I| ≥ this ⇒ broken (manual)
 
 
+def distribute_sequential(total_ua: float, n_channels: int,
+                          per_channel_max_ua: float = STIM_MAX_AMPLITUDE_UA
+                          ) -> List[float]:
+    """Split a TOTAL current across ``n_channels`` physically-SHORTED channels by
+    SEQUENTIAL FILL (operator: "after a channel has reached its 1 mA limit, start
+    using the other shorted channel to apply more current").
+
+    Fills the FIRST channel to its ``per_channel_max_ua`` (1 mA) before engaging
+    the second, and so on — NOT an even split.  So the electrode receives the sum
+    ``total_ua`` (up to ``n_channels × per_channel_max_ua``), the primary channel
+    (index 0, the monitored one) saturates first, and each extra shorted channel
+    only turns on once the previous is maxed.  Returns the per-channel share list
+    (each ≤ ``per_channel_max_ua``); shares beyond the total are 0."""
+    n = max(1, int(n_channels))
+    cap = abs(float(per_channel_max_ua)) or STIM_MAX_AMPLITUDE_UA
+    remaining = max(0.0, float(total_ua))
+    shares: List[float] = []
+    for _ in range(n):
+        s = min(remaining, cap)
+        shares.append(s)
+        remaining -= s
+    return shares
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -427,19 +451,32 @@ class VoltageTransientExperiment(ExperimentRunner):
                  cathodic_limit_v: Optional[float] = None,
                  anodic_limit_v: Optional[float] = None,
                  polarization_tolerance_v: float = 0.0,
-                 sweep_points: Optional[List[SweepPoint]] = None):
+                 sweep_points: Optional[List[SweepPoint]] = None,
+                 shorted_channels: Optional[List[int]] = None):
         super().__init__(session, stimulator, oscilloscope)
         self.ramp = ramp or RampPolicy()
-        # SAFETY: never let the ramp target past the PlexStim hardware rail
-        # (1000 µA).  A pattern above it raises ValueError in
-        # PulsePattern.validate → the run aborts.  This clamps ANY caller-passed
-        # ramp (e.g. a legacy RampPolicy(max_ua=1500), or Long Pulsing's default
-        # ramp which omits max_ua and would inherit the dataclass default) down
-        # to the rail, so no path can climb into the invalid region.  gotcha #56.
+        # SHORTED CHANNELS (operator: "indicate that channels will be shorted
+        # together to apply more than 1 mA … after a channel reaches its 1 mA
+        # limit, start using the other shorted channel").  Physically-paralleled
+        # stim channels driving the ACTIVE electrode so the TOTAL current can
+        # exceed the 1 mA per-channel rail.  The ramp's ``amp`` is the TOTAL
+        # current (up to N × the rail); at load time it is split by SEQUENTIAL
+        # FILL (:func:`distribute_sequential`) so each channel stays ≤ 1 mA and
+        # the primary (monitored) channel saturates first.
+        self._shorted_channels: Tuple[int, ...] = tuple(
+            int(c) for c in (shorted_channels or ()) if int(c) > 0)
+        self._shorted_n = max(1, len(self._shorted_channels))
+        self._effective_rail_ua = self._shorted_n * float(STIM_MAX_AMPLITUDE_UA)
+        # SAFETY: never let the ramp target past the EFFECTIVE hardware rail —
+        # N × 1000 µA for N shorted channels, else the 1000 µA single-channel
+        # rail (gotcha #56).  A per-channel pattern above 1000 µA raises
+        # ValueError in PulsePattern.validate; the split keeps each ≤ 1000, and
+        # the ramp total ≤ N × 1000.  Clamps ANY caller-passed ramp down.
         try:
-            self.ramp.max_ua = min(float(self.ramp.max_ua), STIM_MAX_AMPLITUDE_UA)
+            self.ramp.max_ua = min(float(self.ramp.max_ua),
+                                   self._effective_rail_ua)
         except Exception:
-            self.ramp.max_ua = STIM_MAX_AMPLITUDE_UA
+            self.ramp.max_ua = self._effective_rail_ua
         # STABLE copy of the policy excitation ceiling (post-rail-clamp).  Each
         # configuration derives its own RECHARGE-AWARE ceiling from THIS value
         # (not the possibly-already-lowered ``self.ramp.max_ua``) so a per-point
@@ -787,7 +824,12 @@ class VoltageTransientExperiment(ExperimentRunner):
             ratio = max(abs(float(p.amplitude_ua)) / exc for p in phases)
             if ratio <= 1.0 + 1e-9:
                 return base_ceiling
-            return min(base_ceiling, float(STIM_MAX_AMPLITUDE_UA) / ratio)
+            # Rail is the EFFECTIVE rail (N × 1 mA for N shorted channels): the
+            # per-channel split keeps each channel's largest phase ≤ 1 mA, so the
+            # TOTAL excitation ceiling is N × (1 mA / ratio).
+            _rail = float(getattr(self, "_effective_rail_ua",
+                                  STIM_MAX_AMPLITUDE_UA))
+            return min(base_ceiling, _rail / ratio)
         except Exception:
             return base_ceiling
 
@@ -1642,6 +1684,58 @@ class VoltageTransientExperiment(ExperimentRunner):
         except Exception:
             pass
 
+    def _shorted_group_for(self, config: Configuration) -> Tuple[int, ...]:
+        """Ordered channels driving the active electrode: the active (monitored,
+        filled FIRST by the sequential split) then the OTHER shorted channels.
+        ``(config.active,)`` when no shorting is configured."""
+        grp = tuple(self._shorted_channels)
+        if len(grp) <= 1:
+            return (config.active,)
+        rest = [c for c in grp if c != config.active]
+        return (config.active,) + tuple(rest)
+
+    def _load_active_or_shorted(self, pattern: PulsePattern,
+                                config: Configuration) -> Tuple[int, ...]:
+        """Load the active channel with ``pattern`` — or, when channels are
+        SHORTED onto this electrode, split the pattern's TOTAL current across
+        the group by SEQUENTIAL FILL and load each channel with its share (each
+        ≤ 1 mA), so the electrode receives the total > 1 mA (operator).  Each
+        share pattern is ``pattern.scaled(share/total)`` — same shape, so the N
+        shorted channels SUM back to the logical total pattern.  All loaded
+        channels are started SYNCHRONISED by the caller's ``start_all``
+        (PS_StartStimAllChannels) so they pulse at the same time and their
+        currents add correctly (operator: "the shorted channels need to start
+        pulsing at the same time").  Returns the loaded group so the caller
+        EXCLUDES it from the zero-unused set."""
+        group = self._shorted_group_for(config)
+        if len(group) <= 1:
+            self.stim.load_channel(config.active, pattern)
+            self.stim.set_repetitions(config.active, 0)
+            return group
+        total = abs(pattern.excitation_phase.amplitude_ua)
+        # Per-channel EXCITATION cap so each channel's LARGEST phase stays ≤ 1 mA
+        # — an asymmetric recharge phase runs ``ratio`` × the excitation, so a
+        # channel can only carry ``1 mA / ratio`` of excitation (ratio = 1 for a
+        # symmetric biphasic → the full 1 mA).
+        try:
+            ratio = (max(abs(float(p.amplitude_ua)) for p in pattern.phases)
+                     / total) if total > 1e-12 else 1.0
+        except Exception:
+            ratio = 1.0
+        per_ch = float(STIM_MAX_AMPLITUDE_UA) / max(1.0, ratio)
+        shares = distribute_sequential(total, len(group), per_ch)
+        for ch, share in zip(group, shares):
+            # A share of 0 (this shorted channel not yet engaged) loads
+            # ``pattern.scaled(0.0)`` — a ZERO-amplitude copy that MATCHES the
+            # pulse timing (phase widths, interphase + discharge delays), so the
+            # channel TICKS in cadence and turns on cleanly once the previous
+            # channel maxes out (operator: "when the shorted channel is unused,
+            # apply 0 µA that matches the stimulation pulse width").
+            frac = (share / total) if total > 1e-12 else 0.0
+            self.stim.load_channel(ch, pattern.scaled(frac))
+            self.stim.set_repetitions(ch, 0)
+        return group
+
     def _one_capture(self, config: Configuration, pattern: PulsePattern,
                      index: int) -> Capture:
         # Pulsing-window timer (operator: "the number of pulses must be
@@ -1724,18 +1818,22 @@ class VoltageTransientExperiment(ExperimentRunner):
             except Exception:
                 pass
             self.stim.set_monitor_channel(config.active)
-            self.stim.load_channel(config.active, pattern)
-            self.stim.set_repetitions(config.active, 0)  # infinite for sweep, then stop
+            # Load the active channel — or, when channels are SHORTED onto this
+            # electrode, SPLIT the total current across them (sequential fill) so
+            # the electrode receives > 1 mA while each channel stays ≤ 1 mA.
+            _group = self._load_active_or_shorted(pattern, config)
             # Load a zero-amplitude, same-duration copy of the pattern
-            # onto every "unused" channel (anything not active and not
-            # in returns).  Port of MATLAB ``setPattern.m`` Zero Current
+            # onto every "unused" channel (anything not active/shorted and
+            # not in returns).  Port of MATLAB ``setPattern.m`` Zero Current
             # block — keeps unused channels TICKING in sync with the
             # active channel's pulse cycle rather than carrying a stale
             # pattern from a previous step or falling out of cadence.
             # Returns are intentionally excluded so they stay UNLOADED
             # (passive sink); CG configs are auto-skipped because their
-            # returns span every other channel (unused set is empty).
-            self.load_zero_unused_channels(pattern, config)
+            # returns span every other channel (unused set is empty).  The
+            # SHORTED group is excluded too (they carry the real shares).
+            self.load_zero_unused_channels(pattern, config,
+                                           active_channels=set(_group))
             # MONOPOLAR commit (config.returns empty) → ONE
             # PS_LoadAllChannels; multipolar is a no-op here (the
             # per-channel PS_LoadChannel loads stand).  MATLAB
@@ -1846,8 +1944,18 @@ class VoltageTransientExperiment(ExperimentRunner):
                 def _offset_recap(_t=_capture_timeout_s):
                     self.scope.settle_one_acquisition(timeout_s=_t)
                     return self.scope.single_capture(timeout_s=_t)
+                # LENIENT interpulse-SD accept at ~0 µA (operator #5): the
+                # baseline capture is the pure noise floor with no pulse, so a
+                # 3× looser flatness accept lets the DC→AC offset measurement
+                # proceed instead of exhausting the retries on noise.
+                from .base import _AC_INTERPULSE_SD_LENIENT_V as _LENIENT_SD
+                try:
+                    _amp0 = abs(float(pattern.excitation_phase.amplitude_ua))
+                except Exception:
+                    _amp0 = 1.0
                 self.measure_electrode_dc_offsets_and_switch_to_ac(
-                    _offset_recap, roles=_ac_roles)
+                    _offset_recap, roles=_ac_roles,
+                    settle_sd_v=(_LENIENT_SD if _amp0 < 0.5 else None))
                 self._electrode_offset_config_key = _cfg_key
 
             try:

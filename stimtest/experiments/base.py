@@ -139,6 +139,13 @@ _AC_COUPLING_SETTLE_S = 0.5
 #: mode SKIPS this entirely — the helper isn't called; E_ret is stable
 #: DC-coupled from the first frame.)
 _AC_INTERPULSE_SD_V = 0.005           # 5 mV — SD of a settled (flat) interpulse
+#: LENIENT interpulse-SD threshold used when the pulse amplitude is ~0 µA
+#: (operator #5: "be more lenient on AC+DC waveforms at 0 µA").  At 0 µA there
+#: is no pulse — the whole trace is the noise floor, so the strict 5 mV
+#: flatness accept can't reliably pass on a noisy baseline and there is no
+#: signal to preserve; a 3× looser accept lets the DC→AC offset measurement
+#: proceed instead of exhausting the retries + force-accepting.
+_AC_INTERPULSE_SD_LENIENT_V = 0.015   # 15 mV
 #: Bounded re-captures while waiting for the AC interpulse SD to settle.
 #: Each is a full averaged capture; typically 1-2 suffice.  On timeout the
 #: last capture is accepted anyway (with a ⚠ log) so a run never stalls.
@@ -2816,7 +2823,8 @@ class ExperimentRunner(ABC):
         return acq
 
     def measure_electrode_dc_offsets_and_switch_to_ac(
-            self, recapture, *, roles=("eret", "eact")) -> None:
+            self, recapture, *, roles=("eret", "eact"),
+            settle_sd_v=None) -> None:
         """Capture the DC rest potential of E_ret / E_act, then AC-couple them.
 
         Operator: "Let's try AC coupled after capturing the offset from DC
@@ -2949,6 +2957,11 @@ class ExperimentRunner(ABC):
                 # DC level AND confirms the averager has flushed the settling
                 # frames.  A short head-start sleep lets the RC begin
                 # discharging before the first averaged window.
+                # Acceptance SD threshold — the caller passes a LENIENT value at
+                # ~0 µA (operator #5), where the trace is the pure noise floor
+                # and the strict 5 mV flatness accept can't reliably pass.
+                _sd_thresh = (float(settle_sd_v) if settle_sd_v
+                              else _AC_INTERPULSE_SD_V)
                 self.abort_sleep(_AC_COUPLING_SETTLE_S)
                 _sdb = _sda = float("nan")
                 for _chk in range(_AC_SETTLE_MAX_CHECKS):
@@ -2959,8 +2972,8 @@ class ExperimentRunner(ABC):
                         continue
                     _sdb, _sda = self._interpulse_sds(_acq2, ch)
                     _ok = (_np.isfinite(_sdb) and _np.isfinite(_sda)
-                           and _sdb <= _AC_INTERPULSE_SD_V
-                           and _sda <= _AC_INTERPULSE_SD_V)
+                           and _sdb <= _sd_thresh
+                           and _sda <= _sd_thresh)
                     if _ok:
                         self._emit(ExperimentEvent(
                             kind="log", session=self.session,
@@ -2968,7 +2981,7 @@ class ExperimentRunner(ABC):
                                 f"[scope] {_role_disp(role)} ({ch}) AC interpulse "
                                 f"settled: SD before={_sdb*1e3:.2f} mV, "
                                 f"after={_sda*1e3:.2f} mV "
-                                f"(≤ {_AC_INTERPULSE_SD_V*1e3:.0f} mV) after "
+                                f"(≤ {_sd_thresh*1e3:.0f} mV) after "
                                 f"{_chk + 1} check(s) — accepted.")))
                         break
                     self._emit(ExperimentEvent(

@@ -216,6 +216,40 @@ def test_ac_rejects_when_only_one_side_is_flat(monkeypatch):
         stim.close(); scope.close()
 
 
+def test_ac_lenient_threshold_accepts_noisy_baseline_at_zero_ua(monkeypatch):
+    """At ~0 µA the caller passes a LENIENT ``settle_sd_v`` (operator #5): an
+    interpulse SD between the strict 5 mV and the lenient 15 mV — which the
+    default REJECTS — is ACCEPTED so the DC→AC offset measurement proceeds on
+    the pure-noise baseline instead of exhausting the retries."""
+    from stimtest.experiments.base import (_AC_INTERPULSE_SD_LENIENT_V,
+                                           _AC_SETTLE_MAX_CHECKS)
+
+    def _drive(settle_sd_v):
+        runner, stim, scope = _runner()
+        try:
+            scope.channel_aliases = {"vmon": "CH1", "eret": "CH3"}
+            monkeypatch.setattr(scope, "set_channel_coupling", lambda ch, c: None)
+            monkeypatch.setattr(runner, "abort_sleep", lambda *a, **k: True)
+            # drift 35 mV → SD ≈ 10.1 mV (above strict 5, below lenient 15).
+            seq = [_cap_with_interpulse(2, 2)] + [_cap_with_interpulse(35, 35)] * 6
+            calls = {"n": 0}
+
+            def _recap():
+                c = seq[min(calls["n"], len(seq) - 1)]
+                calls["n"] += 1
+                return c
+            runner.measure_electrode_dc_offsets_and_switch_to_ac(
+                _recap, settle_sd_v=settle_sd_v)
+            return calls["n"]
+        finally:
+            stim.close(); scope.close()
+
+    # STRICT default → ~10 mV SD rejected, exhausts all checks.
+    assert _drive(None) == 1 + _AC_SETTLE_MAX_CHECKS
+    # LENIENT (0 µA) → accepted on the first settle check.
+    assert _drive(_AC_INTERPULSE_SD_LENIENT_V) == 2
+
+
 def test_ac_accepts_anyway_after_max_sd_checks(monkeypatch):
     """If the interpulse never flattens (e.g. a very slow corner), the loop
     is bounded — it accepts the last capture after the max checks rather

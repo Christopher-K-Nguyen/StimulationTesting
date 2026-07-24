@@ -4935,6 +4935,7 @@ class VoltageTransientTab(_BaseExperimentTab):
         ("qinj_mc", "target charge density"),
         ("fixed_ramp_check", "ramp sweep"),
         ("pause_between_channels_check", "pause between channels"),
+        ("shorted_check", "short channels together"),
         ("strategy_combo", "ramp strategy"),
         ("start_ua", "ramp start current"),
         ("coarse_ua", "coarse step"),
@@ -5298,8 +5299,41 @@ class VoltageTransientTab(_BaseExperimentTab):
             lab = QtWidgets.QLabel(label); lab.setTextFormat(QtCore.Qt.TextFormat.RichText)
             ramp_form.addRow(lab, widget)
             self._ramp_rows[key] = (lab, widget)
+        # ---- Shorted channels (parallel drive for > 1 mA) ----------------
+        # Operator: "indicate that channels will be shorted together to apply
+        # more than 1 mA … after a channel reaches its 1 mA limit, start using
+        # the other shorted channel."  Physically parallel N stim channels onto
+        # the active electrode; the ramp total then reaches N × 1 mA, SPLIT by
+        # sequential fill at load time.
+        self.shorted_check = QtWidgets.QCheckBox(
+            "Short channels together (parallel drive for > 1 mA)")
+        self.shorted_check.setToolTip(
+            "Physically parallel several stimulator channels onto the active "
+            "electrode to exceed the 1 mA per-channel limit. PULSAR splits the "
+            "total by SEQUENTIAL FILL: drive the primary channel to 1 mA, then "
+            "engage the next shorted channel, and so on. Pause between "
+            "electrodes to re-wire.")
+        self.shorted_channels_edit = QtWidgets.QLineEdit()
+        self.shorted_channels_edit.setPlaceholderText("e.g. 1, 2, 3")
+        self.shorted_channels_edit.setToolTip(
+            "Stimulator channels physically shorted together (comma-separated); "
+            "the FIRST is the primary (monitored) channel.")
+        self.shorted_channels_edit.setEnabled(False)
+        self.shorted_max_label = QtWidgets.QLabel("Maximum current: 1.0 mA")
+        self.shorted_check.toggled.connect(self._on_shorted_changed)
+        self.shorted_channels_edit.textChanged.connect(self._on_shorted_changed)
+        self.shorted_channels_edit.editingFinished.connect(
+            lambda: self._emit_param("shorted channels ="
+                                     f" {self.shorted_channels_edit.text()}"))
+        _sh_form = rich.make_form()
+        _sh_form.addRow("", self.shorted_check)
+        _sh_form.addRow("Shorted channels:", self.shorted_channels_edit)
+        _sh_form.addRow("", self.shorted_max_label)
+
         ramp_box = QtWidgets.QGroupBox("Ramp policy")
-        QtWidgets.QVBoxLayout(ramp_box).addLayout(ramp_form)
+        _ramp_vbox = QtWidgets.QVBoxLayout(ramp_box)
+        _ramp_vbox.addLayout(ramp_form)
+        _ramp_vbox.addLayout(_sh_form)
 
         # ----- Early open/broken failure detection (operator-configurable) ----
         # Operator: CH02/CH10 were mis-flagged "open" at 6 µA and the ramp
@@ -5424,6 +5458,7 @@ class VoltageTransientTab(_BaseExperimentTab):
         # Apply initial visibility
         self._on_mode_changed()
         self._on_strategy_changed()
+        self._on_shorted_changed()
         self._on_sweep_toggled()
 
         # Hand off to the base class for the Parameters / Experiment sub-tabs
@@ -5803,8 +5838,39 @@ class VoltageTransientTab(_BaseExperimentTab):
             visible = key in show
             lab.setVisible(visible); w.setVisible(visible)
 
+    def _shorted_channels_list(self) -> list:
+        """Parse the comma-separated shorted-channel edit → a list of ints
+        (deduped, order-preserving, 1..16).  Empty / disabled → []."""
+        if not getattr(self, "shorted_check", None) or \
+                not self.shorted_check.isChecked():
+            return []
+        out, seen = [], set()
+        for tok in self.shorted_channels_edit.text().replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ch = int(tok)
+            except ValueError:
+                continue
+            if 1 <= ch <= 16 and ch not in seen:
+                seen.add(ch); out.append(ch)
+        return out
+
+    def _on_shorted_changed(self, *_):
+        """Enable the channel edit + refresh the read-only max-current label.
+        The effective maximum = (number of shorted channels) × 1 mA — the
+        current PULSAR can drive by paralleling those stimulator channels
+        (operator: "display the maximum current")."""
+        on = bool(self.shorted_check.isChecked())
+        self.shorted_channels_edit.setEnabled(on)
+        chans = self._shorted_channels_list()
+        n = max(1, len(chans))
+        self.shorted_max_label.setText(f"Maximum current: {n:.1f} mA")
+
     PREF_FIELDS = ("mode_combo", "strategy_combo", "fixed_ramp_check",
                    "pause_between_channels_check",
+                   "shorted_check", "shorted_channels_edit",
                    "qinj_mc",
                    "qph_current", "qph_width", "qph_qph",
                    "start_ua", "coarse_ua", "fine_ua", "max_ua", "safety_factor",
@@ -6059,6 +6125,7 @@ class VoltageTransientTab(_BaseExperimentTab):
             anodic_limit_v=self._anodic_limit_v,
             polarization_tolerance_v=self._polarization_tolerance_v,
             sweep_points=sweep_points,
+            shorted_channels=self._shorted_channels_list() or None,
         )
         runner.trigger_source = self._trigger_source
         runner.trigger_is_digital = self._trigger_is_digital
@@ -6070,8 +6137,18 @@ class VoltageTransientTab(_BaseExperimentTab):
         # Push the between-channels rewire-pause flag onto the runner.
         # Only meaningful when more than one configuration was selected;
         # the runner's wait_for_continue short-circuits if the flag is off.
+        # Shorted-channel testing ALWAYS forces the pause — the operator has
+        # to physically re-wire the shorting harness onto the next electrode
+        # (operator: "this type of testing will have to have pausing between
+        # electrode testing").
+        _shorted = self._shorted_channels_list()
         runner.pause_between_channels = (
-            self.pause_between_channels_check.isChecked())
+            self.pause_between_channels_check.isChecked() or bool(_shorted))
+        if len(_shorted) >= 2:
+            self.log_pane.log(
+                f"Shorted-channel drive: channels {_shorted} paralleled → "
+                f"max {len(_shorted):.1f} mA (sequential fill). Pausing "
+                f"between electrodes for re-wiring.")
         save_name = (f"{self._session_stem}.npz" if self._session_stem else
                      f"VT_{config.display_name().replace(' ', '_')}.npz")
         self._start_runner(runner, save_name)
@@ -6088,6 +6165,27 @@ class VoltageTransientTab(_BaseExperimentTab):
         )
 
     def _build_ramp_policy(self, panel_amp_ua: float) -> "RampPolicy":
+        """Build the ramp policy, then RAISE the ceiling for shorted channels.
+
+        When N stimulator channels are shorted together (operator), the ramp
+        can reach N × the 1 mA per-channel rail, so — in Maximum mode — the
+        ``max_ua`` ceiling is boosted to N × 1000 µA (the runner then splits
+        the total by sequential fill).  A single-shot / fixed-current run is
+        left alone (its ceiling is the pattern amplitude)."""
+        pol = self._build_ramp_policy_impl(panel_amp_ua)
+        chans = self._shorted_channels_list()
+        if len(chans) >= 2 and self.mode_combo.currentText() == self.MODE_MAX:
+            import dataclasses
+            from ..config import STIM_MAX_AMPLITUDE_UA
+            boosted = float(len(chans)) * float(STIM_MAX_AMPLITUDE_UA)
+            try:
+                pol = dataclasses.replace(
+                    pol, max_ua=max(float(pol.max_ua), boosted))
+            except Exception:
+                pass
+        return pol
+
+    def _build_ramp_policy_impl(self, panel_amp_ua: float) -> "RampPolicy":
         """Translate (mode, strategy) into a :class:`RampPolicy`.
 
         The VT ramp ALWAYS starts at the configured stimulation pattern's
