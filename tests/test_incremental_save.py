@@ -200,23 +200,38 @@ def test_incremental_new_capture_forces_write(tmp_path):
     assert len(meta["runs"][0]["captures"]) == 2
 
 
-def test_incremental_time_elapsed_forces_write(tmp_path):
-    """Enough time elapsed bypasses the capture-count throttle."""
+def test_incremental_no_rewrite_without_new_data(tmp_path):
+    """Time elapsed must NOT force a rewrite when NO new capture has landed
+    since the last save (operator #6): a long PCC run's multi-second capture
+    cycle otherwise re-wrote a fresh ~10 MB npz of IDENTICAL data every
+    ``min_interval_s`` (~14 back-to-back writes at the same capture count).
+    The time throttle only CAPS the rate; new data is required to write."""
     from stimtest.persistence import save_session_npz_incremental
 
     sess = _make_session_with_n_captures(1)
     path = tmp_path / "incr.npz"
     _, t1, n1, _ = save_session_npz_incremental(sess, path)
 
-    # Fake an old timestamp by subtracting from t1.
+    # Lots of time elapsed but NO new captures → SKIP (unchanged data).
     fake_old_t = t1 - 100.0  # 100 s in the past
-    _, _, _, did_write = save_session_npz_incremental(
+    _, t2, n2, did_write = save_session_npz_incremental(
         sess, path,
         last_save_at=fake_old_t, last_capture_count=n1,
-        min_interval_s=2.0,          # 100 s > 2 s
-        min_capture_interval=10,     # no new captures, but time triggers
+        min_interval_s=2.0,          # 100 s > 2 s — but no new data
+        min_capture_interval=10,
     )
-    assert did_write is True
+    assert did_write is False
+    assert t2 == fake_old_t and n2 == n1   # throttle state unchanged
+
+    # WITH a new capture + elapsed time → write.
+    sess.runs[0].captures.append(sess.runs[0].captures[0])
+    _, _, n3, did_write2 = save_session_npz_incremental(
+        sess, path,
+        last_save_at=fake_old_t, last_capture_count=n1,
+        min_interval_s=2.0, min_capture_interval=10,
+    )
+    assert did_write2 is True
+    assert n3 == 2
 
 
 def test_incremental_overwrites_same_file(tmp_path):

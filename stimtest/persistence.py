@@ -238,7 +238,18 @@ def save_session_npz_incremental(
     enough_time = time_elapsed >= min_interval_s
     enough_captures = new_captures >= min_capture_interval
 
-    # First call always writes (last_save_at is None).
+    # NEVER rewrite the (large, possibly OneDrive-synced) npz when NO new
+    # capture has landed since the last save (operator #6): a long PCC run's
+    # multi-second capture cycle otherwise re-wrote a fresh ~10 MB snapshot of
+    # IDENTICAL data every ``min_interval_s`` (the time throttle fired even
+    # though the capture count was unchanged — the profile showed ~14 back-to-
+    # back writes all at the same "18 caps").  The time throttle now only CAPS
+    # the rate; it never TRIGGERS a redundant write of unchanged data.  This is
+    # crash-recovery-safe: with no new data there is nothing new to recover.
+    if new_captures <= 0:
+        return (Path(path), last_save_at, last_capture_count, False)
+
+    # First call (with ≥1 new capture) always writes (last_save_at is None).
     if last_save_at is not None and not (enough_time or enough_captures):
         return (Path(path), last_save_at, last_capture_count, False)
 
