@@ -1083,6 +1083,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.conn._refresh_cal_label()
         except Exception:
             pass
+        # Verification forced the scope to SAMPLE / DC / TIGHT.  The experiment
+        # run re-applies its own acquisition mode + coupling at entry/Start,
+        # but the HORIZONTAL fit mode isn't re-applied there (gotcha #92 sets
+        # it only on the Setup dropdown / scope connect) — so restore the
+        # Setup's Wide/Tight choice now that verification is done, so its tight
+        # window doesn't leak into the next experiment.
+        try:
+            self._apply_horiz_scaling_to_scope(
+                self.setup_tab.current_horizontal_scaling())
+        except Exception:
+            pass
         # Remove + destroy the verification tab so it's gone from the tab bar
         # (a later Run Verification re-creates it via _open_calibration_tab).
         if cal is not None:

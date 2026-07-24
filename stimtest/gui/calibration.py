@@ -980,11 +980,13 @@ class CalibrationTab(QtWidgets.QWidget):
         return sorted(ch for ch in channels if 1 <= ch <= n_max)
 
     #: Hardcoded acquisition mode for the calibration sweep.  Removed
-    #: from the UI (was a SAMPLE / AVERAGE combo); calibration always
-    #: uses AVERAGE since the IR-step + cap-ramp fits need clean
-    #: traces and SAMPLE mode adds too much variance to the per-step
-    #: ``measured_ua``.
-    CAL_ACQ_MODE: str = "AVERAGE"
+    #: Acquisition mode for verification.  Operator: "Do only sample mode
+    #: acquisition for verification" — capture single sweeps (no averaging),
+    #: like the experiments, with V_mon / I_mon strictly DC-coupled.  NOTE:
+    #: SAMPLE is noisier than AVERAGE for the IR-step + cap-ramp fits (the
+    #: per-step ``measured_ua`` carries more variance); this is the operator's
+    #: deliberate choice.
+    CAL_ACQ_MODE: str = "SAMPLE"
     #: Hardcoded NUMAVg count for the calibration sweep.  Was a
     #: user-facing combo; pinned at 64 (lab convention).  64 gives
     #: √64 = 8× noise reduction — more than enough for the access-
@@ -998,6 +1000,15 @@ class CalibrationTab(QtWidgets.QWidget):
         :data:`CAL_N_AVERAGES` — the UI control was removed.
         """
         return int(self.CAL_N_AVERAGES)
+
+    def _cal_is_sample(self) -> bool:
+        """True when verification uses SAMPLE (single-sweep) acquisition."""
+        return str(self.CAL_ACQ_MODE).strip().upper().startswith("SAM")
+
+    def _cal_n_acq(self) -> int:
+        """Acquisitions to wait for per capture.  SAMPLE mode is a single
+        sweep (no averaging → 1); AVERAGE waits for the full NUMAVg stack."""
+        return 1 if self._cal_is_sample() else self._cal_navg()
 
     def _on_run_sweep(self):
         """Run the per-channel amplitude sweep against the test board.
@@ -1105,6 +1116,25 @@ class CalibrationTab(QtWidgets.QWidget):
                     f"Scope setup: acquisition mode {acq_mode}, "
                     f"n_avg={navg_val} (hardcoded for verification)")
                 self._scope.set_acquisition_mode(acq_mode, n_avg=navg_val)
+                # V_mon + I_mon are STRICTLY DC-coupled for verification
+                # (operator).  Force it explicitly so a prior experiment's AC
+                # (or DC+AC) coupling on those channels can't leak in.
+                _vmon_ch = (self.cal_vmon_combo.currentText() or "CH1")
+                _imon_ch = (self.cal_imon_combo.currentText() or "CH2")
+                for _cch in (_vmon_ch, _imon_ch):
+                    try:
+                        self._scope.set_channel_coupling(_cch, "DC")
+                        self._log(f"Scope setup: {_cch} coupling = DC")
+                    except Exception:
+                        pass
+                # Tight horizontal window (operator: "Make the horizontal
+                # window of verification tight").  Applies to the
+                # auto_layout_for_pulse call below.
+                try:
+                    self._scope.set_horizontal_fit_mode("tight")
+                    self._log("Scope setup: horizontal window = tight")
+                except Exception:
+                    pass
                 # Trigger: always I_mon (CH2), FALL edge, negative threshold.
                 # Calibration pulse is cathodic-first → I_mon goes negative
                 # on the phase-1 onset.  Pass the SIGNED amplitude (negative
@@ -1981,8 +2011,11 @@ class CalibrationTab(QtWidgets.QWidget):
         # extra setup.
         self._stim.start_channel(channel)
         pulse_period_s = 1.0 / pat.rate_hz
-        # Timeout: N_avg periods + generous 5 s overhead for trigger latency.
-        seq_timeout_s = navg * pulse_period_s + 5.0
+        # Acquisitions per capture — a single sweep in SAMPLE mode (no
+        # averaging), the full NUMAVg stack in AVERAGE mode.
+        n_acq = self._cal_n_acq()
+        # Timeout: n_acq periods + generous 5 s overhead for trigger latency.
+        seq_timeout_s = n_acq * pulse_period_s + 5.0
 
         # Skip the FIRST completed averaged acquisition (operator: "skip
         # the first completed acquisition").  After load_channel +
@@ -1996,7 +2029,7 @@ class CalibrationTab(QtWidgets.QWidget):
         # never aborts the real capture below.
         try:
             self._scope.capture_single_sequence(
-                n_acq=navg, timeout_s=seq_timeout_s,
+                n_acq=n_acq, timeout_s=seq_timeout_s,
                 tick_fn=lambda: QtWidgets.QApplication.processEvents())
         except Exception as _skip_err:
             self._log(
@@ -2017,7 +2050,7 @@ class CalibrationTab(QtWidgets.QWidget):
                 # already discarded by the skip-first capture above, so
                 # THIS is the clean averaged acquisition we keep.
                 acq = self._scope.capture_single_sequence(
-                    n_acq=navg,
+                    n_acq=n_acq,
                     timeout_s=seq_timeout_s,
                     tick_fn=lambda: QtWidgets.QApplication.processEvents())
                 chan_data = getattr(acq, "channels", {}) or {}

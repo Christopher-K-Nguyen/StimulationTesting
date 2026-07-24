@@ -38,6 +38,39 @@ def test_amplitude_grid_has_no_500():
     assert CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA[-1] == 200.0
 
 
+# ------------------------------- SAMPLE mode + DC coupling + tight window
+def test_verification_uses_sample_mode():
+    """Operator: 'Do only sample mode acquisition for verification.'"""
+    from stimtest.gui.calibration import CalibrationTab
+    assert CalibrationTab.CAL_ACQ_MODE.upper() == "SAMPLE"
+
+
+def _cal_src() -> str:
+    import pathlib
+    import stimtest.gui.calibration as c
+    return pathlib.Path(c.__file__).read_text(encoding="utf-8")
+
+
+def test_verification_single_sweep_in_sample_mode():
+    """SAMPLE mode captures a single sweep (n_acq = 1), not an average stack."""
+    src = _cal_src()
+    assert "def _cal_n_acq" in src
+    assert "n_acq=n_acq," in src           # capture calls use the derived count
+    assert "_cal_navg()" in src            # AVERAGE path still uses NUMAVg
+
+
+def test_verification_forces_dc_coupling():
+    """Operator: 'Vmon and Imon are strictly in DC-coupled mode.'"""
+    src = _cal_src()
+    assert 'set_channel_coupling(_cch, "DC")' in src
+
+
+def test_verification_uses_tight_horizontal_window():
+    """Operator: 'Make the horizontal window of verification tight.'"""
+    src = _cal_src()
+    assert 'set_horizontal_fit_mode("tight")' in src
+
+
 # ------------------------------------------------- has_unsaved_results
 def test_unsaved_results_flag(_app):
     from stimtest.gui.calibration import CalibrationTab
