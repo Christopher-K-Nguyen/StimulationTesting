@@ -88,7 +88,7 @@ def test_confirm_noop_without_scope(_app):
 def test_confirm_noop_in_sample_mode(_app):
     st = _setup(_app)
     st._scope = _FakeScope()
-    st.acq_mode_combo.setCurrentText("SAMPLE")
+    st.set_acq_mode("SAMPLE")
     st.acq_navg_spin.setValue(100)
     st._confirm_navg_on_scope()
     assert st.acq_navg_spin.value() == 100  # NUMAVg irrelevant in SAMPLE
@@ -97,7 +97,7 @@ def test_confirm_noop_in_sample_mode(_app):
 def test_change_arms_debounce_timer(_app):
     st = _setup(_app)
     st._scope = _FakeScope()
-    st.acq_mode_combo.setCurrentText("AVERAGE")
+    st.set_acq_mode("AVERAGE")
     # The count commits on Enter/return/focus-out (editingFinished), NOT per
     # keystroke — setValue alone must NOT arm the confirm.
     st.acq_navg_spin.setValue(120)

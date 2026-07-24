@@ -852,6 +852,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     _pp.acqNavgEdited.connect(self._on_inline_navg_edited)
                 except Exception:
                     pass
+                # Live pulse-rate feed → the Setup tab's capture-time↔count
+                # conversion (Setup has no rate of its own).  patternChanged
+                # is per-keystroke so the derived count tracks the rate as the
+                # user drags it; the setter no-ops on an unchanged rate.
+                try:
+                    _pp.patternChanged.connect(self._push_active_rate_to_setup)
+                except Exception:
+                    pass
             # Test-parameters inputs (channel/combo selection + de-selection,
             # duration, ramp mode, stop conditions, camera capture, …) carry
             # their own ready-to-log string via ``paramChanged`` (mirrors
@@ -870,6 +878,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # effect at run start.
         try:
             self._log_initial_setup_snapshot()
+        except Exception:
+            pass
+        # Seed the Setup tab's capture-time↔count conversion with the active
+        # experiment's pulse rate (so a restored capture-time derives the
+        # right count before the first pattern edit).
+        try:
+            self._push_active_rate_to_setup()
         except Exception:
             pass
         # Apply the saved colour theme (View → Theme: system / light / dark)
@@ -1353,10 +1368,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             try:
-                mode, n_avg = (
-                    self.setup_tab.acq_mode_combo.currentText(),
-                    int(self.setup_tab.acq_navg_spin.value()),
-                )
+                # SCPI mode name + the effective count (derived from the
+                # capture time in time mode) — same payload the runner reads.
+                mode, n_avg = self.setup_tab.current_acquisition()
                 self._log_setup_change(
                     f"acquisition = {mode}, n_avg = {n_avg}")
             except Exception:
@@ -2008,6 +2022,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._current_exp_code = code
+        # The experiment-to-run changed → feed its pulse rate to Setup's
+        # capture-time↔count conversion.
+        self._push_active_rate_to_setup()
         # Re-anchor the Start / Pause / Stop button row to the
         # currently-focused top-level tab — the swap might have
         # invalidated the previous placement if the old experiment's
@@ -2704,6 +2721,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._safe_call(w, "selectAll")
 
     # ------------------------------------------------------------ Run menu
+    def _push_active_rate_to_setup(self, *_):
+        """Feed the Setup tab the pulse rate of the experiment that will RUN
+        (the "Experiment to run" selection = ``_current_exp_code``), so its
+        capture-time↔count conversion has a rate.  Setup has no rate of its
+        own.  No-op-safe: the setter ignores an unchanged / invalid rate."""
+        try:
+            code = getattr(self, "_current_exp_code", None)
+            entry = self._exp_tab_by_code.get(code) if code else None
+            tab = entry[0] if entry else None
+            pp = getattr(tab, "pattern_panel", None) if tab else None
+            fn = getattr(pp, "effective_rate_hz", None) if pp else None
+            if fn is not None:
+                self.setup_tab.set_pulse_rate_hz(fn())
+        except Exception:
+            pass
+
     def _active_experiment_tab(self):
         """The experiment tab currently visible in the main tab bar,
         or the first experiment tab when the user is on a

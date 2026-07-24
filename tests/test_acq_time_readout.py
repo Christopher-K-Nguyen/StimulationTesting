@@ -39,17 +39,15 @@ def _panel():
 
 
 # ------------------------------------------------------------------- layout
-def test_label_on_its_own_row_below_rate(_app):
+def test_readout_sits_beside_the_rate_unit(_app):
     p = _panel()
     assert isinstance(p.acq_time_label, QtWidgets.QLabel)
-    # The acq-time readout + inline average-count editor were MOVED off the
-    # rate row onto their own "Average count" row (operator: "the
-    # calculation of time per capture is making the panel too wide … Move
-    # the Average count to below the pulse rate with the calculation on its
-    # right").  So they share a container with each other, but NOT with the
-    # rate-unit combo any more.
-    assert p.acq_time_label.parent() is p.acq_navg_inline.parent()
-    assert p.acq_time_label.parent() is not p.rate_unit_combo.parent()
+    # The average COUNT is now set in Setup → Oscilloscope acquisition, so the
+    # inline count editor + its "Average count" row were removed from Test
+    # parameters — only the calculated-capture-time readout remains, back on
+    # the pulse-rate row beside the rate-unit combo (operator: "only keep
+    # '1 sweep ÷ 200 pps ≈ 5 ms / capture' by the pulse rate unit").
+    assert p.acq_time_label.parent() is p.rate_unit_combo.parent()
     # A non-empty default readout (default 16 avg @ default rate),
     # showing the calculation (operator: "show the calculation").
     assert "≈" in p.acq_time_label.text()

@@ -23,6 +23,7 @@ which :class:`MainWindow` connects to a ``QTabWidget.setCurrentWidget``.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import numpy as np
@@ -39,6 +40,25 @@ from . import rich
 from .device_view import DeviceView
 from .repeating_spinbox import (RepeatingDoubleSpinBox, RepeatingSpinBox,
                                 ScientificDoubleSpinBox)
+
+
+# Friendly DISPLAY names for the oscilloscope acquisition modes (operator:
+# "SAMPLE to Sample, AVERAGE to Average, HIRES to Hi-Res").  The combo stores
+# the raw SCPI mode as item DATA (what the driver / runner / snapshot use);
+# only the shown text is prettified.
+_ACQ_MODE_LABELS = {
+    "SAMPLE": "Sample",
+    "AVERAGE": "Average",
+    "HIRES": "Hi-Res",
+    "PEAKDETECT": "Peak detect",
+    "ENVELOPE": "Envelope",
+}
+
+
+def _acq_mode_label(scpi: str) -> str:
+    """Friendly display text for an SCPI acquisition-mode name."""
+    s = str(scpi).strip()
+    return _ACQ_MODE_LABELS.get(s.upper(), s.title())
 
 
 CUSTOM_COATING_LABEL = "Custom…"
@@ -1211,8 +1231,11 @@ class SetupTab(QtWidgets.QWidget):
         # markers / POLARIS follow (it's stored per capture).
         from ..config import DEPOLARIZATION_TIME_US as _DEPOL_DEFAULT
         self._depol_default_us = float(_DEPOL_DEFAULT)
+        # QCheckBox text is plain (no HTML) → use the Unicode-subscript
+        # variable form "Eₚₒₗ" (operator: "E_pol should be formatted as a
+        # variable").
         self.depol_custom_chk = QtWidgets.QCheckBox(
-            "Custom E_pol time delay")
+            f"Custom {rich.plain_label('E', 'pol')} time delay")
         self.depol_custom_chk.setToolTip(
             "Override the electrode-polarization time delay used by the "
             "operator TIME method (E_pol sampled at phase_end + delay, for a "
@@ -1326,15 +1349,27 @@ class SetupTab(QtWidgets.QWidget):
         # accepting arbitrary values). The widget is rebuilt on scope
         # connect via :meth:`apply_scope_capabilities`.
         self.acq_mode_combo = QtWidgets.QComboBox()
-        self.acq_mode_combo.addItems(["SAMPLE", "AVERAGE"])
-        self.acq_mode_combo.setCurrentText("AVERAGE")
+        # Friendly display text, raw SCPI mode as item DATA (driver / runner /
+        # snapshot read the SCPI value via ``_current_acq_mode``).  The default
+        # (disconnected) list is the universal Sample / Average pair; on scope
+        # connect ``apply_scope_capabilities`` REPLACES it with the connected
+        # model's actual modes — a modern Tek then ADDS Hi-Res (rendered
+        # "Hi-Res"), a legacy scope offers only Sample / Average.
+        for _m in ("SAMPLE", "AVERAGE"):
+            self.acq_mode_combo.addItem(_acq_mode_label(_m), _m)
+        self.acq_mode_combo.setCurrentIndex(self.acq_mode_combo.findData("AVERAGE"))
         self.acq_mode_combo.setToolTip(
-            "Oscilloscope acquisition mode. SAMPLE captures every "
-            "trigger as-is. AVERAGE coherently averages N consecutive "
-            "captures (count set in the field to the right) — much "
-            "lower noise floor, but the runner waits for N stable "
-            "captures per step.")
-        self.acq_mode_combo.currentTextChanged.connect(self._on_acq_changed)
+            "Oscilloscope acquisition mode.\n"
+            "• Sample — captures every trigger as-is (single sweep).\n"
+            "• Average — coherently averages N consecutive captures (count "
+            "set in the field to the right) — much lower noise floor, but the "
+            "runner waits for N stable captures per step.\n"
+            "• Hi-Res — a single sweep with adjacent samples boxcar-averaged "
+            "for higher vertical resolution (no average count; ≈ one pulse "
+            "period per capture, like Sample).")
+        # currentIndexChanged (not currentTextChanged) so the SCPI-data read
+        # in _on_acq_changed is reliable regardless of the display text.
+        self.acq_mode_combo.currentIndexChanged.connect(self._on_acq_changed)
         # Connected scope (set in ``apply_scope_capabilities``; None when
         # offline/disconnected) — used by the average-count confirm below.
         self._scope = None
@@ -1361,6 +1396,44 @@ class SetupTab(QtWidgets.QWidget):
         self.acq_navg_spin.editingFinished.connect(self._on_acq_changed)
         self._last_acq_emitted = None   # (mode, n_avg) — skip no-op commits
         self.acq_navg_combo: QtWidgets.QComboBox | None = None
+
+        # Input-mode dropdown — express the AVERAGE acquisition as a COUNT
+        # (number of averaged waveforms) or a target CAPTURE TIME in seconds
+        # (operator: "a dropdown list of average count and capture time on the
+        # right of the acquisition mode dropdown list.  On the right of that is
+        # the input for average count or capture time").  In time mode the
+        # count is DERIVED (ceil(time × pulse rate), floored at 2); the pulse
+        # rate is fed from the active experiment's pattern via MainWindow.
+        self.acq_input_mode_combo = QtWidgets.QComboBox()
+        self.acq_input_mode_combo.addItem("Average count", "count")
+        self.acq_input_mode_combo.addItem("Capture time", "time")
+        self.acq_input_mode_combo.setToolTip(
+            "How to express the AVERAGE acquisition:\n"
+            "• Average count — the number of averaged waveforms (NUMAVg).\n"
+            "• Capture time — a target time per capture; the average count is "
+            "computed as ceil(time × pulse rate).")
+        self.acq_input_mode_combo.currentIndexChanged.connect(
+            self._on_acq_input_mode_changed)
+        # Capture-time spinbox — shown IN PLACE OF the count spin when
+        # "Capture time" is selected (operator: "the increment/decrement is
+        # 0.1 s").  Editing it derives the average count from time × rate.
+        self.acq_time_spin = RepeatingDoubleSpinBox()
+        self.acq_time_spin.setDecimals(1)
+        self.acq_time_spin.setRange(0.1, 3600.0)
+        self.acq_time_spin.setSingleStep(0.1)
+        self.acq_time_spin.setValue(1.0)
+        self.acq_time_spin.setSuffix(" s")
+        self.acq_time_spin.setToolTip(
+            "Target acquisition time per averaged capture.  The average count "
+            "is computed as ceil(time × pulse rate) and clamped to the scope's "
+            "supported range (min 2).  Step 0.1 s.  The calculated capture "
+            "time is shown beside the pulse rate on the Test parameters page.")
+        self.acq_time_spin.setVisible(False)          # count mode by default
+        self.acq_time_spin.editingFinished.connect(self._on_capture_time_changed)
+        # Input mode ("count" / "time") + the pulse rate fed from the active
+        # experiment's pattern (Setup has no rate of its own).
+        self._acq_input_mode = "count"
+        self._pulse_rate_hz = 0.0
 
         # Horizontal auto-scaling window — Wide (more post-pulse recovery,
         # MATLAB-like) vs Tight (the pulse fills more of the screen).  Drives
@@ -1792,7 +1865,9 @@ class SetupTab(QtWidgets.QWidget):
         depol_row.addWidget(self.depol_delay_us)
         depol_row.addStretch(1)
         depol_w = QtWidgets.QWidget(); depol_w.setLayout(depol_row)
-        dev_form.addRow(self._lbl("E_pol time delay:"), depol_w)
+        # E_pol as a proper italic-variable + subscript (operator: "E_pol
+        # should be formatted as a variable").
+        dev_form.addRow(self._lbl(f"{rich.var('E', 'pol')} time delay:"), depol_w)
 
         # Environment + Gas sparging directly under Tolerance so
         # the user reads the full electrochemistry context as one
@@ -1821,24 +1896,37 @@ class SetupTab(QtWidgets.QWidget):
         # holder is the QHBoxLayout we keep a reference to so we can
         # swap the inner widget (combo vs spinbox) at scope-connect.
         acq_form = rich.make_form()
-        acq_form.addRow("Mode:", self.acq_mode_combo)
+        # Mode row: the acquisition-mode combo, then the count-vs-capture-time
+        # dropdown, then the input (count spin/combo OR capture-time spin) —
+        # all on one row (operator: "a dropdown list of average count and
+        # capture time on the right of the acquisition mode dropdown list.  On
+        # the right of that is the input for average count or capture time").
         self._acq_navg_holder = QtWidgets.QHBoxLayout()
-        # Zero the wrapper margins so the inner combo/spinbox fills the whole
-        # form field column — otherwise the QWidget wrapper's default layout
-        # margins inset it and the "Average count" dropdown renders NARROWER
-        # than the (unwrapped) Mode + Horizontal-window combos (operator:
-        # "make the dropdown list width for average count the same as Mode and
-        # Horizontal window").
         self._acq_navg_holder.setContentsMargins(0, 0, 0, 0)
         self._acq_navg_holder.addWidget(self.acq_navg_spin, stretch=1)
         navg_w = QtWidgets.QWidget(); navg_w.setLayout(self._acq_navg_holder)
+        self._acq_navg_field = navg_w          # the count input container
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(6)
+        mode_row.addWidget(self.acq_mode_combo, stretch=1)
+        mode_row.addWidget(self.acq_input_mode_combo)
+        mode_row.addWidget(navg_w, stretch=1)              # count (count mode)
+        mode_row.addWidget(self.acq_time_spin, stretch=1)  # time (time mode)
+        mode_w = QtWidgets.QWidget(); mode_w.setLayout(mode_row)
+        acq_form.addRow("Mode:", mode_w)
+        # Kept for back-compat (old code toggled its enabled state); no longer
+        # a visible row label since the dropdown names the input now.
         self._acq_navg_label = QtWidgets.QLabel("Average count:")
-        acq_form.addRow(self._acq_navg_label, navg_w)
+        self._acq_navg_label.setVisible(False)
         acq_form.addRow("Horizontal window:", self.horiz_scaling_combo)
         acq_box = QtWidgets.QGroupBox("Oscilloscope acquisition")
         acq_vbox = QtWidgets.QVBoxLayout(acq_box)
         acq_vbox.addLayout(acq_form)
         acq_vbox.addWidget(self.ext_trigger_check)
+        # Initial count/capture-time input visibility (default AVERAGE + count
+        # → dropdown + count spin shown, time spin hidden).
+        self._refresh_acq_input_visibility()
 
         # Oscilloscope mapping — one row per scope channel, dropdown
         # picks the waveform role assigned to that channel. Labels
@@ -2419,7 +2507,7 @@ class SetupTab(QtWidgets.QWidget):
         keystroke (operator).  A no-op commit (focus-out with no change) is
         skipped via ``_last_acq_emitted`` so it doesn't re-log / re-confirm an
         unchanged value.  The enable/grey state is refreshed UNCONDITIONALLY."""
-        mode = self.acq_mode_combo.currentText()
+        mode = self._current_acq_mode()
         n_avg = self._current_n_avg()
         # Average count is only meaningful in AVERAGE mode — grey it out
         # otherwise so the user sees the value won't be used.  (Always, even on
@@ -2429,6 +2517,11 @@ class SetupTab(QtWidgets.QWidget):
         if self.acq_navg_combo is not None:
             self.acq_navg_combo.setEnabled(is_avg)
         self.acq_navg_spin.setEnabled(is_avg)
+        # The count/capture-time dropdown + BOTH inputs are only meaningful in
+        # AVERAGE mode (SAMPLE / HIRES are single-acquisition, no average
+        # count) — HIDE them entirely otherwise (operator: "hide the new
+        # dropdown list and spinners if average acquisition is not selected").
+        self._refresh_acq_input_visibility()
         # Skip a no-op commit (e.g. a focus-out that changed nothing) so it
         # doesn't re-emit the log line + re-run the scope round-trip.
         if (mode, n_avg) == getattr(self, "_last_acq_emitted", None):
@@ -2472,7 +2565,7 @@ class SetupTab(QtWidgets.QWidget):
         scope = getattr(self, "_scope", None)
         if scope is None:
             return
-        if self.acq_mode_combo.currentText().upper() != "AVERAGE":
+        if self._current_acq_mode() != "AVERAGE":
             return
         requested = int(self.acq_navg_spin.value())
         try:
@@ -2496,9 +2589,91 @@ class SetupTab(QtWidgets.QWidget):
         # directly (not via setValue) so this doesn't re-arm the confirm
         # timer.  Keep ``_last_acq_emitted`` coherent with the snapped value so
         # a later no-op focus-out on it is correctly skipped.
-        self._last_acq_emitted = (self.acq_mode_combo.currentText(), applied)
-        self.acquisitionChanged.emit(
-            self.acq_mode_combo.currentText(), applied)
+        self._last_acq_emitted = (self._current_acq_mode(), applied)
+        self.acquisitionChanged.emit(self._current_acq_mode(), applied)
+
+    # ---- count vs capture-time input mode -----------------------------
+    def set_pulse_rate_hz(self, rate_hz: float) -> None:
+        """Feed the ACTIVE experiment's pulse rate so the capture-time↔count
+        conversion has a rate (Setup has none of its own — MainWindow pushes
+        the active pattern's rate).  In capture-time mode a rate change
+        re-derives the average count."""
+        try:
+            r = float(rate_hz)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(r) or r <= 0.0:
+            return
+        if abs(r - self._pulse_rate_hz) < 1e-9:
+            return
+        self._pulse_rate_hz = r
+        if self._acq_input_mode == "time":
+            self._apply_capture_time()
+
+    def _refresh_acq_input_visibility(self) -> None:
+        """Show the count/capture-time dropdown + the matching input ONLY in
+        AVERAGE mode; hide the dropdown AND both inputs in SAMPLE / HIRES
+        (single-acquisition, no average count) — operator: "hide the new
+        dropdown list and spinners if average acquisition is not selected"."""
+        is_avg = self._current_acq_mode() == "AVERAGE"
+        is_time = self._acq_input_mode == "time"
+        self.acq_input_mode_combo.setVisible(is_avg)
+        # ``_acq_navg_field`` wraps the count spin/combo.
+        self._acq_navg_field.setVisible(is_avg and not is_time)
+        self.acq_time_spin.setVisible(is_avg and is_time)
+
+    def _on_acq_input_mode_changed(self, *_):
+        """Dropdown flipped between "Average count" and "Capture time": swap
+        which input is visible.  Switching TO time mode seeds the time spin
+        from the current count / rate so the acquisition doesn't jump."""
+        mode = self.acq_input_mode_combo.currentData() or "count"
+        self._acq_input_mode = str(mode)
+        self._refresh_acq_input_visibility()
+        is_time = self._acq_input_mode == "time"
+        if is_time and self._pulse_rate_hz > 0.0 and math.isfinite(self._pulse_rate_hz):
+            t = self._current_n_avg() / self._pulse_rate_hz
+            self.acq_time_spin.blockSignals(True)
+            try:
+                self.acq_time_spin.setValue(
+                    max(self.acq_time_spin.minimum(),
+                        min(self.acq_time_spin.maximum(), t)))
+            finally:
+                self.acq_time_spin.blockSignals(False)
+
+    def _on_capture_time_changed(self, *_):
+        """Capture-time spin COMMITTED → derive + apply the average count."""
+        self._apply_capture_time()
+
+    def _apply_capture_time(self) -> None:
+        """Derive the average count from ``ceil(capture_time × pulse_rate)``
+        (operator: "Round average count to the ceiling"), floored at 2
+        (AVERAGE needs ≥ 2 — count 1 IS a single SAMPLE) and clamped to the
+        scope's supported range, then set the count spin + re-emit via
+        ``_on_acq_changed`` (which reads the spin, broadcasts, and confirms on
+        the scope).  No-op outside time mode or without a rate."""
+        if self._acq_input_mode != "time":
+            return
+        rate = self._pulse_rate_hz
+        if not (rate > 0.0) or not math.isfinite(rate):
+            return
+        t = float(self.acq_time_spin.value())
+        # Round the product to 6 dp BEFORE ceil so an exact-integer target
+        # (e.g. 0.4 s × 25 pps = 10.0, which can float to 10.0000000001)
+        # doesn't spuriously ceil up by one.
+        n = int(math.ceil(round(t * rate, 6)))
+        lo = max(2, int(self.acq_navg_spin.minimum()))
+        hi = int(self.acq_navg_spin.maximum())
+        n = max(lo, min(hi, n))
+        if n == self._current_n_avg():
+            return
+        self.acq_navg_spin.blockSignals(True)
+        try:
+            self.acq_navg_spin.setValue(n)
+        finally:
+            self.acq_navg_spin.blockSignals(False)
+        # Re-emit (mode, n) + scope confirm + enable-state refresh.  The spin
+        # now holds the derived count, so ``_current_n_avg`` reads it.
+        self._on_acq_changed()
 
     def _on_horiz_scaling_changed(self, *_):
         """Horizontal-window (Wide/Tight) dropdown changed → re-emit."""
@@ -2599,12 +2774,34 @@ class SetupTab(QtWidgets.QWidget):
     # from the trigger-source / phase-1-polarity rule set internally
     # at run start (see ``_BaseExperimentTab._start_runner``).
 
+    def _current_acq_mode(self) -> str:
+        """The SELECTED acquisition mode as its raw SCPI name (``SAMPLE`` /
+        ``AVERAGE`` / ``HIRES`` / …) — the combo stores the SCPI value as item
+        DATA while displaying a friendly label.  Falls back to the (upper-cased)
+        display text for any item added without data."""
+        d = self.acq_mode_combo.currentData()
+        if d is not None:
+            return str(d).upper()
+        return self.acq_mode_combo.currentText().strip().upper()
+
+    def set_acq_mode(self, scpi: str) -> bool:
+        """Select the acquisition mode by its SCPI name (``SAMPLE`` / ``AVERAGE``
+        / ``HIRES``).  Returns True if the mode exists in the current list.
+        The combo shows a friendly label, so callers must NOT use
+        ``setCurrentText`` with the SCPI name."""
+        i = self.acq_mode_combo.findData(str(scpi).strip().upper())
+        if i >= 0:
+            self.acq_mode_combo.setCurrentIndex(i)
+            return True
+        return False
+
     def current_acquisition(self) -> tuple[str, int]:
         """Return the ``(mode, n_avg)`` oscilloscope-acquisition pair —
         the same payload ``acquisitionChanged`` emits.  Used by
         MainWindow to pull the scope acquisition settings into the
-        active experiment tab on entering the Test parameters page."""
-        return (self.acq_mode_combo.currentText(), self._current_n_avg())
+        active experiment tab on entering the Test parameters page.
+        ``mode`` is the raw SCPI name (the driver / runner expect that)."""
+        return (self._current_acq_mode(), self._current_n_avg())
 
     def _current_n_avg(self) -> int:
         # Prefer the discrete-choice combo whenever it EXISTS — it holds
@@ -2930,18 +3127,20 @@ class SetupTab(QtWidgets.QWidget):
         choices = (scope.average_count_choices() if scope is not None else None)
         max_n = (scope.max_average_count() if scope is not None else 512)
 
-        # Mode combo — repopulate while preserving the selection.
-        prev_mode = self.acq_mode_combo.currentText()
+        # Mode combo — repopulate while preserving the selection.  Friendly
+        # display text, raw SCPI mode as item data (``modes`` are SCPI names
+        # from the driver, e.g. SAMPLE / AVERAGE / HIRES).
+        prev_mode = self._current_acq_mode()
+        _modes = [str(m).upper() for m in modes]
         self.acq_mode_combo.blockSignals(True)
         try:
             self.acq_mode_combo.clear()
-            for m in modes:
-                self.acq_mode_combo.addItem(m)
-            if prev_mode in modes:
-                self.acq_mode_combo.setCurrentText(prev_mode)
-            else:
-                self.acq_mode_combo.setCurrentIndex(
-                    modes.index("AVERAGE") if "AVERAGE" in modes else 0)
+            for m in _modes:
+                self.acq_mode_combo.addItem(_acq_mode_label(m), m)
+            _idx = self.acq_mode_combo.findData(prev_mode)
+            if _idx < 0:
+                _idx = self.acq_mode_combo.findData("AVERAGE")
+            self.acq_mode_combo.setCurrentIndex(max(0, _idx))
         finally:
             self.acq_mode_combo.blockSignals(False)
 
@@ -2981,6 +3180,10 @@ class SetupTab(QtWidgets.QWidget):
             _tip += f"\n\nRange for this scope: {_lo}–{_hi}."
         self.acq_navg_spin.setToolTip(_tip)
         self._on_acq_changed()
+        # The count range/max may have changed → re-derive from the capture
+        # time so the count stays within the new scope range (time mode only).
+        if self._acq_input_mode == "time":
+            self._apply_capture_time()
 
     def _apply_scope_role_options(self, allow_electrode_roles: bool) -> None:
         """Show / hide the E_act + E_ret roles in the scope-mapping combos.
@@ -4423,7 +4626,7 @@ class SetupTab(QtWidgets.QWidget):
             # mapped Plexon stim channel.  str keys for JSON round-trip.
             "channel_map": {str(k): int(v)
                             for k, v in self.current_channel_map().items()},
-            "acq_mode": self.acq_mode_combo.currentText(),
+            "acq_mode": self._current_acq_mode(),
             "acq_n_avg": self._current_n_avg(),
             "horiz_scaling": self.current_horizontal_scaling(),
             "ext_trigger": self.ext_trigger_check.isChecked(),
@@ -4527,8 +4730,13 @@ class SetupTab(QtWidgets.QWidget):
             "auto_save_plots": self.auto_save_plots.isChecked(),
             "auto_save_plots_fmt": self.current_auto_save_plots_format(),
             "auto_save_plots_dpi": self.current_auto_save_plots_dpi(),
-            "acq_mode": self.acq_mode_combo.currentText(),
+            "acq_mode": self._current_acq_mode(),
             "acq_n_avg": self._current_n_avg(),
+            # Acquisition input mode (count vs capture-time) + the saved
+            # target capture time (absent → count mode, so legacy prefs load
+            # unchanged).  In time mode acq_n_avg above IS the derived count.
+            "acq_input_mode": self.acq_input_mode_combo.currentData() or "count",
+            "acq_capture_time_s": float(self.acq_time_spin.value()),
             "horiz_scaling": self.current_horizontal_scaling(),
             "ext_trigger": self.ext_trigger_check.isChecked(),
             # Custom E_pol time delay toggle + value (operator).
@@ -4982,8 +5190,20 @@ class SetupTab(QtWidgets.QWidget):
             except Exception:
                 pass
         if "acq_mode" in p:
-            try: self.acq_mode_combo.setCurrentText(str(p["acq_mode"]))
-            except Exception: pass
+            # Prefs store the SCPI mode name (SAMPLE / AVERAGE / HIRES); select
+            # by item DATA.  Fall back to display-text match for any legacy
+            # blob that stored the friendly label.
+            try:
+                _m = str(p["acq_mode"]).strip().upper()
+                _mi = self.acq_mode_combo.findData(_m)
+                if _mi < 0:
+                    _mi = self.acq_mode_combo.findText(
+                        _acq_mode_label(_m),
+                        QtCore.Qt.MatchFlag.MatchFixedString)
+                if _mi >= 0:
+                    self.acq_mode_combo.setCurrentIndex(_mi)
+            except Exception:
+                pass
         if "horiz_scaling" in p:
             try:
                 self.horiz_scaling_combo.setCurrentText(
@@ -5005,6 +5225,23 @@ class SetupTab(QtWidgets.QWidget):
                     self.acq_navg_spin.setValue(n)
             except (TypeError, ValueError):
                 pass
+        # Acquisition input mode (count vs capture-time) + saved target time.
+        # Restore the time value first (blocked), then the mode combo (which
+        # refreshes visibility + seeds).  The count derives from the time on
+        # the first rate feed (set_pulse_rate_hz) — rate is 0 during restore.
+        if "acq_capture_time_s" in p:
+            self.acq_time_spin.blockSignals(True)
+            try:
+                self.acq_time_spin.setValue(float(p["acq_capture_time_s"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.acq_time_spin.blockSignals(False)
+        if "acq_input_mode" in p:
+            _idx = self.acq_input_mode_combo.findData(str(p["acq_input_mode"]))
+            if _idx >= 0:
+                self.acq_input_mode_combo.setCurrentIndex(_idx)
+        self._refresh_acq_input_visibility()
         # Custom E_pol time delay — restore the value first, then the toggle
         # (block signals so the restore doesn't emit a ``settingChanged`` /
         # false-log during prefs load), then sync the enabled state.
