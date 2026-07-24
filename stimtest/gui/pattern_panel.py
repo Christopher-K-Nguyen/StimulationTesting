@@ -746,6 +746,15 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # on screen before the first push.
         self._acq_mode: str = "AVERAGE"
         self._acq_n_avg: int = 16
+        # How the AVERAGE acquisition is EXPRESSED in the UI (operator:
+        # "dropdown … average count or capture time").  "count" = the user
+        # types the number of averaged waveforms; "time" = the user types a
+        # target seconds-per-capture and the count is DERIVED (count =
+        # round(time × pulse rate)).  Both describe the same NUMAVg the scope
+        # applies — this is a pure input-convenience view.  ``_acq_recomputing``
+        # guards the time→count recompute against re-entry.
+        self._acq_input_mode: str = "count"
+        self._acq_recomputing: bool = False
         # ---- Login profile (gates restricted shapes) ----------------
         # Starts as ANONYMOUS (Profile.NONE) so the panel populates
         # its shape dropdowns WITHOUT the gated entries.  MainWindow
@@ -1250,6 +1259,41 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # wiring would re-run that on every digit.
         self.acq_navg_inline.editingFinished.connect(
             self._on_inline_navg_changed)
+        # Input-mode dropdown (operator: "Add a dropdown list if average
+        # acquisition is selected … average count or capture time").  Selects
+        # what the input beside it MEANS: a number of averaged waveforms
+        # (count) or a target seconds-per-capture (time).  Only meaningful in
+        # AVERAGE mode; disabled in SAMPLE mode (single sweep, no averaging).
+        self.acq_input_mode_combo = QtWidgets.QComboBox()
+        self.acq_input_mode_combo.setObjectName("acq_input_mode_combo")
+        self.acq_input_mode_combo.addItem("Average count", "count")
+        self.acq_input_mode_combo.addItem("Capture time", "time")
+        self.acq_input_mode_combo.setToolTip(
+            "How to express the AVERAGE acquisition:<br>"
+            "• <b>Average count</b> — the number of averaged waveforms "
+            "(NUMAVg).<br>"
+            "• <b>Capture time</b> — a target time per capture; the average "
+            "count is computed as round(time × pulse rate).")
+        self.acq_input_mode_combo.currentIndexChanged.connect(
+            self._on_acq_input_mode_changed)
+        # Capture-time spinbox — shown IN PLACE OF the count spin when
+        # "Capture time" is selected (operator: "it sets the capture time
+        # (average count / pulse rate) … the increment/decrement is 0.1 s").
+        # Editing it derives the average count from time × pulse rate.
+        self.acq_time_spin = RepeatingDoubleSpinBox()
+        self.acq_time_spin.setObjectName("acq_time_spin")
+        self.acq_time_spin.setDecimals(1)
+        self.acq_time_spin.setRange(0.1, 3600.0)
+        self.acq_time_spin.setSingleStep(0.1)
+        self.acq_time_spin.setValue(1.0)
+        self.acq_time_spin.setSuffix(" s")
+        self.acq_time_spin.setToolTip(
+            "Target acquisition time per averaged capture.  The average "
+            "count is computed as round(time × pulse rate) and clamped to "
+            "the scope's supported range; the readout shows the resulting "
+            "count and actual time.  Step 0.1 s.")
+        self.acq_time_spin.setVisible(False)          # count mode by default
+        self.acq_time_spin.editingFinished.connect(self._on_acq_time_changed)
 
         # Toggles for the three "have / pin" delay shortcuts. All three
         # use the "ON = HAS the delay" convention so a checked box reads
@@ -1910,10 +1954,14 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         avg_row = QtWidgets.QHBoxLayout()
         avg_row.setContentsMargins(0, 0, 0, 0)
         avg_row.setSpacing(6)
-        avg_row.addWidget(self.acq_navg_inline)
+        avg_row.addWidget(self.acq_input_mode_combo)
+        avg_row.addWidget(self.acq_navg_inline)         # shown in count mode
+        avg_row.addWidget(self.acq_time_spin)           # shown in time mode
         avg_row.addWidget(self.acq_time_label, stretch=1)
         avg_w = QtWidgets.QWidget(); avg_w.setLayout(avg_row)
-        delays.addRow("Average count", avg_w)
+        # The row label is "Acquisition" now that the dropdown selects
+        # count-vs-time (operator: the input beside the dropdown is either).
+        delays.addRow("Acquisition", avg_w)
         outer.addLayout(delays)
 
         # ------ burst / pulse-train group (below the timing form) ------
@@ -3904,6 +3952,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # same-value no-op in the slot breaks the loop anyway, this just
         # avoids the churn).  The spin is meaningful only in AVERAGE
         # mode — SAMPLE captures are single sweeps, so grey it out.
+        is_avg = "AVER" in self._acq_mode.upper()
         sp = getattr(self, "acq_navg_inline", None)
         if sp is not None:
             sp.blockSignals(True)
@@ -3911,8 +3960,121 @@ class PatternControlPanel(QtWidgets.QGroupBox):
                 sp.setValue(self._acq_n_avg)
             finally:
                 sp.blockSignals(False)
-            sp.setEnabled("AVER" in self._acq_mode.upper())
+            sp.setEnabled(is_avg)
+        # The input-mode dropdown + capture-time spin are only meaningful in
+        # AVERAGE mode (SAMPLE is a single sweep); grey them out otherwise.
+        for _w in (getattr(self, "acq_input_mode_combo", None),
+                   getattr(self, "acq_time_spin", None)):
+            if _w is not None:
+                _w.setEnabled(is_avg)
+        # Display-only refresh — do NOT recompute the count here (this push
+        # may carry a scope-snapped value we must not undo in time mode).
         self._update_acq_time_label()
+
+    def _acq_effective_rate_hz(self) -> float:
+        """Pulses-per-second the averager actually sees — the OVERALL rate in
+        burst mode (``pulses_per_burst / burst_period``, far slower than the
+        intra-burst rate because of the inter-burst gaps), else ``rate_hz``.
+        Single source of truth for both the readout and the capture-time ↔
+        count conversion so they can never disagree."""
+        rate_hz = self._current_rate_hz()
+        if self._burst_enabled():
+            try:
+                n = int(self.pulses_per_burst_spin.value())
+                period_s = float(self.burst_period_ms.value()) / 1000.0
+                if n >= 2 and period_s > 0.0:
+                    return n / period_s
+            except Exception:
+                pass
+        return rate_hz
+
+    def _on_acq_input_mode_changed(self, *_):
+        """Dropdown flipped between "Average count" and "Capture time":
+        swap which input is visible.  Switching TO time mode seeds the time
+        spin from the current count so the acquisition doesn't jump."""
+        mode = self.acq_input_mode_combo.currentData() or "count"
+        self._acq_input_mode = str(mode)
+        is_time = self._acq_input_mode == "time"
+        self.acq_navg_inline.setVisible(not is_time)
+        self.acq_time_spin.setVisible(is_time)
+        if is_time:
+            self._sync_time_spin_from_count()
+        self._update_acq_time_label()
+
+    def _sync_time_spin_from_count(self) -> None:
+        """Set the capture-time spin to ``count / rate`` (signal-guarded) so a
+        mode switch keeps the same acquisition."""
+        rate = self._acq_effective_rate_hz()
+        if not (rate > 0.0) or not math.isfinite(rate):
+            return
+        t = self._acq_n_avg / rate
+        self.acq_time_spin.blockSignals(True)
+        try:
+            self.acq_time_spin.setValue(
+                max(self.acq_time_spin.minimum(),
+                    min(self.acq_time_spin.maximum(), t)))
+        finally:
+            self.acq_time_spin.blockSignals(False)
+
+    def _on_acq_time_changed(self, *_):
+        """Capture-time spin COMMITTED → derive + publish the average count."""
+        self._apply_capture_time()
+
+    def _apply_capture_time(self) -> None:
+        """Derive the average count from ``ceil(target_time × pulse_rate)`` and
+        publish it (operator: "Round average count to the ceiling when capture
+        time is selected" — rounding UP guarantees the actual capture time
+        meets-or-exceeds the target).  Clamped to the count spin's supported
+        range; refreshes the readout either way.  No-op outside time mode."""
+        if self._acq_input_mode != "time":
+            return
+        rate = self._acq_effective_rate_hz()
+        if not (rate > 0.0) or not math.isfinite(rate):
+            self._update_acq_time_label()
+            return
+        t = float(self.acq_time_spin.value())
+        # Round the product to 6 dp BEFORE ceil so an exact-integer target
+        # (e.g. 0.4 s × 25 pps = 10.0, which can float to 10.0000000001)
+        # doesn't spuriously ceil up by one.
+        n = int(math.ceil(round(t * rate, 6)))
+        # AVERAGE mode needs a count of at least 2 — a count of 1 IS a single
+        # SAMPLE capture, not an average (operator: "average acquisition
+        # average count must be at least 2").  Floor at 2 regardless of the
+        # spin's reported minimum.
+        lo = max(2, int(self.acq_navg_inline.minimum()))
+        hi = int(self.acq_navg_inline.maximum())
+        n = max(lo, min(hi, n))
+        if n == self._acq_n_avg:
+            self._update_acq_time_label()
+            return
+        self._acq_n_avg = n
+        # Keep the (hidden) count spin coherent so a switch back to count
+        # mode shows the derived value.
+        self.acq_navg_inline.blockSignals(True)
+        try:
+            self.acq_navg_inline.setValue(n)
+        finally:
+            self.acq_navg_inline.blockSignals(False)
+        self._update_acq_time_label()
+        # Publish to the Setup master (the runner reads the Setup value at
+        # Start) — but not during a prefs restore / programmatic switch.
+        if not getattr(self, "_suspend_signals", False):
+            self.acqNavgEdited.emit(n)
+
+    def _refresh_acq_readout(self) -> None:
+        """Called on a rate/pattern edit.  In capture-time mode the count
+        follows ``time × rate``, so recompute it; otherwise just refresh the
+        readout.  Guarded against re-entry (``_apply_capture_time`` calls back
+        into ``_update_acq_time_label``)."""
+        if (self._acq_input_mode == "time"
+                and not self._acq_recomputing):
+            self._acq_recomputing = True
+            try:
+                self._apply_capture_time()
+            finally:
+                self._acq_recomputing = False
+        else:
+            self._update_acq_time_label()
 
     def _on_inline_navg_changed(self, n_avg: "int | None" = None) -> None:
         """The user COMMITTED the inline average-count spinbox (Enter/return/
@@ -4584,10 +4746,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         asym = (not triphasic) and (self.symmetry.currentText() == ASYMMETRIC)
         manual = self.charge_mode.currentText() == CHARGE_BAL_OFF
         self.balanceWarningVisibility.emit(asym and manual)
-        # Refresh the approximate-acquisition-time readout — the rate may
-        # have just changed (and _update_rate_max above may have clamped
-        # it), so recompute after the pattern is emitted.
-        self._update_acq_time_label()
+        # Refresh the acquisition readout — the rate may have just changed
+        # (and _update_rate_max above may have clamped it).  In capture-time
+        # mode the average count follows the new rate, so recompute it here
+        # (via _refresh_acq_readout); in count mode this is a display-only
+        # refresh.
+        self._refresh_acq_readout()
 
     def _refresh_sym_slope_readout(self) -> None:
         """Render the per-phase slope (µA/µs) for linear shapes in
@@ -5409,6 +5573,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "burst_enabled": bool(self.burst_enable_check.isChecked()),
             "pulses_per_burst": int(self.pulses_per_burst_spin.value()),
             "burst_period_ms": float(self.burst_period_ms.value()),
+            # Acquisition input-mode (count vs capture-time) + the saved
+            # target capture time (absent → count mode, so legacy prefs load
+            # unchanged).  The average count itself is the Setup-tab master;
+            # in time mode it is DERIVED from this time × the pulse rate.
+            "acq_input_mode": self.acq_input_mode_combo.currentData() or "count",
+            "acq_capture_time_s": float(self.acq_time_spin.value()),
         }
 
     def _dump_arb_table(self) -> List[List[str]]:
@@ -5618,6 +5788,40 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             finally:
                 self.burst_enable_check.blockSignals(False)
         self._on_burst_enable_toggled(self.burst_enable_check.isChecked())
+        # Acquisition input-mode (count vs capture-time) — restore the saved
+        # target time first, then the mode, then DERIVE the count locally
+        # (in time mode) without emitting to Setup (the derive re-runs on the
+        # first real edit / rate refresh anyway).  The rate is already
+        # restored above, so the derive uses the right rate.
+        if "acq_capture_time_s" in p:
+            self.acq_time_spin.blockSignals(True)
+            try:
+                self.acq_time_spin.setValue(float(p["acq_capture_time_s"]))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                self.acq_time_spin.blockSignals(False)
+        _aim = str(p.get("acq_input_mode", "count"))
+        _idx = self.acq_input_mode_combo.findData(_aim)
+        if _idx >= 0:
+            self.acq_input_mode_combo.blockSignals(True)
+            try:
+                self.acq_input_mode_combo.setCurrentIndex(_idx)
+            finally:
+                self.acq_input_mode_combo.blockSignals(False)
+        self._acq_input_mode = _aim if _idx >= 0 else "count"
+        _is_time = self._acq_input_mode == "time"
+        self.acq_navg_inline.setVisible(not _is_time)
+        self.acq_time_spin.setVisible(_is_time)
+        if _is_time:
+            _prev_sig = self._suspend_signals
+            self._suspend_signals = True
+            try:
+                self._apply_capture_time()      # derive count, no emit
+            finally:
+                self._suspend_signals = _prev_sig
+        else:
+            self._update_acq_time_label()
         self._on_mode_changed()
         self._on_balance_changed()
         # After restoring the amplitude + polarity, force the excitation
