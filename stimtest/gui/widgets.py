@@ -2848,40 +2848,75 @@ class _HtmlItemDelegate(QtWidgets.QStyledItemDelegate):
                             int(doc.size().height()))
 
 
-def _fmt_cumulative_charge(nc: float) -> str:
-    """Auto-scale a charge in nanocoulombs to nC / µC / mC for display.
-
-    Cumulative delivered charge spans a wide range across a run (one VT
-    capture ≈ Q_ph × N_avg ≈ tens of µC; a full ramp ≈ hundreds of µC to
-    a few mC), so a fixed unit would either lose precision or read as a
-    huge number.  Picks the unit that keeps the value in a readable 1-3
-    digit range.
+def _split_cumulative_charge(nc: float):
+    """Auto-scale a charge in nanocoulombs → ``(value_str, unit)`` (nC / µC /
+    mC).  The UNIT is returned separately so it can live in the metric (label)
+    column rather than the value column (operator: "have the units in the
+    metric column and not value column").  Cumulative delivered charge spans a
+    wide range across a run, so a fixed unit would lose precision or read huge;
+    picks the unit that keeps the value in a readable 1-3 digit range.
     """
     a = abs(nc)
     if a < 1e3:
-        return f"{nc:.1f} nC"
+        return f"{nc:.1f}", "nC"
     if a < 1e6:
-        return f"{nc / 1e3:.2f} µC"
-    return f"{nc / 1e6:.3f} mC"
+        return f"{nc / 1e3:.2f}", "µC"
+    return f"{nc / 1e6:.3f}", "mC"
 
 
-def _fmt_energy(uj: float) -> str:
-    """Auto-scale a driving energy in microjoules to pJ / nJ / µJ / mJ.
+def _fmt_cumulative_charge(nc: float) -> str:
+    """Combined ``value unit`` string (back-compat)."""
+    v, u = _split_cumulative_charge(nc)
+    return f"{v} {u}"
 
-    A single neural-stim pulse delivers tens of nanojoules (≈ V_d · I ·
-    t_phase), so the raw µJ value reads as ``0.0xx``; pick the unit that
+
+def _split_energy(uj: float):
+    """Auto-scale a driving energy in microjoules → ``(value_str, unit)``
+    (pJ / nJ / µJ / mJ), unit separated for the label column (operator).
+    ``("", "")`` if non-finite.  A single neural-stim pulse delivers tens of
+    nanojoules, so the raw µJ value reads as ``0.0xx``; pick the unit that
     keeps it in a readable 1-3 digit range.
     """
     if not np.isfinite(uj):
-        return ""
+        return "", ""
     a = abs(uj)
     if a < 1e-3:
-        return f"{uj * 1e6:.1f} pJ"
+        return f"{uj * 1e6:.1f}", "pJ"
     if a < 1.0:
-        return f"{uj * 1e3:.2f} nJ"
+        return f"{uj * 1e3:.2f}", "nJ"
     if a < 1e3:
-        return f"{uj:.3f} µJ"
-    return f"{uj / 1e3:.3f} mJ"
+        return f"{uj:.3f}", "µJ"
+    return f"{uj / 1e3:.3f}", "mJ"
+
+
+def _fmt_energy(uj: float) -> str:
+    """Combined ``value unit`` string (back-compat); ``""`` if non-finite."""
+    v, u = _split_energy(uj)
+    return f"{v} {u}" if u else ""
+
+
+def _fmt_voltage_list_auto(vlist):
+    """Auto-scale a list of voltages (in V) to V / mV / µV based on the row's
+    LARGEST magnitude → ``(', '-joined value string, unit)``.
+
+    Operator: "the return access voltage can be small, even showing 0.000, but
+    there is still an access resistance extracted.  Please use mV or µV if the
+    voltage is too small."  So a tiny access voltage renders as e.g.
+    ``0.300 mV`` / ``42.0 µV`` instead of ``0.000`` — the unit goes in the
+    label column.  All values in the ROW share ONE unit (picked from the row's
+    max magnitude) so the per-phase numbers stay directly comparable.  The
+    normal (large) active access voltage keeps V; only genuinely small rows
+    (e.g. the return access voltage) drop to mV / µV.
+    """
+    finite = [float(x) for x in vlist if np.isfinite(x)]
+    maxabs = max((abs(x) for x in finite), default=0.0)
+    if maxabs >= 0.1 or maxabs == 0.0:      # normal range → keep V
+        scale, unit, dec = 1.0, "V", 3
+    elif maxabs >= 1e-4:                     # 0.1 mV … 100 mV → mV
+        scale, unit, dec = 1e3, "mV", 3
+    else:                                    # sub-0.1 mV → µV
+        scale, unit, dec = 1e6, "µV", 1
+    return ", ".join(f"{float(x) * scale:.{dec}f}" for x in vlist), unit
 
 
 def _pulse_rate_period_rows(pattern) -> list:
@@ -3115,6 +3150,11 @@ class MetricTable(QtWidgets.QTableWidget):
             (f"{V('I','stim')} [µA]",
                 f"{c.pattern.excitation_phase.amplitude_ua:.2f}"),
             (f"{V('Q','ph')} [nC]", f"{m.charge_per_phase_nc:.2f}"),
+            # Charge imbalance Q_net = signed sum of the phase charges (0 for a
+            # perfectly balanced biphasic; non-zero = the residual DC charge)
+            # (operator: "add charge imbalance (nC) in the metrics").  Ideal
+            # pattern charge (gotcha #108).
+            (f"{V('Q','net')} [nC]", f"{c.pattern.net_charge_nc:+.3f}"),
             (f"{V('Q','inj')} [mC/cm<sup>2</sup>]",
                 f"{m.charge_injection_mc_per_cm2:.3f}"),
         ]
@@ -3129,8 +3169,8 @@ class MetricTable(QtWidgets.QTableWidget):
             rows.append(("Cumulative " + V("N", "pulse"),
                          _group_thousands(m.cumulative_n_pulses)))
         if np.isfinite(m.cumulative_charge_nc):
-            rows.append(("Cumulative Q",
-                         _fmt_cumulative_charge(m.cumulative_charge_nc)))
+            _cq_v, _cq_u = _split_cumulative_charge(m.cumulative_charge_nc)
+            rows.append((f"Cumulative Q [{_cq_u}]", _cq_v))
         rows += [
             (f"{V('E','ip')} [V]", f"{m.interpulse_potential_v:.3f}"),
             (f"{V('C','d')} [mF/cm<sup>2</sup>]",
@@ -3142,7 +3182,8 @@ class MetricTable(QtWidgets.QTableWidget):
             rows.append((f"{V('Z','d')} [kΩ]",
                          f"{m.driving_impedance_kohm:.3f}"))
         if np.isfinite(m.driving_energy_uj):
-            rows.append(("Driving energy", _fmt_energy(m.driving_energy_uj)))
+            _de_v, _de_u = _split_energy(m.driving_energy_uj)
+            rows.append((f"Driving energy [{_de_u}]", _de_v))
         # Harris 2019 chronopotentiometry capacitive/Faradaic decomposition
         # (normal captures only): C_dl (double-layer capacitance from the
         # constant-dE/dt window) + the APPROXIMATE Faradaic split.  Finite only
@@ -3183,9 +3224,18 @@ class MetricTable(QtWidgets.QTableWidget):
                            or getattr(m, "return_shaped_access_v_per_phase", None))
         _act = " active" if _has_return else ""
         if _has_return:
+            # The TOTAL driving voltage (V_mon) accounts for ALL involved
+            # electrodes during pulsing — distinct from the per-electrode
+            # active / return driving voltage (each measured vs the reference)
+            # (operator: "distinguish the driving voltage [total, all
+            # electrodes] from the active/return driving voltage").  Show the
+            # total FIRST, then the per-electrode breakdown.
+            if np.isfinite(m.driving_voltage_v):
+                rows.append((f"{V('V','d')} total [V]",
+                             f"{m.driving_voltage_v:.3f}"))
             _driving_rows = (
-                (f"{V('V','d')} active [V]", m.active_driving_voltage_per_phase_v),
-                (f"{V('V','d')} return [V]", m.return_driving_voltage_per_phase_v),
+                (f"{V('V','d')} active", m.active_driving_voltage_per_phase_v, "V"),
+                (f"{V('V','d')} return", m.return_driving_voltage_per_phase_v, "V"),
             )
         else:
             _driving_rows = ()
@@ -3200,35 +3250,51 @@ class MetricTable(QtWidgets.QTableWidget):
                                        m.active_driving_voltage_per_phase_v)))
             elif np.isfinite(m.driving_voltage_v):
                 rows.append((f"{V('V','d')} [V]", f"{m.driving_voltage_v:.3f}"))
-        for k, vlist in (
+        # (prefix, value list, unit) — the ACCESS-VOLTAGE rows ("Vauto") pick
+        # V / mV / µV per row from their own magnitude so a small (e.g. return)
+        # access voltage doesn't render as 0.000 (operator); the unit lands in
+        # the label column.  R_a stays kΩ, E_pol / V_d stay V.
+        for _prefix, vlist, _unit in (
             *_driving_rows,
-            (f"{V('V','a')}{_act} [V]", m.access_voltage_per_phase_v),
-            (f"{V('R','a')}{_act} [kΩ]", m.access_resistance_per_phase_kohm),
-            (f"{V('V','a')} return [V]", m.return_access_voltage_per_phase_v),
-            (f"{V('R','a')} return [kΩ]", m.return_access_resistance_per_phase_kohm),
-            (f"{V('E','pol')}{_act} [V]", m.polarization_per_phase_v),
-            (f"{V('E','pol')} return [V]", m.return_polarization_per_phase_v),
+            (f"{V('V','a')}{_act}", m.access_voltage_per_phase_v, "Vauto"),
+            (f"{V('R','a')}{_act}", m.access_resistance_per_phase_kohm, "kΩ"),
+            (f"{V('V','a')} return", m.return_access_voltage_per_phase_v, "Vauto"),
+            (f"{V('R','a')} return", m.return_access_resistance_per_phase_kohm, "kΩ"),
+            (f"{V('E','pol')}{_act}", m.polarization_per_phase_v, "V"),
+            (f"{V('E','pol')} return", m.return_polarization_per_phase_v, "V"),
         ):
-            if vlist:
-                rows.append((k, ", ".join(f"{x:.3f}" for x in vlist)))
+            if not vlist:
+                continue
+            if _unit == "Vauto":
+                _vs, _u = _fmt_voltage_list_auto(vlist)
+                rows.append((f"{_prefix} [{_u}]", _vs))
+            else:
+                rows.append((f"{_prefix} [{_unit}]",
+                             ", ".join(f"{x:.3f}" for x in vlist)))
         # PEAK-CURRENT access for SMOOTH shaped phases (gaussian / sinusoidal
         # with no edge) — a SEPARATE measurement, labelled "(peak I)" so it's
         # distinct from the edge-based V_a above (operator: "change the
         # discontinuous gaussian and sinusoidal to peak current").  NaN entries
         # (non-qualifying phases) are filtered out.
-        for _slbl, _svl in (
-            (f"{V('V','a')} (peak I){_act} [V]",
-             getattr(m, "shaped_access_v_per_phase", None)),
-            (f"{V('R','a')} (peak I){_act} [kΩ]",
-             getattr(m, "shaped_access_r_kohm_per_phase", None)),
-            (f"{V('V','a')} (peak I) return [V]",
-             getattr(m, "return_shaped_access_v_per_phase", None)),
-            (f"{V('R','a')} (peak I) return [kΩ]",
-             getattr(m, "return_shaped_access_r_kohm_per_phase", None)),
+        for _sprefix, _svl, _sunit in (
+            (f"{V('V','a')} (peak I){_act}",
+             getattr(m, "shaped_access_v_per_phase", None), "Vauto"),
+            (f"{V('R','a')} (peak I){_act}",
+             getattr(m, "shaped_access_r_kohm_per_phase", None), "kΩ"),
+            (f"{V('V','a')} (peak I) return",
+             getattr(m, "return_shaped_access_v_per_phase", None), "Vauto"),
+            (f"{V('R','a')} (peak I) return",
+             getattr(m, "return_shaped_access_r_kohm_per_phase", None), "kΩ"),
         ):
             _fin = [x for x in (_svl or []) if np.isfinite(x)]
-            if _fin:
-                rows.append((_slbl, ", ".join(f"{x:.3f}" for x in _fin)))
+            if not _fin:
+                continue
+            if _sunit == "Vauto":
+                _vs, _u = _fmt_voltage_list_auto(_fin)
+                rows.append((f"{_sprefix} [{_u}]", _vs))
+            else:
+                rows.append((f"{_sprefix} [{_sunit}]",
+                             ", ".join(f"{x:.3f}" for x in _fin)))
         rows.append(("Limit reached?", "yes" if c.status.reached_potential_limit else "no"))
         # Distinct from "reached" — E_pol overshot PAST the acceptance band
         # (operator: differentiate a clean in-band stop from an overshoot).

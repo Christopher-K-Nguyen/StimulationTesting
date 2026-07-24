@@ -205,9 +205,13 @@ def make_form(parent=None) -> "QtWidgets.QFormLayout":
       field, even if the field row is wider than the form column.
       Some Qt themes default to ``WrapLongRows``, which silently
       breaks the "Name [unit]:" layout convention.
-    * ``LabelAlignment.AlignRight | AlignVCenter`` — labels hug their
-      fields and share the spinbox's vertical centerline so no row
-      reads as misaligned.
+    * ``LabelAlignment.AlignLeft | AlignVCenter`` — label text starts at
+      the left edge of the label column (operator: "I want the input
+      labels left aligned") and shares the field's vertical centerline so
+      no row reads as off-baseline.  Field columns are aligned ACROSS
+      stacked groups separately (see ``SetupTab._align_form_label_columns``),
+      which a shared label-column width — not the per-form auto width —
+      handles.
     * ``FieldGrowthPolicy.AllNonFixedFieldsGrow`` — fields stretch to
       fill the form column, so spinboxes / line edits don't end up
       orphaned in the middle of a wide row.
@@ -224,7 +228,7 @@ def make_form(parent=None) -> "QtWidgets.QFormLayout":
     f.setRowWrapPolicy(
         QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows)
     f.setLabelAlignment(
-        QtCore.Qt.AlignmentFlag.AlignRight |
+        QtCore.Qt.AlignmentFlag.AlignLeft |
         QtCore.Qt.AlignmentFlag.AlignVCenter)
     f.setFieldGrowthPolicy(
         QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)

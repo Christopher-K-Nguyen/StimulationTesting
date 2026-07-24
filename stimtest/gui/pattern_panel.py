@@ -1051,8 +1051,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "The solver then re-derives the OTHER free parameter "
             "(width or amplitude) to keep charge balanced.")
         self.tau_us = self._dspin(TAU_MIN_US, TAU_MAX_US, TAU_DEFAULT_US,
-                                  step=10.0, decimals=1,
-                                  suffix=" " + rich.US)
+                                  step=1.0, decimals=1)
         # Tooltip frames τ as a DESIGN parameter (the time
         # constant of the imitated RC discharge) rather than a
         # fitted electrode property. Cites the Weiland lumped
@@ -1079,7 +1078,12 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "      ~5τ = 175 µs.\n"
             "  • Slow zero (Faradaic-branch RC): τ ≈ 330 µs\n"
             "      = R_ct · C_s\n"
-            "      Governs the visible decay-tail envelope.\n\n"
+            "      Governs the visible decay-tail envelope.\n"
+            "  • Sputtered RuOx (Meyer, Cogan et al.; 200 µs\n"
+            "      cathodic-pulse VT): the open-circuit recovery\n"
+            "      (E_mc → 0) relaxes with τ ≈ 0.2–0.3 ms\n"
+            "      (≈ 250 µs) — a good starting τ for a\n"
+            "      RuOx-like pseudocapacitive coating.\n\n"
             "Real electrodes show CPE behaviour — no single τ "
             "fits. Pick the fast pole if you want stiff settling,\n"
             "the slow zero if you want a tail that resembles a\n"
@@ -1533,8 +1537,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # remains the fallback when this value is 0.
         self.sym_tau_us = self._dspin(
             0.0, TAU_MAX_US, 0.0,
-            step=10.0, decimals=1,
-            suffix=" " + rich.US)
+            step=1.0, decimals=1)
         self.sym_tau_us.setToolTip(
             "Time constant τ for the exponential shapes (decay / "
             "increasing / exp pairs). Default 0 falls back to the "
@@ -1542,7 +1545,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
             "τ explicitly (matches a measured electrode RC, etc.).")
         self.sym_tau_us.valueChanged.connect(self._emit)
         self._sym_tau_label = QtWidgets.QLabel(
-            f"{getattr(rich, 'TAU', 'τ')}:")
+            f"Time constant ({getattr(rich, 'TAU', 'τ')}) [{rich.US}]:")
         self._sym_form.addRow(self._sym_tau_label, self.sym_tau_us)
         # Speedbump-count row was removed — bump_count is hardcoded
         # at 2 internally. The placeholder labels below stay for
@@ -1789,7 +1792,7 @@ class PatternControlPanel(QtWidgets.QGroupBox):
         # helper isn't loaded keeps the panel constructible
         # in head-less / partial-import test contexts.
         self._cap_tau_label = QtWidgets.QLabel(
-            f"{getattr(rich, 'TAU', 'τ')}:")
+            f"Time constant ({getattr(rich, 'TAU', 'τ')}) [{rich.US}]:")
         af.addRow(self._cap_tau_label, self._cap_tau_row_w)
         # Per-phase amp/width rows
         self._phase_rows: List[QtWidgets.QWidget] = []

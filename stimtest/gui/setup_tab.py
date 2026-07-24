@@ -1895,6 +1895,21 @@ class SetupTab(QtWidgets.QWidget):
         ev.addWidget(self.experiment_blurb)
         ev.addWidget(self.open_exp_btn)
 
+        # Field-column alignment across the stacked left-column groups: each
+        # QFormLayout otherwise sizes its OWN label column to its OWN longest
+        # label, so the groups' field columns start at different x and the
+        # left column reads as ragged (operator: "align the middles").  Give
+        # every label a shared minimum width = the widest label across the
+        # groups, so — with left-aligned label text — every group's fields
+        # begin at the SAME x, forming one clean vertical divider.
+        # The Oscilloscope CHANNEL MAPPING form (``sf``) is deliberately
+        # EXCLUDED — it's a 3-column mini-table (Role / Bandwidth / Coupling
+        # per CHx), so its short "CHx:" labels should stay narrow and let the
+        # three combos use the full width; forcing them behind the shared wide
+        # label column squeezes the combos.
+        self._label_align_forms = [sess_form, dev_form, acq_form, exp_form]
+        self._align_form_label_columns()
+
         # ---------------- left column container ----------------
         left_w = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left_w)
@@ -2001,6 +2016,32 @@ class SetupTab(QtWidgets.QWidget):
                   getattr(self, "device_view", None)):
             if w is not None:
                 w.setEnabled(not locked)
+
+    def _align_form_label_columns(self):
+        """Give every label-role widget in the left-column forms a shared
+        minimum width so the field columns line up across the stacked group
+        boxes (operator: "align the middles").  Run once after the forms are
+        built.  The width = the widest label-role widget across all the
+        grouped forms; with left-aligned label text (rich.make_form), every
+        group's fields then begin at the same x — one clean vertical divider.
+        Applies to ANY label-role widget (QLabel AND the checkbox some rows
+        use as their label, e.g. the notebook toggle) so those rows' fields
+        align too."""
+        LabelRole = QtWidgets.QFormLayout.ItemRole.LabelRole
+        widgets = []
+        for form in getattr(self, "_label_align_forms", []):
+            if form is None:
+                continue
+            for r in range(form.rowCount()):
+                item = form.itemAt(r, LabelRole)
+                w = item.widget() if item is not None else None
+                if isinstance(w, QtWidgets.QWidget):
+                    widgets.append(w)
+        if not widgets:
+            return
+        maxw = max(w.sizeHint().width() for w in widgets)
+        for w in widgets:
+            w.setMinimumWidth(maxw)
 
     @staticmethod
     def _lbl(html: str) -> QtWidgets.QLabel:

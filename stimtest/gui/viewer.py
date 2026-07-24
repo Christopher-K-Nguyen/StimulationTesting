@@ -1777,14 +1777,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # setup + max Q_inj (operator: "Metric table is all wrong … no
         # waveform metrics besides maximum Q_inj").
         rep = self._representative_capture(run)
+        # Cumulative Q with the auto-scaled unit in the LABEL column (operator:
+        # "have the units in the metric column and not value column").
+        _cq_nc = _run_accumulated_charge_nc(run)
+        if math.isfinite(_cq_nc):
+            from .widgets import _split_cumulative_charge
+            _cq_v, _cq_u = _split_cumulative_charge(_cq_nc)
+            _cq_label, _cq_val = f"Cumulative Q [{_cq_u}]", _cq_v
+        else:
+            _cq_label, _cq_val = "Cumulative Q", "—"
         rows = [
             ("Channel/combo", run.configuration.display_name()),
             ("Captures", str(len(run.captures))),
             ("Max Q_inj [mC/cm²]", _fmt_or_dash(run.max_q_inj, ".3f")),
             ("Cumulative N_pulse", _fmt_pulses_or_dash(
                 _run_cumulative_n_pulses(run))),
-            ("Cumulative Q",
-             _fmt_charge_nc(_run_accumulated_charge_nc(run))),
+            (_cq_label, _cq_val),
             ("Time to complete", _fmt_duration_s(run.duration_s)),
         ]
         if rep is not None:
@@ -2791,6 +2799,8 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun,
         ("Amplitude [µA]", _fmt_or_dash(
             cap.pattern.excitation_phase.amplitude_ua, "+.2f")),
         (f"{L('Q','ph')} [nC]",  _fmt_or_dash(m.charge_per_phase_nc, ".3f")),
+        # Charge imbalance Q_net (operator: "add charge imbalance (nC)").
+        (f"{L('Q','net')} [nC]", _fmt_or_dash(cap.pattern.net_charge_nc, "+.3f")),
         (f"{L('Q','inj')} [mC/cm²]", _fmt_or_dash(m.charge_injection_mc_per_cm2,
                                                   ".3f")),
         (f"{L('E','ip')} [V]",  _fmt_or_dash(m.interpulse_potential_v, ".3f")),
@@ -2802,7 +2812,12 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun,
     # tagged with a 3rd element (field name) are hand-editable Value cells.
     _cls = getattr(m, "response_class", "normal") or "normal"
     rows.append(("Response", _class_display(_cls)))
-    rows.append((f"{L('V','d')} [V]", _fmt_or_dash(m.driving_voltage_v, ".3f"),
+    # TOTAL driving voltage (V_mon, all electrodes) — call it out as "total"
+    # when the per-electrode active/return driving voltage rows are also shown
+    # (operator: distinguish total vs active/return driving voltage).
+    _vd_total = f"{L('V','d')} total [V]" if m.return_driving_voltage_per_phase_v \
+        else f"{L('V','d')} [V]"
+    rows.append((_vd_total, _fmt_or_dash(m.driving_voltage_v, ".3f"),
                  "driving_voltage_v"))
     if _cls != "normal" or math.isfinite(
             getattr(m, "effective_capacitance_nf", float("nan"))):
@@ -2845,8 +2860,9 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun,
         rows.append((f"{L('Z','d')} [kΩ]",
                      _fmt_or_dash(m.driving_impedance_kohm, ".3f")))
     if math.isfinite(getattr(m, "driving_energy_uj", float("nan"))):
-        from .widgets import _fmt_energy
-        rows.append(("Driving energy", _fmt_energy(m.driving_energy_uj)))
+        from .widgets import _split_energy
+        _de_v, _de_u = _split_energy(m.driving_energy_uj)
+        rows.append((f"Driving energy [{_de_u}]", _de_v))
     # Harris 2019 chronopotentiometry capacitive/Faradaic decomposition
     # (normal captures only) — C_dl + approximate Faradaic split.
     if math.isfinite(getattr(m, "c_dl_mf_per_cm2", float("nan"))):
@@ -2867,14 +2883,18 @@ def _capture_metric_rows(cap: Capture, run: ChannelRun,
         rows.append((f"{L('V','d')} return per phase [V]",
                      ", ".join(f"{v:.3f}" for v in m.return_driving_voltage_per_phase_v)))
     if m.access_voltage_per_phase_v:
-        rows.append((f"{L('V','a')} active [V]",
-                     ", ".join(f"{v:.3f}" for v in m.access_voltage_per_phase_v)))
+        # Auto-scale V / mV / µV so a small access voltage doesn't read 0.000
+        # (operator); unit lands in the label column.  See widgets helper.
+        from .widgets import _fmt_voltage_list_auto
+        _va_v, _va_u = _fmt_voltage_list_auto(m.access_voltage_per_phase_v)
+        rows.append((f"{L('V','a')} active [{_va_u}]", _va_v))
     if m.access_resistance_per_phase_kohm:
         rows.append((f"{L('R','a')} active [kΩ]",
                      ", ".join(f"{r:.2f}" for r in m.access_resistance_per_phase_kohm)))
     if m.return_access_voltage_per_phase_v:
-        rows.append((f"{L('V','a')} return [V]",
-                     ", ".join(f"{v:.3f}" for v in m.return_access_voltage_per_phase_v)))
+        from .widgets import _fmt_voltage_list_auto
+        _rva_v, _rva_u = _fmt_voltage_list_auto(m.return_access_voltage_per_phase_v)
+        rows.append((f"{L('V','a')} return [{_rva_u}]", _rva_v))
     if m.return_access_resistance_per_phase_kohm:
         rows.append((f"{L('R','a')} return [kΩ]",
                      ", ".join(f"{r:.2f}" for r in m.return_access_resistance_per_phase_kohm)))
