@@ -233,11 +233,10 @@ class CalibrationTab(QtWidgets.QWidget):
     doneRequested = QtCore.pyqtSignal()
 
     #: Default amplitude grid (µA) swept on every channel. Sparse
-    #: enough to keep total wall-clock per-channel under ~5 s
-    #: (5 capture cycles × ~1 s each) while dense enough to fit
-    #: a linear gain + offset per channel cleanly. The 1000 µA
-    #: endpoint is the PlexStim hardware ceiling.
-    DEFAULT_AMPLITUDE_GRID_UA: tuple = (10.0, 20.0, 50.0, 100.0, 200.0, 500.0)
+    #: enough to keep total wall-clock per-channel short while dense
+    #: enough to fit a linear gain + offset per channel cleanly.
+    #: (Operator: the 500 µA point was removed.)
+    DEFAULT_AMPLITUDE_GRID_UA: tuple = (10.0, 20.0, 50.0, 100.0, 200.0)
     #: Default load resistance per channel (Ω) for the Plexon
     #: test board. The 14-04-A-03-A wires each channel to an
     #: **RC series** (4.99 kΩ + 4700 pF), NOT a pure resistor —
@@ -301,6 +300,10 @@ class CalibrationTab(QtWidgets.QWidget):
         # Abort button. The sweep loop polls this between
         # captures to short-circuit out cleanly.
         self._aborted: bool = False
+        # True once a completed sweep's results have been written to
+        # calibration.json (or when there are no results yet).  Done
+        # prompts to save when this is False.  See ``has_unsaved_results``.
+        self._saved_since_sweep: bool = True
         # Scaling-validation result — populated by
         # ``_validate_scaling`` after the sweep, persisted into
         # calibration.json on save, and surfaced in the
@@ -2733,6 +2736,10 @@ class CalibrationTab(QtWidgets.QWidget):
         self.status_progress.setText(_done_msg)
         self._log(_done_msg)
         self._btn_save.setEnabled(True)
+        # A fresh sweep produced results that are NOT yet on disk — Done
+        # prompts to save (operator lost a verification by clicking Done
+        # without "Save verification…").
+        self._saved_since_sweep = False
         # Final summary pop-up — pass/fail counts plus aggregate
         # accuracy + precision, with the per-channel breakdown
         # in the expandable details pane.
@@ -3094,6 +3101,12 @@ class CalibrationTab(QtWidgets.QWidget):
         box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
         box.exec()
 
+    def has_unsaved_results(self) -> bool:
+        """True when a completed sweep produced verification coefficients that
+        have NOT been written to ``calibration.json`` yet — MainWindow prompts
+        to save before closing the verification tab on Done."""
+        return bool(self._fit) and not self._saved_since_sweep
+
     def _on_save_calibration(self):
         """Persist the fitted per-channel gain / offset to the prefs
         directory so the runner picks it up next session.
@@ -3163,6 +3176,9 @@ class CalibrationTab(QtWidgets.QWidget):
                 self, "Save failed",
                 f"Could not write verification file:\n{e}")
             return
+        # Write succeeded → the current sweep's results are now on disk, so
+        # Done no longer needs to prompt to save.
+        self._saved_since_sweep = True
         # Persist the validated serial → scaling mapping into the
         # shared prefs map (the same store the Connection panel
         # reads on stim init). Recorded for EVERY successfully-

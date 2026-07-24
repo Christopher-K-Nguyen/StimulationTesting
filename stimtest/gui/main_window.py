@@ -1053,15 +1053,44 @@ class MainWindow(QtWidgets.QMainWindow):
             "first (Setup tab → Connection panel).")
 
     def _on_calibration_done(self):
-        """Calibration tab signalled it's done (user clicked Done, or save
-        finished). Switch focus back to the Setup tab so the user can
-        continue with experiment configuration, and refresh the
-        ConnectionPanel's "last verified" label since a partial run may
-        have written updated coefficients."""
+        """Done — CLOSE the verification tab (operator: "When pressing Done in
+        the verification, close the verification tab") and return to Setup.
+
+        Verification results are only persisted via the separate "Save
+        verification…" button, so if a completed sweep hasn't been saved,
+        PROMPT first (the operator lost a verification by clicking Done
+        without saving).  Cancel aborts the close.  The tab is destroyed so a
+        later "Run Verification" re-creates it fresh."""
+        from PyQt6.QtWidgets import QMessageBox
+        cal = self.cal_tab
+        if cal is not None and getattr(cal, "has_unsaved_results", None) \
+                and cal.has_unsaved_results():
+            r = QMessageBox.question(
+                self, "Save verification?",
+                "This verification hasn't been saved to disk.  Save it "
+                "before closing?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save)
+            if r == QMessageBox.StandardButton.Cancel:
+                return
+            if r == QMessageBox.StandardButton.Save:
+                cal._on_save_calibration()
+                if cal.has_unsaved_results():   # save failed / nothing to save
+                    return                       # keep the tab open
         try:
             self.conn._refresh_cal_label()
         except Exception:
             pass
+        # Remove + destroy the verification tab so it's gone from the tab bar
+        # (a later Run Verification re-creates it via _open_calibration_tab).
+        if cal is not None:
+            idx = self.tabs.indexOf(cal)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            cal.deleteLater()
+            self.cal_tab = None
         idx = self.tabs.indexOf(self.setup_tab)
         if idx >= 0:
             self.tabs.setCurrentIndex(idx)
