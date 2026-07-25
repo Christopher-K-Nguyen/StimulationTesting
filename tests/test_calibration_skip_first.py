@@ -45,16 +45,20 @@ def test_discard_loop_precedes_kept_capture():
     assert "self.CAL_DISCARD_ACQUISITIONS" in block
 
 
-def test_collects_the_third_sample():
-    """Operator: "collect the third sample" -> discard 2, keep the 3rd."""
+def test_discards_one_stale_average():
+    """AVERAGE mode: the first completed average is a stale blend of the
+    PREVIOUS amplitude's frames, so exactly one is discarded.
+
+    (An earlier SAMPLE-mode configuration discarded 2 and kept the 3rd;
+    "average mode with average count of 64" supersedes it.)"""
     from stimtest.gui.calibration import CalibrationTab
-    assert CalibrationTab.CAL_DISCARD_ACQUISITIONS == 2
+    assert CalibrationTab.CAL_DISCARD_ACQUISITIONS == 1
 
 
-def test_pulse_rate_is_10_pps():
-    """Operator: "Do 10 pps"."""
+def test_pulse_rate_is_200_pps():
+    """Operator: "Apply pulse rate of 200 pps" (supersedes 10 pps)."""
     from stimtest.gui.calibration import CalibrationTab
-    assert CalibrationTab.PULSE_RATE_PPS == 10.0
+    assert CalibrationTab.PULSE_RATE_PPS == 200.0
 
 
 def test_one_time_setup_discard_removed():

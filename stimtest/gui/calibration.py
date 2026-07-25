@@ -177,6 +177,18 @@ _VERT_GRID_VPD: tuple = _build_matlab_vert_grid()
 #: trace fills ~4 divs (not 3) by default.
 _VMON_TARGET_DIVS: float = 4.0
 
+#: A constant-current phase must ramp at ~I/C.  A measured slope below
+#: this FRACTION of that expectation means the fit window is flat —
+#: i.e. the phase is railed — so the capacitance it implies is
+#: meaningless and the phase is excluded rather than averaged in.
+_SLOPE_SANITY_FRAC: float = 0.25
+
+#: A real capture must reach at least this FRACTION of the expected
+#: V_mon excursion ``(I·R + I·W/C)·k``.  Below it the frame is not a
+#: pulse — it is an untriggered / free-running acquisition — and is
+#: re-captured rather than recorded.
+_PULSE_SANITY_FRAC: float = 0.40
+
 
 def _vmon_vertical_scale(amp_ua: float, load_r_ohm: float, load_c_pf: float,
                          phase_us: float, vmon_v_per_v: float,
@@ -288,8 +300,19 @@ class CalibrationTab(QtWidgets.QWidget):
     #: Default amplitude grid (µA) swept on every channel. Sparse
     #: enough to keep total wall-clock per-channel short while dense
     #: enough to fit a linear gain + offset per channel cleanly.
-    #: (Operator: the 500 µA point was removed.)
-    DEFAULT_AMPLITUDE_GRID_UA: tuple = (10.0, 20.0, 50.0, 100.0, 200.0)
+    #:
+    #: Operator history — the grid has been trimmed from the BOTTOM as the
+    #: low-amplitude points proved unreliable rather than merely noisy:
+    #:   * 500 µA removed (top end).
+    #:   * 10 µA removed and 20 → 25 µA.  At 10 µA on a NIL-preset
+    #:     stimulator the I_mon peak is only ~10 mV, which sits BELOW the
+    #:     small-amplitude I_mon trigger threshold, and the V_mon iR step
+    #:     (~50 mV into 4.99 kΩ) is close enough to the averaged noise floor
+    #:     that the edge extrapolation is dominated by it.  Both effects bias
+    #:     the fit while contributing a point the through-origin estimator
+    #:     weights least (it weights by I), so dropping it costs almost no
+    #:     conditioning and removes a systematic.
+    DEFAULT_AMPLITUDE_GRID_UA: tuple = (25.0, 50.0, 100.0, 200.0)
     #: Default load resistance per channel (Ω) for the Plexon
     #: test board. The 14-04-A-03-A wires each channel to an
     #: **RC series** (4.99 kΩ + 4700 pF), NOT a pure resistor —
@@ -316,20 +339,22 @@ class CalibrationTab(QtWidgets.QWidget):
     #: phase width so the waveform is charge-balanced and the discharge
     #: phase is visible on the oscilloscope alongside the two active phases.
     DISCHARGE_US: float = 0.0
-    #: Pulse rate (pps) used for every calibration capture.  10 pps gives a
-    #: 100 ms interpulse — ~4000 RC time constants on the 4.99 kΩ / 4700 pF
-    #: test board — so the load is fully discharged and thermally settled
-    #: before every capture (operator).
-    PULSE_RATE_PPS: float = 10.0
+    #: Pulse rate (pps) used for every calibration capture.  200 pps with
+    #: AVERAGE/64 gives a 0.32 s acquisition (operator) — the averaging, not
+    #: a long interpulse, is what rejects noise now.  5 ms between pulses is
+    #: still ~200 RC time constants on the 4.99 kΩ / 4700 pF board, so the
+    #: load fully discharges between pulses.
+    #: (Supersedes an earlier 10 pps chosen to minimise capacitance drift.)
+    PULSE_RATE_PPS: float = 200.0
     #: How many completed acquisitions to DISCARD per amplitude before the
-    #: one that is kept — so the KEPT capture is acquisition
-    #: ``CAL_DISCARD_ACQUISITIONS + 1`` (operator: "collect the third
-    #: sample" ⇒ discard 2, keep the 3rd).  After ``load_channel`` +
-    #: ``start_channel`` the first frames still carry the settings-change
-    #: transient (and, in AVERAGE mode, a stale blend of the PREVIOUS
-    #: amplitude's pulses); discarding more of them buys a cleaner capture
-    #: at the cost of run time — the operator's stated preference.
-    CAL_DISCARD_ACQUISITIONS: int = 2
+    #: one that is kept — the KEPT capture is acquisition
+    #: ``CAL_DISCARD_ACQUISITIONS + 1``.  In AVERAGE mode this is
+    #: load-bearing: after ``load_channel`` + ``start_channel`` the averager
+    #: is still flushing the PREVIOUS amplitude's frames, so the first
+    #: completed average is a stale blend of old + new and must be thrown
+    #: away.  (An earlier SAMPLE-mode configuration discarded 2 and kept the
+    #: 3rd; AVERAGE/64 supersedes it — the averaging does that work now.)
+    CAL_DISCARD_ACQUISITIONS: int = 1
     #: Number of waveforms the scope averages before the curve is
     #: read. AVERAGE mode sends the stimulator running, waits for
     #: N triggered acquisitions to complete, then reads the averaged
@@ -356,6 +381,18 @@ class CalibrationTab(QtWidgets.QWidget):
         # (programmed_ua, measured_ua) tuples. Empty when the
         # sweep hasn't run yet.
         self._results: Dict[int, list] = {}
+        #: RAW per-measurement values, so the channel fit can use
+        #: EVERY value rather than one average per amplitude
+        #: (operator: "I want the fitting to use all values").
+        #: ``{channel: [(I_amps, [va_volts...], [ramp_slope_V_per_s...])]}``
+        #: — one entry per capture, holding that capture's INDIVIDUAL
+        #: iR drops (one per current edge) and per-phase ramp slopes.
+        self._raw_meas: Dict[int, list] = {}
+        #: Per-capture r² of the NOMINAL RC model against V_mon,
+        #: averaged per channel for the results table.  LOWERCASE r²
+        #: throughout (operator) so it is never confused with the
+        #: RESISTANCE R.
+        self._r2_meas: Dict[int, list] = {}
         # Linear-fit coefficients per channel, populated after the
         # sweep finishes. Keys are channel indices (as strings to
         # round-trip cleanly through JSON); values are
@@ -682,7 +719,7 @@ class CalibrationTab(QtWidgets.QWidget):
         # waveform fit perfectly) and they're no longer used for
         # pass/fail.  The pass/fail gate is now just "did we get
         # finite, positive R_load and C_load fits?".
-        self.results_table = QtWidgets.QTableWidget(0, 6)
+        self.results_table = QtWidgets.QTableWidget(0, 7)
         # VARIABLE FORMAT for every quantity (operator, twice: "have R_load
         # and C and other variables in proper variable format" / "I have told
         # you to use variable format") — italic variable, upright subscript,
@@ -699,7 +736,12 @@ class CalibrationTab(QtWidgets.QWidget):
              f"{rich.var('R', 'load')} fit [Ω]",
              f"{rich.var('C', 'load')} fit [pF]",
              f"{rich.var('I', 'mon')} gain ({rich.var('a')})",
-             f"{rich.var('I', 'mon')} offset ({rich.var('b')}) [µA]"])
+             f"{rich.var('I', 'mon')} offset ({rich.var('b')}) [µA]",
+             # LOWERCASE r² (operator) — the coefficient of
+             # determination of the NOMINAL RC model against the
+             # measured V_mon.  Lowercase so it is never read as the
+             # RESISTANCE R.
+             f"{rich.var('r')}² (RC fit)"])
         # Row-index lookup so re-running a channel updates its existing
         # row instead of appending a duplicate.
         self._row_by_channel: Dict[int, int] = {}
@@ -1065,7 +1107,7 @@ class CalibrationTab(QtWidgets.QWidget):
     #: SAMPLE is noisier than AVERAGE for the IR-step + cap-ramp fits (the
     #: per-step ``measured_ua`` carries more variance); this is the operator's
     #: deliberate choice.
-    CAL_ACQ_MODE: str = "SAMPLE"
+    CAL_ACQ_MODE: str = "AVERAGE"
     #: Hardcoded NUMAVg count for the calibration sweep.  Was a
     #: user-facing combo; pinned at 64 (lab convention).  64 gives
     #: √64 = 8× noise reduction — more than enough for the access-
@@ -1403,6 +1445,8 @@ class CalibrationTab(QtWidgets.QWidget):
         # ---- Sweep ----
         self._aborted = False
         self._results.clear()
+        self._raw_meas.clear()
+        self._r2_meas.clear()
         self._fit.clear()
         self._scaling_validation = {}
         self._btn_run.setEnabled(False)
@@ -1443,6 +1487,8 @@ class CalibrationTab(QtWidgets.QWidget):
                 "Sweep aborted by user. Partial results discarded.")
             self._log("Sweep aborted by user. Partial results discarded.")
             self._results.clear()
+            self._raw_meas.clear()
+            self._r2_meas.clear()
             return
         self._fit_and_render_results(load_ohm)
 
@@ -1936,6 +1982,8 @@ class CalibrationTab(QtWidgets.QWidget):
                 if self._aborted:
                     return
                 self._results[ch] = []
+                self._raw_meas[ch] = []
+                self._r2_meas[ch] = []
                 # Route V_mon / I_mon to this channel once per channel —
                 # doesn't change across amplitude steps.
                 try:
@@ -2017,6 +2065,8 @@ class CalibrationTab(QtWidgets.QWidget):
                     # replaces (rather than appends to) the data
                     # from the failed attempt.
                     self._results[ch] = []
+                    self._raw_meas[ch] = []
+                    self._r2_meas[ch] = []
                     for amp_ua in amplitudes:
                         if self._aborted:
                             return
@@ -2151,6 +2201,22 @@ class CalibrationTab(QtWidgets.QWidget):
                              float(phase1_sign_raw), float(dt_s_raw),
                              float(_vmon_offset_capture),
                              float(_imon_offset_capture)))
+                        # REAL-TIME results row (operator: "update the table
+                        # in real time as more amplitudes are being tested").
+                        # ``_append_results_row`` UPSERTS on
+                        # ``_row_by_channel``, so re-fitting after every
+                        # amplitude refreshes this channel's existing row
+                        # rather than adding duplicates.  The fit needs >= 2
+                        # amplitudes; below that it returns None and the row
+                        # simply is not written yet.  Wrapped so a transient
+                        # fit failure mid-sweep can never abort the sweep.
+                        try:
+                            self._fit_one_channel(ch)
+                            QtWidgets.QApplication.processEvents()
+                        except Exception as _live_err:
+                            self._log(
+                                f"  live results-row update skipped: "
+                                f"{_live_err}")
                     # ---- End of amplitude loop — fit this attempt ----
                     try:
                         _fit_result = self._fit_one_channel(ch)
@@ -2305,8 +2371,44 @@ class CalibrationTab(QtWidgets.QWidget):
                 if v_mon is None or len(v_mon) < 4:
                     continue
                 v_arr_f = np.asarray(v_mon, dtype=float)
-                if float(np.max(np.abs(v_arr_f))) < 1e-6:
-                    continue  # flat/blank trace — trigger may have misfired
+                # ---- Is this actually a PULSE? --------------------------
+                # A real capture must reach ~(I·R + I·W/C)·k.  A frame that
+                # falls far short is not a pulse at all — it is an
+                # UNTRIGGERED / free-running acquisition (the "NUMACq = 0/1"
+                # poll timeouts), whose trace is essentially flat.  Keeping
+                # one is silently corrosive: a flat phase has a ~0 ramp
+                # slope, so ``C = I·k/slope`` explodes (bench: 7e8 pF), the
+                # iR steps read as noise, and r² goes hugely negative — all
+                # while the HIGH-amplitude captures look perfect, because
+                # only the low-amplitude ones fail to trigger.
+                #
+                # The old guard here was ``max|v| < 1e-6`` — 1 µV, which any
+                # noise frame clears.  Compare against the EXPECTED excursion
+                # instead and re-capture, spending the retry budget on a real
+                # pulse rather than recording a blank one.
+                _amp_a = abs(float(amp_ua)) * 1e-6
+                # ``vmon_v_per_v`` is not bound until later in this method,
+                # so derive the scaling locally (same source, own name to
+                # avoid shadowing).
+                _info_k = (getattr(self._stim, "info", None)
+                           if self._stim else None)
+                _k_vmon = float(
+                    getattr(_info_k, "vmon_scaling_v_per_v",
+                            VMON_SCALING_DEFAULT) or VMON_SCALING_DEFAULT)
+                _v_expect = (
+                    (_amp_a * float(load_ohm)
+                     + _amp_a * float(self.PHASE_WIDTH_US) * 1e-6
+                     / max(float(load_cap_pf) * 1e-12, 1e-15))
+                    * _k_vmon)
+                _v_obs = float(np.max(np.abs(v_arr_f)))
+                if _v_expect > 0 and _v_obs < _PULSE_SANITY_FRAC * _v_expect:
+                    self._log(
+                        f"  ⚠ capture at {amp_ua:.0f} µA reached only "
+                        f"{_v_obs*1e3:.1f} mV of the expected "
+                        f"{_v_expect*1e3:.1f} mV — not a pulse (likely an "
+                        f"UNTRIGGERED / free-running frame); re-capturing "
+                        f"(attempt {_attempt + 1}/5).")
+                    continue
 
                 # Adapt vertical scale while stim is running.
                 # If either channel changes scale, re-capture with the new
@@ -2756,6 +2858,12 @@ class CalibrationTab(QtWidgets.QWidget):
                         np.sqrt(_ss_res / residuals.size)) * 1e3
                     model_r2 = ((1.0 - _ss_res / _ss_tot)
                                 if _ss_tot > 0 else float("nan"))
+                    try:
+                        if np.isfinite(model_r2):
+                            self._r2_meas.setdefault(
+                                int(channel), []).append(float(model_r2))
+                    except Exception:
+                        pass
                     self._log(
                         f"  RC model vs V_mon: R² = {model_r2:.5f}, "
                         f"RMSD = {model_rmsd_mv:.2f} mV over "
@@ -2766,27 +2874,82 @@ class CalibrationTab(QtWidgets.QWidget):
                         f"LOW R_load fit means the board is nominal and the "
                         f"iR-step extraction is under-reading.")
 
-                # Estimate C from the phase-1 ramp slope.
-                # Model: dV/dt = -phase1_sign · I · k / C
-                # → C = -phase1_sign · I · k / slope
-                # Use the middle 50 % of phase 1 to avoid edge transients.
-                ph1_start_us = t0_us + self.PHASE_WIDTH_US * 0.25
-                ph1_end_us   = t0_us + self.PHASE_WIDTH_US * 0.75
-                mask_p1 = (t_us >= ph1_start_us) & (t_us < ph1_end_us)
-                if mask_p1.sum() >= 4:
-                    t_p1 = t_us[mask_p1] * 1e-6   # → seconds
-                    v_p1 = v_arr[mask_p1]
-                    # Linear fit: slope in V/s (scope volts, not load volts)
-                    slope, _ = np.polyfit(t_p1, v_p1, 1)
-                    I_A = amp_ua * 1e-6
-                    # slope = dV_scope/dt = phase1_sign · I · k / C
-                    # → C = phase1_sign · I · k / slope  (always positive when correct)
-                    if abs(slope) > 1e-6:
-                        est_cap_pf = (phase1_sign * I_A * vmon_v_per_v / slope) * 1e12
-                    # Carry the raw ramp slope (V_scope per second) and
-                    # phase-1 sign out of this scope so the channel-level
-                    # joint R/C fit can use them directly.
-                    ramp_slope_v_per_s = float(slope)
+                # Estimate C from the ramp slope in EVERY phase, then average
+                # (operator: "for capacitance get slants in each phase and
+                # average them").
+                #
+                # Model: dV/dt = sign · I · k / C, so each constant-current
+                # phase carries an INDEPENDENT estimate of the SAME C — phase
+                # 1 ramps one way, phase 2 the other (opposite current sign).
+                # Averaging both halves the noise and, more usefully, the
+                # SPREAD between them is diagnostic: two phases of the same
+                # load must agree, so a large phase-to-phase difference flags
+                # a real asymmetry (clipping on one excursion, charge
+                # imbalance) that a phase-1-only fit cannot see.
+                #
+                # Each phase is fitted over its MIDDLE 50 % to stay clear of
+                # the switching edges at both ends.
+                I_A = amp_ua * 1e-6
+                _cap_per_phase = []          # pF, one per phase
+                _slope_per_phase = []        # V_scope/s, signed
+                for _pi in range(2):
+                    # Phase k starts after k×(width + interphase-if-any).
+                    _pstart = t0_us + _pi * (self.PHASE_WIDTH_US
+                                             + self.INTERPHASE_US)
+                    _lo = _pstart + self.PHASE_WIDTH_US * 0.25
+                    _hi = _pstart + self.PHASE_WIDTH_US * 0.75
+                    _m = (t_us >= _lo) & (t_us < _hi)
+                    if _m.sum() < 4:
+                        continue
+                    _slope, _ = np.polyfit(t_us[_m] * 1e-6, v_arr[_m], 1)
+                    # SANITY-BOUND the slope against the physics.  A
+                    # constant-current phase MUST ramp at ~I/C; a slope far
+                    # below that means the fit window landed on a FLAT
+                    # region — which happens when the phase is RAILED
+                    # (clipped), where the samples sit on the ADC limit.
+                    # ``C = I·k/slope`` then explodes: a 0.14 V/s slope on a
+                    # 100 µA phase reports 7e8 pF.  The old ``<= 1e-6`` floor
+                    # let that through (huge but finite and positive, so it
+                    # passed the ``> 0`` check) and poisoned the mean.
+                    _slope_expect = I_A * vmon_v_per_v / max(
+                        float(load_cap_pf) * 1e-12, 1e-15)
+                    if abs(_slope) < _SLOPE_SANITY_FRAC * abs(_slope_expect):
+                        self._log(
+                            f"  phase {_pi + 1} ramp slope "
+                            f"{_slope:+.1f} V/s is < "
+                            f"{_SLOPE_SANITY_FRAC:.0%} of the expected "
+                            f"{_slope_expect:+.1f} V/s — window is FLAT "
+                            f"(phase likely railed); excluded from C.")
+                        continue
+                    # Phase 1 has sign ``phase1_sign``; phase 2 is opposite.
+                    _sign = phase1_sign * (1.0 if _pi == 0 else -1.0)
+                    _c_pf = (_sign * I_A * vmon_v_per_v / _slope) * 1e12
+                    if np.isfinite(_c_pf) and _c_pf > 0:
+                        _cap_per_phase.append(float(_c_pf))
+                        _slope_per_phase.append(float(_slope))
+                # Keep the INDIVIDUAL measurements so the channel-level fit
+                # can use EVERY value instead of one average per amplitude
+                # (operator: "I want the fitting to use all values").
+                try:
+                    self._raw_meas.setdefault(int(channel), []).append(
+                        (float(amp_ua) * 1e-6,
+                         [float(v) for v in step_mags],
+                         list(_slope_per_phase)))
+                except Exception:
+                    pass
+                if _cap_per_phase:
+                    est_cap_pf = float(np.mean(_cap_per_phase))
+                    if len(_cap_per_phase) > 1:
+                        self._log(
+                            "  C per phase: "
+                            + ", ".join(f"{c:.0f} pF" for c in _cap_per_phase)
+                            + f"  → mean {est_cap_pf:.0f} pF "
+                            f"(spread {max(_cap_per_phase) - min(_cap_per_phase):.0f} pF)")
+                    # Carry the PHASE-1 raw ramp slope (V_scope per second)
+                    # and sign out of this scope — the channel-level joint
+                    # R/C fit models phase 1 specifically, so it must NOT be
+                    # handed the two-phase average.
+                    ramp_slope_v_per_s = float(_slope_per_phase[0])
                     phase1_sign_out = float(phase1_sign)
 
                 # Estimate R from the per-boundary access voltage.
@@ -2874,13 +3037,54 @@ class CalibrationTab(QtWidgets.QWidget):
         fit_r_rmse = float("nan")
         fit_c_rmse = float("nan")
         v_offset_v = float("nan")
+        # ---- Expand to EVERY individual measurement ---------------------
+        # Operator: "I want the fitting to use all values."  The arrays above
+        # hold ONE averaged value per amplitude; the raw side-map holds each
+        # capture's INDIVIDUAL iR drops (one per current edge — 4 on a
+        # biphasic with an interphase gap) and per-phase ramp slopes.
+        # Expanding them into parallel (I, y) pairs feeds the SAME
+        # through-origin estimator far more points, so the fit is better
+        # conditioned AND its residual becomes a genuine measure of
+        # measurement scatter rather than of amplitude-to-amplitude scatter.
+        # Falls back to the per-amplitude averages when the raw values are
+        # unavailable (a channel fitted from a re-loaded session).
+        _raw = self._raw_meas.get(ch) or []
+        _I_step, _Y_step, _I_ramp, _Y_ramp = [], [], [], []
+        for _entry in _raw:
+            try:
+                _i_a, _vas, _slopes = _entry
+            except (TypeError, ValueError):
+                continue
+            for _v in (_vas or ()):
+                if np.isfinite(_v):
+                    _I_step.append(float(_i_a))
+                    _Y_step.append(float(_v))
+            for _s in (_slopes or ()):
+                if np.isfinite(_s):
+                    _I_ramp.append(float(_i_a))
+                    # Phase 2's ramp runs the OPPOSITE way; the model is
+                    # signed per phase, so normalise every slope to the
+                    # phase-1 sense before pooling.
+                    _Y_ramp.append(abs(float(_s)))
+        _use_raw = len(_I_step) >= 2 and len(_I_ramp) >= 2
+        if _use_raw:
+            I_step_A = np.array(_I_step)
+            step_all = np.array(_Y_step)
+            I_ramp_A = np.array(_I_ramp)
+            ramp_all = np.array(_Y_ramp) * float(np.sign(
+                float(np.mean(slope_arr)) if slope_arr.size else 1.0) or 1.0)
+        else:
+            I_step_A, step_all = I_prog_A, step_v_arr
+            I_ramp_A, ramp_all = I_prog_A, slope_arr
+
         if I_prog_A.size >= 2 and float(np.std(I_prog_A)) > 0:
-            denom_x2 = float(np.sum(I_prog_A * I_prog_A))
-            if denom_x2 > 0:
-                slope_step = (float(np.sum(I_prog_A * step_v_arr))
+            denom_x2 = float(np.sum(I_step_A * I_step_A))
+            _denom_ramp = float(np.sum(I_ramp_A * I_ramp_A))
+            if denom_x2 > 0 and _denom_ramp > 0:
+                slope_step = (float(np.sum(I_step_A * step_all))
                               / denom_x2)
-                slope_ramp = (float(np.sum(I_prog_A * slope_arr))
-                              / denom_x2)
+                slope_ramp = (float(np.sum(I_ramp_A * ramp_all))
+                              / _denom_ramp)
                 if slope_ramp != 0.0:
                     fit_c_pf = (phase1_sign * vmon_v_per_v
                                 / slope_ramp) * 1e12
@@ -2894,12 +3098,22 @@ class CalibrationTab(QtWidgets.QWidget):
                     # R = slope_step / vmon_v_per_v exactly — no
                     # dt/C correction term anymore.
                     fit_r_ohm = slope_step / vmon_v_per_v
-                pred_step = slope_step * I_prog_A
-                pred_ramp = slope_ramp * I_prog_A
+                # Residuals against the SAME arrays the fit consumed — with
+                # the raw expansion these measure per-MEASUREMENT scatter
+                # (across every iR drop / phase slope), not just
+                # amplitude-to-amplitude scatter.
+                pred_step = slope_step * I_step_A
+                pred_ramp = slope_ramp * I_ramp_A
                 fit_r_rmse = float(np.sqrt(np.mean(
-                    (step_v_arr - pred_step) ** 2)))
+                    (step_all - pred_step) ** 2)))
                 fit_c_rmse = float(np.sqrt(np.mean(
-                    (slope_arr - pred_ramp) ** 2)))
+                    (ramp_all - pred_ramp) ** 2)))
+                self._log(
+                    f"  Channel {ch} fit used "
+                    f"{I_step_A.size} iR drop(s) and {I_ramp_A.size} phase "
+                    f"slope(s) across {I_prog_A.size} amplitude(s)"
+                    + ("" if _use_raw else
+                       "  (per-amplitude averages — raw values unavailable)"))
             pass  # v_offset_v is now computed from per-capture
                   # pre-trigger baselines below, NOT a polyfit
                   # intercept (which would blow up on noisy data
@@ -3178,6 +3392,17 @@ class CalibrationTab(QtWidgets.QWidget):
         self.results_table.setItem(row, 3, _cell(c_text, flag_orange=c_oot))
         self.results_table.setItem(row, 4, _cell(_fmt(a_fit, ".4f")))
         self.results_table.setItem(row, 5, _cell(_fmt(b_fit, "+.3f")))
+        # r² of the NOMINAL RC model vs V_mon (mean over this
+        # channel's captures).  ⚠ Dominated by the CAPACITIVE RAMP —
+        # at 100 µA the ramp is ~1.06 V against a ~0.50 V iR step — so
+        # a large R error barely moves it.  Read it as "does the model
+        # describe the waveform", NOT as "is R correct".
+        # Mean r² over this channel's captures (side map — the raw
+        # per-capture values are stashed where the RC model is fitted).
+        _r2_vals = [v for v in (self._r2_meas.get(ch) or [])
+                    if math.isfinite(v)]
+        _r2_mean = (sum(_r2_vals) / len(_r2_vals)) if _r2_vals else float("nan")
+        self.results_table.setItem(row, 6, _cell(_fmt(_r2_mean, ".4f")))
 
     def _validate_scaling(self, programmed_ua: list,
                           imon_peak_v: list) -> dict:

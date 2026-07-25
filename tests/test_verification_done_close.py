@@ -38,11 +38,39 @@ def test_amplitude_grid_has_no_500():
     assert CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA[-1] == 200.0
 
 
-# ------------------------------- SAMPLE mode + DC coupling + tight window
-def test_verification_uses_sample_mode():
-    """Operator: 'Do only sample mode acquisition for verification.'"""
+def test_amplitude_grid_starts_above_the_trigger_branch():
+    """Operator: "exclude 10 uA and do 25 uA instead of 20 uA".
+
+    ``imon_trigger_level`` switches formula at 20 uA: at or BELOW it asks for
+    ``(amp + 3.5) mV/uA``, which on a NIL-preset stimulator (1 mV/uA) is
+    ABOVE the I_mon peak it is meant to trigger on -- 13.5 mV against a
+    10 mV signal -- so the scope can never fire and the capture is a
+    free-running frame (the "NUMACq = 0/1" poll timeouts).  Above 20 uA it
+    uses ``amp x 0.25``, comfortably under the peak.
+    """
+    from stimtest.experiments.base import imon_trigger_level
     from stimtest.gui.calibration import CalibrationTab
-    assert CalibrationTab.CAL_ACQ_MODE.upper() == "SAMPLE"
+    grid = CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA
+    assert grid == (25.0, 50.0, 100.0, 200.0)
+    for amp in grid:
+        level = abs(imon_trigger_level(
+            amp_ua_signed=-amp,
+            phase_width_us=CalibrationTab.PHASE_WIDTH_US,
+            imon_v_per_ua=1e-3))
+        peak = amp * 1e-3            # NIL preset: 1 mV per uA
+        assert level < peak, (
+            f"{amp} uA: trigger level {level*1e3:.2f} mV exceeds the "
+            f"{peak*1e3:.2f} mV I_mon peak -- the scope cannot fire")
+
+
+# ----------------------------- AVERAGE mode + DC coupling + wide window
+def test_verification_uses_average_mode_64():
+    """Operator: "instead of sample mode acquisition and taking the third
+    sample, do average mode with average count of 64" -- supersedes the
+    earlier 'do only sample mode acquisition for verification'."""
+    from stimtest.gui.calibration import CalibrationTab
+    assert CalibrationTab.CAL_ACQ_MODE.upper() == "AVERAGE"
+    assert CalibrationTab.CAL_N_AVERAGES == 64
 
 
 def _cal_src() -> str:
@@ -51,8 +79,9 @@ def _cal_src() -> str:
     return pathlib.Path(c.__file__).read_text(encoding="utf-8")
 
 
-def test_verification_single_sweep_in_sample_mode():
-    """SAMPLE mode captures a single sweep (n_acq = 1), not an average stack."""
+def test_acquisition_count_is_mode_derived():
+    """``_cal_n_acq`` derives the poll target from the MODE -- the full
+    NUMAVg stack in AVERAGE, a single sweep in SAMPLE."""
     src = _cal_src()
     assert "def _cal_n_acq" in src
     assert "n_acq=n_acq," in src           # capture calls use the derived count
