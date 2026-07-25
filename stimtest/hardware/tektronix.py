@@ -3674,6 +3674,50 @@ class TektronixOscilloscope(Oscilloscope):
         self._record_length = n
         return n
 
+    def set_transfer_full_record(self) -> Optional[int]:
+        """Pin ``DATa:STOP`` to the record length so ``CURVe?`` returns the
+        WHOLE record.  Returns the confirmed ``DATa:STOP``, or None on failure.
+
+        **OPT-IN — callers must ask for this.**  The default (and the
+        experiment path) deliberately leaves ``DATa:STOP`` alone for MATLAB
+        parity (operator: "I do not want DATa:STOP"), because pinning it on a
+        WIDE window pulls in the off-screen record tail — the record is longer
+        than the screen (e.g. 20000 x 80 ns = 1600 µs of record behind a
+        1500 µs screen), and that tail can hold the next pulse's onset, which
+        is the end-of-record artifact the rule exists to prevent.
+
+        It is REQUIRED, however, when the pulse fills the window.  ``DATa:STOP``
+        is an ABSOLUTE sample index and the firmware leaves a stale value in it
+        (bench: stuck at 16624 against a 20000-point record), so ``CURVe?``
+        silently returns only the first ~83 % of the record.  On a WIDE window
+        the discarded tail is empty interpulse and nothing is lost; on the
+        TIGHT verification window the very same truncation lands on the pulse,
+        clipping the end of phase 2 and its final iR drop.
+
+        The verification sweep therefore opts in: tight window + the
+        experiment's record length + the whole pulse are only simultaneously
+        satisfiable if the transfer bound follows the record.
+        """
+        n = getattr(self, "_record_length", None)
+        if not n:
+            try:
+                n = self._refresh_record_length()
+            except Exception:
+                return None
+        try:
+            self._w(f"DATa:STOP {int(n)}")
+            applied = int(float(self._q("DATa:STOP?")))
+            self._log(
+                f"[scope] set_transfer_full_record(): DATa:STOP = {applied} "
+                f"(record {int(n)}) — CURVe? now returns the FULL record "
+                f"(the firmware's stale default truncated the transfer).")
+            # NR_Pt changes ⇒ every channel's cached preamble is stale.
+            self._invalidate_preamble_cache()
+            return applied
+        except Exception as exc:
+            self._log(f"[scope] set_transfer_full_record() failed: {exc}")
+            return None
+
     def set_acquisition_mode(self, mode: str = "AVERAGE", n_avg: int = 16) -> None:
         mode_u = mode.upper()
         if mode_u not in ("SAMPLE", "AVERAGE", "PEAK"):
@@ -4607,7 +4651,51 @@ class TektronixOscilloscope(Oscilloscope):
             f"{'MSB' if is_big_endian else 'LSB'})   "
             f"< {raw.size} samples, min={int(raw.min())}, max={int(raw.max())}   "
             f"({_fmt_elapsed(time.perf_counter() - _t0)})")
-        y_v = (raw.astype(np.float64) - yoff) * ymult + yzero
+        # --- YOFF cross-check: "Method P" for the VERTICAL axis ------------
+        # The TBS2000 firmware can answer ``WFMOutpre?`` with ``YOFf = 0``
+        # while the channel is genuinely POSITIONED off zero — the exact
+        # Y-axis twin of the XZEro quirk handled below (gotcha #22), where the
+        # firmware reports ``XZEro = -record/2`` regardless of the horizontal
+        # position and the true zero has to be derived from the position we
+        # WROTE.  Trusting a zero YOFF against a non-zero position leaves the
+        # position term in the reconstruction, so every sample comes back
+        # offset by ``position_divs x volts_per_div`` — a constant DC shift the
+        # instrument's own screen never shows (bench: verification centred
+        # V_mon at 2.592 div, and the reported V_mon offset tracked
+        # 2.592 x V/div across the amplitude sweep to within 0.4 %).
+        #
+        # So: when we KNOW the position we wrote and the codes-per-div for
+        # this channel, prefer the write-derived YOFF over a contradictory
+        # readback.  Logged ONCE per scope session (the disagreement repeats
+        # on every capture, and per-capture logging spammed the session log
+        # for the X-axis equivalent).
+        _yoff_used = yoff
+        try:
+            _st = getattr(self, "_adapt_state", {}).get(ch) or {}
+            _pos = _st.get("last_pos")
+            _cpd = getattr(self, "_y_codes_per_div", {}).get(ch)
+            if (_pos is not None and _cpd and np.isfinite(float(_pos))
+                    and float(_cpd) > 0):
+                _yoff_expect = float(_pos) * float(_cpd)
+                # Disagreement beyond half a code is a real contradiction,
+                # not rounding.
+                if abs(_yoff_expect - float(yoff)) > 0.5:
+                    _yoff_used = _yoff_expect
+                    if not getattr(self, "_yoff_disagree_logged", False):
+                        self._log(
+                            f"[scope-vert] {ch}: YOFf readback "
+                            f"({float(yoff):+.1f} levels) contradicts the "
+                            f"WRITTEN position ({float(_pos):+.3f} div x "
+                            f"{float(_cpd):.1f} levels/div = "
+                            f"{_yoff_expect:+.1f}) — using the "
+                            f"position-derived value so the trace is not "
+                            f"offset by position x V/div (TBS2000 reports "
+                            f"YOFf=0 regardless of position; expected, "
+                            f"logged once per session).")
+                        self._yoff_disagree_logged = True
+        except Exception:
+            _yoff_used = yoff
+        y_v = (raw.astype(np.float64) - _yoff_used) * ymult + yzero
         # Time axis — three methods (per MATLAB's getTime.m, getTime2.m,
         # and getSettings.m's batch path):
         #

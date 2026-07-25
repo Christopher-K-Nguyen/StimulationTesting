@@ -729,6 +729,20 @@ def _localize_access_point(deriv_abs: np.ndarray, peak_idx: int,
 _ACCESS_AFTER_START_US = 1.0
 _ACCESS_AFTER_WIN_US = 2.0
 
+#: PRE-edge plateau fit window (µs).  MUST be TIME-based, exactly like the
+#: post-edge window above — a window expressed in SAMPLES silently shrinks as
+#: the timebase gets finer and collapses INSIDE the stimulator's current slew
+#: (measured on the bench: 0.64 µs 10-90 %, up to 0.96 µs), so the "baseline"
+#: line gets fitted on the transition itself and the step reads LOW.  The
+#: verification tab made this visible: at 20 000 points over a 150 µs tight
+#: window (dt = 7.5 ns) the historical 10 / 40 SAMPLES spanned just
+#: 0.075 / 0.300 µs — entirely within the slew.
+#: 1.5 / 6.0 µs are EXACTLY the historical 10 / 40 samples at the 0.15 µs
+#: sample interval this method was originally tuned for, so a capture at that
+#: timebase is unchanged by construction.
+_ACCESS_BEFORE_GAP_US = 1.5
+_ACCESS_BEFORE_WIN_US = 6.0
+
 #: The access step is the FAST ohmic jump AT the current transition, so an
 #: access point is localized in a TIGHT window around the pattern-derived edge
 #: time — never a distant mid-phase / post-polarization |dV/dt| feature, and
@@ -749,7 +763,9 @@ def access_step_by_extrapolation(time_us, v, peak_idx: int, acc_idx: int,
                                  *, before_len: int = 40, before_gap: int = 10,
                                  after_len: int = 30,
                                  after_start_us: float = _ACCESS_AFTER_START_US,
-                                 after_win_us: float = _ACCESS_AFTER_WIN_US
+                                 after_win_us: float = _ACCESS_AFTER_WIN_US,
+                                 before_gap_us: float = _ACCESS_BEFORE_GAP_US,
+                                 before_win_us: float = _ACCESS_BEFORE_WIN_US,
                                  ) -> float:
     """The IR STEP at a current edge, via linear extrapolation of V_mon on both
     sides of the edge back to the edge moment (the ``|dV/dt|`` peak).
@@ -791,11 +807,16 @@ def access_step_by_extrapolation(time_us, v, peak_idx: int, acc_idx: int,
     if dt > 0 and np.isfinite(dt):
         acc_start = peak_idx + max(1, int(round(after_start_us / dt)))
         hi_end = min(acc_start + max(4, int(round(after_win_us / dt))), n)
+        # PRE-edge window in TIME too — see ``_ACCESS_BEFORE_GAP_US``.  A
+        # SAMPLE-count window collapses inside the current slew on a fine
+        # timebase and biases the step LOW.
+        lo_end = max(peak_idx - max(1, int(round(before_gap_us / dt))), 0)
+        lo_start = max(lo_end - max(4, int(round(before_win_us / dt))), 0)
     else:                                    # unusable time axis → legacy window
         acc_start = acc_idx
         hi_end = min(acc_idx + after_len, n)
-    lo_end = max(peak_idx - before_gap, 0)
-    lo_start = max(lo_end - before_len, 0)
+        lo_end = max(peak_idx - before_gap, 0)
+        lo_start = max(lo_end - before_len, 0)
     if acc_start >= n or hi_end - acc_start < 4 or lo_end - lo_start < 4:
         return float("nan")
     try:
@@ -1090,6 +1111,20 @@ def access_voltage_and_resistance(
 # ---------------------------------------------------------------------------
 # Polarization (E_pol)
 # ---------------------------------------------------------------------------
+def _has_interpulse_gap(pattern) -> bool:
+    """True when a REST window follows the pulse (the normal pulsed case).
+
+    False only for a CONTINUOUS pattern (KHFAC and friends), where the last
+    phase runs straight into the next pulse so the end-of-pulse boundary is
+    the next phase-1 lead rather than a step back to zero.  Defaults to True
+    for a pattern that can't answer (the overwhelmingly common case, and the
+    historical behaviour of every caller)."""
+    try:
+        return bool(pattern.has_interpulse_gap())
+    except Exception:
+        return True
+
+
 def access_index_labels(pattern: PulsePattern, *,
                         time_us: Optional[np.ndarray] = None,
                         v_trace: Optional[np.ndarray] = None,
@@ -1195,6 +1230,29 @@ def access_index_labels(pattern: PulsePattern, *,
             _bnext = _pstart[k + 1] if _have_trace else 0.0
             if _emit(net_step >= cutoff, _bnext):
                 labels.append((k + 1, "lead"))
+        else:
+            # LAST phase with NO trailing (discharge) delay.  The current
+            # STILL steps to zero here whenever an INTERPULSE GAP follows —
+            # the pulse ends and the electrode rests — so this boundary
+            # carries a real ohmic drop that must be read like any other
+            # (operator: "be sure to capture all the iR drops in the
+            # waveform and average them").  Historically only a non-zero
+            # discharge delay emitted this entry, so a pattern with
+            # ``discharge_us = 0`` silently dropped its LAST iR step —
+            # e.g. the verification pulse (50/25/50, discharge 0) read only
+            # 3 of its 4 drops.
+            #
+            # A CONTINUOUS pattern (no interpulse gap — KHFAC) is excluded:
+            # there the current runs straight into the NEXT pulse's phase 1,
+            # so the boundary is a phase-1 lead, not a return to zero.
+            if _has_interpulse_gap(pattern) and not (
+                    # ...and skip it when the record was CLIPPED short of
+                    # the boundary, so a truncated capture can't contribute
+                    # a garbage step to the average.
+                    _have_trace
+                    and _pk_end > float(np.asarray(time_us)[-1])):
+                if _emit(abs(ph.amplitude_ua) * f_trail_k >= cutoff, _pk_end):
+                    labels.append((k, "trail"))
     return labels
 
 

@@ -65,10 +65,17 @@ def test_verification_forces_dc_coupling():
     assert 'set_channel_coupling(_cch, "DC")' in src
 
 
-def test_verification_uses_tight_horizontal_window():
-    """Operator: 'Make the horizontal window of verification tight.'"""
+def test_verification_uses_wide_horizontal_window():
+    """Operator: 'Instead of tight, do wide horizontal window' — supersedes
+    the earlier 'make the horizontal window of verification tight'.
+
+    WIDE is one grid increment above the tightest non-clipping step, so the
+    125 us pulse frames in 300 us instead of 150 us: whole pulse plus real
+    post-pulse recovery, and it is no longer pressed against the edge of the
+    record."""
     src = _cal_src()
-    assert 'set_horizontal_fit_mode("tight")' in src
+    assert 'set_horizontal_fit_mode("wide")' in src
+    assert 'set_horizontal_fit_mode("tight")' not in src
 
 
 # ------------------------------------------------- has_unsaved_results

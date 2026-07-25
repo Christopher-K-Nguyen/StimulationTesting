@@ -69,16 +69,29 @@ def test_calibration_wires_rail_check_and_positioning():
     # plateau-false-positive _clipped must NOT force a grow).
     assert "force_grow=_i_railed" in src
     assert "force_grow=_clipped" not in src
-    # Faithful captures get the asymmetric-midpoint position write.
-    assert src.count("set_channel_position") >= 3, \
-        "V_mon centring write missing from _capture_one_amplitude"
 
 
-def test_position_write_triggers_recapture():
-    # The centring write must set scale_changed so the stored waveform
-    # is re-captured at the centred state (the loop's accept contract:
-    # break only when nothing changed).
+def test_no_centring_position_write_in_capture_loop():
+    """SUPERSEDED CONTRACT (operator: "Do not change the vertical position
+    from 0").
+
+    ``_capture_one_amplitude`` used to re-centre the cathodic-heavy V_mon
+    with a non-zero ``CHx:POSition``, on the premise that POSition is
+    ADC-centering only and leaves the reconstructed volts alone.  The
+    TBS2000 reports ``YOFf = 0`` even when positioned, so the decode kept
+    the shift and every sample carried ``position x V/div`` (+951 mV on the
+    bench).  The capture loop must no longer move the position at all --
+    see ``tests/test_verification_position_zero.py`` for the full contract.
+    """
     src = (_ROOT / "stimtest" / "gui" / "calibration.py").read_text(
         encoding="utf-8")
-    block = src[src.find("def _capture_one_amplitude"):]
-    assert "scale_changed = True  # re-capture centred" in block
+    start = src.find("def _capture_one_amplitude")
+    assert start != -1
+    # Bound at the next 4-space-indented def, so the slice is THIS method
+    # only (running to EOF would sweep in every later method).
+    end = src.find("\n    def ", start + 1)
+    block = src[start:end] if end != -1 else src[start:]
+    # Look for an actual CALL -- the block deliberately keeps a comment
+    # naming the method so a future edit is warned off re-adding it.
+    assert "self._scope.set_channel_position(" not in block
+    assert "scale_changed = True  # re-capture centred" not in block

@@ -41,7 +41,60 @@ from typing import Dict, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from . import rich
 from .prefs import prefs_dir, load_prefs, save_prefs
+
+
+class _HtmlHeaderView(QtWidgets.QHeaderView):
+    """Header view that paints its section text as RICH TEXT.
+
+    ``QHeaderView.paintSection`` draws through ``QStyle::CE_Header`` and never
+    consults the view's item delegate, so the ``_HtmlItemDelegate`` that
+    handles CELLS cannot format HEADERS — this is the only way to get
+    ``<i>R</i><sub>load</sub>`` into a table header (operator: "use variable
+    format").
+
+    Sections without markup fall through to the base implementation, so the
+    plain "Channel" header keeps stock styling.  The text colour is taken
+    from the palette so it follows the light / dark theme (a bare
+    ``QTextDocument`` defaults to BLACK, which is invisible on a dark header).
+    """
+
+    def paintSection(self, painter, rect, logicalIndex):     # noqa: N802
+        try:
+            text = str(self.model().headerData(
+                logicalIndex, self.orientation(),
+                QtCore.Qt.ItemDataRole.DisplayRole) or "")
+        except Exception:
+            text = ""
+        if "<" not in text or ">" not in text:
+            super().paintSection(painter, rect, logicalIndex)
+            return
+        painter.save()
+        try:
+            # Draw the stock header chrome (background / borders / sort
+            # indicator) with an EMPTY label, then paint the rich text over it.
+            opt = QtWidgets.QStyleOptionHeader()
+            self.initStyleOption(opt)
+            opt.rect = rect
+            opt.section = logicalIndex
+            opt.text = ""
+            self.style().drawControl(
+                QtWidgets.QStyle.ControlElement.CE_Header, opt, painter, self)
+
+            doc = QtGui.QTextDocument()
+            doc.setDefaultFont(self.font())
+            col = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
+            doc.setHtml(f'<span style="color:{col.name()}">{text}</span>')
+            doc.setTextWidth(max(0, rect.width() - 6))
+            painter.translate(
+                rect.left() + 3,
+                rect.top() + max(0, (rect.height() - doc.size().height()) / 2.0))
+            doc.drawContents(painter)
+        except Exception:
+            pass
+        finally:
+            painter.restore()
 from ..readback_calibration import _IMON_GAIN_MIN, _IMON_GAIN_MAX
 from ..config import (IMON_SCALING_DEFAULT, IMON_SCALING_NIL,
                       VMON_SCALING_DEFAULT, VMON_SCALING_NIL,
@@ -263,8 +316,20 @@ class CalibrationTab(QtWidgets.QWidget):
     #: phase width so the waveform is charge-balanced and the discharge
     #: phase is visible on the oscilloscope alongside the two active phases.
     DISCHARGE_US: float = 0.0
-    #: Pulse rate (pps) used for every calibration capture.
-    PULSE_RATE_PPS: float = 50.0
+    #: Pulse rate (pps) used for every calibration capture.  10 pps gives a
+    #: 100 ms interpulse — ~4000 RC time constants on the 4.99 kΩ / 4700 pF
+    #: test board — so the load is fully discharged and thermally settled
+    #: before every capture (operator).
+    PULSE_RATE_PPS: float = 10.0
+    #: How many completed acquisitions to DISCARD per amplitude before the
+    #: one that is kept — so the KEPT capture is acquisition
+    #: ``CAL_DISCARD_ACQUISITIONS + 1`` (operator: "collect the third
+    #: sample" ⇒ discard 2, keep the 3rd).  After ``load_channel`` +
+    #: ``start_channel`` the first frames still carry the settings-change
+    #: transient (and, in AVERAGE mode, a stale blend of the PREVIOUS
+    #: amplitude's pulses); discarding more of them buys a cleaner capture
+    #: at the cost of run time — the operator's stated preference.
+    CAL_DISCARD_ACQUISITIONS: int = 2
     #: Number of waveforms the scope averages before the curve is
     #: read. AVERAGE mode sends the stimulator running, waits for
     #: N triggered acquisitions to complete, then reads the averaged
@@ -541,7 +606,8 @@ class CalibrationTab(QtWidgets.QWidget):
             from .widgets import disable_plot_wheel_zoom
             disable_plot_wheel_zoom(self._plot_widget)
             self._plot_widget.setLabel("bottom", "Time", units="µs", **_ls_x)
-            self._plot_widget.setLabel("left",   "V_mon",   units="V",  **_ls_left)
+            self._plot_widget.setLabel("left", rich.var("V", "mon"),
+                                       units="V", **_ls_left)
             self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
             # MATLAB-style "nice multiples" tick step (5 ticks, picked
             # from {1, 2, 2.5, 5}×10ⁿ) instead of pyqtgraph's denser
@@ -585,7 +651,7 @@ class CalibrationTab(QtWidgets.QWidget):
             self._plot_widget.scene().addItem(self._right_vb)
             right_ax = self._plot_widget.getAxis("right")
             right_ax.linkToView(self._right_vb)
-            right_ax.setLabel("I_mon", units="mV", **_ls_right)
+            right_ax.setLabel(rich.var("I", "mon"), units="mV", **_ls_right)
             right_ax.setPen(pg.mkPen(IMON_COLOR))
             right_ax.setTextPen(pg.mkPen(IMON_COLOR))
             # NOTE: leaving the right-axis label at pyqtgraph's default
@@ -617,10 +683,23 @@ class CalibrationTab(QtWidgets.QWidget):
         # pass/fail.  The pass/fail gate is now just "did we get
         # finite, positive R_load and C_load fits?".
         self.results_table = QtWidgets.QTableWidget(0, 6)
+        # VARIABLE FORMAT for every quantity (operator, twice: "have R_load
+        # and C and other variables in proper variable format" / "I have told
+        # you to use variable format") — italic variable, upright subscript,
+        # unit in brackets.  ``QHeaderView`` paints via QStyle and NEVER
+        # consults an item delegate, so the HTML needs the painting subclass
+        # ``_HtmlHeaderView`` below; the plain-text fallback is kept for any
+        # header that carries no markup.
+        self.results_table.setHorizontalHeader(
+            _HtmlHeaderView(QtCore.Qt.Orientation.Horizontal,
+                            self.results_table))
         self.results_table.setHorizontalHeaderLabels(
-            ["Channel", "V_mon Offset (mV)",
-             "R_load Fit (Ω)", "C_load Fit (pF)",
-             "I_mon Gain (a)", "I_mon Offset (b, µA)"])
+            ["Channel",
+             f"{rich.var('V', 'mon')} offset [mV]",
+             f"{rich.var('R', 'load')} fit [Ω]",
+             f"{rich.var('C', 'load')} fit [pF]",
+             f"{rich.var('I', 'mon')} gain ({rich.var('a')})",
+             f"{rich.var('I', 'mon')} offset ({rich.var('b')}) [µA]"])
         # Row-index lookup so re-running a channel updates its existing
         # row instead of appending a duplicate.
         self._row_by_channel: Dict[int, int] = {}
@@ -1010,6 +1089,112 @@ class CalibrationTab(QtWidgets.QWidget):
         sweep (no averaging → 1); AVERAGE waits for the full NUMAVg stack."""
         return 1 if self._cal_is_sample() else self._cal_navg()
 
+    #: Per-capture tuple layout in ``self._results[ch]`` — indices of the
+    #: two quantities the plot subtitle summarises.
+    _RESULT_IDX_CAP_PF = 4
+    _RESULT_IDX_R_OHM = 5
+
+    @staticmethod
+    def format_mean_sd(values, unit: str, *, decimals: int = 0) -> str:
+        """``mean ± SD unit (n=N)`` over the FINITE entries of ``values``.
+
+        Returns "" when nothing is finite, and omits the ± term for a single
+        sample (an SD of one point is meaningless, not zero).  Pure + static
+        so the formatting is unit-testable without a widget."""
+        vals = []
+        for v in (values or ()):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f):
+                vals.append(f)
+        if not vals:
+            return ""
+        n = len(vals)
+        mean = sum(vals) / n
+        if n < 2:
+            return f"{mean:.{decimals}f} {unit} (n=1)"
+        # Sample SD (ddof=1) — these are repeated measurements of one load.
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        sd = math.sqrt(var)
+        return f"{mean:.{decimals}f} ± {sd:.{decimals}f} {unit} (n={n})"
+
+    def _rc_spread_subtitle(self, channel) -> str:
+        """``R_load = … ± … Ω  ·  C_load = … ± … pF`` for ``channel``.
+
+        Summarises the PER-CAPTURE estimates gathered across the amplitude
+        sweep so far.  Empty string when the channel has no usable captures
+        yet (e.g. the very first acquisition), so the caller can simply skip
+        the subtitle."""
+        if channel is None:
+            return ""
+        try:
+            rows = self._results.get(int(channel)) or []
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        r_vals, c_vals = [], []
+        for row in rows:
+            try:
+                r_vals.append(row[self._RESULT_IDX_R_OHM])
+                c_vals.append(row[self._RESULT_IDX_CAP_PF])
+            except (IndexError, TypeError):
+                continue
+        parts = []
+        _r = self.format_mean_sd(r_vals, "Ω", decimals=0)
+        if _r:
+            parts.append(f"{rich.var('R', 'load')} = {_r}")
+        _c = self.format_mean_sd(c_vals, "pF", decimals=0)
+        if _c:
+            parts.append(f"{rich.var('C', 'load')} = {_c}")
+        return "  ·  ".join(parts)
+
+    @staticmethod
+    def sweep_retry_reasons(r_fit_ohm: float, v_offset_mv: float,
+                            *, nominal_ohm: float,
+                            r_tolerance_pct: float,
+                            vmon_offset_tolerance_mv: float) -> list:
+        """Why this channel's sweep should be re-run — empty list = accept.
+
+        TWO independent quality gates sharing ONE attempt budget:
+
+        * **R_load deviation** — more than ``r_tolerance_pct`` off the nominal
+          board resistance.  A non-finite / non-positive fit counts as failed
+          (it carries no information, so it can't be accepted).
+        * **V_mon DC offset** — magnitude over ``vmon_offset_tolerance_mv``
+          (operator: "If the V_mon offset is more than ±5 mV, then try
+          again").  A large baseline means the kept frame was a stale /
+          still-settling acquisition, and that SAME frame supplied the step /
+          ramp slopes the joint R/C fit consumes — so the offset is a
+          frame-QUALITY proxy that catches a bad sweep the R check can miss.
+
+        A **NaN offset is NOT a failure**: no baseline was recorded, so it
+        can't be judged and mustn't burn a retry.  (A NaN *R* is the opposite —
+        the fit genuinely failed.)  Pure + static so the policy is unit-
+        testable without hardware.
+        """
+        reasons = []
+        # ``math`` (module-level) NOT numpy — numpy is lazily imported inside
+        # the sweep, and this helper takes plain floats so it must stay
+        # importable/callable without it.
+        if not (math.isfinite(r_fit_ohm) and r_fit_ohm > 0):
+            reasons.append("R_load fit unavailable")
+        else:
+            dev = abs(r_fit_ohm - nominal_ohm) / nominal_ohm * 100.0
+            if dev > r_tolerance_pct:
+                reasons.append(
+                    f"R_load = {r_fit_ohm:.0f} Ω (off nominal "
+                    f"{nominal_ohm:.0f} Ω by {dev:.1f}% > "
+                    f"±{r_tolerance_pct:.0f}%)")
+        if (math.isfinite(v_offset_mv)
+                and abs(v_offset_mv) > vmon_offset_tolerance_mv):
+            reasons.append(
+                f"V_mon offset = {v_offset_mv:+.2f} mV "
+                f"(> ±{vmon_offset_tolerance_mv:.0f} mV)")
+        return reasons
+
     def _on_run_sweep(self):
         """Run the per-channel amplitude sweep against the test board.
 
@@ -1108,6 +1293,23 @@ class CalibrationTab(QtWidgets.QWidget):
                     f"Scope setup: record length "
                     f"{DEFAULT_RECORD_LENGTH} (snapped to model choices)")
                 self._scope.set_record_length(DEFAULT_RECORD_LENGTH)
+                # Transfer the WHOLE record (operator: "Do DATa:STOP").
+                # ``DATa:STOP`` is an ABSOLUTE sample index and the firmware
+                # leaves a stale value in it (bench: 16624 against a 20000-pt
+                # record), so ``CURVe?`` returned only ~83 % of the record.
+                # On the experiment's WIDE window the discarded tail is empty
+                # interpulse, which is why it was never noticed; on the TIGHT
+                # verification window the SAME truncation lands on the pulse
+                # and clipped the end of phase 2 — taking its iR drop with it.
+                # OPT-IN here only: the experiment path keeps MATLAB parity
+                # (gotcha #82), where pinning would pull in an off-screen tail
+                # that can hold the next pulse's onset.
+                try:
+                    self._scope.set_transfer_full_record()
+                except Exception as _ds_err:
+                    self._log(
+                        f"Scope setup: full-record transfer not applied "
+                        f"({_ds_err}); the capture may be truncated.")
                 # Hardcoded: AVERAGE mode, NUMAVg = 64.  See
                 # :data:`CAL_ACQ_MODE` / :data:`CAL_N_AVERAGES`.
                 acq_mode = self.CAL_ACQ_MODE
@@ -1127,12 +1329,17 @@ class CalibrationTab(QtWidgets.QWidget):
                         self._log(f"Scope setup: {_cch} coupling = DC")
                     except Exception:
                         pass
-                # Tight horizontal window (operator: "Make the horizontal
-                # window of verification tight").  Applies to the
-                # auto_layout_for_pulse call below.
+                # WIDE horizontal window (operator: "Instead of tight, do wide
+                # horizontal window" — supersedes the earlier "make the
+                # horizontal window of verification tight").  WIDE is ONE grid
+                # increment larger than the tightest non-clipping step, so the
+                # 125 µs verification pulse gets a 300 µs window instead of
+                # 150 µs: the whole pulse plus real post-pulse recovery, with
+                # the pulse no longer pressed against the edge of the record.
+                # Applies to the auto_layout_for_pulse call below.
                 try:
-                    self._scope.set_horizontal_fit_mode("tight")
-                    self._log("Scope setup: horizontal window = tight")
+                    self._scope.set_horizontal_fit_mode("wide")
+                    self._log("Scope setup: horizontal window = wide")
                 except Exception:
                     pass
                 # Trigger: always I_mon (CH2), FALL edge, negative threshold.
@@ -1386,7 +1593,21 @@ class CalibrationTab(QtWidgets.QWidget):
                 _title = f"{abs(float(amp_ua)):.0f} µA"
             else:
                 _title = ""
+            # Subtitle: mean ± SD of the per-capture R and C for THIS channel
+            # (operator: "in the plot subtitle, include the mean +/- SD
+            # resistance and capacitance").  These are the per-amplitude
+            # estimates accumulated so far in the sweep — the spread across
+            # amplitudes is the useful diagnostic: a tight SD means the load
+            # is behaving linearly and the fit is trustworthy, while a wide
+            # SD flags amplitude-dependent behaviour (clipping at the large
+            # steps, or noise domination at the small ones) that a single
+            # fitted number would hide.
+            _sub = self._rc_spread_subtitle(channel)
             if hasattr(self, "_plot_title_label") and _title:
+                if _sub:
+                    _title = f"{_title}<br/><span style='font-size:9pt'>{_sub}</span>"
+                    self._plot_title_label.setTextFormat(
+                        QtCore.Qt.TextFormat.RichText)
                 self._plot_title_label.setText(_title)
                 self._plot_title_label.setVisible(True)
                 self._plot_title_label.repaint()
@@ -1420,15 +1641,21 @@ class CalibrationTab(QtWidgets.QWidget):
                     # grid and the RC-model overlay underneath, especially
                     # at small amplitudes where the trace barely fills 2
                     # divisions on the scope.
-                    c = self._plot_widget.plot(pen=pg.mkPen(VMON_COLOR, width=1),
-                                               name=f"V_mon ({v_mon_phys})")
+                    # Variable format (operator: "the legend is not in
+                    # variable format").  pyqtgraph's LegendItem renders its
+                    # label through a LabelItem, which DOES accept HTML — so
+                    # the same italic-variable / upright-subscript markup the
+                    # results-table headers use works here verbatim.
+                    c = self._plot_widget.plot(
+                        pen=pg.mkPen(VMON_COLOR, width=1),
+                        name=f"{rich.var('V', 'mon')} ({v_mon_phys})")
                     c.setZValue(1)
                     self._plot_curves[v_mon_phys] = c
                 self._plot_curves[v_mon_phys].setData(t_us, y_v)
 
             if i_mon_phys in channels and self._right_vb is not None:
                 y_i = np.asarray(channels[i_mon_phys], dtype=float) * 1000.0
-                label = f"I_mon ({i_mon_phys})"
+                label = f"{rich.var('I', 'mon')} ({i_mon_phys})"
                 if i_mon_phys not in self._plot_right_curves:
                     c = pg.PlotDataItem(t_us, y_i, pen=pg.mkPen(IMON_COLOR, width=1),
                                         name=label)
@@ -1444,33 +1671,30 @@ class CalibrationTab(QtWidgets.QWidget):
                     self._plot_sim_curve = self._plot_widget.plot(
                         sim_t_us, sim_v,
                         pen=pg.mkPen("#9e9e9e", width=1),
-                        name="RC model (V_mon)")
+                        name=f"RC model ({rich.var('V', 'mon')})")
                     self._plot_sim_curve.setZValue(-1)
                 else:
                     self._plot_sim_curve.setData(sim_t_us, sim_v)
 
-            # X range — exact port of MATLAB ``getPlot.m``:
-            #   xMin = round(min(time), 1, 'significant');
-            #   xMax = round(max(time), 1, 'significant');
-            #   xlim([xMin xMax]);
-            # Uses min/max of the actual captured time array (not
-            # first/last — equivalent for a monotonically increasing
-            # vector but safer if the driver ever returns a reversed
-            # axis), and MATLAB's ``xlim`` does not add padding so we
-            # pass padding=0 to pyqtgraph.
+            # X range — do NOT force a rounded window (operator: "for
+            # verification, do not force the x axis range, and when tight
+            # the pulse should not be clipped").  The old MATLAB
+            # ``xlim([round(min,1sig) round(max,1sig)])`` rounded the MAX
+            # INWARD (e.g. a 135 µs record → 100 µs), which lopped the
+            # trailing phase-2 / discharge off the right edge — the pulse
+            # was clipped even though the scope had captured it.  Show the
+            # FULL captured extent with a hair of padding so nothing is
+            # clipped and the pulse edges aren't flush against the frame.
+            # The right view-box is X-linked to the left, so it follows.
             if acq is not None and acq.time_us.size:
                 _t = np.asarray(acq.time_us, dtype=float)
-                x_min = _round_sig(float(_t.min()), 1)
-                x_max = _round_sig(float(_t.max()), 1)
-                # Defensive: if both round to the same value (e.g. a
-                # single-sample acquisition), fall back to the raw
-                # min/max so setXRange doesn't see a zero-width range.
-                if x_min == x_max:
-                    x_min = float(_t.min())
-                    x_max = float(_t.max())
+                x_min = float(_t.min())
+                x_max = float(_t.max())
+                if x_min == x_max:                 # single-sample guard
+                    x_min, x_max = x_min - 1.0, x_max + 1.0
             else:
                 x_min, x_max = self._plot_x_min, self._plot_x_max
-            self._plot_widget.setXRange(x_min, x_max, padding=0)
+            self._plot_widget.setXRange(x_min, x_max, padding=0.02)
             # ---- Y range: align zero crossings (MATLAB getPlot.m) ----
             # MATLAB:
             #   yyaxis right; ylimr = get(gca,'Ylim'); ratio = ylimr(1)/ylimr(2);
@@ -1770,14 +1994,23 @@ class CalibrationTab(QtWidgets.QWidget):
                 # board-not-by-noise) values and the final attempt's
                 # data is kept.
                 _R_TOLERANCE_PCT = 10.0
+                # Operator: "If the V_mon offset is more than ±5 mV, then try
+                # again."  A large per-channel V_mon DC baseline means the kept
+                # frame was a stale / still-settling acquisition (bench: run 1
+                # = +928.573 mV, run 2 = +1.859 mV on the SAME board).  That
+                # same frame supplied the step / ramp slopes the joint R/C fit
+                # consumes, so the offset is a frame-QUALITY proxy — retrying
+                # on it rejects a bad sweep the R check alone can miss.
+                # Shares the SAME attempt budget as the R check.
+                _VMON_OFFSET_TOLERANCE_MV = 5.0
                 _R_RETRY_MAX = 2
+                _retry_reason = ""      # carries the cause into the banner
                 for _retry_idx in range(_R_RETRY_MAX + 1):
                     if self._aborted:
                         return
                     if _retry_idx > 0:
                         self._log(
-                            f"Channel {ch}: R_load off by "
-                            f">{_R_TOLERANCE_PCT:.0f}% — retry "
+                            f"Channel {ch}: {_retry_reason} — retry "
                             f"{_retry_idx}/{_R_RETRY_MAX} "
                             f"(re-running amplitude sweep for this channel).")
                     # Clear this channel's captures so the retry
@@ -1934,32 +2167,41 @@ class CalibrationTab(QtWidgets.QWidget):
                     # produces if we exhaust the retries.
                     _r_fit = (_fit_result.get("fit_r_ohm", float("nan"))
                               if _fit_result else float("nan"))
-                    if np.isfinite(_r_fit) and _r_fit > 0:
-                        _r_dev_pct = (abs(_r_fit - self.DEFAULT_LOAD_OHM)
-                                      / self.DEFAULT_LOAD_OHM * 100.0)
-                    else:
-                        _r_dev_pct = float("inf")
-                    if _r_dev_pct <= _R_TOLERANCE_PCT:
+                    # ---- V_mon DC offset check (operator: ±5 mV) ----
+                    # Both quality gates compose under the ONE attempt budget;
+                    # the policy is the pure ``sweep_retry_reasons`` helper.
+                    _v_off_mv = ((_fit_result.get("v_offset_v", float("nan"))
+                                  * 1e3) if _fit_result else float("nan"))
+                    _reasons = self.sweep_retry_reasons(
+                        _r_fit, _v_off_mv,
+                        nominal_ohm=float(self.DEFAULT_LOAD_OHM),
+                        r_tolerance_pct=_R_TOLERANCE_PCT,
+                        vmon_offset_tolerance_mv=_VMON_OFFSET_TOLERANCE_MV,
+                    )
+
+                    _v_off_txt = (f"{_v_off_mv:+.2f} mV"
+                                  if np.isfinite(_v_off_mv) else "n/a")
+                    if not _reasons:
                         self._log(
                             f"Channel {ch}: R_load = {_r_fit:.0f} Ω "
                             f"(within ±{_R_TOLERANCE_PCT:.0f}% of nominal "
-                            f"{self.DEFAULT_LOAD_OHM:.0f} Ω) "
+                            f"{self.DEFAULT_LOAD_OHM:.0f} Ω), V_mon offset = "
+                            f"{_v_off_txt} (within "
+                            f"±{_VMON_OFFSET_TOLERANCE_MV:.0f} mV) "
                             f"— accepting after attempt "
                             f"{_retry_idx + 1}.")
                         break
+                    _retry_reason = "; ".join(_reasons)
                     if _retry_idx >= _R_RETRY_MAX:
                         self._log(
-                            f"Channel {ch}: R_load = {_r_fit:.0f} Ω "
-                            f"(deviation {_r_dev_pct:.1f}% from nominal "
-                            f"after {_R_RETRY_MAX + 1} attempts) "
+                            f"Channel {ch}: {_retry_reason} "
+                            f"after {_R_RETRY_MAX + 1} attempts "
                             f"— accepting final attempt.")
                         break
                     # Otherwise the outer ``for _retry_idx`` loop
                     # will repeat the amplitude sweep.
                     self._log(
-                        f"Channel {ch}: R_load = {_r_fit:.0f} Ω "
-                        f"(deviation {_r_dev_pct:.1f}% from nominal "
-                        f"{self.DEFAULT_LOAD_OHM:.0f} Ω) — will retry.")
+                        f"Channel {ch}: {_retry_reason} — will retry.")
 
             self.status_progress.setText("Sweep complete. Fitting …")
             self._log("Sweep complete. Fitting …")
@@ -2017,23 +2259,26 @@ class CalibrationTab(QtWidgets.QWidget):
         # Timeout: n_acq periods + generous 5 s overhead for trigger latency.
         seq_timeout_s = n_acq * pulse_period_s + 5.0
 
-        # Skip the FIRST completed averaged acquisition (operator: "skip
-        # the first completed acquisition").  After load_channel +
-        # start_channel the scope's averager is still flushing the
-        # PREVIOUS amplitude's frames, so the first completed average is a
-        # stale blend of old + new amplitude; discard it and read the NEXT
-        # one, accumulated purely from THIS amplitude's pulses.  This
-        # restores the per-amplitude discard that was traded away for
-        # speed — the operator wants the cleaner, slower capture ("the
-        # calibration runs too quickly").  Wrapped so a failed throwaway
-        # never aborts the real capture below.
-        try:
-            self._scope.capture_single_sequence(
-                n_acq=n_acq, timeout_s=seq_timeout_s,
-                tick_fn=lambda: QtWidgets.QApplication.processEvents())
-        except Exception as _skip_err:
-            self._log(
-                f"  skip-first frame at {amp_ua:.0f} µA skipped: {_skip_err}")
+        # Discard the first ``CAL_DISCARD_ACQUISITIONS`` completed
+        # acquisitions and KEEP the next one (operator: "collect the third
+        # sample" ⇒ discard 2, keep the 3rd).  After load_channel +
+        # start_channel the early frames still carry the settings-change
+        # transient — and in AVERAGE mode the averager is still flushing the
+        # PREVIOUS amplitude's frames, so an early average is a stale blend
+        # of old + new.  Discarding them leaves a capture accumulated purely
+        # from THIS amplitude's pulses.  The operator wants the cleaner,
+        # slower capture ("the calibration runs too quickly").  Each
+        # throwaway is wrapped so a failure never aborts the real capture.
+        for _skip_i in range(max(0, int(self.CAL_DISCARD_ACQUISITIONS))):
+            try:
+                self._scope.capture_single_sequence(
+                    n_acq=n_acq, timeout_s=seq_timeout_s,
+                    tick_fn=lambda: QtWidgets.QApplication.processEvents())
+            except Exception as _skip_err:
+                self._log(
+                    f"  discard frame {_skip_i + 1}/"
+                    f"{self.CAL_DISCARD_ACQUISITIONS} at {amp_ua:.0f} µA "
+                    f"skipped: {_skip_err}")
 
         def _clipped(arr):
             mn, mx = arr.min(), arr.max()
@@ -2046,9 +2291,9 @@ class CalibrationTab(QtWidgets.QWidget):
         i_mon = None
         try:
             for _attempt in range(5):
-                # The amplitude-change transient / stale-blend frame was
-                # already discarded by the skip-first capture above, so
-                # THIS is the clean averaged acquisition we keep.
+                # The amplitude-change transient / stale-blend frames were
+                # already discarded above (``CAL_DISCARD_ACQUISITIONS`` of
+                # them), so THIS is the clean acquisition we keep.
                 acq = self._scope.capture_single_sequence(
                     n_acq=n_acq,
                     timeout_s=seq_timeout_s,
@@ -2102,34 +2347,31 @@ class CalibrationTab(QtWidgets.QWidget):
                         scale_changed = True
                 except Exception:
                     pass
-                # ---- Centre the asymmetric V_mon (faithful data only) --
-                # Cathodic-heavy waveform at position 0 wastes the upper
-                # half-screen and pushes the cathodic peak toward the
-                # rail.  When the capture is faithful (no clip / rail),
-                # offset the excursion midpoint to screen centre at the
-                # CURRENT scale — both peaks then fit at a finer V/div
-                # (better ADC resolution on the I·R edge).  POSition is
-                # ADC-centering only; reconstructed volts are unaffected,
-                # so the edge-step extraction and per-capture offset math
-                # see identical physics.  Mirrors the runners' settled-
-                # recentre (CLAUDE.md §5 #12).
-                if not _v_overflow:
-                    try:
-                        _mid = 0.5 * (vlo + vhi)
-                        _cur_vpd = float(self._scope._q(
-                            f"{v_mon_phys}:SCAle?"))
-                        _cur_pos = float(self._scope._q(
-                            f"{v_mon_phys}:POSition?"))
-                        _swing = max(vhi - vlo, 1e-9)
-                        _bias_ratio = 2.0 * abs(_mid) / _swing
-                        _pos_tgt = max(-5.0, min(5.0, -_mid / _cur_vpd))
-                        if (_bias_ratio >= 0.1
-                                and abs(_pos_tgt - _cur_pos) > 0.25):
-                            self._scope.set_channel_position(
-                                v_mon_phys, _pos_tgt)
-                            scale_changed = True  # re-capture centred
-                    except Exception:
-                        pass
+                # ---- V_mon VERTICAL POSITION STAYS AT 0 ----------------
+                # Operator: "Do not change the vertical position from 0."
+                #
+                # This used to re-centre the cathodic-heavy V_mon by writing
+                # a non-zero ``CHx:POSition`` (bench: 2.592 div), on the
+                # premise that "POSition is ADC-centering only, so the
+                # reconstructed volts are unaffected".  That premise FAILED
+                # on this hardware: the TBS2000 answers ``WFMOutpre?`` with
+                # ``YOFf = 0`` even when the channel is positioned, so the
+                # decode never removed the shift and EVERY sample came back
+                # offset by ``position x V/div`` — the +951 mV "V_mon offset"
+                # the operator saw on a scope screen showing none.
+                #
+                # Centring is also self-defeating HERE specifically:
+                # verification's job is to MEASURE the V_mon DC offset and
+                # the load R/C, so deliberately injecting a screen offset
+                # into the very channel whose offset is being measured
+                # corrupts the measurement it exists to make.
+                #
+                # The position is therefore left at the 0 that scope setup
+                # and the per-channel default-view revert establish.  The
+                # driver's YOFF/position cross-check remains as defence in
+                # depth for the EXPERIMENT path, which still centres.
+                #
+                # ⚠ Do NOT reintroduce a ``set_channel_position`` call here.
                 if i_mon is not None and len(i_mon) >= 2:
                     i_arr_f = np.asarray(i_mon, dtype=float)
                     ilo, ihi = float(i_arr_f.min()), float(i_arr_f.max())
@@ -2159,6 +2401,33 @@ class CalibrationTab(QtWidgets.QWidget):
 
                 if not scale_changed:
                     break  # waveform properly acquired at correct scale
+            else:
+                # The `for` ran to exhaustion — the scale never settled, so
+                # the capture we are about to KEEP may still be railed
+                # (operator: "the vertical scaling is not applied before
+                # plotting — V_mon was clipped").  A railed V_mon flattens
+                # exactly the extremes the iR-step extrapolation reads, so
+                # EVERY access step under-measures and R_load reads LOW —
+                # silently.  Make that impossible to miss.
+                self._log(
+                    f"  ⚠ vertical scale did NOT settle at {amp_ua:.0f} µA "
+                    f"after 5 attempts — the kept capture may still be "
+                    f"CLIPPED, which under-reads the iR steps and biases "
+                    f"R_load LOW.  Check the V_mon V/div for this step.")
+
+            # Final guard: whatever we kept, say so if it is still railed.
+            try:
+                if v_mon is not None:
+                    _v_final = np.asarray(v_mon, dtype=float)
+                    if _clipped(_v_final):
+                        self._log(
+                            f"  ⚠ KEPT capture at {amp_ua:.0f} µA is CLIPPED "
+                            f"(V_mon railed at "
+                            f"[{_v_final.min():+.3f}, {_v_final.max():+.3f}] V) "
+                            f"— the iR steps read from it are LOWER BOUNDS, "
+                            f"so this amplitude biases R_load low.")
+            except Exception:
+                pass
 
             if acq is None:
                 raise RuntimeError("No acquisition returned from scope")
@@ -2268,34 +2537,38 @@ class CalibrationTab(QtWidgets.QWidget):
             # Necessary because some TBS firmware reports XZEro=0 (and
             # PT_Off=0) even when a non-zero horizontal position is set
             # — no SCPI fix has been reliable across firmware revs.
+            # ⚠ The time axis is taken AS-IS — verification uses the SAME t=0
+            # method as the EXPERIMENT (operator: "check how you are adjusting
+            # 0 µs point, needs to be like the experiment method").
+            #
+            # It used to SHIFT the axis destructively
+            # (``acq.time_us = t_arr - _t_edge``) so the phase-1 onset landed
+            # on t=0.  The experiment NEVER does that — CLAUDE.md gotcha #37:
+            # "There should not be an active adjustment of time for proper
+            # zero placement."  The driver already places t=0 at the TRIGGER
+            # (Method P — trigger % × record length, gotcha #22); every
+            # phase-time chain then ANCHORS at the DETECTED onset instead of
+            # assuming onset == 0 (gotcha #44).
+            #
+            # So: detect the onset with the SHARED experiment detector and
+            # pass it downstream; leave ``acq.time_us`` untouched.  This also
+            # keeps the PLOT's time axis honest — a shifted axis silently
+            # disagreed with the oscilloscope's own screen.
+            _onset_us = 0.0
             try:
+                from ..metrics import pulse_onset_us as _pulse_onset_us
                 t_arr = getattr(acq, "time_us", None)
                 if (t_arr is not None and len(t_arr) >= 2
                         and len(imon_arr) == len(t_arr)):
-                    _peak_neg = float(np.min(imon_arr))   # cathodic peak (negative)
-                    # First sample where the signal has dropped below
-                    # half the cathodic peak — captures the phase-1
-                    # onset robustly, regardless of where the noise
-                    # peaks in ``|diff|``.
-                    if _peak_neg < -1e-4:   # at least 0.1 mV cathodic
-                        _half = 0.5 * _peak_neg
-                        _below = imon_arr < _half
-                        if _below.any():
-                            _onset_idx = int(np.argmax(_below))
-                            _t_edge = float(t_arr[_onset_idx])
-                            acq.time_us = np.asarray(t_arr) - _t_edge
-                            if abs(_t_edge) > 0.5:
-                                self._log(
-                                    f"  trigger re-zeroed: phase-1 onset "
-                                    f"at t={_t_edge:+.2f} µs → shifted to "
-                                    f"t=0 (used first-crossing detection, "
-                                    f"peak={_peak_neg*1000:+.1f} mV, "
-                                    f"threshold={_half*1000:+.1f} mV).")
-                    else:
-                        self._log(
-                            f"  ⚠ I_mon cathodic peak too weak to re-zero "
-                            f"(peak={_peak_neg*1000:+.2f} mV); time axis "
-                            f"left as-is.")
+                    _det = float(_pulse_onset_us(
+                        np.asarray(t_arr, dtype=float), imon_arr))
+                    if np.isfinite(_det):
+                        _onset_us = _det
+                        if abs(_det) > 0.5:
+                            self._log(
+                                f"  pulse onset detected at t={_det:+.2f} µs "
+                                f"(time axis left AS-IS — metrics anchor at "
+                                f"the detected onset, same as the experiment).")
             except Exception:
                 pass
 
@@ -2361,7 +2634,7 @@ class CalibrationTab(QtWidgets.QWidget):
             # list IS those steps (the calibration used to inline this exact
             # extrapolation, with identical windows), so we just average them.
             _va_list, _ra_list, _acc_idx = access_voltage_and_resistance(
-                t_us_arr, v_arr, pat, onset_us=0.0)
+                t_us_arr, v_arr, pat, onset_us=_onset_us)
         except Exception:
             _va_list = []
         step_mags = [float(v) for v in _va_list if np.isfinite(v)]
@@ -2378,6 +2651,7 @@ class CalibrationTab(QtWidgets.QWidget):
         # compute RMSD over the pulse window, and estimate C from the
         # phase-1 ramp slope.
         model_rmsd_mv = float("nan")
+        model_r2 = float("nan")
         est_cap_pf = float("nan")
         est_r_ohm = float("nan")
         sim_t_us_out = None
@@ -2397,10 +2671,27 @@ class CalibrationTab(QtWidgets.QWidget):
                     or VMON_SCALING_DEFAULT)
 
                 # The scope trigger fires on the positive-going I_mon edge, so
-                # t=0 is at the start of whichever phase goes positive first.
-                # For cathodic-first: t=0 is at phase-2 onset; phase 1 is in
-                # the pre-trigger window (negative t). Adjust t0 so the
-                # simulation reference matches the captured waveform reference.
+                # RC model starts at t = 0 — NOT at the start of the record
+                # (operator: "make sure that the RC model starts at t = 0 and
+                # not the beginning of the record length").
+                #
+                # Verification triggers on the phase-1 CATHODIC edge itself
+                # (I_mon, FALL — see the trigger setup in _on_run_sweep), so
+                # t=0 IS the pulse start by construction and the model needs
+                # no detected-onset correction.  Anchoring it to the DETECTED
+                # onset instead would let a noisy detection at low amplitude
+                # (10 µA is only a few mV of I_mon) drag the model's phase 1
+                # left, toward the beginning of the record.
+                #
+                # ``_simulate_vmon_trace`` zero-fills everything before t0
+                # (``v = np.zeros(...)``, ``m1 = (t_s >= 0) & …``), so with
+                # t0 = 0 the grey overlay sits flat across the pre-trigger
+                # baseline and its phase 1 begins exactly at t=0.
+                #
+                # NOTE this is the MODEL's anchor only — the ACCESS/iR
+                # extraction still anchors at the detected onset (passed as
+                # ``onset_us=_onset_us``), which is what absorbs any real
+                # trigger-to-onset skew.
                 t0_us = 0.0
 
                 # Hardcoded cathodic-first.  Calibration ALWAYS programs the
@@ -2429,12 +2720,51 @@ class CalibrationTab(QtWidgets.QWidget):
                 sim_t_us_out = t_us
                 sim_v_out = v_sim
 
-                # RMSD over the active pulse window [t0, t0+2W+G].
+                # Agreement between the NOMINAL RC model and the measured
+                # V_mon, over the active pulse window [t0, t0+2W+G].
+                #
+                # Reported as BOTH RMSD (mV) and R² (operator: "include the
+                # r2 regression comparing RC model and Vmon").  R² is the
+                # number that actually adjudicates the R_load question: the
+                # overlay is drawn from the NOMINAL R and C, so a high R²
+                # says the board really IS ~nominal and a low R_load fit is
+                # the EXTRACTION's error, not the board's.
+                #
+                # ⚠ R² is dominated by the CAPACITIVE RAMP, which is the
+                # bulk of the excursion (at 100 µA the ramp is 1.06 V vs a
+                # 0.50 V iR step), so a large R error moves R² only slightly.
+                # Read R² as "does the model describe the waveform", NOT as
+                # "is R correct" — that is what the per-edge iR steps are for.
                 pulse_end_us = t0_us + 2 * self.PHASE_WIDTH_US + self.INTERPHASE_US
                 mask_pulse = (t_us >= t0_us) & (t_us <= pulse_end_us)
-                if mask_pulse.sum() >= 4:
-                    residuals = v_arr[mask_pulse] - v_sim[mask_pulse]
-                    model_rmsd_mv = float(np.sqrt(np.mean(residuals ** 2))) * 1e3
+                # Exclude the switching edges: the model is an IDEAL step
+                # while the real source slews over ~0.6 µs, so the edges
+                # would otherwise dominate the residual.
+                _EDGE_GUARD_US = 2.0
+                for _e in (t0_us,
+                           t0_us + self.PHASE_WIDTH_US,
+                           t0_us + self.PHASE_WIDTH_US + self.INTERPHASE_US,
+                           pulse_end_us):
+                    mask_pulse &= np.abs(t_us - _e) > _EDGE_GUARD_US
+                if mask_pulse.sum() >= 8:
+                    _meas = v_arr[mask_pulse]
+                    _mdl = v_sim[mask_pulse]
+                    residuals = _meas - _mdl
+                    _ss_res = float(np.sum(residuals ** 2))
+                    _ss_tot = float(np.sum((_meas - float(_meas.mean())) ** 2))
+                    model_rmsd_mv = float(
+                        np.sqrt(_ss_res / residuals.size)) * 1e3
+                    model_r2 = ((1.0 - _ss_res / _ss_tot)
+                                if _ss_tot > 0 else float("nan"))
+                    self._log(
+                        f"  RC model vs V_mon: R² = {model_r2:.5f}, "
+                        f"RMSD = {model_rmsd_mv:.2f} mV over "
+                        f"{int(mask_pulse.sum())} samples "
+                        f"(model uses NOMINAL R = {load_ohm:.0f} Ω, "
+                        f"C = {load_cap_pf:.0f} pF, V_mon scaling "
+                        f"k = {vmon_v_per_v:.3f} V/V) — a HIGH R² with a "
+                        f"LOW R_load fit means the board is nominal and the "
+                        f"iR-step extraction is under-reading.")
 
                 # Estimate C from the phase-1 ramp slope.
                 # Model: dV/dt = -phase1_sign · I · k / C
