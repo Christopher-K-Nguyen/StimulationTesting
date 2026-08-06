@@ -60,10 +60,47 @@ def test_offset_off_is_no_subtraction():
     assert np.allclose(cap.i_mon_ua, 10.0), cap.i_mon_ua
 
 
-def test_offset_on_subtracts_imon_offset():
+def test_offset_on_is_now_a_noop():
+    """Operator (0.2.226): "Do not calibrate the system based on the
+    verification test — only the scaling whether it is default or NIL."
+
+    ``apply_current_offset=True`` used to subtract ``cal.imon_offset_v``
+    (10 µA → 8 µA here).  No verification-FITTED quantity may touch a capture
+    any more, so the flag is retained for call compatibility but does nothing.
+    """
     cap = _capture(apply_offset=True)
-    # (0.010 − 0.002) / 1 mV/µA = 8 µA.
-    assert np.allclose(cap.i_mon_ua, 8.0), cap.i_mon_ua
+    assert np.allclose(cap.i_mon_ua, 10.0), cap.i_mon_ua
+
+
+def test_fitted_scalings_are_ignored_in_favour_of_the_preset():
+    """The core of the instruction: a verification's fitted scalings must NOT
+    override the stimulator PRESET.  Here the fit claims 2 mV/µA and 0.5 V/V
+    while the preset says 1 mV/µA and 0.25 V/V — the preset must win, or a bad
+    sweep silently rescales every later measurement (gotcha #161)."""
+    from stimtest.waveforms import PulsePattern
+    c = ReadbackCalibration()
+    c.imon_v_per_ua_actual = 2.0e-3          # 2x the preset
+    c.vmon_v_per_v_actual = 0.5              # 2x the preset
+    c.imon_offset_v = 0.002
+    pat = PulsePattern.biphasic(amplitude_ua=-50.0, polarity=-1)
+    acq = _Acq([0.010, 0.010, 0.010, 0.010])
+    cap = make_capture(0, pat, acq, _Scope(), _Stim(), cal=c, channel=0)
+    # PRESET 1 mV/µA -> 10 µA (not 5 µA, which the fitted 2 mV/µA would give).
+    assert np.allclose(cap.i_mon_ua, 10.0), cap.i_mon_ua
+
+
+def test_per_channel_gain_is_not_applied():
+    """``apply_imon`` (per-channel gain ``a`` / offset ``b``) is dormant: the
+    degenerate 1e14 slope of gotcha #161 must be structurally unable to reach
+    a capture, not merely caught by a plausibility guard."""
+    from stimtest.waveforms import PulsePattern
+    from stimtest.readback_calibration import ChannelCoeffs
+    c = ReadbackCalibration()
+    c.channels = {0: ChannelCoeffs(a=3.0, b=100.0)}
+    pat = PulsePattern.biphasic(amplitude_ua=-50.0, polarity=-1)
+    acq = _Acq([0.010, 0.010, 0.010, 0.010])
+    cap = make_capture(0, pat, acq, _Scope(), _Stim(), cal=c, channel=0)
+    assert np.allclose(cap.i_mon_ua, 10.0), cap.i_mon_ua
 
 
 def test_default_is_off():

@@ -114,3 +114,47 @@ def test_helper_is_callable_without_hardware(_app):
     """Pure + static: no scope, no stim, no widget state."""
     from stimtest.gui.calibration import CalibrationTab
     assert CalibrationTab.sweep_retry_reasons(NOMINAL, 0.0, **KW) == []
+
+
+# ------------------------------------------------- r2 gate (3rd reason)
+def _reasons_r2(r2):
+    from stimtest.gui.calibration import CalibrationTab
+    return CalibrationTab.sweep_retry_reasons(
+        NOMINAL, 0.0, model_r2=r2, **KW)
+
+
+def test_negative_r2_triggers_retry():
+    """Operator: "redo the channel if the ending r2 is negative".
+
+    The RC model is NOT fitted to the data, so r2 is unbounded below;
+    negative means it describes the captures worse than a flat line.
+    Bench: CH04 read -1.99 (alongside a -66 mV V_mon offset) while healthy
+    channels read ~+0.99."""
+    out = _reasons_r2(-1.9917)
+    assert len(out) == 1 and "r²" in out[0]
+
+
+def test_positive_r2_accepts():
+    assert _reasons_r2(0.9985) == []
+    assert _reasons_r2(0.0) == []          # zero is not negative
+
+
+def test_nan_r2_is_not_a_failure():
+    """Unjudgeable -- must not burn a retry (same rule as a NaN offset)."""
+    assert _reasons_r2(float("nan")) == []
+
+
+def test_r2_gate_composes_with_the_others():
+    from stimtest.gui.calibration import CalibrationTab
+    out = CalibrationTab.sweep_retry_reasons(
+        3412.0, +928.573, model_r2=-1.99, **KW)
+    assert len(out) == 3
+    assert any("R_load" in r for r in out)
+    assert any("V_mon offset" in r for r in out)
+    assert any("r²" in r for r in out)
+
+
+def test_r2_defaults_to_not_supplied():
+    """Callers that pass no r2 keep the previous two-gate behaviour."""
+    from stimtest.gui.calibration import CalibrationTab
+    assert CalibrationTab.sweep_retry_reasons(NOMINAL, 0.0, **KW) == []

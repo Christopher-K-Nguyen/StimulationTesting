@@ -383,22 +383,39 @@ def make_capture(index: int,
         # calibration ``apply_imon``) is applied now.  The offset fields
         # stay in calibration.json for diagnostics but are no longer
         # applied to captures.
-        vmon_scale  = cal.vmon_v_per_v_actual if cal.vmon_v_per_v_actual is not None else nom_vmon
-        v_mon_v = raw_vmon_arr / vmon_scale
-
-        # OPT-IN current offset (operator: "Have a toggle checkbox for current
-        # offset").  Default OFF keeps gotcha #78's no-subtract behavior.  When
-        # the test-parameters toggle is on, re-subtract the calibration-wizard-
-        # measured I_mon (CURRENT-monitor) DC offset before scaling — the
-        # literal "current offset".  Only the I_mon offset is re-enabled; the
-        # V_mon offset stays off (it was the one shifting testboard traces off
-        # zero, gotcha #78).
-        imon_offset = (cal.imon_offset_v
-                       if (apply_current_offset and cal.imon_offset_v is not None)
-                       else 0.0)
-        imon_scale  = cal.imon_v_per_ua_actual if cal.imon_v_per_ua_actual is not None else nom_imon
-        i_mon_ua = (raw_imon_arr - imon_offset) / imon_scale
-        i_mon_ua = cal.apply_imon(i_mon_ua, channel)
+        # ⚠ VERIFICATION DOES NOT CALIBRATE THE SYSTEM (operator, 0.2.226:
+        # "Do not calibrate the system based on the verification test — only
+        # the scaling whether it is default or NIL").
+        #
+        # Captures are reconstructed with the STIMULATOR PRESET scaling ONLY
+        # (``nom_vmon`` / ``nom_imon`` = Default 0.25 V/V + 2.5 mV/µA, or NIL
+        # 1.0 V/V + 1.0 mV/µA).  NONE of the verification's FITTED quantities
+        # are applied any more:
+        #
+        #   * ``vmon_v_per_v_actual`` / ``imon_v_per_ua_actual`` — fitted
+        #     scalings, no longer substituted for the preset;
+        #   * ``apply_imon`` (per-channel gain ``a`` + offset ``b``);
+        #   * ``imon_offset_v`` (and the ``apply_current_offset`` flag, now a
+        #     no-op — the parameter is kept so existing callers still import
+        #     and run).
+        #
+        # WHY.  These fitted values are derived from the very captures the
+        # verification is judging, so a bad sweep silently corrupts every
+        # later measurement — and did: a degenerate ``np.polyfit`` slope of
+        # ~1e14 multiplied real ±3 µA readings into ±1e14 µA (gotcha #161),
+        # and a 1.2073 gain alone would rescale every current by 21 %.  The
+        # sanity guards added for #161 stay as belt-and-braces, but the
+        # structural fix is not to apply the coefficients at all.  What the
+        # verification IS for: confirming the load and telling the operator
+        # which PRESET (Default vs NIL) the stimulator is on — that choice is
+        # recorded per serial and applied upstream, not here.
+        #
+        # The coefficients remain in calibration.json for forensics, and
+        # ``apply_imon`` / ``is_plausible`` stay defined + tested but dormant
+        # (same pattern as the removed current-offset toggle, gotcha #132).
+        # **Don't re-wire any fitted coefficient back into this path.**
+        v_mon_v  = raw_vmon_arr / nom_vmon
+        i_mon_ua = raw_imon_arr / nom_imon
     else:
         v_mon_v  = raw_vmon_arr / nom_vmon
         i_mon_ua = raw_imon_arr / nom_imon

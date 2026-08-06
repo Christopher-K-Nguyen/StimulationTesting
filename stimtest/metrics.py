@@ -832,6 +832,8 @@ def access_voltage_and_resistance(
     time_us: np.ndarray, v_trace: np.ndarray, pattern: PulsePattern,
     *, onset_us: Optional[float] = None,
     labels: Optional[List[Tuple[int, str]]] = None,
+    after_start_us: Optional[float] = None,
+    after_win_us: Optional[float] = None,
 ) -> Tuple[List[float], List[float], List[int]]:
     """Compute access voltages and resistances per phase boundary.
 
@@ -1093,7 +1095,17 @@ def access_voltage_and_resistance(
         # extrapolation, so this reads a bit LOWER + cleaner than the old
         # settling-plateau read (which sat ~20-30 samples past the edge and
         # carried the cap charge accumulated over that window).
-        v_a = access_step_by_extrapolation(time_us, v_ds, pk, acc)
+        # ``after_*`` default to None -> the module constants, so every
+        # existing caller is byte-identical.  They exist so the POST-edge
+        # window can be MOVED for a diagnostic without touching the shared
+        # default (see CalibrationTab.CAL_ACCESS_POST_*).
+        _after_kw = {}
+        if after_start_us is not None:
+            _after_kw["after_start_us"] = float(after_start_us)
+        if after_win_us is not None:
+            _after_kw["after_win_us"] = float(after_win_us)
+        v_a = access_step_by_extrapolation(time_us, v_ds, pk, acc,
+                                           **_after_kw)
         va.append(float(v_a))
         amp_for.append(float(amp))
 

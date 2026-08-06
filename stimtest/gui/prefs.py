@@ -94,18 +94,67 @@ def load_prefs() -> Dict[str, Dict[str, Any]]:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}
-        # Strip metadata that isn't a section
-        return {k: v for k, v in data.items() if isinstance(v, dict) and not k.startswith("_")}
+        # Strip metadata that isn't a section.  LIST-valued sections are kept
+        # as well as dict ones: ``imported_profiles`` is written by
+        # ``_collect_prefs_payload`` as a LIST, and a dict-only filter silently
+        # dropped it on load — so an imported profile (e.g. CWRU) never
+        # survived a restart even though it was correctly written to disk.
+        return {k: v for k, v in data.items()
+                if isinstance(v, (dict, list)) and not k.startswith("_")}
     except Exception as e:
         _log.warning("Could not read prefs at %s: %s", p, e)
         return {}
 
 
+def _preserve_unowned_sections(p: Path,
+                               prefs: Dict[str, Dict[str, Any]]
+                               ) -> Dict[str, Dict[str, Any]]:
+    """Carry forward top-level sections the caller's payload doesn't mention.
+
+    ``_write_prefs_atomic`` is a WHOLESALE REPLACE, but several sections are
+    maintained by a read-modify-write against :func:`load_prefs` somewhere
+    else entirely — ``theme`` (View menu) and ``stim_scaling_by_serial``
+    (Verification / ConnectionPanel) are the current examples.  The main
+    window's snapshot payload doesn't know about those, so every auto-save
+    silently DELETED them: the theme could not survive an app close, and a
+    verification's serial→preset record was lost on the next save.
+
+    Rather than require every future section to be added to the snapshot —
+    the exact omission that caused the bug — merge anything already on disk
+    that the payload doesn't claim.  Keys the payload DOES carry always win,
+    so a real update is never shadowed by the stale on-disk copy.
+
+    Deliberately NOT applied to :func:`save_prefs_to`: an exported profile
+    should be exactly what was snapshotted, not a union with whatever the
+    user happened to pick as the destination file.
+    """
+    try:
+        if not p.is_file():
+            return prefs
+        with p.open("r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if not isinstance(existing, dict):
+            return prefs
+    except Exception:
+        # An unreadable/corrupt prefs file must never block the save.
+        return prefs
+    merged = dict(prefs)
+    for k, v in existing.items():
+        if k.startswith("_") or k in merged:
+            continue
+        merged[k] = v
+    return merged
+
+
 def save_prefs(prefs: Dict[str, Dict[str, Any]]) -> None:
-    """Atomically write the prefs JSON. Silent on failure (it's a convenience)."""
+    """Atomically write the prefs JSON. Silent on failure (it's a convenience).
+
+    Sections the payload doesn't mention are preserved — see
+    :func:`_preserve_unowned_sections`.
+    """
     p = prefs_path()
     try:
-        _write_prefs_atomic(p, prefs)
+        _write_prefs_atomic(p, _preserve_unowned_sections(p, prefs))
     except Exception as e:
         _log.warning("Could not write prefs at %s: %s", p, e)
 
@@ -133,7 +182,9 @@ def load_prefs_from(path: Path) -> Dict[str, Dict[str, Any]]:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError(f"{p}: top-level JSON object expected.")
-    return {k: v for k, v in data.items() if isinstance(v, dict) and not k.startswith("_")}
+    # Keep list-valued sections too — see the note in ``load_prefs``.
+    return {k: v for k, v in data.items()
+            if isinstance(v, (dict, list)) and not k.startswith("_")}
 
 
 def _write_prefs_atomic(p: Path, prefs: Dict[str, Dict[str, Any]]) -> None:

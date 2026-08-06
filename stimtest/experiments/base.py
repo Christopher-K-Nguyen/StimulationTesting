@@ -152,6 +152,19 @@ _AC_INTERPULSE_SD_LENIENT_V = 0.015   # 15 mV
 _AC_SETTLE_MAX_CHECKS = 4
 
 
+#: Amplitude (µA) at or below which the SMALL-AMPLITUDE trigger formula
+#: applies (operator: "change the threshold for low amplitude trigger
+#: adjustment to 25 µA and below, not 20 µA").  Above it the threshold is a
+#: FRACTION of amplitude, which shrinks with the signal and eventually sinks
+#: into the constant I_mon noise floor — at 25 µA the old ``× 0.25`` rule gave
+#: 6.25 mV, indistinguishable from noise, and the scope stopped triggering.
+_IMON_TRIG_LOW_AMP_UA: float = 25.0
+
+#: Hard ceiling on the trigger threshold as a FRACTION of the expected I_mon
+#: peak.  A threshold above the peak is uncrossable, so the scope never fires.
+_IMON_TRIG_PEAK_FRAC_MAX: float = 0.60
+
+
 def imon_trigger_level(amp_ua_signed: float,
                        phase_width_us: float = 200.0,
                        imon_v_per_ua: Optional[float] = None) -> float:
@@ -178,9 +191,12 @@ def imon_trigger_level(amp_ua_signed: float,
     was the failure mode we hit earlier.  The fix is on the
     *bandwidth* axis, not on the trigger formula.
 
-    ``imon_v_per_ua`` is accepted for API compatibility with earlier
-    revisions but is no longer used to clamp — the MATLAB-exact
-    threshold is what the lab convention expects.
+    ``imon_v_per_ua`` IS used: when the caller supplies the actual
+    scaling the threshold is capped at ``_IMON_TRIG_PEAK_FRAC_MAX`` of the
+    expected peak, so it can never exceed the signal it must cross.  The
+    MATLAB-exact value is preserved wherever it already fits (a Default-preset
+    device); the cap only rescues the NIL case, where the unmodified formula
+    lands ABOVE the peak and the scope never triggers.
     """
     SCALING = _IMON_TRIG_SCALING_V_PER_UA
     amp_mag = abs(float(amp_ua_signed))
@@ -191,7 +207,7 @@ def imon_trigger_level(amp_ua_signed: float,
     # for every non-zero amplitude; only the ``±0.0`` baseline changes.
     amp_sign = math.copysign(1.0, float(amp_ua_signed))
     scale = 0.40 if phase_width_us >= 100.0 else 0.25
-    if amp_mag <= 20.0:
+    if amp_mag <= _IMON_TRIG_LOW_AMP_UA:
         # Small-amplitude branch tightened: ``(amp + 3.5) × 1 mV/µA``
         # caps the threshold at exactly 13.5 mV for 10 µA (down from
         # MATLAB's 14.5 mV).  The 4.5 mV buffer in MATLAB assumed a
@@ -204,6 +220,23 @@ def imon_trigger_level(amp_ua_signed: float,
         level_mag = (amp_mag + 3.5) * SCALING
     else:
         level_mag = amp_mag * SCALING * scale
+    # ---- Keep the threshold INSIDE the realised I_mon peak ------------
+    # ``(amp + 3.5) mV/µA`` assumes a DEFAULT-preset stimulator
+    # (2.5 mV/µA), where at 20 µA it is 23.5 mV against a 50 mV peak — 47 %,
+    # comfortably reachable.  On a NIL device (1 mV/µA) the SAME threshold
+    # sits ABOVE the 20 mV peak, so the scope can never fire: NUMACq stays 0,
+    # every capture is a free-running frame, and at 200 pps (2.5 % duty) it
+    # almost always lands in the interpulse — flat V_mon, absurd R/C, hugely
+    # negative r².
+    #
+    # When the caller tells us the ACTUAL scaling, cap the threshold at a
+    # fraction of the expected peak so it is always crossable.  This can only
+    # ever LOWER an otherwise-unreachable threshold, so a device where the
+    # MATLAB-exact value already fits is untouched.
+    if imon_v_per_ua:
+        _peak = amp_mag * float(imon_v_per_ua)
+        if _peak > 0:
+            level_mag = min(level_mag, _IMON_TRIG_PEAK_FRAC_MAX * _peak)
     return amp_sign * level_mag
 
 

@@ -4043,6 +4043,18 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 # cost of 200 k / 2 M / 5 M.  See DEFAULT_RECORD_LENGTH in
                 # ``tektronix.py`` for the full rationale.
                 from ..hardware.tektronix import DEFAULT_RECORD_LENGTH
+                # ⚠ DO NOT un-pin ``DATa:STOP`` here.  An earlier revision
+                # called ``restore_transfer_window()`` at this point on the
+                # theory that a leftover pin from the Verification tab
+                # violated gotcha #82.  That is WRONG for this rig: the pin
+                # exists precisely BECAUSE the transfer was coming back SHORT
+                # of the record on this bench too (operator: "we did that
+                # DATa:STOP because even on our setup, the waveform was being
+                # clipped, and the record length was incomplete") — the
+                # firmware leaves a stale absolute DATa:STOP (observed 16624
+                # against a 20000-point record) and ``CURVe?`` silently
+                # truncates, cutting the end of the pulse off.  Un-pinning
+                # here would reintroduce that clipping in every experiment.
                 _log(
                     f"Scope setup: record length = {DEFAULT_RECORD_LENGTH}")
                 _tick()

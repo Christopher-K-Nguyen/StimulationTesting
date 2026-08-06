@@ -652,6 +652,22 @@ class Oscilloscope(ABC):
         centre.  Default no-op so simulator-style drivers don't have
         to override; the Tek driver overrides with a SCPI write."""
 
+    def set_transfer_full_record(self) -> Optional[int]:
+        """Pin the waveform-transfer bound to the full record so a capture
+        can't be silently truncated.  Default no-op returning ``None`` —
+        only the Tektronix driver has a stale ``DATa:STOP`` to defeat.
+
+        **Always pair with** :meth:`restore_transfer_window`: this is
+        INSTRUMENT state on a shared scope object, and leaving it pinned
+        corrupts the experiment path (gotcha #82).
+        """
+        return None
+
+    def restore_transfer_window(self) -> Optional[int]:
+        """Undo :meth:`set_transfer_full_record`.  Default no-op returning
+        ``None``; idempotent, and safe to call even if nothing was pinned."""
+        return None
+
     def set_channel_coupling(self, channel: str, coupling: str) -> None:
         """Set AC / DC input coupling on one channel.  Default no-op so
         simulator-style drivers don't have to override; the Tek driver

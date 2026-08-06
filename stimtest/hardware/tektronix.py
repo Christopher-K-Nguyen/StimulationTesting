@@ -863,6 +863,10 @@ class TektronixOscilloscope(Oscilloscope):
         # tracks the actual returned points (Method P uses raw.size).
         self._w("DATa:STARt 1")
         self._record_length = None
+        # A reconnect re-enumerates the device, so any DATa:STOP we stashed
+        # for ``restore_transfer_window`` describes a session that no longer
+        # exists — drop it rather than write a stale bound back later.
+        self._prev_data_stop = None
         # Force the next set_acquisition_mode to actually write — we
         # don't reliably know the front panel's current acq mode at
         # connect, so the idempotent skip must not fire on first use.
@@ -3705,18 +3709,66 @@ class TektronixOscilloscope(Oscilloscope):
             except Exception:
                 return None
         try:
+            # Remember the PRE-PIN value so ``restore_transfer_window`` can put
+            # the instrument back the way the experiment path expects it
+            # (gotcha #82).  The pin is DEVICE state on a SHARED scope — it
+            # outlives this tab, and without an inverse it silently leaks into
+            # every subsequent experiment capture.  Stash only on the FIRST pin
+            # so a repeat call can't overwrite the original with our own value.
+            if getattr(self, "_prev_data_stop", None) is None:
+                try:
+                    self._prev_data_stop = int(float(self._q("DATa:STOP?")))
+                except Exception:
+                    self._prev_data_stop = None
             self._w(f"DATa:STOP {int(n)}")
             applied = int(float(self._q("DATa:STOP?")))
             self._log(
                 f"[scope] set_transfer_full_record(): DATa:STOP = {applied} "
-                f"(record {int(n)}) — CURVe? now returns the FULL record "
-                f"(the firmware's stale default truncated the transfer).")
+                f"(record {int(n)}, was {self._prev_data_stop}) — CURVe? now "
+                f"returns the FULL record (the firmware's stale default "
+                f"truncated the transfer).")
             # NR_Pt changes ⇒ every channel's cached preamble is stale.
             self._invalidate_preamble_cache()
             return applied
         except Exception as exc:
             self._log(f"[scope] set_transfer_full_record() failed: {exc}")
             return None
+
+    def restore_transfer_window(self) -> Optional[int]:
+        """Undo :meth:`set_transfer_full_record`, restoring the pre-pin
+        ``DATa:STOP``.  Returns the confirmed value, or None if nothing was
+        pinned / the restore failed.
+
+        **Why this must exist.**  ``DATa:STOP`` is INSTRUMENT state on a scope
+        object shared by every tab.  The verification sweep opts into the pin;
+        the experiment path must NOT have it (gotcha #82 — on the experiment's
+        wide window a pinned transfer pulls in the off-screen record tail,
+        which can hold the next pulse's onset).  Without this inverse the pin
+        survived verification and corrupted every later experiment capture,
+        and only a scope power-cycle cleared it.
+
+        Idempotent and safe to call unconditionally: a no-op when we never
+        pinned (nothing stashed).
+        """
+        prev = getattr(self, "_prev_data_stop", None)
+        if prev is None:
+            return None
+        try:
+            self._w(f"DATa:STOP {int(prev)}")
+            applied = int(float(self._q("DATa:STOP?")))
+            self._log(
+                f"[scope] restore_transfer_window(): DATa:STOP = {applied} "
+                f"(back to the pre-verification value — the experiment path "
+                f"requires the natural window, gotcha #82).")
+            self._invalidate_preamble_cache()
+            return applied
+        except Exception as exc:
+            self._log(f"[scope] restore_transfer_window() failed: {exc}")
+            return None
+        finally:
+            # Clear the stash either way: a failed restore must not make a
+            # later call believe it still owns a pending un-pin.
+            self._prev_data_stop = None
 
     def set_acquisition_mode(self, mode: str = "AVERAGE", n_avg: int = 16) -> None:
         mode_u = mode.upper()

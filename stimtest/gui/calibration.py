@@ -355,6 +355,33 @@ class CalibrationTab(QtWidgets.QWidget):
     #: away.  (An earlier SAMPLE-mode configuration discarded 2 and kept the
     #: 3rd; AVERAGE/64 supersedes it — the averaging does that work now.)
     CAL_DISCARD_ACQUISITIONS: int = 1
+
+    #: ---- DIAGNOSTIC SWITCH: post-edge iR window --------------------------
+    #: ``None`` (default) = use the shared ``metrics`` window,
+    #: ``[peak + 1.0 µs, + 2.0 µs]``.
+    #:
+    #: WHY THIS EXISTS.  The extracted R_load is systematically ~17 % LOW
+    #: (bench, 16 channels: 4164 ± 186 Ω against a nominal 4990) while C is
+    #: correct to +2.7 % and the NOMINAL-R RC model fits at r² ≈ 0.99.  Since
+    #: R and C divide by the SAME V_mon scaling, a scaling error would move
+    #: BOTH — so the deficit is in the STEP extraction, and the extraction is
+    #: very sensitive to the first ~2 µs after the edge.  Despiking
+    #: (0.3-1.2 pp) and the measured current overshoot (+1.4 %, wrong sign)
+    #: have both been excluded.
+    #:
+    #: HOW TO USE.  Set these to 3.0 / 4.0 and re-run one sweep:
+    #:   * R jumps to ~4900 Ω  → the mechanism is confined to the first ~3 µs
+    #:     after the edge, and the fix is a window placement validated on the
+    #:     RC board.
+    #:   * R stays  ~4000 Ω    → the mechanism is broadband and the V_mon
+    #:     monitor path is implicated instead.
+    #:
+    #: ⚠ DIAGNOSTIC ONLY — do NOT ship a late window without re-checking
+    #: gotcha #190, which deliberately moved this window NEAR-edge so a
+    #: capacitive / high-Z electrode's flattening exponential tail cannot
+    #: over-project and inflate R_a.
+    CAL_ACCESS_POST_START_US: Optional[float] = None
+    CAL_ACCESS_POST_WIN_US: Optional[float] = None
     #: Number of waveforms the scope averages before the curve is
     #: read. AVERAGE mode sends the stimulator running, waits for
     #: N triggered acquisitions to complete, then reads the averaged
@@ -1193,11 +1220,84 @@ class CalibrationTab(QtWidgets.QWidget):
             parts.append(f"{rich.var('C', 'load')} = {_c}")
         return "  ·  ".join(parts)
 
+    #: Amplitudes are matched to this many decimals when a re-test
+    #: replaces a previous entry (µA values are whole numbers in practice;
+    #: the tolerance guards against float round-trips).
+    _AMP_MATCH_DECIMALS = 6
+
+    def _purge_amplitude(self, ch: int, amp_ua: float) -> int:
+        """Drop every stored measurement for ``ch`` at ``amp_ua``.
+
+        Keeps the THREE parallel per-channel stores consistent — the results
+        row, the raw per-measurement values the fit expands, and the r²
+        history — so a re-tested amplitude supersedes its predecessor in all
+        of them rather than being averaged in beside it.  Returns how many
+        entries were removed (0 on the first pass at an amplitude)."""
+        key = round(float(amp_ua), self._AMP_MATCH_DECIMALS)
+        removed = 0
+
+        def _same(v) -> bool:
+            try:
+                return round(float(v), self._AMP_MATCH_DECIMALS) == key
+            except (TypeError, ValueError):
+                return False
+
+        rows = self._results.get(ch)
+        if rows:
+            keep = [r for r in rows if not (len(r) and _same(r[0]))]
+            removed += len(rows) - len(keep)
+            self._results[ch] = keep
+        raw = self._raw_meas.get(ch)
+        if raw:
+            # stored in AMPS -> compare in µA
+            self._raw_meas[ch] = [
+                e for e in raw
+                if not (len(e) and _same(float(e[0]) * 1e6))]
+        r2 = self._r2_meas.get(ch)
+        if r2:
+            self._r2_meas[ch] = [
+                e for e in r2 if not (len(e) >= 2 and _same(e[0]))]
+        if removed:
+            self._log(
+                f"  re-testing {amp_ua:.0f} µA — replacing "
+                f"{removed} previous value(s) for this amplitude.")
+        return removed
+
+    @staticmethod
+    def sweep_progress_pct(ch_pos: int, n_channels: int,
+                           amp_i: int, n_amps: int,
+                           last_pct: int = 0) -> int:
+        """Sweep progress as a percentage, retry-proof.
+
+        The obvious ``step_idx / (channels x amplitudes)`` is WRONG here: a
+        channel that fails its checks re-runs its ENTIRE amplitude sweep (up
+        to 3 attempts), so the numerator counts retried captures the
+        denominator never anticipated.  On a real 16-channel run that read
+        "step 113 / 64" with the bar pinned at 100 % from roughly channel 6
+        onwards — dead for most of the sweep.  Because the retry count isn't
+        knowable up front, the true total isn't either.
+
+        So: measure CHANNELS COMPLETED (``ch_pos``) plus how far through the
+        current channel's CURRENT attempt we are.  Always in [0, 100], and it
+        reaches exactly 100 on the final amplitude of the final channel.
+
+        ``last_pct`` keeps it MONOTONIC — a retry restarts the within-channel
+        fraction, and a progress bar that jumps backwards reads as a fault.
+        """
+        n_channels = max(1, int(n_channels))
+        n_amps = max(1, int(n_amps))
+        frac = (int(ch_pos) + (int(amp_i) + 1) / n_amps) / n_channels
+        pct = min(100, max(0, int(round(100.0 * frac))))
+        return max(int(last_pct), pct)
+
     @staticmethod
     def sweep_retry_reasons(r_fit_ohm: float, v_offset_mv: float,
                             *, nominal_ohm: float,
-                            r_tolerance_pct: float,
-                            vmon_offset_tolerance_mv: float) -> list:
+                            r_tolerance_pct: float = None,
+                            vmon_offset_tolerance_mv: float,
+                            r_tolerance_low_pct: float = None,
+                            r_tolerance_high_pct: float = None,
+                            model_r2: float = float("nan")) -> list:
         """Why this channel's sweep should be re-run — empty list = accept.
 
         TWO independent quality gates sharing ONE attempt budget:
@@ -1221,20 +1321,50 @@ class CalibrationTab(QtWidgets.QWidget):
         # ``math`` (module-level) NOT numpy — numpy is lazily imported inside
         # the sweep, and this helper takes plain floats so it must stay
         # importable/callable without it.
+        # ASYMMETRIC band (operator, 0.2.226): −20 % / +10 %.  The bench error
+        # is systematically NEGATIVE (4164 ± 186 Ω = −16.6 % across 16
+        # channels), so the band is widened DOWNWARD to accept the real
+        # measurement while staying TIGHT above nominal, where a high reading
+        # has no known benign explanation and still deserves a retry.
+        # ``r_tolerance_pct`` remains accepted as a SYMMETRIC fallback so
+        # existing callers/tests keep working.
+        _lo_pct = (r_tolerance_low_pct if r_tolerance_low_pct is not None
+                   else r_tolerance_pct)
+        _hi_pct = (r_tolerance_high_pct if r_tolerance_high_pct is not None
+                   else r_tolerance_pct)
+        if _lo_pct is None or _hi_pct is None:
+            raise TypeError(
+                "sweep_retry_reasons needs r_tolerance_pct or both "
+                "r_tolerance_low_pct and r_tolerance_high_pct")
         if not (math.isfinite(r_fit_ohm) and r_fit_ohm > 0):
             reasons.append("R_load fit unavailable")
         else:
-            dev = abs(r_fit_ohm - nominal_ohm) / nominal_ohm * 100.0
-            if dev > r_tolerance_pct:
+            # SIGNED deviation: negative = below nominal.
+            dev_signed = (r_fit_ohm - nominal_ohm) / nominal_ohm * 100.0
+            if dev_signed < -abs(_lo_pct) or dev_signed > abs(_hi_pct):
                 reasons.append(
                     f"R_load = {r_fit_ohm:.0f} Ω (off nominal "
-                    f"{nominal_ohm:.0f} Ω by {dev:.1f}% > "
-                    f"±{r_tolerance_pct:.0f}%)")
+                    f"{nominal_ohm:.0f} Ω by {dev_signed:+.1f}%, "
+                    f"outside −{abs(_lo_pct):.0f}% / +{abs(_hi_pct):.0f}%)")
         if (math.isfinite(v_offset_mv)
                 and abs(v_offset_mv) > vmon_offset_tolerance_mv):
             reasons.append(
                 f"V_mon offset = {v_offset_mv:+.2f} mV "
                 f"(> ±{vmon_offset_tolerance_mv:.0f} mV)")
+        # r² of the NOMINAL RC model against the measured V_mon (operator:
+        # "redo the channel if the ending r² is negative").  The model is NOT
+        # fitted to the data, so r² is not bounded to [0, 1] — it simply asks
+        # "does the nominal load describe this waveform".  NEGATIVE means the
+        # model is worse than a flat line at the mean, i.e. the captures do
+        # not look like the board at all (bench: CH04 read -1.99 alongside a
+        # -66 mV V_mon offset, against ~+0.99 on every healthy channel), so
+        # the sweep is re-run rather than recorded.
+        # NaN is NOT a failure — as with the offset, an unjudgeable value
+        # must not burn a retry.
+        if math.isfinite(model_r2) and model_r2 < 0.0:
+            reasons.append(
+                f"RC-model r² = {model_r2:.4f} (negative — the nominal "
+                f"load does not describe these captures)")
         return reasons
 
     def _on_run_sweep(self):
@@ -1459,7 +1589,9 @@ class CalibrationTab(QtWidgets.QWidget):
         self._log("=" * 64)
         self._log(f"Sweep started — {len(channels_to_sweep)} channel(s), "
                   f"{len(amplitudes)} amplitude(s), "
-                  f"{total_steps} total steps.")
+                  f"{total_steps} steps minimum "
+                  f"(a channel that fails its checks re-runs its whole "
+                  f"amplitude sweep, up to 3 attempts).")
         self._log("=" * 64)
         import time as _time
         _sweep_t0 = _time.perf_counter()
@@ -1469,6 +1601,17 @@ class CalibrationTab(QtWidgets.QWidget):
         finally:
             self._btn_run.setEnabled(True)
             self._btn_abort.setEnabled(False)
+            # ⚠ The DATa:STOP pin is DELIBERATELY LEFT IN PLACE.  It is
+            # instrument state on the shared scope, so it does outlive this
+            # tab — but that is WANTED here, not a leak: without it the
+            # firmware's stale absolute DATa:STOP (observed 16624 against a
+            # 20000-point record) makes ``CURVe?`` return a PREFIX and the end
+            # of the pulse is cut off, on the experiment path as well as this
+            # one (operator: "we did that DATa:STOP because even on our setup,
+            # the waveform was being clipped, and the record length was
+            # incomplete").  ``TektronixOscilloscope.restore_transfer_window``
+            # exists and is tested, but is deliberately NOT called — un-pinning
+            # reintroduces the truncation it was added to fix.
         from ..hardware.tektronix import _fmt_elapsed
         _sweep_elapsed = _time.perf_counter() - _sweep_t0
         # End-of-sweep summary — total time, per-step average, error count.
@@ -1476,10 +1619,17 @@ class CalibrationTab(QtWidgets.QWidget):
                          for _t in self._results[ch]
                          if _t[1] != _t[1])   # NaN check on measured_ua
         self._log("=" * 64)
+        # ACTUAL captures taken (retries included), not the nominal
+        # channels x amplitudes — otherwise a sweep with retries reports a
+        # ms/step average inflated by however many extra sweeps it ran.
+        _actual_steps = int(getattr(self, "_last_sweep_steps", 0) or total_steps)
+        _retried = max(0, _actual_steps - total_steps)
         self._log(
             f"Sweep finished — total {_fmt_elapsed(_sweep_elapsed)} "
-            f"({_sweep_elapsed / max(total_steps, 1) * 1000:.1f} ms/step avg, "
-            f"{_err_count} step(s) returned NaN)")
+            f"({_sweep_elapsed / max(_actual_steps, 1) * 1000:.1f} ms/step avg "
+            f"over {_actual_steps} capture(s)"
+            + (f", {_retried} from retries" if _retried else "")
+            + f", {_err_count} step(s) returned NaN)")
         self._log("=" * 64)
         # ---- Fit ----
         if self._aborted:
@@ -1978,7 +2128,20 @@ class CalibrationTab(QtWidgets.QWidget):
 
             # ---- Main sweep loop ----------------------------------------
             step_idx = 0
-            for ch in channels:
+            # ---- PROGRESS accounting -----------------------------------
+            # ``step_idx`` counts EVERY capture INCLUDING retried ones, so it
+            # is NOT comparable against a fixed channels x amplitudes total.
+            # A handful of retries pushed it past the denominator — the
+            # operator saw "step 113 / 64" with the bar pinned at 100 % from
+            # channel ~6 onwards, i.e. the bar stopped meaning anything for
+            # most of the sweep.  Retries make the true total UNKNOWABLE up
+            # front (0-2 extra amplitude sweeps per channel), so progress is
+            # measured in CHANNELS COMPLETED plus the fraction of the current
+            # channel's CURRENT attempt — always in [0, 1], whatever happens.
+            n_channels = max(1, len(channels))
+            n_amps = max(1, len(amplitudes))
+            _last_pct = 0
+            for ch_pos, ch in enumerate(channels):
                 if self._aborted:
                     return
                 self._results[ch] = []
@@ -2041,7 +2204,39 @@ class CalibrationTab(QtWidgets.QWidget):
                 # off-nominal, all retries return similar (wrong-by-
                 # board-not-by-noise) values and the final attempt's
                 # data is kept.
-                _R_TOLERANCE_PCT = 10.0
+                # ±20 % (operator, 0.2.226 — was ±10 %).  Why the widening is
+                # the CORRECT call and not a papering-over:
+                #
+                #   * The R fit already divides by the PROGRAMMED current
+                #     (``I_A = amp_ua * 1e-6``), never the I_mon reading — so
+                #     it does NOT inherit the monitor's gain error.  Keep it
+                #     that way: using the measured current would make R depend
+                #     on the very I_mon calibration this sweep is establishing
+                #     (circular).  Guarded by
+                #     ``tests/test_rload_programmed_current.py``.
+                #   * A GOOD RC-model r² does NOT vindicate R.  At 100 µA the
+                #     capacitive ramp is ~1.06 V against a ~0.50 V iR step, so
+                #     r² is dominated by C: a 17 % R error moves it barely at
+                #     all (gotcha #203 says exactly this).  "r² = 0.99 but
+                #     R is off" is therefore the EXPECTED signature, not a
+                #     contradiction — r² simply cannot adjudicate R.
+                #   * The extraction itself is sound: driven against a
+                #     synthesised 4990 Ω / 4700 pF board with the measured
+                #     0.64 µs current slew it returns R to within ~1 %, and
+                #     ``_despike`` preserves a step edge exactly (25.16 mV
+                #     raw vs 25.16 mV despiked).
+                #
+                # The bench spread is 4164 ± 186 Ω across 16 channels — tight,
+                # i.e. systematic rather than noisy, and ±10 % rejected every
+                # channel and burned two extra sweeps each for nothing.
+                #
+                # ASYMMETRIC (operator, 0.2.226): −20 % / +10 %.  The error is
+                # systematically LOW, so the band opens downward to accept the
+                # real measurement, while ABOVE nominal stays tight at +10 % —
+                # a high R has no known benign explanation here and should
+                # still trigger a retry.
+                _R_TOLERANCE_LOW_PCT = 20.0
+                _R_TOLERANCE_HIGH_PCT = 10.0
                 # Operator: "If the V_mon offset is more than ±5 mV, then try
                 # again."  A large per-channel V_mon DC baseline means the kept
                 # frame was a stale / still-settling acquisition (bench: run 1
@@ -2067,15 +2262,21 @@ class CalibrationTab(QtWidgets.QWidget):
                     self._results[ch] = []
                     self._raw_meas[ch] = []
                     self._r2_meas[ch] = []
-                    for amp_ua in amplitudes:
+                    for amp_i, amp_ua in enumerate(amplitudes):
                         if self._aborted:
                             return
                         step_idx += 1
 
                         # Per-step VERTICAL SCALES — both V_mon and I_mon.
-                        _step_msg = (f"Channel {ch} / {channels[-1]}  ·  "
+                        # Position within THIS channel's attempt — a running
+                        # "step N / total" is meaningless once anything
+                        # retries (it overflowed the total).  ``channels[-1]``
+                        # was also the wrong denominator for a channel SUBSET
+                        # (sweeping {5, 7, 9} rendered "Channel 7 / 9").
+                        _step_msg = (f"Channel {ch} "
+                                     f"({ch_pos + 1} / {n_channels})  ·  "
                                      f"{amp_ua:.0f} µA  ·  "
-                                     f"step {step_idx} / {total_steps}"
+                                     f"amplitude {amp_i + 1} / {n_amps}"
                                      + (f"  (attempt {_retry_idx + 1})"
                                         if _retry_idx > 0 else ""))
                         self.status_progress.setText(_step_msg)
@@ -2130,13 +2331,29 @@ class CalibrationTab(QtWidgets.QWidget):
                             self._scope.set_trigger_level(_trig_lvl_new)
                         except Exception:
                             pass
-                        # Clamp to 100 — step_idx can exceed total_steps
-                        # when a channel is retried for R_load drift.
-                        pct = min(100, int(round(
-                            100.0 * step_idx / max(1, total_steps))))
+                        # Channels COMPLETED + this channel's fraction — NOT
+                        # step_idx / total_steps, which overflowed on retries
+                        # and pinned the bar at 100 %.  MONOTONIC: a retry
+                        # restarts the within-channel fraction, so the bar
+                        # holds instead of jumping backwards.
+                        pct = self.sweep_progress_pct(
+                            ch_pos, n_channels, amp_i, n_amps,
+                            last_pct=_last_pct)
+                        _last_pct = pct
                         self.progress_bar.setValue(pct)
                         QtWidgets.QApplication.processEvents()
                         import time as _time_step
+                        # RETEST REPLACES (operator: "when retesting an
+                        # amplitude, replace the previous amplitude values").
+                        # Drop any entry this channel already holds for THIS
+                        # amplitude so a re-test supersedes it instead of
+                        # adding a duplicate that would be averaged in
+                        # alongside the value it was meant to correct.
+                        # Purged BEFORE the capture, because the raw / r²
+                        # stores are written DURING it while the results row
+                        # is appended after — clearing afterwards would
+                        # discard the fresh entries.
+                        self._purge_amplitude(ch, amp_ua)
                         _step_t0 = _time_step.perf_counter()
                         try:
                             (measured_ua, imon_peak_v, acq,
@@ -2238,11 +2455,21 @@ class CalibrationTab(QtWidgets.QWidget):
                     # the policy is the pure ``sweep_retry_reasons`` helper.
                     _v_off_mv = ((_fit_result.get("v_offset_v", float("nan"))
                                   * 1e3) if _fit_result else float("nan"))
+                    # Mean r² over this channel's captures (entries are
+                    # ``(amp_ua, r2)`` so a re-tested amplitude replaces its
+                    # predecessor rather than being averaged in beside it).
+                    _r2_seen = [float(v[1]) for v in
+                                (self._r2_meas.get(ch) or [])
+                                if len(v) >= 2 and np.isfinite(v[1])]
+                    _r2_mean = (float(np.mean(_r2_seen)) if _r2_seen
+                                else float("nan"))
                     _reasons = self.sweep_retry_reasons(
                         _r_fit, _v_off_mv,
                         nominal_ohm=float(self.DEFAULT_LOAD_OHM),
-                        r_tolerance_pct=_R_TOLERANCE_PCT,
+                        r_tolerance_low_pct=_R_TOLERANCE_LOW_PCT,
+                        r_tolerance_high_pct=_R_TOLERANCE_HIGH_PCT,
                         vmon_offset_tolerance_mv=_VMON_OFFSET_TOLERANCE_MV,
+                        model_r2=_r2_mean,
                     )
 
                     _v_off_txt = (f"{_v_off_mv:+.2f} mV"
@@ -2250,7 +2477,8 @@ class CalibrationTab(QtWidgets.QWidget):
                     if not _reasons:
                         self._log(
                             f"Channel {ch}: R_load = {_r_fit:.0f} Ω "
-                            f"(within ±{_R_TOLERANCE_PCT:.0f}% of nominal "
+                            f"(within −{_R_TOLERANCE_LOW_PCT:.0f}% / "
+                            f"+{_R_TOLERANCE_HIGH_PCT:.0f}% of nominal "
                             f"{self.DEFAULT_LOAD_OHM:.0f} Ω), V_mon offset = "
                             f"{_v_off_txt} (within "
                             f"±{_VMON_OFFSET_TOLERANCE_MV:.0f} mV) "
@@ -2269,6 +2497,10 @@ class CalibrationTab(QtWidgets.QWidget):
                     self._log(
                         f"Channel {ch}: {_retry_reason} — will retry.")
 
+            # Hand the ACTUAL capture count to the summary line — retries make
+            # it exceed the nominal channels x amplitudes, so dividing the
+            # elapsed time by the nominal total over-reported ms/step.
+            self._last_sweep_steps = step_idx
             self.status_progress.setText("Sweep complete. Fitting …")
             self._log("Sweep complete. Fitting …")
             self.progress_bar.setValue(100)
@@ -2437,6 +2669,24 @@ class CalibrationTab(QtWidgets.QWidget):
                 _v_overflow = _clipped(v_arr_f) or _v_railed
                 if _v_overflow:
                     vlo, vhi = vlo * 2.0, vhi * 2.0
+                # ---- Size on max|v|, NOT half peak-to-peak -------------
+                # The vertical POSITION is pinned at 0 here, so the ADC rail
+                # is symmetric about ZERO: the binding constraint is
+                # ``max(|v_min|, |v_max|)``, not the half-p2p a centred
+                # signal would imply.  The verification V_mon is
+                # cathodic-heavy — bench: [-384.0 .. +110.4] mV, whose
+                # half-p2p is only 247 mV (~2 div at 120 mV/div) while the
+                # true excursion is 384 mV (>3 div).  Judging it by half-p2p
+                # made ``adapt`` call the trace "small" and DOWNSCALE to
+                # 65 mV/div, whose ±325 mV rail is INSIDE the signal — it
+                # scaled itself straight into a clip.
+                #
+                # Passing a symmetric range expresses the real constraint
+                # without touching the shared driver: the same value is both
+                # the fill target and the overflow test, which is exactly
+                # true when the trace is centred on zero.
+                _v_mag = max(abs(vlo), abs(vhi))
+                vlo, vhi = -_v_mag, _v_mag
                 try:
                     if self._scope.adapt_channel_scale(
                             v_mon_phys, v_min=vlo, v_max=vhi,
@@ -2735,8 +2985,21 @@ class CalibrationTab(QtWidgets.QWidget):
             # PURE IR step with the cap ramp subtracted.  The returned ``va``
             # list IS those steps (the calibration used to inline this exact
             # extrapolation, with identical windows), so we just average them.
+            _post_kw = {}
+            if self.CAL_ACCESS_POST_START_US is not None:
+                _post_kw["after_start_us"] = float(self.CAL_ACCESS_POST_START_US)
+            if self.CAL_ACCESS_POST_WIN_US is not None:
+                _post_kw["after_win_us"] = float(self.CAL_ACCESS_POST_WIN_US)
+            if _post_kw and not getattr(self, "_post_win_logged", False):
+                self._log(
+                    f"  ⚠ DIAGNOSTIC post-edge iR window in use: "
+                    f"start={self.CAL_ACCESS_POST_START_US} µs, "
+                    f"width={self.CAL_ACCESS_POST_WIN_US} µs "
+                    f"(default is 1.0 / 2.0) — R_load from this sweep is a "
+                    f"diagnostic, not a calibration.")
+                self._post_win_logged = True
             _va_list, _ra_list, _acc_idx = access_voltage_and_resistance(
-                t_us_arr, v_arr, pat, onset_us=_onset_us)
+                t_us_arr, v_arr, pat, onset_us=_onset_us, **_post_kw)
         except Exception:
             _va_list = []
         step_mags = [float(v) for v in _va_list if np.isfinite(v)]
@@ -2861,7 +3124,8 @@ class CalibrationTab(QtWidgets.QWidget):
                     try:
                         if np.isfinite(model_r2):
                             self._r2_meas.setdefault(
-                                int(channel), []).append(float(model_r2))
+                                int(channel), []).append(
+                                    (float(amp_ua), float(model_r2)))
                     except Exception:
                         pass
                     self._log(
@@ -3077,7 +3341,16 @@ class CalibrationTab(QtWidgets.QWidget):
             I_step_A, step_all = I_prog_A, step_v_arr
             I_ramp_A, ramp_all = I_prog_A, slope_arr
 
-        if I_prog_A.size >= 2 and float(np.std(I_prog_A)) > 0:
+        # The joint R/C fit needs at least TWO distinct amplitudes.  With
+        # the row now refreshed after EVERY amplitude, a channel's first
+        # capture would otherwise fall through to the single-capture median
+        # below and be DISPLAYED as though it were a fit — the bench showed
+        # CH02 reading 1164 Ω (-76.7 %, flagged red) off its first 25 µA
+        # capture while its r² was 0.998, i.e. the load was nominal all
+        # along.  Track whether the fit actually ran so an in-progress
+        # channel shows "—" instead of a misleading number.
+        _fit_ran = bool(I_prog_A.size >= 2 and float(np.std(I_prog_A)) > 0)
+        if _fit_ran:
             denom_x2 = float(np.sum(I_step_A * I_step_A))
             _denom_ramp = float(np.sum(I_ramp_A * I_ramp_A))
             if denom_x2 > 0 and _denom_ramp > 0:
@@ -3120,16 +3393,22 @@ class CalibrationTab(QtWidgets.QWidget):
                   # and report values like 700 mV that the user
                   # can never see on the scope).
         # Use the fitted values as the per-channel reported R / C.
-        median_r_ohm = fit_r_ohm if np.isfinite(fit_r_ohm) else float(
+        # Fall back to the per-capture median ONLY once the sweep has
+        # enough amplitudes for a fit to have been attempted; while it is
+        # still in progress leave the cells blank rather than parade a
+        # one-point estimate as a result.
+        median_r_ohm = fit_r_ohm if np.isfinite(fit_r_ohm) else (
+            float("nan") if not _fit_ran else float(
             np.median([p[5] for p in pairs
                        if len(p) >= 6 and np.isfinite(p[5]) and p[5] > 0])
             if any(len(p) >= 6 and np.isfinite(p[5]) and p[5] > 0
-                   for p in pairs) else float("nan"))
-        median_cap_pf = fit_c_pf if np.isfinite(fit_c_pf) else float(
+                   for p in pairs) else float("nan")))
+        median_cap_pf = fit_c_pf if np.isfinite(fit_c_pf) else (
+            float("nan") if not _fit_ran else float(
             np.median([p[4] for p in pairs
                        if len(p) >= 5 and np.isfinite(p[4]) and p[4] > 0])
             if any(len(p) >= 5 and np.isfinite(p[4]) and p[4] > 0
-                   for p in pairs) else float("nan"))
+                   for p in pairs) else float("nan")))
         # ---- Per-channel V_mon and I_mon DC offsets ----------------
         # These are the actual pre-trigger baselines averaged across
         # captures — the resting voltage / current you can read off
@@ -3399,8 +3678,8 @@ class CalibrationTab(QtWidgets.QWidget):
         # describe the waveform", NOT as "is R correct".
         # Mean r² over this channel's captures (side map — the raw
         # per-capture values are stashed where the RC model is fitted).
-        _r2_vals = [v for v in (self._r2_meas.get(ch) or [])
-                    if math.isfinite(v)]
+        _r2_vals = [float(v[1]) for v in (self._r2_meas.get(ch) or [])
+                    if len(v) >= 2 and math.isfinite(v[1])]
         _r2_mean = (sum(_r2_vals) / len(_r2_vals)) if _r2_vals else float("nan")
         self.results_table.setItem(row, 6, _cell(_fmt(_r2_mean, ".4f")))
 
