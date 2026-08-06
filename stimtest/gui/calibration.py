@@ -325,9 +325,10 @@ class CalibrationTab(QtWidgets.QWidget):
     #: enough to keep total wall-clock per-channel short while dense
     #: enough to fit a linear gain + offset per channel cleanly.
     #:
-    #: Operator history — the grid has been trimmed from the BOTTOM as the
-    #: low-amplitude points proved unreliable rather than merely noisy:
-    #:   * 500 µA removed (top end).
+    #: Operator history — the BOTTOM of the grid was trimmed because the
+    #: low-amplitude points proved unreliable rather than merely noisy, and
+    #: the TOP was later restored and extended (see below):
+    #:   * 500 µA removed, then RE-ADDED at 0.2.228 along with 8 more points.
     #:   * 10 µA removed and 20 → 25 µA.  At 10 µA on a NIL-preset
     #:     stimulator the I_mon peak is only ~10 mV, which sits BELOW the
     #:     small-amplitude I_mon trigger threshold, and the V_mon iR step
@@ -336,7 +337,28 @@ class CalibrationTab(QtWidgets.QWidget):
     #:     the fit while contributing a point the through-origin estimator
     #:     weights least (it weights by I), so dropping it costs almost no
     #:     conditioning and removes a systematic.
-    DEFAULT_AMPLITUDE_GRID_UA: tuple = (25.0, 50.0, 100.0, 200.0)
+    #:
+    #: WIDENED (operator, 0.2.228) from the 4-point 25/50/100/200 grid to
+    #: TWELVE points reaching 500 µA.  Two reasons this is worth 3x the sweep
+    #: time.  (1) CONDITIONING: the R fit is a slope through the origin,
+    #: ``sum(I*V)/sum(I^2)``, so leverage goes as I^2 — on the old grid 200 µA
+    #: alone carried 75 % of the weight and the whole fit leaned on one point.
+    #: 500 µA now carries the most weight, and there are 12 points instead of
+    #: 4.  (2) LINEARITY: the ~13 % low R_load reads uniformly across all 16
+    #: channels, and the open question is whether that deficit is a constant
+    #: FRACTION (a scale error) or grows/shrinks with amplitude (an additive
+    #: artifact).  A 20x amplitude span answers that directly — the
+    #: per-amplitude spread in the plot subtitle is the readout.
+    #:
+    #: Every point stays inside the 9.0 V ``STIM_VOLTAGE_COMPLIANCE_V``: on
+    #: the 4.99 kΩ + 4700 pF board at 50 µs the peak is ``I*R + I*W/C``, so
+    #: 500 µA -> 2.495 + 5.319 = 7.81 V, leaving 1.19 V of headroom.  That is
+    #: the binding constraint — do NOT extend the grid past 500 µA without
+    #: re-checking it (550 µA is 8.6 V, and 600 µA CLIPS at compliance, which
+    #: would silently truncate the cap ramp and corrupt both R and C).
+    DEFAULT_AMPLITUDE_GRID_UA: tuple = (
+        25.0, 50.0, 75.0, 100.0, 150.0, 200.0,
+        250.0, 300.0, 350.0, 400.0, 450.0, 500.0)
     #: Default load resistance per channel (Ω) for the Plexon
     #: test board. The 14-04-A-03-A wires each channel to an
     #: **RC series** (4.99 kΩ + 4700 pF), NOT a pure resistor —
@@ -1896,11 +1918,14 @@ class CalibrationTab(QtWidgets.QWidget):
                         from .widgets import _plus_symbol
                         from ..plotting import MARKER_COLOURS
                         _col = MARKER_COLOURS.get("access", "#B0143C")
+                        # NO ``name=`` here: pyqtgraph auto-registers a NAMED
+                        # item with the legend on addItem, and we register it
+                        # explicitly below to get the rich-text label — passing
+                        # both put "iR drops" in the legend TWICE.
                         self._plot_ir_marks = pg.ScatterPlotItem(
                             symbol=_plus_symbol(), size=13,
                             pen=pg.mkPen(_col, width=3),
-                            brush=pg.mkBrush(None),
-                            name="iR drops")
+                            brush=pg.mkBrush(None))
                         self._plot_ir_marks.setZValue(5)
                         self._plot_widget.addItem(self._plot_ir_marks)
                         if self._plot_legend is not None:

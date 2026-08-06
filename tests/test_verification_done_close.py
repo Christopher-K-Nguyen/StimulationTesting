@@ -32,10 +32,16 @@ def _mw(_app):
 
 
 # ------------------------------------------------------------- 500 µA
-def test_amplitude_grid_has_no_500():
+def test_amplitude_grid_top_is_500():
+    """REVERSED at 0.2.228.  This test used to assert 500 uA was ABSENT (it
+    had been trimmed off the top).  The operator re-added it along with 8
+    more points to condition the R fit and to test whether the ~13 % low
+    R_load deficit is amplitude-dependent.  The compliance ceiling that makes
+    500 the safe maximum is pinned in
+    ``tests/test_verification_amplitude_grid.py``.
+    """
     from stimtest.gui.calibration import CalibrationTab
-    assert 500.0 not in CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA
-    assert CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA[-1] == 200.0
+    assert CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA[-1] == 500.0
 
 
 def test_amplitude_grid_starts_above_the_trigger_branch():
@@ -51,7 +57,7 @@ def test_amplitude_grid_starts_above_the_trigger_branch():
     from stimtest.experiments.base import imon_trigger_level
     from stimtest.gui.calibration import CalibrationTab
     grid = CalibrationTab.DEFAULT_AMPLITUDE_GRID_UA
-    assert grid == (25.0, 50.0, 100.0, 200.0)
+    assert min(grid) >= 25.0        # the branch point, not the exact grid
     for amp in grid:
         level = abs(imon_trigger_level(
             amp_ua_signed=-amp,
