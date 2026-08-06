@@ -170,9 +170,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # which one is focused.
         self.tabs.currentChanged.connect(self._on_top_tab_changed)
         self.tabs.addTab(self.setup_tab, "Setup")
-        # Calibration tab is created lazily — only when the user clicks
-        # "Run Calibration" on the ConnectionPanel (or Run → Calibrate in
-        # the menu).  Keeping it out of the initial tab bar trims the
+        # Verification tab is created lazily — only when the user clicks
+        # "Run Verification" on the ConnectionPanel (or Run → Stimulator
+        # Verification in the menu).  Keeping it out of the initial tab bar trims the
         # default chrome and matches the workflow: most sessions don't
         # need a fresh verification sweep on every launch.  See
         # :meth:`_open_calibration_tab` for the on-demand wire-up.
@@ -970,9 +970,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # parameters must run the sync + hardware pre-apply even if
         # Setup itself hasn't changed since.
         self._setup_dirty_for_test = True
-        # Embedded Calibration tab tracks the live handles too — only if
+        # Embedded Verification tab tracks the live handles too — only if
         # it has actually been instantiated (it's created lazily on first
-        # "Run Calibration" press).
+        # "Run Verification" press).
         if self.cal_tab is not None:
             self.cal_tab.set_hardware(stim=stim, scope=scope)
         # Route every SCPI command + every PlexStim SDK call through
@@ -2832,11 +2832,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "Single capture isn't available for this experiment.")
 
     def _open_calibration_tab(self) -> "CalibrationTab":
-        """Create the Calibration tab on first use, insert it directly to
+        """Create the Verification tab on first use, insert it directly to
         the right of Setup, and wire its ``doneRequested`` signal.
 
-        Idempotent — repeated presses of "Run Calibration" just switch
+        Idempotent — repeated presses of "Run Verification" just switch
         focus to the existing tab.
+
+        (The feature is USER-FACING "Verification"; the module, class and
+        method names stay ``calibration`` for back-compat — gotcha #93.)
         """
         if self.cal_tab is None:
             self.cal_tab = CalibrationTab(
@@ -2857,7 +2860,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.cal_tab
 
     def _on_run_calibrate(self):
-        """Run → Calibrate (menu) / "Run Calibration" button (Setup tab).
+        """Run → Stimulator Verification (menu) / "Run Verification" button.
 
         Lazily instantiates the embedded :class:`CalibrationTab`, inserts
         it after Setup, and switches focus to it.  The tab persists after

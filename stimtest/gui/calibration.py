@@ -58,7 +58,22 @@ class _HtmlHeaderView(QtWidgets.QHeaderView):
     plain "Channel" header keeps stock styling.  The text colour is taken
     from the palette so it follows the light / dark theme (a bare
     ``QTextDocument`` defaults to BLACK, which is invisible on a dark header).
+
+    **Alignment.**  The DATA cells are ``AlignCenter``, so the headers must be
+    too or the table reads crooked.  Two separate things have to agree:
+    ``setDefaultAlignment`` (used by the base implementation for the plain
+    "Channel" section) and the QTextDocument's own text option (used for the
+    rich-text sections).  Getting only the first is the trap — a
+    ``QTextDocument`` laid out at ``setTextWidth(section width)`` aligns its
+    text LEFT inside that width regardless of the header's alignment, so the
+    markup headers sat flush-left while every value below them was centred.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Matches the AlignCenter used for the value cells; also covers the
+        # plain-text sections that fall through to super().paintSection().
+        self.setDefaultAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
     def paintSection(self, painter, rect, logicalIndex):     # noqa: N802
         try:
@@ -84,6 +99,15 @@ class _HtmlHeaderView(QtWidgets.QHeaderView):
 
             doc = QtGui.QTextDocument()
             doc.setDefaultFont(self.font())
+            # CENTRE the rich text.  Set the text option BEFORE setHtml so the
+            # first layout already uses it; a QTextDocument otherwise aligns
+            # LEFT inside its textWidth no matter what the header's
+            # defaultAlignment says, which left the markup headers flush-left
+            # above centred values.
+            _topt = QtGui.QTextOption()
+            _topt.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+            _topt.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
+            doc.setDefaultTextOption(_topt)
             col = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
             doc.setHtml(f'<span style="color:{col.name()}">{text}</span>')
             doc.setTextWidth(max(0, rect.width() - 6))
@@ -652,6 +676,11 @@ class CalibrationTab(QtWidgets.QWidget):
         self._plot_curves: Dict[str, object] = {}
         self._plot_right_curves: Dict[str, object] = {}
         self._plot_sim_curve = None
+        # Plus-symbol markers on the measured iR drops (operator request) and
+        # the per-capture (t_us, volts) points feeding them, refreshed by
+        # ``_capture_one_amplitude`` for each capture that gets plotted.
+        self._plot_ir_marks = None
+        self._last_ir_points: list = []
         self._plot_legend = None
         self._plot_x_min: float = -26.5
         self._plot_x_max: float = 223.5
@@ -1849,6 +1878,42 @@ class CalibrationTab(QtWidgets.QWidget):
                     self._plot_curves[v_mon_phys] = c
                 self._plot_curves[v_mon_phys].setData(t_us, y_v)
 
+            # iR-DROP MARKERS (operator: "put plus symbols on the iR drops in
+            # the verification plot").  These are the very points the R_load
+            # fit is built from -- one per current edge, located by the shared
+            # |dV/dt| edge localizer and measured by the before/after
+            # extrapolation -- so seeing them on the trace is the fastest way
+            # to tell a bad R fit (markers off the edges) from a bad board.
+            # Stashed by ``_capture_one_amplitude`` for the capture that is
+            # being drawn; cleared there too, so a capture whose extraction
+            # failed shows no stale markers.
+            try:
+                _ir = list(getattr(self, "_last_ir_points", ()) or ())
+                if _ir:
+                    _xs = [p[0] for p in _ir]
+                    _ys = [p[1] for p in _ir]
+                    if self._plot_ir_marks is None:
+                        from .widgets import _plus_symbol
+                        from ..plotting import MARKER_COLOURS
+                        _col = MARKER_COLOURS.get("access", "#B0143C")
+                        self._plot_ir_marks = pg.ScatterPlotItem(
+                            symbol=_plus_symbol(), size=13,
+                            pen=pg.mkPen(_col, width=3),
+                            brush=pg.mkBrush(None),
+                            name="iR drops")
+                        self._plot_ir_marks.setZValue(5)
+                        self._plot_widget.addItem(self._plot_ir_marks)
+                        if self._plot_legend is not None:
+                            self._plot_legend.addItem(
+                                self._plot_ir_marks,
+                                f"iR drops ({rich.var('V', 'a')})")
+                    self._plot_ir_marks.setData(_xs, _ys)
+                    self._plot_ir_marks.setVisible(True)
+                elif self._plot_ir_marks is not None:
+                    self._plot_ir_marks.setVisible(False)
+            except Exception:
+                pass
+
             if i_mon_phys in channels and self._right_vb is not None:
                 y_i = np.asarray(channels[i_mon_phys], dtype=float) * 1000.0
                 label = f"{rich.var('I', 'mon')} ({i_mon_phys})"
@@ -2975,6 +3040,9 @@ class CalibrationTab(QtWidgets.QWidget):
         # independent of stim rise time or the localizer's settling
         # offset.  This is the same physics MATLAB's setDriving uses
         # when extracting R from the V_mon trace.
+        # Drop any previous capture's marker points FIRST, so a capture whose
+        # extraction fails below plots no markers rather than the last one's.
+        self._last_ir_points = []
         try:
             from ..metrics import access_voltage_and_resistance
             # SAME method as the experiment (operator: "calibration should use
@@ -2996,10 +3064,25 @@ class CalibrationTab(QtWidgets.QWidget):
                     f"start={self.CAL_ACCESS_POST_START_US} µs, "
                     f"width={self.CAL_ACCESS_POST_WIN_US} µs "
                     f"(default is 1.0 / 2.0) — R_load from this sweep is a "
-                    f"diagnostic, not a calibration.")
+                    f"diagnostic, not a verification result.")
                 self._post_win_logged = True
             _va_list, _ra_list, _acc_idx = access_voltage_and_resistance(
                 t_us_arr, v_arr, pat, onset_us=_onset_us, **_post_kw)
+            # Where each iR drop was MEASURED, for the plot's plus markers.
+            # Uses the localizer's own indices into the SAME arrays the plot
+            # draws, so a marker can never drift from the value it represents.
+            _pts = []
+            for _k, _i in enumerate(_acc_idx or ()):
+                try:
+                    _ii = int(_i)
+                    if not (0 <= _ii < t_us_arr.size):
+                        continue
+                    if _k < len(_va_list) and not np.isfinite(_va_list[_k]):
+                        continue          # drop we couldn't measure
+                    _pts.append((float(t_us_arr[_ii]), float(v_arr[_ii])))
+                except Exception:
+                    continue
+            self._last_ir_points = _pts
         except Exception:
             _va_list = []
         step_mags = [float(v) for v in _va_list if np.isfinite(v)]
@@ -3938,9 +4021,19 @@ class CalibrationTab(QtWidgets.QWidget):
 
         # Per-channel detail — plain text in the expandable pane.
         detail_lines: list = []
+        # NOTE: this used to read "acceptance: |a − 1| ≤ {accept} %", left over
+        # from the removed ACCEPTANCE_PCT gain gate.  ``accept`` went with it,
+        # so the line raised NameError — but only on the summary popup, which
+        # is reached solely by a sweep that RUNS TO COMPLETION.  While the R
+        # band was ±10 % every channel exhausted its retries and the operator
+        # aborted, so the crash stayed hidden until the −20 %/+10 % band let a
+        # sweep finish.  The pass criterion is now simply a finite, positive
+        # R_load AND C_load fit; the gain / offset / RMSD columns below are
+        # INFORMATIONAL and gate nothing.
         detail_lines.append(
             "Per-channel breakdown "
-            f"(acceptance: |a − 1| ≤ {accept:.1f} %)")
+            "(pass = finite, positive R_load and C_load fit; "
+            "a / b / RMSD are informational)")
         detail_lines.append("")
         detail_lines.append(
             f"{'Ch':<6}{'Status':<8}{'a':<10}"
