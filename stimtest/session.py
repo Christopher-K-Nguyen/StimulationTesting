@@ -370,6 +370,40 @@ class Capture:
     #: Active potential vs Ag|AgCl (volts), if measured directly (optional)
     e_act_v: Optional[np.ndarray] = None
 
+    #: RAW, PRE-CONVERSION acquisition (operator: "store the raw waveform data
+    #: before conversion and scaling"), plus the CHANNEL SETTINGS in force.
+    #:
+    #: The trace arrays above are twice-derived — ADC codes -> volts (via the
+    #: preamble) -> engineering units (via the stimulator preset).  When a
+    #: scaling looks wrong, those arrays cannot show WHERE it went wrong, and
+    #: the only recourse is inference.  This keeps the codes and every
+    #: constant needed to redo the chain offline under any assumption.
+    #:
+    #: ``{"channels": {name: {"codes", "ymult", "yoff", "yzero", "xincr",
+    #: "xzero", "scale_v_per_div", "position_div", "wfid", ...}},
+    #: "scaling": {"vmon_v_per_v", "imon_v_per_ua", "preset"},
+    #: "aliases": {role: channel}}``
+    #:
+    #: ``None`` on drivers that cannot supply codes (simulator, PicoScope) and
+    #: on every capture saved before this existed — always guard before use.
+    raw_channels: Optional[dict] = None
+
+    #: IDEAL / EXPECTED current (µA) — the PROGRAMMED pulse reconstructed on
+    #: this capture's own time axis, as an alternative trace to the measured
+    #: I_mon (operator request).
+    #:
+    #: I_mon carries switching spikes, ringing, and a variable turn-on skew at
+    #: small pulse widths, none of which are what the current source actually
+    #: delivered.  Having the intended waveform stored ALONGSIDE the measured
+    #: one makes the comparison direct: overlay them and any disagreement is
+    #: visible rather than inferred.  It is also what the driving-energy
+    #: integral already uses (gotcha #117).
+    #:
+    #: Anchored at the DETECTED onset, quantised to the device's nA grid, and
+    #: exactly zero in the interphase / discharge / interpulse gaps.  ``None``
+    #: when no pattern or time axis was available.
+    i_ideal_ua: Optional[np.ndarray] = None
+
     metrics: CaptureMetrics = field(default_factory=CaptureMetrics)
     status: CaptureStatus = field(default_factory=CaptureStatus)
 

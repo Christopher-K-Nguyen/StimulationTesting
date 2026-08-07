@@ -18,6 +18,7 @@ import sys
 
 import numpy as np
 import pytest
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 pytest.importorskip("pyqtgraph")
 
@@ -575,8 +576,8 @@ def test_metric_table_drops_active_qualifier_without_eact(qapp):
     c.metrics.access_resistance_per_phase_kohm = [1.6, 1.7]
     c.metrics.polarization_per_phase_v = [-0.83, 0.15]
     tbl = MetricTable(); tbl.show_capture(c)
-    labels = " ".join(tbl.item(i, 0).text() for i in range(tbl.rowCount()))
-    vals = [tbl.item(i, 1).text() for i in range(tbl.rowCount())]
+    labels = " ".join(_mrt(tbl, i)[0] for i in range(tbl.rowCount()))
+    vals = [_mrt(tbl, i)[1] for i in range(tbl.rowCount())]
     assert "active" not in labels                  # no "active" qualifier
     assert "2.684" in vals                          # single V_d = max|V_mon|
 
@@ -591,7 +592,7 @@ def test_metric_table_keeps_active_return_with_eact(qapp):
     c.metrics.polarization_per_phase_v = [-0.83, 0.15]
     c.metrics.return_polarization_per_phase_v = [-0.10, 0.05]
     tbl = MetricTable(); tbl.show_capture(c)
-    labels = " ".join(tbl.item(i, 0).text() for i in range(tbl.rowCount()))
+    labels = " ".join(_mrt(tbl, i)[0] for i in range(tbl.rowCount()))
     assert "active" in labels and "return" in labels
 
 

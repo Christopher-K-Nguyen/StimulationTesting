@@ -32,6 +32,7 @@ _APP.setApplicationName("pulsar-pytest")
 from stimtest.waveforms import (Phase, PulsePattern, SHAPE_SINUSOIDAL,  # noqa: E402
                                 SHAPE_RECTANGULAR, SHAPE_GAUSSIAN)
 from stimtest.experiments.base import continuous_trigger_level_slope  # noqa: E402
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 
 def _cont(shape, amp=-1.0, width=100.0, rate=5000.0):
@@ -207,7 +208,7 @@ def test_metric_table_sinusoidal_has_frequency_not_method():
     c.metrics.polarization_method = "sinusoidal"
     c.metrics.ghazavi_freq_khz = 5.0
     tbl = MetricTable(); tbl.show_capture(c)
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount()) if tbl.item(r, 0)]
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount()) if tbl.item(r, 0)]
     assert not any("Method" in k for k in keys)
     assert any("frequency" in k.lower() for k in keys)
 
@@ -218,6 +219,6 @@ def test_metric_table_normal_has_rate_and_period():
     c = Capture(index=0, pattern=PulsePattern.biphasic(amplitude_ua=50.0,
                                                        rate_hz=1000.0))
     tbl = MetricTable(); tbl.show_capture(c)
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount()) if tbl.item(r, 0)]
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount()) if tbl.item(r, 0)]
     assert any("Pulse rate" in k for k in keys)
     assert any("Pulse period" in k for k in keys)

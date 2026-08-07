@@ -327,13 +327,24 @@ class RampPolicy:
     # electrode reaches the band via bounded steps, never a fling.  The
     # per-capture band stop then catches the crossing at a bounded amplitude.
     snap_ceiling_max_ratio: float = 0.75
-    # 2-CONSECUTIVE band confirmation (operator: "require 2 consecutive in-band
-    # captures").  E_pol is noisy near the water window, so the reached / back-
-    # off stop fires only once the band condition holds on this many CONSECUTIVE
-    # captures — a lone noise spike then can't trip it (a false stop at a random
-    # amplitude / a garbage max-Q_inj from a +1.49 V spike).  1 = the old
-    # single-capture behaviour.
-    reached_min_consecutive: int = 2
+    # Band confirmation, in CAPTURES (operator, decisive: "once only the
+    # potential limit is reached but not exceeded, stop and move on") — so the
+    # default is 1: a single in-band, NOT-exceeded capture ends the ramp.
+    #
+    # This REVERSES the earlier 2-consecutive rule, which was introduced so a
+    # lone noise spike near the window couldn't trip a false stop.  It cost
+    # more than it bought: the confirmation capture is a SECOND pulse train at
+    # an amplitude already known to sit at the water window, and on the AC
+    # bench run (exp_vt_max_cathodal_test_ac) it was actively DANGEROUS —
+    # CH08 reached the band at 281.3 µA (#9, E_mc −0.6154), the confirmation
+    # capture at 281.4 µA was misclassified ``capacitive`` so its E_pol was
+    # cleared to NaN, and the ramp — reading "no polarization" as "nowhere near
+    # the limit" — flung to 1000 µA and drove the electrode to −1.64 V, 2.74×
+    # its window.  Stopping on the first clean in-band capture removes that
+    # whole failure mode, and a noise spike can no longer cost anything
+    # because there is no follow-up pulse train.  The EXCEEDED → back-off path
+    # was already single-capture and is unchanged.  >1 restores confirmation.
+    reached_min_consecutive: int = 1
     # BURIED-REGION √-BOUNDED LOOSENING (operator: "reach the maximum charge
     # injection capacity more efficiently").  The FLAT loosest tier (×2.5) is
     # calibrated for the worst PHYSICAL concave-up electrode (a QUADRATIC
@@ -1846,7 +1857,7 @@ class VoltageTransientExperiment(ExperimentRunner):
             # ("WRONG TRIGGER MODE") on default-mode PlexStim devices.
             # Loaded channels (active + unused-with-zero) fire together;
             # the zero-amp channels deliver no current.
-            self.stim.start_all()
+            self.start_pulsing()
             _pulse_t0 = time.monotonic()   # pulsing has begun
         except Exception as e:
             cap = Capture(index=index, pattern=pattern)
@@ -2340,6 +2351,19 @@ class VoltageTransientExperiment(ExperimentRunner):
                     return True
         return False
 
+    def _latest_measured(self, captures: List[Capture]):
+        """The most recent capture that actually HAS a finite E_pol.
+
+        A capture can carry no usable polarization at all — ``compute_metrics``
+        clears the per-phase E_pol for a non-normal (open / broken /
+        capacitive) response, and that classification can misfire on a single
+        capture.  Every proximity read must fall back to the last real
+        measurement rather than treat "unmeasured" as "zero"."""
+        for c in reversed(captures or ()):
+            if self._cap_has_finite_epol(c):
+                return c
+        return None
+
     def _worst_epol_ratio(self, captures: List[Capture]) -> float:
         """Worst-case ``|E_pol| / |limit|`` of the LATEST capture, clamped to
         [0, 1] — the MEASURED proximity signal driving the growth cap (§2 of
@@ -2351,7 +2375,17 @@ class VoltageTransientExperiment(ExperimentRunner):
         if (abs(self.cathodic_limit_v) < 1e-9
                 and abs(self.anodic_limit_v) < 1e-9):
             return 0.0
-        return float(min(self._polarization_ratio(captures[-1]), 1.0))
+        # ⚠ Read the latest MEASURED capture, not blindly the latest one.
+        # ``_polarization_ratio`` skips non-finite phases and starts at 0.0, so
+        # a capture whose E_pol was CLEARED (a bad-response misclassification
+        # blanks it — gotcha #58) returns 0.0, which is indistinguishable from
+        # "measured, and the electrode is nowhere near its limit".  The growth
+        # cap then puts it in the LOOSEST tier and the √-loosening grants ×6 —
+        # which is exactly how the AC-run CH08 flung 281 µA → 1000 µA and hit
+        # 2.74× the water window.  "Not measured" must inherit the last real
+        # proximity, never license a bigger step.
+        _meas = self._latest_measured(captures)
+        return float(min(self._polarization_ratio(_meas), 1.0)) if _meas else 0.0
 
     def _growth_ratio(self, captures: List[Capture]) -> float:
         """BASELINE-SUBTRACTED worst-case E_pol proximity, in [0, 1] — the
@@ -2387,8 +2421,9 @@ class VoltageTransientExperiment(ExperimentRunner):
         if (abs(self.cathodic_limit_v) < 1e-9
                 and abs(self.anodic_limit_v) < 1e-9):
             return 0.0
-        latest = getattr(captures[-1].metrics,
-                         "polarization_per_phase_v", None) or []
+        _meas_cap = self._latest_measured(captures)
+        latest = (getattr(_meas_cap.metrics, "polarization_per_phase_v", None)
+                  if _meas_cap is not None else None) or []
         if not latest:
             return float(min(self._worst_epol_ratio(captures), 1.0))
         n = len(latest)
@@ -2498,6 +2533,31 @@ class VoltageTransientExperiment(ExperimentRunner):
         # a margin above per-capture measurement jitter so a flat noisy
         # patch doesn't falsely read as saturation.
         return s2 < s1 * 0.9
+
+    def _epol_accelerating(self, captures: List[Capture]) -> bool:
+        """Mirror of :meth:`_epol_concave_down` — is the trajectory speeding
+        UP (concave-up)?  A linear projection OVERSHOOTS on such an electrode,
+        so the wide-secant approach step halves itself when this is True.
+        Requires the later secant to be at least 10 % STEEPER, the same margin
+        above per-capture jitter used by the deceleration test."""
+        pts = []
+        for c in captures[-3:]:
+            try:
+                a = abs(c.pattern.excitation_phase.amplitude_ua)
+            except (AttributeError, TypeError):
+                continue
+            r = self._polarization_ratio(c)
+            if a > 0 and np.isfinite(r) and r > 0:
+                pts.append((a, r))
+        if len(pts) < 3:
+            return False
+        pts.sort()
+        (a0, r0), (a1, r1), (a2, r2) = pts[-3:]
+        if a1 <= a0 or a2 <= a1:
+            return False
+        s1 = (r1 - r0) / (a1 - a0)
+        s2 = (r2 - r1) / (a2 - a1)
+        return s2 > s1 * 1.1
 
     # E_pol SATURATION (plateau-near-limit) early stop.  See
     # ``_epol_plateaued_near_limit`` — bounds the near-crossover fine creep.
@@ -2696,6 +2756,52 @@ class VoltageTransientExperiment(ExperimentRunner):
     # near-edge APPROACH step (``_approach_step``) so the final approach lands
     # IN the acceptance band in one move instead of geometric fine-step creep.
     _APPROACH_RATIO = 0.85
+
+    # Near-limit approach — WIDE-SPAN SECANT (the fix for the "stall just
+    # outside the band" that dominated the bench run).
+    #
+    # ``_oscillate_approach_step``'s distance table converts "volts remaining"
+    # into a µA step through a FIXED lookup, so it has no idea what the
+    # electrode's dE_pol/dI actually is.  On exp_vt_max_cathodal_test_dc the
+    # real slope near the limit is ~6-8e-4 V/µA, so closing the last
+    # 0.02-0.04 V needs 30-50 µA — while the table prescribed 3-12 µA.  Worse,
+    # it SHRINKS the step as the reading drifts closer, so it decelerates
+    # exactly where it should not, and the per-capture E_pol scatter (±10 mV
+    # on CH12) is comparable to the distance being traversed, so the readings
+    # wander instead of converging.  CH12 spent NINE captures (#8-#16) moving
+    # +48 µA with E_pol oscillating inside its own noise; the stall was finally
+    # broken by the growth cap's amplitude-proportional ×1.15 jump (+112 µA),
+    # which OVERSHOT the far edge and needed a back-off.  ~36 of the run's 170
+    # captures went to that one crawl→overshoot→recover pattern.
+    #
+    # So size the step from the MEASURED slope instead.  Two details make it
+    # SAFE, and both are load-bearing:
+    #
+    #  * The secant spans a WIDE amplitude range (≥ ``_APPROACH_SPAN_FRAC`` of
+    #    the current amplitude), never the last two captures.  A short-span
+    #    slope is dominated by the E_pol scatter — precisely what made the OLD
+    #    local projection overshoot (gotcha #155: a noise-shallow 0.9 mV/µA
+    #    two-point slope projected +14 µA past the limit) — and on a plateaued
+    #    electrode (CH01 #9-#13 moved 0.0001 V over 30 µA) a short span reads
+    #    slope ≈ 0 and projects an unbounded step.  A wide span averages the
+    #    scatter out AND, on a saturating (concave-down) electrode, OVER-
+    #    estimates the local slope, so the projection is an UNDERSHOOT BY
+    #    CONSTRUCTION.  Verified on the bench curves: wide 8.3e-4 vs local
+    #    6.1e-4 (CH12), wide 6.8e-4 vs local 5.7e-4 (CH01).
+    #  * The target is the band CENTRE (the limit itself), not the near edge.
+    #    The ±tolerance band exists to ABSORB measurement noise; aiming at its
+    #    near edge spends that budget, so roughly half the readings land
+    #    outside and the ramp cannot converge.  Aiming at the centre puts the
+    #    whole ±10 mV scatter inside the band.  (It is also no less safe: the
+    #    landing is one tolerance short of the far edge, and the projection
+    #    undershoots.)
+    #
+    # An ACCELERATING (concave-up) electrode is the one case where a wide
+    # secant UNDER-estimates the local slope and could overshoot — the
+    # convexity guard halves the projection there, and the E_pol growth cap +
+    # per-capture band stop + back-off remain the backstop.
+    _APPROACH_SPAN_FRAC = 0.05
+    _APPROACH_SPAN_MIN_UA = 5.0
 
     # Fractional safety probe: the informative fraction of a big predicted jump
     # to step FIRST (operator: "jump ~30 % of the way, observe, then commit").
@@ -2919,6 +3025,97 @@ class VoltageTransientExperiment(ExperimentRunner):
                  for c in captures
                  if not c.status.aborted and self._potential_limit_exceeded(c)]
         return min(overs) if overs else None
+
+    def _wide_secant_approach_step(self, captures: List[Capture],
+                                   current_amp_ua: float) -> Optional[float]:
+        """SLOPE-AWARE near-limit step — project the amplitude that lands
+        E_pol at the BAND CENTRE, using a secant measured over a WIDE
+        amplitude span.
+
+        Takes priority over :meth:`_oscillate_approach_step`'s distance table,
+        which is blind to dE_pol/dI and therefore crawled for 3-9 captures per
+        channel on the bench (see ``_APPROACH_SPAN_FRAC`` for the full
+        rationale and the measured numbers).  Returns the positive delta, or
+        ``None`` when no excursion is close enough, when no wide-span pair
+        exists yet, or when the bracket is exhausted — in every one of those
+        cases the caller falls back to the distance table, so this is a strict
+        refinement rather than a replacement.
+
+        Undershoot-biased by construction on a saturating electrode; halved on
+        an accelerating one; and still bounded downstream by the E_pol growth
+        cap, the per-capture band stop and the bidirectional back-off.
+        """
+        _res = abs(getattr(self.ramp, "test_current_resolution_ua", 0.1)) or 0.1
+        best: Optional[float] = None
+        for pts in self._excursion_series(captures).values():
+            if len(pts) < 2:
+                continue
+            a1, v1 = pts[-1]
+            # Only the LATEST capture's excursions (mirrors the table's gate).
+            if abs(a1 - current_amp_ua) > max(1.0, 0.02 * current_amp_ua):
+                continue
+            lim = (self.cathodic_limit_v if v1 < 0
+                   else self.anodic_limit_v if v1 > 0 else None)
+            if lim is None or abs(lim) < 1e-9:
+                continue
+            near = self._band_near_edge(lim)
+            # Already in-band on this excursion → the per-capture band stop
+            # owns it; never step further on account of it.
+            if (lim < 0 and v1 <= near) or (lim > 0 and v1 >= near):
+                continue
+            # Engage only once CLOSE to the limit; the regression/secant owns
+            # the fast far climb (same window as _approach_step).
+            if abs(v1) < self._APPROACH_RATIO * abs(lim):
+                continue
+            # WIDE-span secant: the most recent EARLIER point at least
+            # ``span_min`` below the current amplitude.  Anything closer is
+            # dominated by the E_pol scatter.
+            span_min = max(self._APPROACH_SPAN_MIN_UA,
+                           self._APPROACH_SPAN_FRAC * abs(a1))
+            a0 = v0 = None
+            for aa, vv in reversed(pts[:-1]):
+                if a1 - aa >= span_min:
+                    a0, v0 = aa, vv
+                    break
+            if a0 is None:
+                continue
+            slope = (v1 - v0) / (a1 - a0)
+            # Must be travelling TOWARD this excursion's limit.
+            if (lim < 0 and slope >= -1e-12) or (lim > 0 and slope <= 1e-12):
+                continue
+            d = (lim - v1) / slope          # target = band CENTRE = the limit
+            if not (np.isfinite(d) and d > 0):
+                continue
+            if best is None or d < best:
+                best = d                    # earliest excursion governs
+        if best is None:
+            return None
+        # CONVEXITY GUARD (same rule as _local_secant_target): a linear
+        # projection OVERSHOOTS an accelerating response, so halve it.  This
+        # strictly REDUCES the step and so can never create an overshoot.
+        if self._epol_accelerating(captures):
+            best *= 0.5
+        # HARDWARE CEILING: clamp to ``max_ua`` rather than projecting past it.
+        # Without this the run loop's ``while amp <= max_ua`` exits on the
+        # over-ceiling step and the channel is reported SHORT of the ceiling it
+        # could actually have been driven to — on the bench CH06 stopped at
+        # 970 µA / −0.560 V instead of 1000 µA / −0.578 V, under-reporting a
+        # hardware-limited max(Q_inj) by 3 %.  Clamping only ever SHRINKS the
+        # step, so it cannot overshoot; and it deliberately does NOT invoke the
+        # snap-to-ceiling, which is correctly blocked this close to the band
+        # (``snap_ceiling_max_ratio``, the CH11/CH14 fling guard).
+        room_to_max = float(self.ramp.max_ua) - current_amp_ua
+        if room_to_max <= _res:
+            return None
+        best = min(best, room_to_max)
+        # STRICT over/under BRACKET: never step to/past a known over-amp.
+        over = self._min_over_amp(captures)
+        if over is not None:
+            room = over - current_amp_ua
+            if room <= _res:
+                return None                 # bracket exhausted → accept/back-off
+            best = min(best, room * 0.5)
+        return float(max(best, _res))
 
     def _oscillate_approach_step(self, captures: List[Capture],
                                  current_amp_ua: float) -> Optional[float]:
@@ -3182,6 +3379,13 @@ class VoltageTransientExperiment(ExperimentRunner):
         # for 4-6 captures.  Returns ``None`` when no excursion is close yet.
         # MATLAB distance-table oscillation FIRST (near the limit): shrinking
         # steps that approach without overshooting (operator's changeCurrent.m).
+        # SLOPE-AWARE step first: the distance table below is blind to
+        # dE_pol/dI and crawled 3-9 captures per channel on the bench.  Falls
+        # through to the table whenever a trustworthy wide-span slope is not
+        # available yet.
+        wide = self._wide_secant_approach_step(captures, current_amp_ua)
+        if wide is not None:
+            return wide
         oscillate = self._oscillate_approach_step(captures, current_amp_ua)
         if oscillate is not None:
             return oscillate

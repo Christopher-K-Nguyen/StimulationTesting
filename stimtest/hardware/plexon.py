@@ -833,7 +833,7 @@ class PlexonStimulator(Stimulator):
                      what=f"stop_stim_channel(ch={channel})")
 
     @_dll_locked
-    def stop_all(self) -> None:
+    def stop_all(self, *, force: bool = False) -> None:
         # Idempotent: skip the redundant PS_StopStimAllChannels when we
         # already know the device is stopped (see _is_running).  The sweep
         # issues TWO stops between steps — the per-capture ``finally`` stop
@@ -842,10 +842,34 @@ class PlexonStimulator(Stimulator):
         # DLL round-trip while the explicit stop STILL fires if the finally
         # was skipped (running would still be True then), so the
         # belt-and-suspenders safety is preserved.
-        if not self._is_running:
+        #
+        # ``force=True`` BYPASSES that idempotence guard — for an operator
+        # Stop / Pause the cost of one redundant DLL call is nothing, while
+        # the cost of skipping a real stop because the flag went stale is an
+        # electrode that keeps pulsing after the user pressed Stop.  The
+        # optimization is for the sweep's internal double-stop only.
+        if not self._is_running and not force:
             return
-        self._invoke("ps_stop_stim_all_channels", self._stim_n,
-                     what="stop_stim_all_channels")
+        # ESCALATE rather than raise.  PS_StopStimAllChannels is documented to
+        # return 4 ("wrong trigger mode — not PS_TRIG_SOFT") and to let an
+        # in-flight pulse / arbitrary waveform COMPLETE; PS_AbortAll carries
+        # neither restriction ("cease immediately even if there is a pulse or
+        # arbitrary waveform in progress").  ``_invoke`` RAISES on a non-OK
+        # code, and every caller wraps the stop in try/except — so a refused
+        # stop would be swallowed and the electrode would keep pulsing with
+        # nothing shown to the operator.  A stop that cannot stop must fall
+        # through to the abort, not disappear.
+        try:
+            self._invoke("ps_stop_stim_all_channels", self._stim_n,
+                         what="stop_stim_all_channels")
+        except Exception as exc:
+            self._log(f"stop_stim_all_channels FAILED ({exc}) — escalating "
+                      f"to PS_AbortAll")
+            try:
+                self._invoke("ps_abort_all", what="abort_all(escalated)")
+            finally:
+                self._is_running = False
+            return
         self._is_running = False
 
     @_dll_locked

@@ -167,6 +167,16 @@ def channel_count_from_model(model: str) -> Optional[int]:
 #: bandwidth). 1 k / 2 k would *downgrade* from the legacy
 #: TBS1104B's 2 500-point default.
 # Canonical value lives in :mod:`stimtest.config`; re-exported here
+#: Tektronix 8-bit channels digitise at a FIXED 25 codes per vertical
+#: division.  ``cached_V/div ÷ YMULT`` must equal this; anything else means
+#: our cached ``CHx:SCAle`` is stale, since YMULT is read from the instrument
+#: on every capture.  Used as a self-check in ``_read_channel`` — see the
+#: cross-check there for the real-run failure it catches.
+_EXPECTED_Y_CODES_PER_DIV = 25.0
+#: Fractional tolerance on the above (2 %) — covers float/rounding noise
+#: without admitting a genuinely wrong scale.
+_Y_CPD_TOL = 0.02
+
 # so existing ``from ..hardware.tektronix import DEFAULT_RECORD_LENGTH``
 # imports (e.g. gui/experiment_tabs.py) keep working unchanged.
 from ..config import DEFAULT_RECORD_LENGTH  # noqa: F401,E402
@@ -867,6 +877,9 @@ class TektronixOscilloscope(Oscilloscope):
         # for ``restore_transfer_window`` describes a session that no longer
         # exists — drop it rather than write a stale bound back later.
         self._prev_data_stop = None
+        # Per-channel RAW (pre-conversion) records, refreshed by
+        # ``_read_channel`` and copied into each ScopeAcquisition.
+        self._last_raw = {}
         # Force the next set_acquisition_mode to actually write — we
         # don't reliably know the front panel's current acq mode at
         # connect, so the idempotent skip must not fire on first use.
@@ -4351,6 +4364,11 @@ class TektronixOscilloscope(Oscilloscope):
         return ScopeAcquisition(
             time_us=time_us, channels=out_channels,
             sample_period_us=sample_period_us, record_length=record_length,
+            # Snapshot (not alias) the per-channel RAW records this
+            # frame produced — ``_last_raw`` is overwritten by the next
+            # read, so an aliased dict would mutate under the caller.
+            raw={k: dict(v) for k, v in
+                 (getattr(self, '_last_raw', {}) or {}).items()},
         )
 
     def _check_triggered(self) -> bool:
@@ -4444,6 +4462,11 @@ class TektronixOscilloscope(Oscilloscope):
         return ScopeAcquisition(
             time_us=time_us, channels=out_channels,
             sample_period_us=sample_period_us, record_length=record_length,
+            # Snapshot (not alias) the per-channel RAW records this
+            # frame produced — ``_last_raw`` is overwritten by the next
+            # read, so an aliased dict would mutate under the caller.
+            raw={k: dict(v) for k, v in
+                 (getattr(self, '_last_raw', {}) or {}).items()},
         )
 
     def capture_single_sequence(self, *, n_acq: int = 16,
@@ -4582,6 +4605,11 @@ class TektronixOscilloscope(Oscilloscope):
         return ScopeAcquisition(
             time_us=time_us, channels=out_channels,
             sample_period_us=sample_period_us, record_length=record_length,
+            # Snapshot (not alias) the per-channel RAW records this
+            # frame produced — ``_last_raw`` is overwritten by the next
+            # read, so an aliased dict would mutate under the caller.
+            raw={k: dict(v) for k, v in
+                 (getattr(self, '_last_raw', {}) or {}).items()},
         )
 
     def _read_channel(self, ch: str,
@@ -4677,7 +4705,66 @@ class TektronixOscilloscope(Oscilloscope):
                            if hasattr(self, "_adapt_state") else None)
                     if _ls and ymult > 0:
                         _cpd = float(_ls) / float(ymult)
-                        if 10.0 <= _cpd <= 60.0:
+                        # ---- CROSS-CHECK the cached V/div against YMULT ----
+                        # Every Tek 8-bit channel digitises at a FIXED
+                        # codes/div (25).  ``ymult`` comes straight from the
+                        # instrument each read, so if cached_scale / ymult is
+                        # not that constant, the CACHED SCALE IS STALE — the
+                        # scope moved and our cache did not.
+                        #
+                        # This used to accept anything in [10, 60] and learn
+                        # it, which turned a stale cache into a "learned"
+                        # constant and silently corrupted everything derived
+                        # from it.  Observed on a real run: CH2 (I_mon)
+                        # learned 18.8 codes/div while CH1/CH3 held 25.0, and
+                        # I_mon read ~1.5x the programmed current with a
+                        # non-round V/div (0.354015) as the tell-tale.
+                        #
+                        # YMULT is authoritative; on disagreement re-query the
+                        # scope and repair the cache rather than trust it.
+                        _exp = _EXPECTED_Y_CODES_PER_DIV
+                        if abs(_cpd - _exp) > _Y_CPD_TOL * _exp:
+                            _true = None
+                            try:
+                                _true = float(self._q(f"{ch}:SCAle?"))
+                            except Exception:
+                                _true = None
+                            self._log(
+                                f"[scope] ⚠ {ch}: cached V/div {float(_ls):.6g} "
+                                f"disagrees with the preamble YMULT "
+                                f"{ymult:.4e} ({_cpd:.1f} codes/div, expected "
+                                f"{_exp:.0f}) — cache was STALE; "
+                                + (f"re-queried {_true:.6g} V/div."
+                                   if _true else
+                                   "re-query FAILED, using YMULT-derived "
+                                   f"{ymult * _exp:.6g} V/div."))
+                            _fixed = _true if _true else ymult * _exp
+                            # The TBS applies V/div at 3 SIGNIFICANT FIGURES
+                            # (``set_channel_scale`` writes ``{vpd:.2e}``), so
+                            # snap the repaired value to that grid — otherwise
+                            # the cache holds a full-precision number the scope
+                            # can never actually be at, and the very next
+                            # cross-check flags a phantom mismatch.
+                            #
+                            # Note 3 sig figs bounds rounding at ~0.1 %, well
+                            # inside _Y_CPD_TOL — so quantization can never
+                            # trip this check.  The real case that did
+                            # (0.354015 cached vs 0.472 from YMULT) was 33 %
+                            # off: a stale cache, not rounding.
+                            try:
+                                _fixed = float(f"{float(_fixed):.2e}")
+                            except Exception:
+                                pass
+                            try:
+                                # Repair the cache in place so the next read
+                                # does not repeat the round-trip.
+                                self._adapt_state.setdefault(
+                                    ch, {})["last_scale"] = float(_fixed)
+                            except Exception:
+                                pass
+                            # Re-derive from the corrected scale.
+                            _cpd = float(_fixed) / float(ymult)
+                        if abs(_cpd - _exp) <= _Y_CPD_TOL * _exp:
                             if not hasattr(self, "_y_codes_per_div"):
                                 self._y_codes_per_div: Dict[str, float] = {}
                             self._y_codes_per_div[ch] = _cpd
@@ -4963,6 +5050,74 @@ class TektronixOscilloscope(Oscilloscope):
                         f"channel data may not be in volts!")
             except Exception:
                 pass
+        # ---- RAW, PRE-CONVERSION record (operator: "store the raw waveform
+        # data before conversion and scaling").  Stashed on the driver rather
+        # than returned, so ``_read_channel``'s 4-tuple signature and its three
+        # call sites stay unchanged; the ScopeAcquisition builders copy it.
+        #
+        # These are the instrument's own ADC codes plus everything needed to
+        # re-derive volts: volts = (codes - YOFF) * YMULT + YZERO.  Keeping
+        # them means a scaling question can be settled by arithmetic on the
+        # saved file instead of inferred from the end result.
+        # WFID is parsed ONLY on a preamble-cache MISS, and the parser is
+        # shared across channels so it can only stash ONE value.  Consuming it
+        # here and keying it per channel is what makes it correct: a fresh
+        # parse sets ``_last_wfid_value`` and we claim it for THIS channel; a
+        # cache HIT leaves it None and we fall back to the value this channel
+        # recorded last time.  Without the consume, every channel inherited
+        # whichever one parsed most recently — a real run stored "Ch3, AC
+        # coupling, 1.000mV/div" for CH1, CH2 AND CH3.
+        try:
+            if not hasattr(self, "_last_wfid"):
+                self._last_wfid = {}
+            _w = getattr(self, "_last_wfid_value", None)
+            if _w:
+                self._last_wfid[ch] = _w
+                self._last_wfid_value = None      # consumed
+            _wfid_for_ch = self._last_wfid.get(ch)
+        except Exception:
+            _wfid_for_ch = None
+        try:
+            self._last_raw[ch] = {
+                "codes": np.asarray(raw, dtype=np.int8),
+                "ymult": float(ymult),
+                "yoff": float(_yoff_used),
+                "yoff_reported": float(yoff),
+                "yzero": float(yzero),
+                "xincr": float(xinc),
+                "xzero": float(xz_used),
+                "scale_v_per_div": self._cached_scale_pos(ch)[0],
+                "position_div": self._cached_scale_pos(ch)[1],
+                # Channel SETTINGS (operator: "save all channel setting
+                # information").  ``wfid`` is the instrument's own description
+                # string from the preamble we already parsed — e.g.
+                # "Ch2, AC coupling, 1.000mV/div, 100.0us/div, 20000 points,
+                # Average mode" — so it records coupling, V/div, timebase,
+                # record length and acquisition mode as the SCOPE reports
+                # them, with no extra SCPI round-trip.  That matters here:
+                # AC vs DC coupling on V_mon / I_mon is an operator CHOICE
+                # (deliberately AC when the offset is assumed zero, since DC
+                # induces a slight offset), so the file has to say which was
+                # in force rather than leave it to be guessed.
+                "wfid": _wfid_for_ch,
+                "coupling_override": (
+                    getattr(self, "_channel_coupling_override", {}) or {}
+                ).get(ch),
+                "bandwidth_override": (
+                    getattr(self, "_channel_bandwidth_override", {}) or {}
+                ).get(ch),
+                "record_length": int(getattr(self, "_record_length", 0) or 0),
+                "npts": int(raw.size),
+            }
+        except Exception:
+            # Must NOT touch self._last_raw here — if the failure was that the
+            # dict is missing, popping raises again and the exception escapes
+            # into the capture path.  Raw storage is a diagnostic; it can
+            # never be allowed to break an acquisition.
+            try:
+                getattr(self, "_last_raw", {}).pop(ch, None)
+            except Exception:
+                pass
         return t_us, y_v, xinc * 1e6, raw.size
 
     def _read_preamble(self, preamble_root: str):
@@ -5013,6 +5168,22 @@ class TektronixOscilloscope(Oscilloscope):
             yzero = float(fields["YZERO"])
             xinc  = float(fields["XINCR"])
             xzero = float(fields["XZERO"])
+            # WFID is the scope's own channel description — coupling,
+            # V/div, timebase, record length, acq mode — in one string.
+            # Cached so the RAW record can save the channel SETTINGS with
+            # no extra SCPI round-trip (operator: "save all channel
+            # setting information").  AC vs DC is an operator CHOICE, so
+            # the file must state which was in force.
+            # NOTE: this parser has no ``ch`` in scope — it is shared across
+            # channels.  Stash the value only; ``_read_channel`` keys it by
+            # channel, which is correct because the preamble is parsed for a
+            # channel immediately before that channel's CURVe? is decoded.
+            try:
+                _w = fields.get("WFID")
+                self._last_wfid_value = (
+                    str(_w).strip().strip('"') if _w else None)
+            except Exception:
+                self._last_wfid_value = None
             pt_off = float(fields.get("PT_OFF", "nan"))
             is_signed     = fields.get("BN_FMT", "RI").upper().startswith("RI")
             is_big_endian = fields.get("BYT_OR", "MSB").upper().startswith("MSB")

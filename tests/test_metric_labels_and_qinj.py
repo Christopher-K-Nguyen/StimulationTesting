@@ -11,6 +11,7 @@ import sys
 
 import numpy as np
 import pytest
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 
 # ---- Q_inj auto-scale (pure) ---------------------------------------------
@@ -64,12 +65,14 @@ def test_metric_table_n_pulse_is_a_variable(_app):
     from stimtest.gui.widgets import MetricTable
     mt = MetricTable()
     mt.show_capture(_capture_with_pulses())
-    labels = [mt.item(r, 0).text() for r in range(mt.rowCount())
+    labels = [_mrt(mt, r)[0] for r in range(mt.rowCount())
               if mt.item(r, 0)]
-    # N_pulse rendered as an italic variable + subscript (HTML), NOT plain text.
-    assert "<i>N</i><sub>pulse</sub>" in labels
-    assert "Cumulative <i>N</i><sub>pulse</sub>" in labels
-    assert "N_pulse" not in labels                 # no plain-text version
+    # N_pulse rendered as an italic variable + subscript (HTML) in the SYMBOL
+    # column, NOT plain text.  (The joined label is "<term> <symbol> <unit>".)
+    assert any("<i>N</i><sub>pulse</sub>" in k for k in labels), labels
+    assert any(k.startswith("Number of pulses") for k in labels), labels
+    assert any(k.startswith("Cumulative pulses") for k in labels), labels
+    assert not any("N_pulse" in k for k in labels)   # no plain-text version
 
 
 def test_html_delegate_paints_theme_text_colour(_app):
@@ -163,44 +166,45 @@ def test_metric_table_units_in_label_and_small_access_voltage_scaled(_app):
     from stimtest.gui.widgets import MetricTable
     mt = MetricTable()
     mt.show_capture(_cap_with_return())
-    pairs = [(mt.item(r, 0).text(), mt.item(r, 1).text())
+    pairs = [(_mrt(mt, r)[0], _mrt(mt, r)[1])
              for r in range(mt.rowCount())
-             if mt.item(r, 0) and mt.item(r, 1)]
+             if mt.item(r, 0)]
     labels = [k for k, _ in pairs]
     by_label = dict(pairs)
 
-    # (1) Cumulative Q + Driving energy carry the UNIT in the label; the value
-    #     cell is unit-free.
-    assert "Cumulative Q [µC]" in labels
-    assert by_label["Cumulative Q [µC]"] == "504.46"
-    _de = [k for k in labels if k.startswith("Driving energy")]
-    assert _de == ["Driving energy [nJ]"]
-    assert by_label["Driving energy [nJ]"] == "342.62"
+    # (1) Cumulative Q + Driving energy put the UNIT in its own column (the
+    #     joined label ends with it); the value cell is unit-free.
+    _cq = [(k, v) for k, v in pairs if k.startswith("Cumulative charge")]
+    assert _cq and _cq[0][0].endswith("µC"), labels
+    assert _cq[0][1] == "504.46"
+    _de = [(k, v) for k, v in pairs if k.startswith("Driving energy")]
+    assert len(_de) == 1 and _de[0][0].endswith("nJ"), labels
+    assert _de[0][1] == "342.62"
 
     # (2) the tiny RETURN access voltage auto-scales to mV/µV (not 0.000);
     #     the normal active access voltage stays V.
     _ret_va = [(k, v) for k, v in pairs
-               if "return" in k and k.startswith("<i>V</i><sub>a</sub>")]
+               if "return" in k and "<i>V</i><sub>a</sub>" in k]
     assert _ret_va, labels
     (rk, rv) = _ret_va[0]
-    assert "[mV]" in rk or "[µV]" in rk
+    assert rk.endswith("mV") or rk.endswith("µV"), rk
     assert "0.000" not in rv                       # the whole point
     _act_va = [(k, v) for k, v in pairs
-               if k.startswith("<i>V</i><sub>a</sub>") and "return" not in k]
-    assert _act_va and "[V]" in _act_va[0][0]
+               if "<i>V</i><sub>a</sub>" in k and "return" not in k]
+    assert _act_va and _act_va[0][0].endswith("V"), _act_va
 
 
 def test_metric_table_has_charge_imbalance_and_total_driving_voltage(_app):
     from stimtest.gui.widgets import MetricTable
     mt = MetricTable()
     mt.show_capture(_cap_with_return())
-    labels = [mt.item(r, 0).text() for r in range(mt.rowCount()) if mt.item(r, 0)]
+    labels = [_mrt(mt, r)[0] for r in range(mt.rowCount()) if mt.item(r, 0)]
     # (#2) charge imbalance Q_net [nC] row present.
-    assert any(k.startswith("<i>Q</i><sub>net</sub>") and "[nC]" in k
+    assert any("<i>Q</i><sub>net</sub>" in k and k.endswith("nC")
                for k in labels), labels
     # (#29) with a reference electrode, the TOTAL driving voltage (V_mon, all
     # electrodes) is shown distinctly from the per-electrode active/return.
-    assert any("total [V]" in k and k.startswith("<i>V</i><sub>d</sub>")
+    assert any("total" in k and "<i>V</i><sub>d</sub>" in k
                for k in labels), labels
 
 

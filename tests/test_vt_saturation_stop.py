@@ -311,11 +311,23 @@ def test_plateau_below_band_escalates_toward_max():
     assert np.isfinite(run.max_q_inj)
 
 
-def test_single_noise_crossing_does_not_stop_the_ramp():
-    """2-CONSECUTIVE reached: a lone in-band capture (E_pol below the near edge
-    but noise-spiked over it ONCE) must NOT stop the ramp — the electrode is
-    still below the band, so it keeps climbing (exp_vt_max_anodal CH08 crept 34
-    captures because a single noise crossing at 774 µA falsely stopped it)."""
+def test_a_single_in_band_capture_stops_the_ramp():
+    """REACHED-AND-NOT-EXCEEDED STOPS IMMEDIATELY (operator, decisive: "once
+    only the potential limit is reached but not exceeded, stop and move on").
+
+    This REPLACES the earlier 2-consecutive confirmation.  That rule existed so
+    a lone noise spike near the window couldn't trip a false stop, but it cost
+    far more than it bought: the confirmation is a SECOND pulse train at an
+    amplitude already known to sit AT the water window, and on the AC bench run
+    (exp_vt_max_cathodal_test_ac) it was actively dangerous — CH08 reached the
+    band at 281.3 µA, its confirmation capture was misclassified ``capacitive``
+    so E_pol was cleared to NaN, and the ramp read "no polarization" as
+    "nowhere near the limit" and flung to 1000 µA, driving the electrode to
+    −1.64 V = 2.74× its window.
+
+    The accepted trade: a noise spike now stops the ramp EARLY, which
+    under-reports max(Q_inj).  That errs toward LESS stimulation, and unlike
+    the confirmation capture it cannot over-drive the electrode."""
     below = -0.55            # cathodic, near-edge is -0.58 (limit -0.6, tol 0.02)
     seq = iter([below, below, -0.59, below, below, below])   # ONE spike over -0.58
     r = _runner()
@@ -341,9 +353,50 @@ def test_single_noise_crossing_does_not_stop_the_ramp():
     r._seed_scope_scales = lambda *a, **k: None
     r._emit = lambda ev: None
     run = r._run_one_configuration(Configuration.monopolar(1))
-    # The single -0.59 spike (3rd real capture) must NOT have stopped the ramp:
-    # it kept going past that capture.
+    # The -0.59 capture is in-band (near edge -0.58) and NOT exceeded
+    # (far edge -0.62), so the ramp stops ON it — no confirmation capture.
     reached_caps = [c for c in run.captures
                     if c.status.reached_potential_limit]
-    # The lone spike alone never confirms (needs 2 consecutive) → no stop on it.
-    assert len(run.captures) > 4, [len(run.captures)]
+    assert reached_caps, "the in-band capture was never flagged reached"
+    assert run.captures[-1] is reached_caps[-1], (
+        "the ramp continued past a reached-and-not-exceeded capture")
+    assert not run.captures[-1].status.exceeded_potential_limit
+    # Stopping ON it means no further pulse train at that amplitude.
+    assert len(run.captures) == 3, [len(run.captures)]
+
+
+def _Cap(*, amp, epol=None):
+    """Minimal capture at ``amp`` µA.  ``epol=None`` models a BLIND capture —
+    ``compute_metrics`` CLEARS ``polarization_per_phase_v`` to an empty list
+    for a non-normal (open / broken / capacitive) response, so that is what a
+    misclassified capture actually looks like."""
+    from stimtest.waveforms import PulsePattern
+    c = Capture(index=0,
+                pattern=PulsePattern.biphasic(amplitude_ua=-abs(amp), polarity=-1))
+    c.metrics.polarization_per_phase_v = [] if epol is None else [epol, 0.0]
+    return c
+
+
+def test_a_blind_capture_never_licenses_a_bigger_step():
+    """An UNMEASURABLE capture must not read as "far from the limit".
+
+    ``_polarization_ratio`` skips non-finite phases and starts at 0.0, so a
+    capture whose E_pol was CLEARED (``compute_metrics`` blanks it for a
+    non-normal response, and that classification can misfire on one capture)
+    returned 0.0 — indistinguishable from a real measurement showing the
+    electrode nowhere near its window.  The growth cap then placed it in the
+    LOOSEST tier and the √-loosening granted ×6.  That is exactly how the AC
+    bench run's CH08 went 281 µA → 1000 µA and hit 2.74× the water window.
+
+    Proximity must fall back to the last REAL measurement instead.
+    """
+    r = _runner()
+    near = _Cap(amp=280.0, epol=-0.59)          # measured, hard against the band
+    blind = _Cap(amp=281.0)                     # E_pol cleared
+    assert r._latest_measured([near, blind]) is near
+    # The blind capture inherits the near capture's proximity, NOT 0.0.
+    assert r._worst_epol_ratio([near, blind]) > 0.9
+    assert r._worst_epol_ratio([near, blind]) == r._worst_epol_ratio([near])
+    # With no measured capture at all there is nothing to inherit.
+    assert r._latest_measured([blind]) is None
+    assert r._worst_epol_ratio([blind]) == 0.0

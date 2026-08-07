@@ -116,6 +116,12 @@ class BiasConnector(QtWidgets.QWidget):
         self.connected_dot.setToolTip(
             "Bias module session: gray = not connected, green = open + "
             "ready to receive commands.")
+        # The dot alone is unlabelled (operator: "there needs to be a label
+        # for this indicator") — a bare coloured circle says nothing about
+        # WHAT is or is not connected, and the detection dot right next to it
+        # has its own text, so an unlabelled second dot reads as ambiguous.
+        self.connected_label = QtWidgets.QLabel("Not connected")
+        self.connected_label.setToolTip(self.connected_dot.toolTip())
 
         # ---- simulate checkbox + port combobox + buttons ------------
         self.simulate_check = QtWidgets.QCheckBox("Simulate")
@@ -151,6 +157,7 @@ class BiasConnector(QtWidgets.QWidget):
         row1.addWidget(self.status_label, stretch=1)
         row1.addWidget(QtWidgets.QLabel("Open"))
         row1.addWidget(self.connected_dot)
+        row1.addWidget(self.connected_label)
         v.addLayout(row1)
 
         row2 = QtWidgets.QHBoxLayout()
@@ -385,6 +392,16 @@ class BiasConnector(QtWidgets.QWidget):
         self.port_combo.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self.connected_dot.setStyleSheet(_dot_qss(self._dot_on))
+        try:
+            _p = ""
+            if getattr(self, "simulate_check", None) is not None                     and self.simulate_check.isChecked():
+                _p = "simulator"
+            else:
+                _p = (self.port_combo.currentText() or "").strip()
+            self.connected_label.setText(
+                f"Connected — {_p}" if _p else "Connected")
+        except Exception:
+            self.connected_label.setText("Connected")
 
     def _apply_disconnected_ui(self) -> None:
         """Update the connector's widgets to the 'disconnected' look."""
@@ -395,6 +412,10 @@ class BiasConnector(QtWidgets.QWidget):
         self.port_combo.setEnabled(not sim)
         self.refresh_btn.setEnabled(not sim)
         self.connected_dot.setStyleSheet(_dot_qss(self._dot_off))
+        try:
+            self.connected_label.setText("Not connected")
+        except Exception:
+            pass
 
     # ============================================================ helpers
     @staticmethod

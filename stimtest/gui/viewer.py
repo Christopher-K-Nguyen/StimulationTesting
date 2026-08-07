@@ -653,6 +653,14 @@ class _PlotViewBar(QtWidgets.QWidget):
                                    "dashed) on the capture plot.")
         self.dvdt_check.toggled.connect(lambda *_: self._emit())
         lay.addWidget(self.dvdt_check)
+        # Ideal / expected current overlay (operator request).
+        self.ideal_check = QtWidgets.QCheckBox("Ideal current")
+        self.ideal_check.setToolTip(
+            "Overlay the PROGRAMMED current waveform (dashed) on the measured "
+            "I_mon.  I_mon carries switching spikes, ringing and turn-on "
+            "skew; the ideal trace is what the source was told to deliver.")
+        self.ideal_check.toggled.connect(lambda *_: self._emit())
+        lay.addWidget(self.ideal_check)
         self.recip_check = QtWidgets.QCheckBox("1/(dV/dt)")
         self.recip_check.setToolTip("Overlay the reciprocal derivative "
                                     "1/(dV/dt) (normalized, dotted).")
@@ -751,6 +759,10 @@ class _PlotViewBar(QtWidgets.QWidget):
     def reciprocal_derivative(self) -> bool:
         return self.rdc_check.isChecked()
 
+    def ideal_current(self) -> bool:
+        """True when the ideal/expected current overlay is requested."""
+        return bool(self.ideal_check.isChecked())
+
     def deriv_overlays(self) -> set:
         s = set()
         if self.dvdt_check.isChecked():
@@ -780,6 +792,7 @@ class _PlotViewBar(QtWidgets.QWidget):
                 "charge_transfer": self.charge_transfer(),
                 "reciprocal_derivative": self.reciprocal_derivative(),
                 "dvdt": self.dvdt_check.isChecked(),
+                "ideal_current": self.ideal_check.isChecked(),
                 "recip": self.recip_check.isChecked(),
                 "filter_spikes": self.filter_spikes(),
                 "filter_window": self.filter_window_us()}
@@ -801,6 +814,8 @@ class _PlotViewBar(QtWidgets.QWidget):
             self.ct_check.setChecked(bool(p.get("charge_transfer", False)))
             self.rdc_check.setChecked(bool(p.get("reciprocal_derivative", False)))
             self.dvdt_check.setChecked(bool(p.get("dvdt", False)))
+            self.ideal_check.setChecked(
+                bool(p.get("ideal_current", False)))
             self.recip_check.setChecked(bool(p.get("recip", False)))
             self.filter_win.setValue(float(p.get("filter_window", 4.0)))
             self.filter_check.setChecked(bool(p.get("filter_spikes", False)))
@@ -1667,6 +1682,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                          show_grid=self._show_grid,
                          density=self.view_bar.density(),
                          deriv_overlays=self.view_bar.deriv_overlays(),
+                         show_ideal_current=self.view_bar.ideal_current(),
                          potential_axis=True, return_axis=True)
         self._finish_render()
         self._set_metric_table(_capture_metric_rows(cap, run),

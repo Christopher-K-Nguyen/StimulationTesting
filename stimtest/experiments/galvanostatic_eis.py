@@ -319,7 +319,7 @@ class GalvanostaticEISExperiment(ExperimentRunner):
                 self.load_zero_unused_channels(pattern, config)
                 self.commit_loaded_channels(config)
                 self._layout_for_frequency(actual_f, cycles)
-                self.stim.start_all()
+                self.start_pulsing()
 
                 # SETTLE (Gamry startup-transient exclusion): wait
                 # ``settle_cycles`` for the interface to reach steady state

@@ -236,7 +236,7 @@ class LongPulsingExperiment(ExperimentRunner):
             # PS_StartStimAllChannels — single-channel start fails with
             # WRONG-TRIGGER-MODE on default-mode PlexStim devices.
             # Every pulse channel + the unused-zero channels fire together.
-            self.stim.start_all()
+            self.start_pulsing()
         except Exception as e:
             self._emit(ExperimentEvent(kind="aborted", session=self.session, run=run,
                                        message=f"Stim load failed: {e}"))
@@ -333,7 +333,7 @@ class LongPulsingExperiment(ExperimentRunner):
                 # every pulsed channel).  Exclude the paused wall-clock from the
                 # pulsing-time anchor so the pause doesn't count against
                 # ``duration_s`` (same compensation as the char window below).
-                if not self.wait_if_paused(restart=lambda: self.stim.start_all()):
+                if not self.wait_if_paused(restart=lambda: self.start_pulsing()):
                     break
                 if self._last_pause_duration_s > 0:
                     t_start += self._last_pause_duration_s
@@ -415,7 +415,7 @@ class LongPulsingExperiment(ExperimentRunner):
                     # MONOPOLAR commit (config.returns empty) → ONE
                     # PS_LoadAllChannels; multipolar no-op.
                     self.commit_loaded_channels(config)
-                    self.stim.start_all()  # PS_StartStimAllChannels
+                    self.start_pulsing()  # PS_StartStimAllChannels
                     # Restore default scope view — the inline VT
                     # called ``apply_default_scope_view`` which wiped
                     # the adapt history and may have changed scales.

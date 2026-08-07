@@ -313,6 +313,23 @@ class ScopeAcquisition:
     sample_period_us: float = 0.0
     record_length: int = 0
     trigger_position_us: float = 0.0
+    #: RAW, PRE-CONVERSION acquisition — the instrument's own ADC codes plus
+    #: the preamble that decodes them (operator: "store the raw waveform data
+    #: before conversion and scaling").
+    #:
+    #: ``channels`` above is already twice-derived: codes -> volts (via
+    #: YMULT/YOFF/YZERO) -> engineering units (via the stimulator preset).  If
+    #: any link in that chain is wrong, the saved file cannot show it and the
+    #: only recourse is inference from the end result — which is exactly the
+    #: position the I_mon scaling investigation got stuck in.  Keeping the
+    #: codes plus the decode constants makes the whole chain re-derivable
+    #: offline under any assumption.
+    #:
+    #: ``{channel_name: {"codes": int8 array, "ymult", "yoff", "yzero",
+    #: "xincr", "xzero", "scale_v_per_div", "position_div", "coupling",
+    #: "probe_gain", "bit_nr", "byt_nr", "bn_fmt"}}``.  Empty when the driver
+    #: cannot supply codes (simulator, PicoScope) — never assume it is present.
+    raw: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 class Oscilloscope(ABC):

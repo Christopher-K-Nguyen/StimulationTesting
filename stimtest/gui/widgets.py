@@ -1603,8 +1603,53 @@ class ScopePlot(QtWidgets.QWidget):
         # (~9 px half-size) without the text touching it.
         gap_x = 0.004 * x_span      # small horizontal offset from the glyph
         gap_y = 0.009 * y_span      # small vertical offset from the glyph
-        line_h = 0.052 * y_span     # ~one text line (data coords, estimate)
-        char_w = 0.0085 * x_span    # ~one char wide (data coords, estimate)
+        # Label size in DATA units, MEASURED — not a fixed fraction of the
+        # view span.  A tag's size in data units is (its size in PIXELS) ×
+        # (data units per pixel); the old ``0.052 * y_span`` / ``0.0085 *
+        # x_span`` bakes in one particular widget pixel size, so every Height
+        # +/− press, window resize or splitter drag silently rescaled the
+        # boxes the overlap test uses — and the scorer then approved
+        # placements that render on top of each other.  ``viewPixelSize()``
+        # gives the real conversion and ``QFontMetricsF`` the real text
+        # extent, including per-string width (an ``R_a`` line is not the same
+        # width as a ``V_a`` line).
+        try:
+            _vb0 = self._plot.getViewBox()
+            _pxw, _pxh = (float(v) for v in _vb0.viewPixelSize())
+        except Exception:
+            _pxw = _pxh = 0.0
+        if not (_pxw > 0 and _pxh > 0):        # not laid out yet
+            _pxw, _pxh = x_span / 900.0, y_span / 380.0
+        try:
+            from PyQt6.QtGui import QFont as _QF, QFontMetricsF as _QFM
+            _mf = _QF()
+            _mf.setPointSizeF(float(self._MARKER_PT))
+            _fm = _QFM(_mf)
+            _fh = float(_fm.height()) or 16.0
+            line_h = _fh * _pxh
+            # CAP the advance at plausible typography.  Some Qt font backends
+            # (notably the offscreen QPA with only a fallback family) report a
+            # DEGENERATE metric — a digit advancing a full em, i.e. as wide as
+            # the line is tall — which inflates every box ~2× and makes the
+            # scorer see collisions that do not exist.  A real proportional
+            # face averages well under 0.6 em across these strings, so clamp
+            # to that; on a correct backend the measured value is smaller and
+            # wins unchanged.
+            def _adv(_s):
+                _s = str(_s)
+                _m = float(_fm.horizontalAdvance(_s))
+                return min(_m, 0.60 * _fh * max(len(_s), 1))
+
+            char_w = _adv("0") * _pxw
+
+            def _text_w(_s):
+                return _adv(_s) * _pxw
+        except Exception:                      # pragma: no cover - defensive
+            line_h = 0.052 * y_span
+            char_w = 0.0085 * x_span
+
+            def _text_w(_s):
+                return len(str(_s)) * char_w
 
         # Traces the labels must avoid.  The markers sit on the LEFT
         # (voltage) axis — but I_mon lives on the RIGHT axis and shares the
@@ -1706,7 +1751,10 @@ class ScopePlot(QtWidgets.QWidget):
         # How many label-height/-width tiers a tag may escalate to clear a
         # cluster before it just accepts the least-bad spot (caps how far a
         # tag can fly from its glyph).
-        _MAX_LABEL_TIER = 3
+        # Enough outward tiers that a dense cluster can escalate to genuinely
+        # free space.  With label-label overlap now prohibitive, running out
+        # of tiers is what forces a residual overlap.
+        _MAX_LABEL_TIER = 8
         plan = [None] * len(recs)
         placed_boxes = []   # (left, right, bottom, top) of placed tags
         for i in sorted(range(len(recs)), key=lambda i: recs[i][0]):
@@ -1731,7 +1779,8 @@ class ScopePlot(QtWidgets.QWidget):
                 _plain_lines = str(_text).split("\n")
             n_lines = max(1, len(_plain_lines))
             lab_h = n_lines * line_h
-            lab_w = max((len(s) for s in _plain_lines), default=8) * char_w
+            lab_w = max((_text_w(s) for s in _plain_lines),
+                        default=8 * char_w)
             best = None
             best_score = None
             # TIER STACKING: when the signal is small (low current) every
@@ -1764,21 +1813,24 @@ class ScopePlot(QtWidgets.QWidget):
                     # label is being clipped by the left axis" — its left
                     # placement clipped only a few px, so the old purely-
                     # graded 30× penalty was tiny and lost to the trace term.)
-                    if bl < x0: score += 8.0 + (x0 - bl) / x_span * 30.0
-                    if br > x1: score += 8.0 + (br - x1) / x_span * 30.0
-                    if bb < y0: score += 8.0 + (y0 - bb) / y_span * 30.0
-                    if bt > y1: score += 8.0 + (bt - y1) / y_span * 30.0
+                    if bl < x0: score += 200.0 + (x0 - bl) / x_span * 30.0
+                    if br > x1: score += 200.0 + (br - x1) / x_span * 30.0
+                    if bb < y0: score += 200.0 + (y0 - bb) / y_span * 30.0
+                    if bt > y1: score += 200.0 + (bt - y1) / y_span * 30.0
                     for pl, pr, pb, pt in placed_boxes:
                         ox = min(br, pr) - max(bl, pl)
                         oy = min(bt, pt) - max(bb, pb)
                         if ox > 0 and oy > 0:
-                            # Flat base RAISED (1.0 → 6.0) so ANY label-label
-                            # overlap costs more than a proximity tier-step —
-                            # else the quadratic proximity pull could make two
-                            # close tags tolerate a small overlap instead of
-                            # escalating apart.  Readability (non-overlap)
-                            # beats proximity for close markers.
-                            score += 3.0 + (ox / x_span) * (oy / y_span) * 90.0
+                            # The three avoidance terms are in DIRECT
+                            # competition, so their flat bases define a strict
+                            # priority.  It used to be inverted: overlap cost
+                            # 3.0 while touching the trace cost 9.0+, so a tag
+                            # preferred to sit on ANOTHER LABEL rather than
+                            # cross a line.  Two stacked labels are
+                            # unreadable; a label crossing a line still reads.
+                            # Order is now  off-screen (200) > label-label
+                            # overlap (60) > trace (9+graded).
+                            score += 60.0 + (ox / x_span) * (oy / y_span) * 90.0
                     # GRADED trace-intersection penalty — the more of the
                     # label box over the waveform, the worse, so the scorer
                     # picks the side that clips the trace LEAST.  This is what
@@ -1800,6 +1852,17 @@ class ScopePlot(QtWidgets.QWidget):
                         # overlap the traces during the interpulse").
                         score += (_tov / y_span) * 70.0
                         if _tov > 0.15 * lab_h:
+                            # Raised 9.0 → 40.0 alongside the label-overlap
+                            # base (60.0).  Both terms must be STRONG: the
+                            # operator has separately complained about labels
+                            # on the trace AND labels on each other, so the
+                            # scorer has to exhaust the tiers before accepting
+                            # either.  The ORDER still prefers crossing a line
+                            # over stacking two labels (60 > 40), because a
+                            # crossed line still reads and stacked text does
+                            # not — but 40 keeps a tag off the waveform
+                            # whenever any free spot exists at all.
+                            score += 31.0
                             # Flat base that DOMINATES the near-marker quadratic
                             # proximity pull (peaks ~34× a full-span gap²) so a
                             # label never sits ON a trace merely to be closer —
@@ -2919,6 +2982,123 @@ def _fmt_voltage_list_auto(vlist):
     return ", ".join(f"{float(x) * scale:.{dec}f}" for x in vlist), unit
 
 
+# Spelled-out term for each metric SYMBOL, keyed by the symbol's plain text
+# (``<i>Q</i><sub>ph</sub>`` → "Qph"); the base letter alone is the fallback,
+# so ``φ_Vmon`` / ``φ_Eret`` all resolve through "φ".  Operator: "Have metric
+# be the spelled out term, symbol for variables, value, and unit."
+_METRIC_TERMS = {
+    "Npulse": "Number of pulses",
+    "Istim": "Stimulus current",
+    "Jstim": "Stimulus current density",
+    "Qph": "Charge per phase",
+    "Qinj": "Charge injection",
+    "Qnet": "Net charge (imbalance)",
+    "Vd": "Driving voltage",
+    "Zd": "Driving impedance",
+    "Cd": "Driving capacitance",
+    "Cdl": "Double-layer capacitance",
+    "Ceff": "Effective capacitance",
+    "Va": "Access voltage",
+    "Ra": "Access resistance",
+    "Vaccess": "Access voltage",
+    "Raccess": "Access resistance",
+    "Epol": "Electrode polarization",
+    "Emc": "Max cathodic polarization",
+    "Ema": "Max anodic polarization",
+    "Eio": "Interface polarization amplitude",
+    "Eoff": "Interface offset potential",
+    "Eip": "Interpulse potential",
+    "R": "Fitted resistance",
+    "C": "Fitted capacitance",
+    "f": "Pulse frequency",
+    "φ": "Phase angle",
+    "τ": "Time constant",
+}
+
+# Rows whose label is a PHRASE rather than a leading symbol.  Maps the plain
+# label → (spelled-out term, symbol HTML).  Anything absent keeps its label as
+# the term with an empty symbol, so an unconverted row still renders sensibly.
+_METRIC_PHRASES = {
+    "Cumulative Npulse": ("Cumulative pulses", "Σ<i>N</i><sub>pulse</sub>"),
+    "Cumulative Q": ("Cumulative charge", "Σ<i>Q</i>"),
+    "τ (R∥C)": ("Time constant (R∥C fit)", "<i>τ</i>"),
+    "Capture #": ("Capture number", ""),
+    "Faradaic charge fraction": ("Faradaic charge fraction", ""),
+    "Faradaic onset": ("Faradaic onset", ""),
+    "Driving energy": ("Driving energy", ""),
+    "Pulse rate": ("Pulse rate", ""),
+    "Pulse period": ("Pulse period", ""),
+    "Pulse frequency": ("Pulse frequency", "<i>f</i>"),
+    "Limit reached?": ("Potential limit reached", ""),
+    "Limit exceeded?": ("Potential limit exceeded", ""),
+    "Compliance exceeded?": ("Voltage compliance exceeded", ""),
+    "Response": ("Response class", ""),
+}
+
+_UNIT_RE = re.compile(r"\s*\[([^\[\]]*)\]\s*$")
+_SYM_RE = re.compile(r"^(<i>(.*?)</i>(?:<sub>(.*?)</sub>)?)(.*)$", re.S)
+_VALUE_UNIT_RE = re.compile(r"^([-+]?[\d.,]+(?:[eE][-+]?\d+)?)\s+(\S+)$")
+
+
+def _metric_row_parts(label: str, value: str):
+    """Split a legacy ``"<symbol> qualifier [unit]"`` row into the four
+    display columns ``(term, symbol, value, unit)``.
+
+    Doing the split HERE, rather than rewriting all ~37 row-builder sites,
+    keeps one place to reason about and lets every view (normal, bad-response,
+    KHFAC) gain the columns at once.  Unknown labels degrade gracefully: the
+    label becomes the term and the symbol is blank.
+    """
+    lab = str(label).strip()
+    val = str(value)
+    unit = ""
+    m = _UNIT_RE.search(lab)
+    if m:
+        unit = m.group(1)
+        lab = lab[:m.start()].rstrip()
+    if not unit:
+        # A value carrying its own unit ("5.000 ms") — lift it into the unit
+        # column so it lines up with every other row.
+        mv = _VALUE_UNIT_RE.match(val.strip())
+        # ...but thousands are SPACE-grouped ("10 486", see the
+        # number-formatting-thousands-space convention), so a trailing NUMERIC
+        # group is a digit group, not a unit.
+        if mv and not mv.group(2).replace(".", "").replace(",", "").isdigit():
+            val, unit = mv.group(1), mv.group(2)
+    plain = re.sub(r"<[^>]+>", "", lab).strip()
+    if plain in _METRIC_PHRASES:
+        term, sym = _METRIC_PHRASES[plain]
+        return term, sym, val, unit
+    ms = _SYM_RE.match(lab)
+    if ms and ms.group(1):
+        sym = ms.group(1)
+        base = (ms.group(2) or "").strip()
+        sub = (ms.group(3) or "").strip()
+        rest = re.sub(r"<[^>]+>", "", ms.group(4) or "").strip()
+        term = _METRIC_TERMS.get(base + sub) or _METRIC_TERMS.get(base) or ""
+        if rest:
+            term = f"{term} ({rest})" if term else rest
+        return term or plain, sym, val, unit
+    return lab, "", val, unit
+
+
+def _signed(value: float, decimals: int = 3) -> str:
+    """Signed value, but NO sign on an exact zero (operator: "I do not want a
+    unit +/- displayed with 0").  A leading ``+`` marks a genuine anodic
+    residual; ``+0.000`` just reads as noise on a perfectly balanced pattern.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(v):
+        return f"{v}"
+    txt = f"{v:.{decimals}f}"
+    if float(txt) == 0.0:                 # also catches -0.000 / +0.000
+        return f"{abs(v):.{decimals}f}"
+    return f"{v:+.{decimals}f}"
+
+
 def _pulse_rate_period_rows(pattern) -> list:
     """(label, value) rows for the pulse RATE + PERIOD (operator: "have
     pulse rate and pulse period on the metric measurements").
@@ -2935,14 +3115,32 @@ def _pulse_rate_period_rows(pattern) -> list:
     if not (rate > 0):
         return []
     period_s = 1.0 / rate
+    # The unit goes in the LABEL's brackets so the 4-column table can lift it
+    # into its own column — carrying it on the VALUE put "5.000 ms" in the
+    # value cell while every other row's unit sat in the unit column
+    # (operator: "Pulse period shows the unit on the value").
     if period_s < 1e-3:
-        per = f"{period_s * 1e6:.1f} µs"
+        per, per_u = f"{period_s * 1e6:.1f}", "µs"
     elif period_s < 1.0:
-        per = f"{period_s * 1e3:.3f} ms"
+        per, per_u = f"{period_s * 1e3:.3f}", "ms"
     else:
-        per = f"{period_s:.3f} s"
+        per, per_u = f"{period_s:.3f}", "s"
     return [("Pulse rate [pps]", f"{rate:g}"),
-            ("Pulse period", per)]
+            (f"Pulse period [{per_u}]", per)]
+
+
+def metric_row_text(table, row) -> tuple:
+    """``(label, value)`` for one :class:`MetricTable` row.
+
+    ``label`` re-joins the term / symbol / unit columns, so tooling and tests
+    can ask "is there a Z_d row and what does it read?" without depending on
+    the column layout.  Added when the table split from ``Metric | Value``
+    into ``Metric | Symbol | Value | Unit``."""
+    def _txt(col):
+        it = table.item(row, col)
+        return it.text() if it is not None else ""
+    label = " ".join(t for t in (_txt(0), _txt(1), _txt(3)) if t)
+    return label, _txt(2)
 
 
 class MetricTable(QtWidgets.QTableWidget):
@@ -2956,9 +3154,18 @@ class MetricTable(QtWidgets.QTableWidget):
     """
 
     def __init__(self, parent=None):
-        super().__init__(0, 2, parent)
-        self.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.horizontalHeader().setStretchLastSection(True)
+        # FOUR columns (operator: "Have metric be the spelled out term, symbol
+        # for variables, value, and unit").  The legacy 2-tuple rows are split
+        # by _metric_row_parts, so every view gains the columns at once.
+        super().__init__(0, 4, parent)
+        self.setHorizontalHeaderLabels(["Metric", "Symbol", "Value", "Unit"])
+        _hh = self.horizontalHeader()
+        _hh.setStretchLastSection(False)
+        _hh.setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for _c in (1, 2, 3):
+            _hh.setSectionResizeMode(
+                _c, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setItemDelegate(_HtmlItemDelegate(self))
@@ -3080,8 +3287,9 @@ class MetricTable(QtWidgets.QTableWidget):
                               "yes" if c.status.voltage_compliance else "no"))
             self.setRowCount(len(_sin_rows))
             for _i, (_k, _v) in enumerate(_sin_rows):
-                self.setItem(_i, 0, QtWidgets.QTableWidgetItem(_k))
-                self.setItem(_i, 1, QtWidgets.QTableWidgetItem(_v))
+                for _c, _cell in enumerate(_metric_row_parts(_k, _v)):
+                    self.setItem(_i, _c,
+                                 QtWidgets.QTableWidgetItem(_cell))
             self.resizeRowsToContents()
             return
         _rclass = getattr(m, "response_class", "normal") or "normal"
@@ -3141,8 +3349,9 @@ class MetricTable(QtWidgets.QTableWidget):
                               "yes" if c.status.voltage_compliance else "no"))
             self.setRowCount(len(_bad_rows))
             for _i, (_k, _v) in enumerate(_bad_rows):
-                self.setItem(_i, 0, QtWidgets.QTableWidgetItem(_k))
-                self.setItem(_i, 1, QtWidgets.QTableWidgetItem(_v))
+                for _c, _cell in enumerate(_metric_row_parts(_k, _v)):
+                    self.setItem(_i, _c,
+                                 QtWidgets.QTableWidgetItem(_cell))
             self.resizeRowsToContents()
             return
         rows = [
@@ -3150,13 +3359,15 @@ class MetricTable(QtWidgets.QTableWidget):
             (f"{V('I','stim')} [µA]",
                 f"{c.pattern.excitation_phase.amplitude_ua:.2f}"),
             (f"{V('Q','ph')} [nC]", f"{m.charge_per_phase_nc:.2f}"),
+            (f"{V('Q','inj')} [mC/cm<sup>2</sup>]",
+                f"{m.charge_injection_mc_per_cm2:.3f}"),
             # Charge imbalance Q_net = signed sum of the phase charges (0 for a
             # perfectly balanced biphasic; non-zero = the residual DC charge)
             # (operator: "add charge imbalance (nC) in the metrics").  Ideal
-            # pattern charge (gotcha #108).
-            (f"{V('Q','net')} [nC]", f"{c.pattern.net_charge_nc:+.3f}"),
-            (f"{V('Q','inj')} [mC/cm<sup>2</sup>]",
-                f"{m.charge_injection_mc_per_cm2:.3f}"),
+            # pattern charge (gotcha #108).  Ordered AFTER Q_inj per operator
+            # ("move Qnet below Qinj") — Q_ph → Q_inj are the headline charge
+            # numbers; Q_net is the balance CHECK on them.
+            (f"{V('Q','net')} [nC]", _signed(c.pattern.net_charge_nc, 3)),
         ]
         rows += _pulse_rate_period_rows(c.pattern)
         # Cumulative pulse count + cumulative cathodic charge delivered to the
@@ -3304,8 +3515,8 @@ class MetricTable(QtWidgets.QTableWidget):
         rows.append(("Compliance exceeded?", "yes" if c.status.voltage_compliance else "no"))
         self.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):
-            self.setItem(i, 0, QtWidgets.QTableWidgetItem(k))
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(v))
+            for _c, _cell in enumerate(_metric_row_parts(k, v)):
+                self.setItem(i, _c, QtWidgets.QTableWidgetItem(_cell))
         # Grow each row to fit its (now word-wrapped) content so the
         # multi-value per-phase cells show every line.
         self.resizeRowsToContents()

@@ -111,7 +111,7 @@ class ShortPulsingExperiment(ExperimentRunner):
             # WRONG-TRIGGER-MODE on default-mode PlexStim devices.
             # Loaded channels (active + unused-zero) fire together;
             # zero channels deliver no current.
-            self.stim.start_all()
+            self.start_pulsing()
         except Exception as e:
             self._emit(ExperimentEvent(kind="aborted", session=self.session, run=run,
                                        message=f"Stim load failed: {e}"))
@@ -194,7 +194,7 @@ class ShortPulsingExperiment(ExperimentRunner):
                 # restart pulsing (start_all resumes the RETAINED pattern).
                 # Exclude the paused wall-clock from the duration + cadence so
                 # a pause doesn't eat into the run ("continue where it left off").
-                if not self.wait_if_paused(restart=lambda: self.stim.start_all()):
+                if not self.wait_if_paused(restart=lambda: self.start_pulsing()):
                     break
                 if self._last_pause_duration_s > 0:
                     t_start += self._last_pause_duration_s

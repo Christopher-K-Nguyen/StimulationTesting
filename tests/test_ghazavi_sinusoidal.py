@@ -18,6 +18,7 @@ from stimtest.metrics import (compute_metrics, ghazavi_polarization,
                               is_continuous_sinusoidal)
 from stimtest.session import Capture
 from stimtest.waveforms import Phase, PulsePattern, SHAPE_SINUSOIDAL
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 
 def _sine_pattern(amp_ua=-100.0, width_us=100.0, rate_hz=5000.0):
@@ -281,7 +282,7 @@ def test_metric_table_shows_active_and_return_rows():
                   v_mon_v=v_mon, i_mon_ua=i, e_ret_v=e_ret)
     cap.metrics = compute_metrics(cap, surface_area_um2=1000.0)
     tbl = MetricTable(); tbl.show_capture(cap)
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount()) if tbl.item(r, 0)]
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount()) if tbl.item(r, 0)]
     joined = " ".join(keys)
     # E_mc appears for BOTH active and return (qualified).
     assert any("mc" in k and "active" in k for k in keys), keys

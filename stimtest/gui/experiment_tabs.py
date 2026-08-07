@@ -1701,6 +1701,7 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         if (duration_s is None or duration_s == 0) and int(total_steps) > 0:
             self._run_progress_step_mode = True
             self._run_progress_total_steps = int(total_steps)
+            self._run_progress_done_keys = set()
             self._run_progress_step_label = f"Channel 0 / {int(total_steps)}"
             self._run_progress_t0 = _t.monotonic()
             self._run_progress_duration_s = None
@@ -4532,6 +4533,26 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             self.multichan_scope.mark_completed(key)
         except Exception:
             pass
+        # Advance the channel-step progress bar from COMPLETED events rather
+        # than from the in-progress ``progress`` event.  The latter reports
+        # "channel N of M starting", so the bar can only ever show N-1 done —
+        # and no progress event fires after the LAST channel finishes, which
+        # left the bar reading "15 / 16 channels" with all 16 ticked ✓
+        # (operator).  Counting completions is both correct mid-run and
+        # reaches M when the sweep really is finished.  Keyed by a SET so the
+        # end-of-run re-mark in ``_on_finished`` cannot double-count.
+        if getattr(self, "_run_progress_step_mode", False):
+            try:
+                if not hasattr(self, "_run_progress_done_keys"):
+                    self._run_progress_done_keys = set()
+                self._run_progress_done_keys.add(str(key))
+                tot = max(1, int(getattr(self, "_run_progress_total_steps", 0)
+                                 or 1))
+                done = min(len(self._run_progress_done_keys), tot)
+                self.run_progress_bar.setValue(int(round(done / tot * 100)))
+                self.run_progress_bar.setFormat(f"{done} / {tot} channels")
+            except Exception:
+                pass
 
     def _capture_key(self, channel: int):
         """Stable list key for the live capture event.
@@ -4627,7 +4648,11 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             try:
                 tot = max(1, int(getattr(self, "_run_progress_total_steps", 0)
                                  or total))
-                done = max(0, min(step - 1, tot))
+                # Never regress below what ``run_completed`` has already
+                # counted — the two sources race and completions are the
+                # authority.
+                _done_evt = len(getattr(self, "_run_progress_done_keys", ()) or ())
+                done = max(0, min(step - 1, tot), min(_done_evt, tot))
                 self.run_progress_bar.setValue(int(round(done / tot * 100)))
                 self.run_progress_bar.setFormat(f"{done} / {tot} channels")
                 self._run_progress_step_label = (
@@ -4745,6 +4770,27 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             self._worker_thread.quit()
             self._worker_thread.wait()
             self._worker_thread = None
+        # PS_CloseAllStim — the third step of the operator's Stop sequence
+        # (PS_StopStimAllChannels -> PS_AbortAll -> PS_CloseAllStim).  Deferred
+        # to HERE, after ``_worker_thread.wait()`` above, so the runner thread
+        # is provably dead and its last DLL call cannot race the close.  Only
+        # a user STOP sets the flag; a normal end-of-run leaves the device
+        # open.  The next Start re-opens with PS_InitAllStim
+        # (``_reinit_stim_for_new_run``), and because the device is genuinely
+        # closed its ``_is_open`` guard skips the internal close — so Start
+        # issues exactly ONE PS_InitAllStim, as the operator specified.
+        if getattr(self, "_stim_needs_close_after_run", False):
+            self._stim_needs_close_after_run = False
+            try:
+                if getattr(self, "_stim", None) is not None:
+                    self._stim.close()
+                    self.log_pane.log(
+                        "Stimulator closed (PS_CloseAllStim) — the next Start "
+                        "reinitializes it (PS_InitAllStim).")
+            except Exception as _e:
+                self.log_pane.log(
+                    f"Stop: stimulator close failed: "
+                    f"{type(_e).__name__}: {_e}")
         self._worker = None
         self._runner = None
         # ---- User-spec: keep the stimulator + oscilloscope CONNECTED
@@ -4939,6 +4985,14 @@ class _BaseExperimentTab(QtWidgets.QWidget):
         if self._runner is not None:
             self._runner.abort()
             self.log_pane.log("Stop requested.")
+            # Operator lifecycle: "Pressing Stop should: PS_StopStimAllChannels,
+            # PS_AbortAll, PS_CloseAllStim."  The first two happen below,
+            # here on the GUI thread; the CLOSE is DEFERRED to _on_finished,
+            # which runs after ``_worker_thread.wait()``.  Closing now would
+            # land PS_CloseAllStim while the runner still has a DLL call in
+            # flight — the ps_close_all_stim cascade that HEAP-CORRUPTS the
+            # vendor DLL (gotcha #29c).
+            self._stim_needs_close_after_run = True
             # ---- User-spec: HALT the pulse but keep the device
             # CONNECTED.  The operator wants the stimulator +
             # oscilloscope to stay live between experiments; only the
@@ -4952,16 +5006,41 @@ class _BaseExperimentTab(QtWidgets.QWidget):
             # mode.  The ``_dll_lock`` re-entrant mutex serializes us
             # against any in-flight runner DLL call, so we wait for the
             # runner to release the lock before we touch the device.
-            try:
-                if getattr(self, "_stim", None) is not None:
-                    self._stim.abort_all()
+            # ⚠ STOP THE PROGRAM **AND** ABORT THE PULSE — in that order.
+            #
+            # ``abort_all`` (PS_AbortAll) alone is NOT enough: it kills the
+            # pulse in flight, but the runners arm channels with
+            # ``set_repetitions(ch, 0)`` = INFINITE repetitions, so the channel
+            # program is still free-running and the train simply continues with
+            # the next pulse.  Operator: "stopping/aborting did not stop the
+            # pulsing."
+            #
+            # ``stop_all`` (PS_StopStimAllChannels) is what actually halts the
+            # program — it is what every runner's ``finally`` and the Pause
+            # path use.  Do it FIRST so no further pulses are scheduled, then
+            # abort to kill anything already in flight.  Both are idempotent
+            # (the driver's ``_is_running`` guard), and each is guarded
+            # separately so a failure of one still attempts the other.
+            _stim = getattr(self, "_stim", None)
+            if _stim is not None:
+                try:
+                    from ..experiments.base import stop_all_forced
+                    stop_all_forced(self._stim)
                     self.log_pane.log(
-                        "Stimulator aborted (PS_AbortAll) — device stays "
+                        "Stimulation stopped (PS_StopStimAllChannels).")
+                except Exception as _e:
+                    self.log_pane.log(
+                        f"Stimulator stop_all failed (trying abort): "
+                        f"{type(_e).__name__}: {_e}")
+                try:
+                    _stim.abort_all()
+                    self.log_pane.log(
+                        "In-flight pulse aborted (PS_AbortAll) — device stays "
                         "connected; next Start will reinitialize it.")
-            except Exception as _e:
-                self.log_pane.log(
-                    f"Stimulator abort_all failed (continuing): "
-                    f"{type(_e).__name__}: {_e}")
+                except Exception as _e:
+                    self.log_pane.log(
+                        f"Stimulator abort_all failed (continuing): "
+                        f"{type(_e).__name__}: {_e}")
 
     def pause_toggled(self, paused: bool):
         """Toggle pulsing on/off without ending the run.
@@ -4979,6 +5058,42 @@ class _BaseExperimentTab(QtWidgets.QWidget):
                 pause_fn(paused)
             except Exception as e:
                 self.log_pane.log(f"Pause failed: {e}")
+        # ---- HALT THE DEVICE NOW (operator: "when stopping an experiment,
+        # all pulsing must stop … that includes pausing").
+        #
+        # ``runner.pause(True)`` only sets a FLAG.  The worker thread does not
+        # act on it until it reaches its next ``wait_if_paused`` checkpoint,
+        # and those sit between captures — so with a slow averager settle the
+        # electrode could keep receiving pulses for SECONDS after the operator
+        # pressed Pause.  Pause has to mean "stop stimulating", immediately,
+        # exactly like Stop does.
+        #
+        # ⚠ STOP, do NOT ABORT (operator: "pause should not abort, it should
+        # stop the pulsing so that resuming will start the pulsing").
+        #
+        # ``stop_all`` (PS_StopStimAllChannels) is the same call the runner's
+        # own ``wait_if_paused`` makes, and it is the halt that ``start_all``
+        # cleanly reverses — the PlexStim RETAINS each channel's loaded
+        # pattern, period and repetitions across a stop/start, so resume needs
+        # no reload.  ``abort_all`` (PS_AbortAll) is reserved for ENDING a run
+        # (see ``stop_clicked``); using it here would make Pause a
+        # tear-down rather than a suspend.
+        #
+        # ``stop_all`` is idempotent (the driver's ``_is_running`` guard), so
+        # the worker calling it again at its own checkpoint is a no-op.
+        if paused:
+            try:
+                if getattr(self, "_stim", None) is not None:
+                    from ..experiments.base import stop_all_forced
+                    stop_all_forced(self._stim)
+                    self.log_pane.log(
+                        "Pulsing stopped (PS_StopStimAllChannels) — paused; "
+                        "Continue restarts stimulation.")
+            except Exception as _e:
+                self.log_pane.log(
+                    f"Pause: stimulator stop_all failed (the runner will "
+                    f"still halt at its next checkpoint): "
+                    f"{type(_e).__name__}: {_e}")
         self.pause_btn.setText("Continue" if paused else "Pause")
         self.log_pane.log("Pause requested." if paused else "Continue requested.")
 

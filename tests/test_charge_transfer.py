@@ -6,6 +6,12 @@ double-layer capacitance C_dl is read from the constant-dE/dt window ONLY
 (defensible, unlike the removed full-pulse C_eff); the charge split is
 first-order/approximate.  Validated on real data: C_dl is amplitude-INDEPENDENT
 (an electrode property) — that's the key correctness signature.
+
+The slope MUST come from the ACTIVE-ELECTRODE POTENTIAL, not the driving
+voltage (operator).  Harris's ``i_c = A·C_dl·dE/dt`` is written at ONE
+interface; V_mon = E_act − E_ret, so ``dV_mon/dt`` also carries the return
+electrode's charging.  ``compute_metrics`` therefore reports these fields only
+when E_act was recorded or is derivable as V_mon + E_ret.
 """
 from __future__ import annotations
 
@@ -90,12 +96,20 @@ def test_no_area_or_zero_amp_is_nan():
     assert math.isnan(ctz.c_dl_mf_per_cm2)
 
 
-def _normal_capture(pat, v):
+def _normal_capture(pat, v, *, e_act=True, e_ret=None):
+    """``e_act=True`` mirrors the trace into ``e_act_v`` — i.e. an ideal return
+    (no polarization), so V_mon == E_act numerically while the analysis sees a
+    genuine active-electrode potential.  ``e_act=False`` gives the common
+    V_mon/I_mon-only capture, where the decomposition must be withheld."""
     i = np.zeros_like(T)
     i[(T >= 0.0) & (T <= 200.0)] = pat.phases[0].amplitude_ua
     i[(T > 200.0) & (T <= 400.0)] = pat.phases[1].amplitude_ua
     c = Capture(index=0, pattern=pat)
     c.time_us = T; c.v_mon_v = v; c.i_mon_ua = i
+    if e_act:
+        c.e_act_v = np.asarray(v, dtype=float)
+    if e_ret is not None:
+        c.e_ret_v = np.asarray(e_ret, dtype=float)
     return c
 
 
@@ -169,3 +183,84 @@ def test_plot_charge_transfer_builds():
     # Tolerates a missing area (C_dl just reads n/a) and a bad capture.
     fig2 = plotting.plot_charge_transfer(c, area_um2=None)
     assert len(fig2.axes) == 3
+
+
+# --------------------------------------------------------------------------
+# The slope source: active-electrode potential, never the driving voltage.
+# --------------------------------------------------------------------------
+
+def _capacitive_trace():
+    v = np.zeros_like(T)
+    m = (T >= 0.0) & (T <= 200.0)
+    v[m] = -0.3 - 0.0004 * T[m]        # 0.3 V IR step + capacitive ramp
+    return v
+
+
+def test_vmon_only_capture_withholds_the_decomposition():
+    """The common V_mon/I_mon-only setup: no active-electrode potential exists,
+    so C_dl / Faradaic onset / split must all stay NaN.  ``dV_mon/dt`` is the
+    DIFFERENCE of the two electrodes' slopes, so ``I/(A·dV_mon/dt)`` would be a
+    series combination reported as if it were the active C_dl."""
+    c = _normal_capture(_pat(-200.0), _capacitive_trace(), e_act=False)
+    m = compute_metrics(c, surface_area_um2=AREA)
+    assert m.response_class == "normal", "the gate must be the only reason"
+    assert math.isnan(m.c_dl_mf_per_cm2)
+    assert math.isnan(m.faradaic_onset_us)
+    assert math.isnan(m.capacitive_charge_nc)
+
+
+def test_recorded_eact_enables_the_decomposition():
+    c = _normal_capture(_pat(-200.0), _capacitive_trace(), e_act=True)
+    m = compute_metrics(c, surface_area_um2=AREA)
+    assert np.isfinite(m.c_dl_mf_per_cm2) and m.c_dl_mf_per_cm2 > 0
+
+
+def test_derived_eact_enables_the_decomposition():
+    """E_act = V_mon + E_ret is the exact differential identity, so a derived
+    active potential is as valid as a recorded one."""
+    v = _capacitive_trace()
+    e_ret = np.full_like(T, 0.05)                  # a real, offset return
+    c = _normal_capture(_pat(-200.0), v, e_act=False, e_ret=e_ret)
+    m = compute_metrics(c, surface_area_um2=AREA)
+    assert np.isfinite(m.c_dl_mf_per_cm2) and m.c_dl_mf_per_cm2 > 0
+    # A CONSTANT E_ret shifts the potential but not its slope, so C_dl matches
+    # the recorded-E_act case exactly — the derivative is offset-invariant.
+    ref = compute_metrics(_normal_capture(_pat(-200.0), v, e_act=True),
+                          surface_area_um2=AREA)
+    assert abs(m.c_dl_mf_per_cm2 - ref.c_dl_mf_per_cm2) < 1e-6
+
+
+def test_polarizing_return_would_have_corrupted_c_dl():
+    """Why the gate matters, quantitatively.  Give the return its own charging
+    ramp: the true active C_dl is unchanged, but a V_mon-derived slope is the
+    SUM of both ramps and under-reports C_dl.  The gate stops that number from
+    ever being produced."""
+    v_act = _capacitive_trace()                     # active: -0.4 mV/µs
+    e_ret = np.zeros_like(T)
+    m1 = (T >= 0.0) & (T <= 200.0)
+    e_ret[m1] = 0.0004 * T[m1]                      # return charges the other way
+    v_mon = v_act - e_ret                           # V_mon = E_act - E_ret
+    truth = chronopotentiometry_charge_transfer(
+        T, v_act, _pat(-200.0), onset_us=0.0, area_um2=AREA)
+    wrong = chronopotentiometry_charge_transfer(
+        T, v_mon, _pat(-200.0), onset_us=0.0, area_um2=AREA)
+    assert np.isfinite(truth.c_dl_mf_per_cm2) and np.isfinite(wrong.c_dl_mf_per_cm2)
+    # Slope doubles → C_dl halves.  A ~2x error, silently.
+    assert wrong.c_dl_mf_per_cm2 < 0.6 * truth.c_dl_mf_per_cm2
+
+
+def test_polaris_view_labels_a_vmon_only_capture_honestly():
+    import matplotlib
+    matplotlib.use("Agg")
+    from stimtest import plotting
+    c = _normal_capture(_pat(-200.0), _capacitive_trace(), e_act=False)
+    fig = plotting.plot_charge_transfer(c, area_um2=AREA)
+    assert len(fig.axes) == 3, "the dE/dt shape is still a useful view"
+    texts = " ".join(t.get_text() for t in fig.texts)
+    assert "needs E" in texts, "the withheld C_dl must say why"
+    assert "mF/cm" not in texts, "no C_dl number from a V_mon slope"
+    # With a real active potential the numbers come back.
+    c2 = _normal_capture(_pat(-200.0), _capacitive_trace(), e_act=True)
+    t2 = " ".join(t.get_text() for t in plotting.plot_charge_transfer(
+        c2, area_um2=AREA).texts)
+    assert "mF/cm" in t2

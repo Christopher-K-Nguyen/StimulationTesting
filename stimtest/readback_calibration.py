@@ -318,6 +318,55 @@ def per_capture_baseline(arr, t_us) -> float:
         return 0.0
 
 
+def _raw_record(acq, scope, nom_vmon: float, nom_imon: float, cal,
+                info=None) -> Optional[dict]:
+    """Bundle the driver's RAW per-channel records with the scaling applied.
+
+    Returns None when the driver supplied no codes (simulator, PicoScope), so
+    callers must always guard.  Never raises — a diagnostic must not be able
+    to break a capture.
+    """
+    try:
+        raw = dict(getattr(acq, "raw", None) or {})
+        if not raw:
+            return None
+        # WHICH stimulator and WHICH preset produced these numbers.  The
+        # divisors alone are ambiguous after the fact — 1.0 mV/µA could be NIL
+        # applied correctly or Default applied wrongly, and that distinction is
+        # the whole question when a current looks mis-scaled.  Name the device
+        # and the preset so the file answers it without a log archaeology dig.
+        preset = None
+        serial = ""
+        try:
+            if info is not None:
+                serial = str(getattr(info, "serial_number", "") or "")
+                # Preset is identified by the scaling pair itself, since
+                # StimulatorInfo carries no preset NAME.
+                _i = float(getattr(info, "imon_scaling_v_per_ua", 0.0) or 0.0)
+                _v = float(getattr(info, "vmon_scaling_v_per_v", 0.0) or 0.0)
+                if abs(_i - 1.0e-3) < 1e-9 and abs(_v - 1.0) < 1e-9:
+                    preset = "NIL"
+                elif abs(_i - 2.5e-3) < 1e-9 and abs(_v - 0.25) < 1e-9:
+                    preset = "Default"
+                else:
+                    preset = f"custom(imon={_i:.4g} V/uA, vmon={_v:.4g} V/V)"
+        except Exception:
+            pass
+        return {
+            "channels": raw,
+            # The EXACT divisors used for this capture:
+            #   v_mon_v = raw_volts / vmon_v_per_v
+            #   i_mon_ua = raw_volts / imon_v_per_ua
+            "scaling": {"vmon_v_per_v": float(nom_vmon),
+                        "imon_v_per_ua": float(nom_imon),
+                        "preset": preset,
+                        "stim_serial": serial},
+            "aliases": dict(getattr(scope, "channel_aliases", {}) or {}),
+        }
+    except Exception:
+        return None
+
+
 def make_capture(index: int,
                  pattern: PulsePattern,
                  acq,
@@ -463,6 +512,10 @@ def make_capture(index: int,
         time_us=np.asarray(acq.time_us),
         v_mon_v=v_mon_v,
         i_mon_ua=i_mon_ua,
+        # RAW pre-conversion data + the scaling actually applied, so the
+        # volts->engineering-units step is reproducible from the file alone.
+        raw_channels=_raw_record(acq, scope, nom_vmon, nom_imon, cal,
+                                 info=info),
         e_act_v=_with_offset(e_act, "eact"),
         e_ret_v=_with_offset(e_ret, "eret"),
     )

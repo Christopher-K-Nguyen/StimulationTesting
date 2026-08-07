@@ -15,6 +15,7 @@ import pytest
 from stimtest.metrics import compute_metrics
 from stimtest.session import Capture
 from stimtest.waveforms import Phase, PulsePattern
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 
 def _synthetic_biphasic():
@@ -126,7 +127,7 @@ def test_metric_table_shows_zd_and_energy(qapp):
     compute_metrics(cap, surface_area_um2=2000.0)
     tbl = MetricTable()
     tbl.show_capture(cap)
-    labels = [tbl.item(r, 0).text() for r in range(tbl.rowCount())
+    labels = [_mrt(tbl, r)[0] for r in range(tbl.rowCount())
               if tbl.item(r, 0)]
     joined = " ".join(labels)
     assert "Z" in joined and "d" in joined        # Z_d row present

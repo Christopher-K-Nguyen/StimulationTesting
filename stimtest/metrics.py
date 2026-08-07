@@ -1791,8 +1791,29 @@ def classify_response_and_ceff(time_us, v_mon, pat, *, onset_us, driving_v,
     # polarisation = a real electrode.  On the operator's run CH01/CH02
     # jump to ~0.5 of the peak (real access R); CH03 0.04 / CH04 0.07 start
     # from ~0 and ramp (no access → bad).
-    _iir = int(np.argmin(np.abs(t - (onset_us + _ACCESS_T_US))))
-    v_ir = abs(float(exc[_iir]))
+    # ⚠ WINDOW MEDIAN, not a single sample.  This used to read exactly one
+    # sample at ``onset + _ACCESS_T_US``, which sits on the still-RISING edge —
+    # so the value changes ~9 % per sample, and ``pulse_onset_us`` routinely
+    # jitters by a sample between adjacent captures.  On the AC bench run
+    # (exp_vt_max_cathodal_test_ac) CH08 flipped normal <-> capacitive at
+    # essentially constant amplitude purely from that jitter:
+    #     #9   281.3 µA  onset -0.08 µs  v_ir 0.1760  access_frac 0.1091 normal
+    #     #10  281.4 µA  onset -0.16 µs  v_ir 0.1600  access_frac 0.0992 capacitive
+    # (identical V_peak 1.6128 V), straddling _ACCESS_FRAC_LOW = 0.10.  A
+    # misclassification CLEARS the capture's E_pol, which is how the VT-max
+    # ramp then lost its proximity signal and flung CH08 to the 1000 µA rail.
+    #
+    # Averaging over a window centred on the read point divides the
+    # onset-jitter sensitivity by the sample count while leaving the value
+    # itself essentially unchanged on a clean capture.  MEDIAN (not mean) so a
+    # switching spike inside the window can't inflate it — same rationale as
+    # ``_despike`` (gotcha, "spikes and ringing must not mislead").
+    _t_ir = onset_us + _ACCESS_T_US
+    _ir_win = (t >= _t_ir - 0.5 * _ACCESS_T_US) & (t <= _t_ir + 0.5 * _ACCESS_T_US)
+    if int(np.count_nonzero(_ir_win)) >= 3:
+        v_ir = abs(float(np.median(exc[_ir_win])))
+    else:                                   # very coarse record → single sample
+        v_ir = abs(float(exc[int(np.argmin(np.abs(t - _t_ir)))]))
     access_frac = v_ir / abs(vpeak)
     has_ramp = abs(vpeak) > _ACCESS_RAMP_FACTOR * v_ir   # polarisation past the step
     # EXTREME voltage per unit current = a very high effective impedance — a
@@ -2219,11 +2240,27 @@ def chronopotentiometry_charge_transfer(time_us, v_active, pattern, *, onset_us,
                                         ) -> ChargeTransferAnalysis:
     """Capacitive/Faradaic decomposition of phase ``phase_idx`` (Harris 2019).
 
-    ``v_active`` is the active-electrode potential (E_act when recorded, else
-    V_mon — same convention as the other bad-response fits).  Constant phase
-    current ``I`` from the pattern; ``area_um2`` for the areal C_dl.  Returns a
-    :class:`ChargeTransferAnalysis` (all-NaN when the phase is unusable:
-    zero amplitude, no area, or too few samples)."""
+    ``v_active`` MUST be a genuine WORKING- (ACTIVE-) ELECTRODE POTENTIAL —
+    E_act measured against the reference, or the identity-derived
+    ``V_mon + E_ret``.  It is NOT the driving voltage (operator: "the slope
+    from Harris 2019 is from the active electrode potential, not the driving
+    voltage" … "the electrode–electrolyte interface is about the working
+    (active) electrode, not the counter (return)").
+
+    Harris writes the capacitive current at the WORKING electrode's SINGLE
+    electrode–electrolyte interface, ``i_c = A·C_dl·dE/dt``, with ``A`` that
+    electrode's area.  V_mon is the DIFFERENCE ``E_act − E_ret`` across BOTH
+    interfaces, so ``dV_mon/dt`` also carries the COUNTER (return) electrode's
+    own double-layer charging and ``I/(A·dV_mon/dt)`` is a series combination
+    of the two, referred to the wrong area.  (The constant access drops cancel
+    in the derivative; the counter's polarization does not.)  There is
+    deliberately NO return-side variant of this analysis — the counter
+    electrode is a current path, not the interface under test.  Callers gate on
+    the trace kind — see :func:`active_potential_trace`.
+
+    Constant phase current ``I`` from the pattern; ``area_um2`` for the areal
+    C_dl.  Returns a :class:`ChargeTransferAnalysis` (all-NaN when the phase
+    is unusable: zero amplitude, no area, or too few samples)."""
     out = ChargeTransferAnalysis(phase_idx=int(phase_idx))
     t = np.asarray(time_us, dtype=float)
     v = np.asarray(v_active, dtype=float)
@@ -2913,6 +2950,18 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     onset_us = pulse_onset_us(capture.time_us, capture.i_mon_ua,
                               capture.v_mon_v)
 
+    # ----- 1e. IDEAL (expected) current trace -----------------------------
+    # Store the PROGRAMMED waveform on the capture as an alternative to the
+    # measured I_mon (operator request).  Same reconstruction the driving-
+    # energy integral uses: onset-anchored, device-nA-quantised, zero in the
+    # passive gaps.  Best-effort — a failure here must never cost the metrics.
+    try:
+        if pat is not None and capture.time_us is not None                 and np.asarray(capture.time_us).size >= 2:
+            capture.i_ideal_ua = ideal_current_ua(
+                capture.time_us, pat, onset_us=onset_us)
+    except Exception:
+        capture.i_ideal_ua = None
+
     # ----- 2. Driving voltage V_d -----------------------------------------
     # V_mon = E_act - E_ret straight off the stimulator's monitor output.
     # Always available; we use its abs-max as the baseline V_d estimate.
@@ -3505,12 +3554,20 @@ def compute_metrics(capture: Capture, surface_area_um2: float,
     # Faradaic charge split of the EXCITATION phase.  ONLY for a FUNCTIONAL
     # (normal) electrode driven by a RECTANGULAR (constant-current) pulse with a
     # known area — the ``i_c = A·C_dl·dE/dt`` model needs constant current, and a
-    # bad electrode is already characterized by its open/broken + R‖C.  Runs on
-    # ``active_trace`` (E_act when recorded, else V_mon), same as the other fits.
+    # bad electrode is already characterized by its open/broken + R‖C.
+    #
+    # REQUIRES a genuine ACTIVE-ELECTRODE POTENTIAL (``_has_eact`` — E_act
+    # recorded, or derived as V_mon + E_ret).  Harris's dE/dt is the slope at
+    # ONE interface; V_mon is E_act − E_ret, so its slope folds in the return
+    # electrode's own charging and would report a series capacitance as if it
+    # were the active C_dl.  In the common V_mon/I_mon-only setup these fields
+    # therefore stay NaN and the C_dl / Faradaic rows are simply omitted —
+    # reporting nothing beats reporting a wrong number.
     try:
         _all_rect = all(getattr(ph, "shape", SHAPE_RECTANGULAR) == SHAPE_RECTANGULAR
                         for ph in pat.phases)
         if (m.response_class == "normal" and _all_rect and pat.phases
+                and _has_eact
                 and surface_area_um2 and surface_area_um2 > 0):
             _exc_idx = max(range(len(pat.phases)),
                            key=lambda i: abs(float(pat.phases[i].amplitude_ua)))

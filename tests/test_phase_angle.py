@@ -22,6 +22,7 @@ from stimtest.metrics import phase_angle_deg, compute_metrics  # noqa: E402
 from stimtest.waveforms import (Phase, PulsePattern,  # noqa: E402
                                 SHAPE_SINUSOIDAL, SHAPE_RECTANGULAR)
 from stimtest.session import Capture  # noqa: E402
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 
 F_HZ = 5_000.0
@@ -194,7 +195,7 @@ def test_metric_table_shows_phase_rows():
                   e_ret_v=(0.1 * np.sin(W * t_s)))
     cap.metrics = compute_metrics(cap, surface_area_um2=1000.0)
     tbl = MetricTable(); tbl.show_capture(cap)
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount()) if tbl.item(r, 0)]
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount()) if tbl.item(r, 0)]
     # φ rows render as italic-var HTML with the trace subscript + [°] unit.
     assert any("Vmon" in k and "°" in k for k in keys)
     assert any("Eret" in k and "°" in k for k in keys)
@@ -213,15 +214,15 @@ def test_metric_table_shows_imon_reference_zero():
                   i_mon_ua=(50.0 * np.sin(W * t_s)))
     cap.metrics = compute_metrics(cap, surface_area_um2=1000.0)
     tbl = MetricTable(); tbl.show_capture(cap)
-    rows = {tbl.item(r, 0).text(): tbl.item(r, 1).text()
+    rows = {_mrt(tbl, r)[0]: _mrt(tbl, r)[1]
             for r in range(tbl.rowCount())
-            if tbl.item(r, 0) and tbl.item(r, 1)}
+            if tbl.item(r, 0)}
     # I_mon is the phase reference → shown as +0.0° (the anchor).
     imon = [(k, v) for k, v in rows.items() if "Imon" in k and "°" in k]
     assert imon, "no I_mon phase reference row"
     assert imon[0][1] == "+0.0"
     # It sits ABOVE the V_mon phase row (reference first).
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount()) if tbl.item(r, 0)]
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount()) if tbl.item(r, 0)]
     i_imon = next(i for i, k in enumerate(keys) if "Imon" in k and "°" in k)
     i_vmon = next(i for i, k in enumerate(keys) if "Vmon" in k and "°" in k)
     assert i_imon < i_vmon

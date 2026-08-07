@@ -595,8 +595,26 @@ class ConnectionPanel(QtWidgets.QGroupBox):
             _ig = QtWidgets.QVBoxLayout(interstellar_group)
             _ig.setContentsMargins(8, 4, 8, 4)
             _ig.setSpacing(6)
+            # ENABLE toggle (operator: "I want toggle checkboxes to enable
+            # INTERSTELLAR and a camera").  Most sessions use neither, and a
+            # live port picker / camera enumerator sitting in the panel is
+            # both clutter and an invitation to connect something by
+            # accident.  Unchecked greys the section out; it does NOT hide it,
+            # so the operator can always see the capability exists.
+            self.interstellar_enable_chk = QtWidgets.QCheckBox(
+                f"Enable {INTERSTELLAR_DISPLAY_NAME}")
+            self.interstellar_enable_chk.setToolTip(
+                "Turn on the interpulse-bias module controls.  Leave "
+                "unchecked when no module is attached — the per-experiment "
+                "feedback options stay hidden either way until it is "
+                "actually connected.")
+            self.interstellar_enable_chk.toggled.connect(
+                self._on_interstellar_enable_toggled)
+            _ig.addWidget(self.interstellar_enable_chk)
             _ig.addWidget(self.bias_connector)
             v.addWidget(interstellar_group)
+            self.bias_connector.setEnabled(
+                self.interstellar_enable_chk.isChecked())
 
         # ----- Camera (bench monitor) -------------------------------
         # The camera is part of the bench-instrument cluster (alongside
@@ -649,9 +667,18 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         _cg = QtWidgets.QVBoxLayout(camera_group)
         _cg.setContentsMargins(8, 4, 8, 4)
         _cg.setSpacing(6)
+        self.camera_enable_chk = QtWidgets.QCheckBox("Enable camera")
+        self.camera_enable_chk.setToolTip(
+            "Turn on the bench-monitor camera controls.  Leave unchecked "
+            "when no camera is attached — enumeration can take a moment on "
+            "some USB backends, and the per-run snapshot / record toggles "
+            "stay hidden until a camera is connected anyway.")
+        self.camera_enable_chk.toggled.connect(self._on_camera_enable_toggled)
+        _cg.addWidget(self.camera_enable_chk)
         _cg.addWidget(self.camera_connector)
         _cg.addWidget(self.camera_preview, stretch=1)
         v.addWidget(camera_group)
+        self.camera_connector.setEnabled(self.camera_enable_chk.isChecked())
 
         # First-time hardware-presence probes — both run on the next
         # event-loop tick so the panel finishes laying out before
@@ -663,6 +690,59 @@ class ConnectionPanel(QtWidgets.QGroupBox):
         # live hardware presence only.
         QtCore.QTimer.singleShot(0, self._refresh_scope_detection_indicator)
         QtCore.QTimer.singleShot(0, self._refresh_stim_detection_indicator)
+
+    # --------------------------------------------------- enable toggles
+    def _on_interstellar_enable_toggled(self, on: bool) -> None:
+        """Grey the INTERSTELLAR controls in/out.
+
+        Disabling also DISCONNECTS: leaving a live serial session open behind
+        a disabled UI would keep the port claimed with no visible way to
+        release it.
+        """
+        try:
+            self.bias_connector.setEnabled(bool(on))
+        except Exception:
+            pass
+        if not on:
+            try:
+                self.close_bias_module()
+            except Exception:
+                pass
+        # ``INTERSTELLAR_DISPLAY_NAME`` is imported inside the feature-flag
+        # block in __init__, so it is NOT in scope in this method — import it
+        # here.  (Caught by tests/test_no_undefined_names.py; without that
+        # guard this would have raised NameError the first time the operator
+        # ticked the box, in a slot where Qt swallows the traceback.)
+        try:
+            from .feature_flags import INTERSTELLAR_DISPLAY_NAME as _name
+        except Exception:
+            _name = "INTERSTELLAR"
+        self.log.emit(
+            f"{_name}: "
+            + ("enabled." if on else "disabled (and disconnected)."))
+
+    def _on_camera_enable_toggled(self, on: bool) -> None:
+        """Grey the camera controls in/out; disabling also disconnects so no
+        capture pipeline is left running unseen."""
+        try:
+            self.camera_connector.setEnabled(bool(on))
+        except Exception:
+            pass
+        try:
+            self.camera_preview.setVisible(
+                bool(on) and self.camera_preview.isVisible())
+        except Exception:
+            pass
+        if not on:
+            try:
+                from .camera import camera_service
+                _svc = camera_service()
+                if _svc is not None and _svc.is_connected():
+                    _svc.disconnect()
+            except Exception:
+                pass
+        self.log.emit("Camera: "
+                      + ("enabled." if on else "disabled (and disconnected)."))
 
     # ------------------------------------------------------------- helpers
     @staticmethod

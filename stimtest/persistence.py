@@ -95,7 +95,33 @@ def save_session_npz(session: Session, path: Path | str,
                 arrays[f"{tag}_e_act_v"] = np.asarray(c.e_act_v)
             if c.e_ret_v is not None:
                 arrays[f"{tag}_e_ret_v"] = np.asarray(c.e_ret_v)
-            captures_meta.append(_capture_to_dict(c))
+            if getattr(c, "i_ideal_ua", None) is not None:
+                arrays[f"{tag}_i_ideal_ua"] = _np(c.i_ideal_ua)
+            _cd = _capture_to_dict(c)
+            # RAW pre-conversion data (operator: "store the raw waveform data
+            # before conversion and scaling").  The int8 CODE arrays go in as
+            # arrays — one per channel, small next to the float traces — while
+            # the decode constants and channel settings ride in the capture's
+            # meta dict.  Splitting them this way keeps meta.json readable and
+            # lets a reader pull just the constants without unpacking arrays.
+            _raw = getattr(c, "raw_channels", None)
+            if isinstance(_raw, dict) and _raw.get("channels"):
+                _meta_ch = {}
+                for _name, _rec in (_raw.get("channels") or {}).items():
+                    if not isinstance(_rec, dict):
+                        continue
+                    _codes = _rec.get("codes")
+                    if _codes is not None:
+                        arrays[f"{tag}_raw_{_name}"] = np.asarray(
+                            _codes, dtype=np.int8)
+                    _meta_ch[_name] = {k: v for k, v in _rec.items()
+                                       if k != "codes"}
+                _cd["raw_channels"] = {
+                    "channels": _meta_ch,
+                    "scaling": _raw.get("scaling"),
+                    "aliases": _raw.get("aliases"),
+                }
+            captures_meta.append(_cd)
         runs_meta.append({
             "configuration": asdict(run.configuration),
             "surface_area_um2": run.surface_area_um2,
@@ -355,6 +381,32 @@ def load_session_meta(path: Path | str) -> Dict[str, Any]:
             raise ValueError(f"{path} is not a PULSAR session .npz (no meta.json blob)")
         raw = z["meta.json"].tobytes().decode("utf-8")
         return json.loads(raw)
+
+
+def _raw_from_npz(cap_dict: dict, arrays, tag: str):
+    """Rebuild ``Capture.raw_channels`` from the npz.
+
+    Returns None for captures saved before raw storage existed, so every
+    consumer must guard.  Never raises — a diagnostic must not break a load.
+    """
+    try:
+        raw = (cap_dict or {}).get("raw_channels")
+        if not isinstance(raw, dict):
+            return None
+        chans = {}
+        for name, rec in (raw.get("channels") or {}).items():
+            rec = dict(rec or {})
+            codes = arrays.get(f"{tag}_raw_{name}")
+            if codes is not None:
+                rec["codes"] = np.asarray(codes, dtype=np.int8)
+            chans[name] = rec
+        if not chans:
+            return None
+        return {"channels": chans,
+                "scaling": raw.get("scaling"),
+                "aliases": raw.get("aliases")}
+    except Exception:
+        return None
 
 
 def load_session_npz(path: Path | str) -> "Session":
@@ -658,6 +710,8 @@ def load_session_npz(path: Path | str) -> "Session":
                 i_mon_ua=arrays.get(f"{tag}_i_mon_ua", np.zeros(0)),
                 e_act_v=arrays.get(f"{tag}_e_act_v"),
                 e_ret_v=arrays.get(f"{tag}_e_ret_v"),
+                i_ideal_ua=arrays.get(f"{tag}_i_ideal_ua"),
+                raw_channels=_raw_from_npz(cap_meta, arrays, tag),
                 metrics=metrics,
                 status=status,
             )

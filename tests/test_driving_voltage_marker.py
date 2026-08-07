@@ -23,6 +23,7 @@ import sys
 
 import numpy as np
 import pytest
+from stimtest.gui.widgets import metric_row_text as _mrt
 
 pytest.importorskip("pyqtgraph")
 
@@ -384,11 +385,11 @@ def test_metric_table_indicates_open_channel(qapp):
     cap.metrics.effective_capacitance_nf = 0.12
     tbl = MetricTable()
     tbl.show_capture(cap)
-    keys = [tbl.item(r, 0).text() for r in range(tbl.rowCount())
+    keys = [_mrt(tbl, r)[0] for r in range(tbl.rowCount())
             if tbl.item(r, 0)]
-    vals = [tbl.item(r, 1).text() for r in range(tbl.rowCount())
+    vals = [_mrt(tbl, r)[1] for r in range(tbl.rowCount())
             if tbl.item(r, 1)]
-    assert "Response" in keys
+    assert any("Response" in k for k in keys), keys
     assert any("OPEN" in v for v in vals)
     # focused view — no per-phase access / polarization rows
     assert not any("access" in k.lower() or "pol" in k.lower() for k in keys)

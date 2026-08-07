@@ -209,7 +209,7 @@ class ProgressiveStressExperiment(ExperimentRunner):
                     # with WRONG-TRIGGER-MODE on default-mode PlexStim.
                     # Active + unused-zero channels fire together; zero
                     # channels deliver no current.
-                    self.stim.start_all()
+                    self.start_pulsing()
                 except Exception as e:
                     self._emit(ExperimentEvent(kind="aborted", session=self.session,
                                                message=f"Step program failed: {e}"))

@@ -372,19 +372,28 @@ def _place_marker_labels_mpl(ax, fig, reqs, traces, *,
     ylim = ax.get_ylim()
     x_span = max(float(xlim[1] - xlim[0]), 1e-9)
     y_span = max(float(ylim[1] - ylim[0]), 1e-9)
-    fig_w_in, fig_h_in = (float(v) for v in fig.get_size_inches())
-    # Usable axes extent is ~80 % of the figure after margins/titles.
-    ax_w_pts = max(fig_w_in * 72.0 * 0.80, 1.0)
-    ax_h_pts = max(fig_h_in * 72.0 * 0.80, 1.0)
-    char_pts = 0.60 * fontsize       # mean glyph advance
-    line_pts = 1.35 * fontsize       # line pitch
-    dpx = x_span / ax_w_pts          # data-x per point
-    dpy = y_span / ax_h_pts          # data-y per point
+    # TRUE geometry, MEASURED — never estimated.  The old code guessed the
+    # axes at "~80 % of the figure" and the label width at a mean glyph
+    # advance × character count.  Both are wrong by an unknown factor, so the
+    # overlap penalty was computed on boxes that did not match what matplotlib
+    # actually drew, and labels scoring as clear rendered on top of each
+    # other.  matplotlib can measure both exactly; ask it.
+    _rend = fig.canvas.get_renderer()
+    _inv = ax.transData.inverted()
+    _p0 = _inv.transform((0.0, 0.0))
+    _p1 = _inv.transform((1.0, 1.0))
+    dpx_px = abs(float(_p1[0] - _p0[0]))   # data-x per display pixel
+    dpy_px = abs(float(_p1[1] - _p0[1]))   # data-y per display pixel
+    char_pts = 0.60 * fontsize
+    line_pts = 1.35 * fontsize
     _traces = [(np.asarray(t, dtype=float), np.asarray(v, dtype=float))
                for (t, v) in traces
                if t is not None and v is not None and len(t) and len(v)]
     gap_x = 0.012 * x_span
-    MAX_TIER = 5
+    # Enough outward tiers that a dense cluster can actually escalate to free
+    # space; with the overlap penalty now prohibitive, running out of tiers is
+    # what forces a residual overlap.
+    MAX_TIER = 9
 
     def _vis_len(line):
         # Count RENDERED glyphs, not mathtext markup: "$V_{\mathrm{a4}}$
@@ -394,12 +403,30 @@ def _place_marker_labels_mpl(ax, fig, reqs, traces, *,
         s = re.sub(r"\\mathrm|[${}\\^_]", "", str(line))
         return len(s)
 
+    _box_cache: dict = {}
+
     def _box_size(text):
-        lines = str(text).split("\n")
-        n = max(len(lines), 1)
-        w = max((_vis_len(s) for s in lines), default=1) * char_pts * dpx
-        h = n * line_pts * dpy
-        return w, h
+        """RENDERED size of the label, in data units.  Lay the text out with
+        matplotlib itself (invisible, then removed) rather than counting
+        glyphs — mathtext has no reliable per-character metric, and the
+        two-line access label (V_a over R_a) compounds the error."""
+        key = str(text)
+        if key in _box_cache:
+            return _box_cache[key]
+        t = ax.text(0.0, 0.0, key, fontsize=fontsize, alpha=0.0,
+                    transform=ax.transAxes)
+        try:
+            bb = t.get_window_extent(_rend)
+            wh = (bb.width * dpx_px, bb.height * dpy_px)
+        except Exception:                      # pragma: no cover - defensive
+            lines = key.split("\n")
+            n = max(len(lines), 1)
+            wh = (max((_vis_len(ln) for ln in lines), default=1)
+                  * char_pts * dpx_px, n * line_pts * dpy_px)
+        finally:
+            t.remove()
+        _box_cache[key] = wh
+        return wh
 
     def _trace_band(x0, x1):
         """Union (min, max) of every avoid-trace within [x0, x1]."""
@@ -472,19 +499,25 @@ def _place_marker_labels_mpl(ax, fig, reqs, traces, *,
         off += max(0.0, xlim[0] - x0) + max(0.0, x1 - xlim[1])
         off_y = max(0.0, ylim[0] - y0) + max(0.0, y1 - ylim[1])
         if off > 0 or off_y > 0:
-            pen += 8.0 + 30.0 * ((off / x_span) + (off_y / y_span))
+            # Must OUTRANK the label-label overlap term (60.0) — a clipped
+            # label is worse than an overlapping one, and with overlap made
+            # prohibitive an 8.0 base would have sent tags off the axes
+            # instead.  Order: off-axes (200) > overlap (60) > trace (30).
+            pen += 200.0 + 30.0 * ((off / x_span) + (off_y / y_span))
         # overlap with already-placed labels
         for (px0, px1, py0, py1) in placed:
             ox = min(x1, px1) - max(x0, px0)
             oy = min(y1, py1) - max(y0, py0)
             if ox > 0 and oy > 0:
-                # Flat base RAISED (1.0 → 6.0) so ANY label-label overlap
-                # costs more than a proximity tier-step — otherwise the
-                # quadratic proximity pull (above) could make two close tags
-                # tolerate a small overlap rather than escalate apart.
-                # Readability (non-overlap) must beat proximity for close
-                # markers.
-                pen += 6.0 + 90.0 * (ox * oy) / (x_span * y_span)
+                # Flat base must EXCEED the maximum trace penalty (30.0
+                # below), because the two are in direct competition and the
+                # ranking was backwards: at 6.0 a label preferred to sit on
+                # ANOTHER LABEL rather than touch the waveform.  Two stacked
+                # labels are unreadable; a label crossing a line still reads
+                # fine.  So overlap is effectively prohibitive — a tag will
+                # take the trace, a farther tier, or the other side first,
+                # and only overlap when nothing at all is free.
+                pen += 60.0 + 90.0 * (ox * oy) / (x_span * y_span)
         # graded trace intersection
         band = _trace_band(x0, x1)
         if band is not None:
@@ -1335,6 +1368,7 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
                  density: bool = True,
                  deriv_overlays: Optional[set] = None,
                  potential_axis: bool = False,
+                 show_ideal_current: bool = False,
                  return_axis: bool = False) -> Figure:
     """Render one capture on a matplotlib Figure.
 
@@ -1499,6 +1533,22 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
         ax_i.plot(time_us, right_y,
                   color=_EXP_TRACE_COLORS[1], linewidth=1.4,
                   label=right_legend)
+        # IDEAL / EXPECTED current — the PROGRAMMED waveform, drawn DASHED on
+        # the same axis as the measured I_mon so the two overlay directly
+        # (operator request).  I_mon carries switching spikes, ringing and
+        # turn-on skew; seeing the intended pulse behind it makes any
+        # disagreement visible rather than inferred.  Same unit conversion as
+        # the measured trace so density mode stays consistent.
+        _ideal = getattr(capture, "i_ideal_ua", None)
+        if (show_ideal_current and _ideal is not None
+                and np.asarray(_ideal).size == np.asarray(time_us).size):
+            _iy = np.asarray(_ideal, dtype=float)
+            if density and area_cm2:
+                _iy = _iy * 1e-6 / area_cm2
+            ax_i.plot(time_us, _iy,
+                      color=_EXP_TRACE_COLORS[1], linewidth=1.2,
+                      linestyle="--", alpha=0.85,
+                      label=f"{right_legend} (ideal)")
         # (No min/max reference rails — operator removed the two dashed
         # right-axis horizontal lines + A/cm² labels; the current
         # extremes are already readable from the trace itself.)
@@ -1532,6 +1582,7 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
     # matches the live experiment plot (operator: "For access and driving
     # voltage plotting, use a horizontal bar symbol. For electrode
     # polarization, use plus symbols, and indicate if Emc or Ema").
+    _deferred_labels = None
     if show_cursors and voltage_traces:
         # Per-kind colourblind-safe glyph + label colours (operator: "vary the
         # color of the markers and respective label, colorblind safe") — the
@@ -1618,8 +1669,14 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
             _bigR = max(abs(v) for v in ax_i.get_ylim()) or 1.0
             _avoid.append((_tt, np.asarray(right_y, dtype=float)
                            * (_bigL / _bigR)))
-        _place_marker_labels_mpl(ax_v, fig, _label_reqs, _avoid,
-                                 fontsize=9.0)
+        # DEFERRED: placed after tight_layout below.  Placing here measured
+        # the axes at their PRE-layout size, and tight_layout then resized
+        # them under the already-positioned labels — a label keeps its DATA
+        # coordinates but its PIXEL size is fixed, so its size in DATA units
+        # changes and boxes that just cleared each other end up overlapping.
+        # (Measured on the bench export: 7 label-label overlaps + 4 labels
+        # sitting on a trace across the 16 channels.)
+        _deferred_labels = (ax_v, _label_reqs, _avoid)
 
     # ---- Axes / cosmetics ----
     # Axis TITLES, spines (the "box"), tick marks AND tick NUMBERS are all
@@ -1727,6 +1784,9 @@ def plot_capture(capture: Capture, run: ChannelRun, session: Session,
     # the tight_layout rect (not just a clipped save) because the POLARIS
     # viewer doesn't crop with bbox_inches="tight".
     fig.tight_layout(rect=(0, 0.12, 1, 0.935))
+    if _deferred_labels is not None:
+        _dax, _dreqs, _davoid = _deferred_labels
+        _place_marker_labels_mpl(_dax, fig, _dreqs, _davoid, fontsize=9.0)
     # Two-line title block, placed AFTER tight_layout (absolute fig coords,
     # va="top" so the gap between the lines is exactly _title_y - _subtitle_y
     # minus the title's height — a tight single block).
@@ -1825,14 +1885,25 @@ def plot_charge_transfer(capture, *, area_um2: Optional[float] = None,
     Faradaic charge fraction.
     """
     from .metrics import (chronopotentiometry_charge_transfer,
-                          charge_transfer_dedt, pulse_onset_us, phase_windows)
+                          charge_transfer_dedt, pulse_onset_us, phase_windows,
+                          active_potential_trace, ChargeTransferAnalysis)
     if fig is None:
         fig = plt.figure(figsize=_figsize_in(), dpi=SCREEN_DPI)
     fig.clear()
     t = np.asarray(capture.time_us, dtype=float)
-    _va = (capture.e_act_v if getattr(capture, "e_act_v", None) is not None
-           else capture.v_mon_v)
-    v = np.asarray(_va, dtype=float)
+    # Harris's dE/dt is the slope at ONE electrode–electrolyte interface, so
+    # this needs the ACTIVE-ELECTRODE POTENTIAL (E_act, or the identity-derived
+    # V_mon + E_ret) — NOT the driving voltage.  ``active_potential_trace``
+    # reports which one we actually got; with only V_mon available the SHAPE is
+    # still a useful diagnostic, so the curves are drawn, but the quantitative
+    # C_dl / Faradaic split is withheld (it would describe the two interfaces
+    # in series, not the active electrode).
+    v, _pot_kind = active_potential_trace(capture)
+    if v.size != t.size:
+        v = np.asarray(capture.v_mon_v, dtype=float)
+        _pot_kind = "v_mon"
+    _is_potential = _pot_kind != "v_mon"
+    _sym = "E" if _is_potential else "V$_{mon}$"
     pat = capture.pattern
     if onset_us is None:
         try:
@@ -1847,9 +1918,10 @@ def plot_charge_transfer(capture, *, area_um2: Optional[float] = None,
         t0, t1 = float(pw[exc_idx].start_us), float(pw[exc_idx].end_us)
     except Exception:
         exc_idx, pw, t0, t1 = 0, [], onset_us, onset_us + 200.0
-    ct = chronopotentiometry_charge_transfer(
-        t, v, pat, onset_us=onset_us, area_um2=(area_um2 or 0.0),
-        phase_idx=exc_idx)
+    ct = (chronopotentiometry_charge_transfer(
+              t, v, pat, onset_us=onset_us, area_um2=(area_um2 or 0.0),
+              phase_idx=exc_idx)
+          if _is_potential else ChargeTransferAnalysis(phase_idx=exc_idx))
     f0 = float(pw[0].start_us) if pw else t0
     f1 = float(pw[-1].end_us) if pw else t1
     margin = 0.12 * (f1 - f0) if f1 > f0 else 20.0
@@ -1857,7 +1929,9 @@ def plot_charge_transfer(capture, *, area_um2: Optional[float] = None,
     recip = 1.0 / np.where(np.abs(dedt) < 1e-6, np.nan, dedt)
     ax = fig.subplots(3, 1, sharex=True)
     ax[0].plot(t[win], v[win] * 1000, color=MATLAB_COLORS[0], lw=1.3)
-    ax[0].set_ylabel("Potential [mV]", fontsize=12, color="black")
+    ax[0].set_ylabel(("Active potential [mV]" if _is_potential
+                      else "Driving voltage V$_{mon}$ [mV]"),
+                     fontsize=12, color="black")
     ax[1].plot(t[win], dedt[win], color=MATLAB_COLORS[1], lw=1.1)
     ax[1].axhline(0, color="black", lw=0.4)
     if np.isfinite(ct.dedt_capacitive_v_per_s):
@@ -1880,10 +1954,13 @@ def plot_charge_transfer(capture, *, area_um2: Optional[float] = None,
         a.tick_params(axis="both", labelsize=11, colors="black")
         for _sp in a.spines.values():
             _sp.set_color("black")
-    cdl = (f"{ct.c_dl_mf_per_cm2:.2f} mF/cm²"
-           if np.isfinite(ct.c_dl_mf_per_cm2) else "n/a (set surface area)")
-    ff = (f"{ct.faradaic_fraction * 100:.0f}%"
-          if np.isfinite(ct.faradaic_fraction) else "n/a")
+    if not _is_potential:
+        cdl = ff = "n/a (needs E$_{act}$, not V$_{mon}$)"
+    else:
+        cdl = (f"{ct.c_dl_mf_per_cm2:.2f} mF/cm²"
+               if np.isfinite(ct.c_dl_mf_per_cm2) else "n/a (set surface area)")
+        ff = (f"{ct.faradaic_fraction * 100:.0f}%"
+              if np.isfinite(ct.faradaic_fraction) else "n/a")
     fig.text(0.5, 0.985, "Capacitive / Faradaic decomposition — chronopotentiometry (Harris 2019)",
              ha="center", va="top", fontsize=11, fontweight="bold")
     fig.text(0.5, 0.955,

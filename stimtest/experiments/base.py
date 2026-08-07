@@ -617,6 +617,21 @@ class _ChannelMappedStimulator:
         return getattr(object.__getattribute__(self, "_stim"), name)
 
 
+def stop_all_forced(stim) -> None:
+    """``stim.stop_all(force=True)`` with a graceful fallback.
+
+    ``force`` bypasses the driver's ``_is_running`` idempotence guard, which is
+    a sweep optimisation we must NOT let skip an operator Stop / Pause.  But
+    the kwarg only exists on the real PlexStim driver — the simulator, test
+    doubles and any third-party stim may still have the plain 2-arg signature,
+    and letting a TypeError escape here wedges a paused worker thread.
+    """
+    try:
+        stim.stop_all(force=True)
+    except TypeError:
+        stim.stop_all()
+
+
 class ExperimentRunner(ABC):
     """Base class. Subclasses implement :meth:`run`."""
 
@@ -3406,6 +3421,34 @@ class ExperimentRunner(ABC):
     def paused(self) -> bool:
         return self._pause_requested
 
+    def start_pulsing(self) -> bool:
+        """Bring stimulation up — UNLESS the run is aborted or paused.
+
+        **The single gate every runner must go through to start pulsing.**
+
+        Operator: "when stopping an experiment, all pulsing must stop … that
+        includes pausing."  Stop and Pause halt the DEVICE straight away from
+        the GUI thread (``PS_AbortAll``), but that only kills the pulse in
+        flight — the worker thread is off doing a capture or an averager
+        settle and, when it comes back, its next step would happily call
+        ``start_all()`` and resume stimulating an electrode the operator
+        believes is quiet.  7 of the 9 ``start_all()`` sites had no guard.
+
+        Routing every start through here closes that window: once aborted or
+        paused, nothing can bring pulsing back up.  Resume is unaffected —
+        ``wait_if_paused`` clears the flag before it calls its ``restart``
+        callback.
+
+        Returns True if stimulation was started, False if it was suppressed.
+        """
+        if self._abort_requested or self._pause_requested:
+            self._log("Start of pulsing SUPPRESSED — run is "
+                      + ("aborted" if self._abort_requested else "paused")
+                      + ".")
+            return False
+        self.stim.start_all()
+        return True
+
     def wait_if_paused(self, restart: Optional[Callable[[], None]] = None) -> bool:
         """Worker-thread checkpoint: if a pause is pending, HALT stimulation,
         emit a log line, and BLOCK until resume or abort; on resume optionally
@@ -3432,7 +3475,7 @@ class ExperimentRunner(ABC):
         t0 = _time.monotonic()
         # Halt pulsing (idempotent — stop_all early-returns if already stopped).
         try:
-            self.stim.stop_all()
+            stop_all_forced(self.stim)
         except Exception:
             pass
         self._emit(ExperimentEvent(
