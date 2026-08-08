@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from stimtest.gui.viewer import _METRIC_VALUE_COL
 
 
 @pytest.fixture(scope="module")
@@ -138,7 +139,7 @@ def test_hand_edit_value_round_trips(qapp, tmp_path, monkeypatch):
     tbl = panel.metric_table
     edited = False
     for r in range(tbl.rowCount()):
-        it = tbl.item(r, 1)
+        it = tbl.item(r, _METRIC_VALUE_COL)
         if it and it.data(QtCore.Qt.ItemDataRole.UserRole) == "effective_capacitance_nf":
             it.setText("12.34 nF")
             edited = True
@@ -163,24 +164,26 @@ def test_original_column_shows_pre_override_value(qapp, tmp_path):
     _select_run(panel)
     tbl = panel.metric_table
     # Before any adjustment: the historic 2-column table.
-    assert tbl.columnCount() == 2
+    # Metric | Symbol | Value | Unit (the 4-column split).
+    assert tbl.columnCount() == 4
     # Override Good → Open: the table gains the Original column.
     panel._on_response_class_chosen("open")
-    assert tbl.columnCount() == 3
+    # ...plus the Original column, which is LAST.
+    assert tbl.columnCount() == 5
     # The Response row now reads new="Open" with Original="Good".
     found = False
     for r in range(tbl.rowCount()):
         cell = tbl.item(r, 0)
-        if cell is not None and cell.text() == "Response":
-            assert tbl.item(r, 1).text() == "Open"
-            assert tbl.item(r, 2).text() == "Good"
+        if cell is not None and cell.text().startswith("Response"):
+            assert tbl.item(r, _METRIC_VALUE_COL).text() == "Open"
+            assert tbl.item(r, tbl.columnCount() - 1).text() == "Good"
             found = True
     assert found, "Response row not found in metric table"
     # An UNCHANGED row (e.g. Q_ph) leaves its Original cell blank.
     for r in range(tbl.rowCount()):
         cell = tbl.item(r, 0)
         if cell is not None and cell.text().startswith("Q"):
-            assert tbl.item(r, 2).text() == ""
+            assert tbl.item(r, tbl.columnCount() - 1).text() == ""
 
 
 def test_edit_bar_hidden_for_non_experiment_node(qapp, tmp_path):
@@ -195,3 +198,40 @@ def test_edit_bar_hidden_for_non_experiment_node(qapp, tmp_path):
     panel.tree.setCurrentItem(top)
     assert panel._edit_target() is None
     assert panel.metric_edit_bar.isHidden()
+
+
+def test_polaris_metric_table_is_four_columns(tmp_path, qtbot=None):
+    """POLARIS mirrors the live experiment table: Metric | Symbol | Value |
+    Unit (operator).  The rows are still built as legacy ``(label, value)``
+    pairs and split by the SAME ``_metric_row_parts`` helper, so the two tables
+    cannot drift."""
+    from stimtest.gui.viewer import ViewerPanel, _METRIC_VALUE_COL
+    p = ViewerPanel()
+    p._set_metric_table([("<i>Q</i><sub>ph</sub> [nC]", "181.72"),
+                         ("Pulse rate [pps]", "200")])
+    t = p.metric_table
+    assert t.columnCount() == 4
+    assert [t.horizontalHeaderItem(i).text() for i in range(4)] == [
+        "Metric", "Symbol", "Value", "Unit"]
+    assert t.item(0, 0).text() == "Charge per phase"
+    assert "<i>Q</i>" in t.item(0, 1).text()
+    assert t.item(0, _METRIC_VALUE_COL).text() == "181.72"
+    assert t.item(0, 3).text() == "nC"
+    # a phrase row has no symbol
+    assert t.item(1, 0).text() == "Pulse rate"
+    assert t.item(1, 1).text() == ""
+    assert t.item(1, 3).text() == "pps"
+
+
+def test_polaris_original_column_moves_to_the_end():
+    """With originals shown the table is 5 wide and Original is LAST — it used
+    to sit at index 2, which is the Value column after the split."""
+    from stimtest.gui.viewer import ViewerPanel, _METRIC_VALUE_COL
+    p = ViewerPanel()
+    p._set_metric_table([("<i>V</i><sub>d</sub> [V]", "1.500")],
+                        originals={"<i>V</i><sub>d</sub> [V]": "1.200"})
+    t = p.metric_table
+    assert t.columnCount() == 5
+    assert t.horizontalHeaderItem(4).text() == "Original"
+    assert t.item(0, _METRIC_VALUE_COL).text() == "1.500"
+    assert t.item(0, 4).text() == "1.200"

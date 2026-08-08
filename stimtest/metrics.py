@@ -1629,6 +1629,19 @@ _CEFF_OPEN_SLOPE_RATIO = 2.0   # |slope_ph2 / slope_ph1| within [1/x, x] → mir
 _ACCESS_T_US = 0.5                # sample the fast IR step this long after onset
 _ACCESS_FRAC_MIN = 0.20          # |V(IR)| / |peak| ≥ this ⇒ a clear access-R step
 _ACCESS_FRAC_LOW = 0.10          # a MODEST but real IR step — enough (with a LOW
+# BORDERLINE band below _ACCESS_FRAC_LOW, as a fraction of it.  An electrode
+# sitting ON the threshold flips class on measurement noise alone — the AC-run
+# CH08 measured 0.0796-0.0992 when it read "capacitive" and 0.1032-0.1431 when
+# it read "normal", i.e. the SAME electrode either side of 0.10.  Inside this
+# band the decision falls back to the far more robust discriminator: the
+# effective impedance.  CH08 is ~5.7 kΩ; the genuinely dead electrodes are
+# 268 kΩ - 1.7 MΩ.  That is a ~50x gap versus access_frac's ~1.3x, so it
+# cannot rescue a real open/broken.
+_ACCESS_FRAC_BORDERLINE = 0.75    # → 0.075 with _ACCESS_FRAC_LOW = 0.10
+# "Clearly" healthy — a safety margin BELOW the open threshold, so the
+# borderline rescue needs an impedance that is unambiguously a real load, not
+# merely on the right side of the open/closed line.
+_HEALTHY_Z_MARGIN = 0.5           # × the open threshold
                                  # impedance) to call a highly-polarisable
                                  # electrode normal; a pure capacitor / broken
                                  # ramp starts from ~0 (access_frac ≈ 0) and
@@ -1838,9 +1851,19 @@ def classify_response_and_ceff(time_us, v_mon, pat, *, onset_us, driving_v,
     # extreme_z, so this NEVER rescues them (the impedance gap 10 kΩ vs 268 kΩ
     # is unambiguous).  **Don't raise this to gate ONLY on access_frac** — a
     # highly-polarisable good SIROF is then mislabelled broken.
+    # (c) BORDERLINE access_frac + an UNAMBIGUOUSLY healthy impedance.
+    # ``access_frac`` is a ratio of two small numbers read near a switching
+    # edge; on an electrode whose IR step lands at the threshold it flips
+    # class on noise alone, and a flip CLEARS the capture's E_pol — which is
+    # how the VT-max ramp lost its proximity signal and drove CH08 to 2.74x
+    # its water window.  In that band, defer to the impedance instead: it
+    # separates good from dead by ~50x rather than ~1.3x.
+    clearly_healthy = eff_z_mohm < _open_z * _HEALTHY_Z_MARGIN
+    borderline = access_frac >= _ACCESS_FRAC_LOW * _ACCESS_FRAC_BORDERLINE
     if has_ramp and not extreme_z and (
             access_frac >= _ACCESS_FRAC_MIN
-            or (healthy_z and access_frac >= _ACCESS_FRAC_LOW)):
+            or (healthy_z and access_frac >= _ACCESS_FRAC_LOW)
+            or (clearly_healthy and borderline)):
         return "normal", float("nan")
     if access_frac >= _ACCESS_FRAC_MIN and not extreme_z:
         # A clear ohmic step but NO ramp: a FLAT low-impedance resistive drop

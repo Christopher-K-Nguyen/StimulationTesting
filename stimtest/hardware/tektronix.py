@@ -4612,6 +4612,70 @@ class TektronixOscilloscope(Oscilloscope):
                  (getattr(self, '_last_raw', {}) or {}).items()},
         )
 
+    #: OPT-IN wire-byte capture.  ``query_binary_values`` parses the
+    #: IEEE-488.2 block internally, so the bytes that actually crossed the
+    #: link are never seen — which is exactly what you need when a TRANSFER
+    #: fault is suspected (a truncated block, a wrong byte count, a stray
+    #: terminator) rather than a scaling or decode error.  Setting this makes
+    #: ``_read_channel`` do the read itself and keep the header + payload.
+    #: Default OFF: the decoded path is proven and this doubles the stored
+    #: bytes, so it is a diagnostic you turn on while chasing a fault.
+    capture_wire_bytes: bool = False
+
+    @staticmethod
+    def parse_ieee_block(buf: bytes):
+        """Split an IEEE-488.2 response into ``(header, payload, trailer)``.
+
+        Definite-length form is ``#<n><length[n digits]><payload>[terminator]``
+        — e.g. ``#520000`` introduces 20000 bytes.  Indefinite form ``#0`` runs
+        to the terminator.  Returns the header bytes, the payload, and whatever
+        followed it, so a SHORT or over-long payload is visible as a mismatch
+        between the declared length and ``len(payload)`` rather than being
+        silently absorbed.
+        """
+        if not buf or buf[:1] != b"#":
+            # Not a block at all — hand the whole thing back as payload so the
+            # caller can log it; this is what a SCPI error string looks like.
+            return b"", bytes(buf), b""
+        if buf[1:2] == b"0":                     # indefinite length
+            body = buf[2:]
+            _term = bytes([13, 10])   # CR LF, spelled without escapes
+            _body = body.rstrip(_term)
+            return buf[:2], _body, body[len(_body):]
+
+        try:
+            ndigits = int(buf[1:2])
+        except ValueError:
+            return b"", bytes(buf), b""
+        hdr_len = 2 + ndigits
+        try:
+            declared = int(buf[2:hdr_len])
+        except ValueError:
+            return buf[:hdr_len], bytes(buf[hdr_len:]), b""
+        payload = bytes(buf[hdr_len:hdr_len + declared])
+        return bytes(buf[:hdr_len]), payload, bytes(buf[hdr_len + declared:])
+
+    def _curve_via_read_raw(self, datatype: str, is_big_endian: bool):
+        """``CURVe?`` read by hand, keeping the bytes off the wire.
+
+        Returns ``(array, header, payload, trailer, declared_len)``.  Decodes
+        identically to ``query_binary_values`` so nothing downstream changes.
+        """
+        self._inst.write("CURVe?")
+        buf = self._inst.read_raw()
+        header, payload, trailer = self.parse_ieee_block(buf)
+        declared = -1
+        if len(header) >= 2 and header[1:2] != b"0":
+            try:
+                declared = int(header[2:])
+            except ValueError:
+                declared = -1
+        dt = np.dtype(np.int8 if datatype == "b" else np.uint8)
+        if dt.itemsize > 1:                      # not reachable today (width 1)
+            dt = dt.newbyteorder(">" if is_big_endian else "<")
+        arr = np.frombuffer(payload, dtype=dt).astype(dt)
+        return arr, header, payload, trailer, declared
+
     def _read_channel(self, ch: str,
                       cached_time_us: Optional[np.ndarray] = None,
                       ) -> Tuple[np.ndarray, np.ndarray, float, int]:
@@ -4781,10 +4845,21 @@ class TektronixOscilloscope(Oscilloscope):
         # Always int8 (signed 'b' or unsigned 'B') — DATa:WIDth is fixed at 1.
         datatype = "b" if is_signed else "B"
         _t0 = time.perf_counter()
-        raw = self._inst.query_binary_values(
-            "CURVe?", datatype=datatype, is_big_endian=is_big_endian,
-            container=np.ndarray,
-        )
+        _wire = None
+        if getattr(self, "capture_wire_bytes", False):
+            raw, _hdr, _pl, _tr, _declared = self._curve_via_read_raw(
+                datatype, is_big_endian)
+            _wire = {"header": _hdr, "payload": _pl, "trailer": _tr,
+                     "declared_len": _declared, "payload_len": len(_pl)}
+            if _declared >= 0 and _declared != len(_pl):
+                self._log(
+                    f"[scope] ⚠ CURVe? block TRUNCATED on {ch}: header "
+                    f"declares {_declared} bytes, {len(_pl)} arrived")
+        else:
+            raw = self._inst.query_binary_values(
+                "CURVe?", datatype=datatype, is_big_endian=is_big_endian,
+                container=np.ndarray,
+            )
         self._log(
             f"[scope] > CURVe? ({ch}, dtype={datatype}, "
             f"{'MSB' if is_big_endian else 'LSB'})   "
@@ -5100,6 +5175,12 @@ class TektronixOscilloscope(Oscilloscope):
                 # induces a slight offset), so the file has to say which was
                 # in force rather than leave it to be guessed.
                 "wfid": _wfid_for_ch,
+                # Wire-level evidence, present only when ``capture_wire_bytes``
+                # is on.  The IEEE-488.2 header + the payload EXACTLY as they
+                # arrived, so a transfer fault (short block, wrong declared
+                # length, stray terminator) is auditable after the fact instead
+                # of only being inferable from a strange-looking waveform.
+                "wire": _wire,
                 "coupling_override": (
                     getattr(self, "_channel_coupling_override", {}) or {}
                 ).get(ch),

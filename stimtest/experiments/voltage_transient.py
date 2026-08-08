@@ -466,6 +466,23 @@ class VoltageTransientExperiment(ExperimentRunner):
                  shorted_channels: Optional[List[int]] = None):
         super().__init__(session, stimulator, oscilloscope)
         self.ramp = ramp or RampPolicy()
+        # Stamp the RESOLVED ramp policy into the session extras so it is
+        # persisted with the archive (persistence saves ``test.extras``).
+        # Without this an archive cannot say how it was produced: replaying the
+        # bench runs there was no way to tell whether Adaptive or Regression
+        # had driven them, nor what max_ua / tolerances were in force, so the
+        # strategy had to be inferred from the amplitude sequence.
+        try:
+            from dataclasses import asdict as _asdict
+            _x = self.session.test.extras
+            if _x is None:
+                _x = self.session.test.extras = {}
+            _x["ramp_policy"] = _asdict(self.ramp)
+            # Also at the top level — the single field most often wanted, and
+            # cheap to read without unpacking the whole policy.
+            _x["ramp_strategy"] = str(getattr(self.ramp, "strategy", "") or "")
+        except Exception:
+            pass
         # SHORTED CHANNELS (operator: "indicate that channels will be shorted
         # together to apply more than 1 mA … after a channel reaches its 1 mA
         # limit, start using the other shorted channel").  Physically-paralleled

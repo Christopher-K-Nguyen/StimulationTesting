@@ -47,6 +47,35 @@ def _capture_to_dict(c: Capture) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # .npz
 # ---------------------------------------------------------------------------
+def _jsonable(obj):
+    """Best-effort coercion to JSON-serializable types.
+
+    ``test.extras`` is operator-supplied context (Setup snapshot, channel map,
+    ramp policy) that is mostly plain data but is not guaranteed to be — and
+    the .npz doubles as the crash-recovery artifact, so a metadata value must
+    never be able to fail the save.  Anything unrecognised degrades to its
+    ``repr`` rather than raising.
+    """
+    import numpy as _np
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, _np.generic):
+        return obj.item()
+    if isinstance(obj, _np.ndarray):
+        return _jsonable(obj.tolist())
+    try:
+        from dataclasses import asdict as _asdict, is_dataclass
+        if is_dataclass(obj) and not isinstance(obj, type):
+            return _jsonable(_asdict(obj))
+    except Exception:
+        pass
+    return repr(obj)
+
+
 def save_session_npz(session: Session, path: Path | str,
                      *, incomplete: bool = False) -> Path:
     """Pack a session into a single .npz file.
@@ -145,6 +174,17 @@ def save_session_npz(session: Session, path: Path | str,
             "counter_electrode_label": session.test.counter_electrode_label,
             "reference_electrode_label": session.test.reference_electrode_label,
             "target_charge_phase_nc": session.test.target_charge_phase_nc,
+            # ``extras`` carries the run's whole descriptive context — the
+            # Setup snapshot, the device->Plexon channel map, the E_pol time
+            # delay, and (for VT) the resolved ramp policy.  It used to be
+            # DROPPED, which made an archive un-self-describing: replaying a
+            # bench run, there was no way to tell whether Adaptive or
+            # Regression had produced it, what the water-window limits were, or
+            # which cable map was in force.  Coerced through ``_jsonable`` so a
+            # stray non-serializable value degrades to its repr instead of
+            # failing the save (the .npz is the crash-recovery artifact — it
+            # must never fail to write because of a metadata value).
+            "extras": _jsonable(session.test.extras or {}),
             "configuration": asdict(session.test.configuration),
             "pattern": _pattern_dict(session.test.pattern),
             "array": {
@@ -485,6 +525,9 @@ def load_session_npz(path: Path | str) -> "Session":
         counter_electrode_label=meta["test"].get("counter_electrode_label", "Pt counter"),
         reference_electrode_label=meta["test"].get("reference_electrode_label", "Ag|AgCl"),
         target_charge_phase_nc=meta["test"].get("target_charge_phase_nc", float("inf")),
+        # Legacy archives have no "extras" key -> {} (never None: callers do
+        # ``test.extras.get(...)`` without guarding).
+        extras=dict(meta["test"].get("extras") or {}),
     )
 
     # Task #57: notes / tags / system_metadata are NEW fields.

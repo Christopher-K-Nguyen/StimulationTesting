@@ -1193,6 +1193,13 @@ class ViewerPanel(QtWidgets.QWidget):
                 pass
 
 
+#: Column holding the (optionally editable) metric VALUE.  The table is
+#: ``Metric | Symbol | Value | Unit`` (+ ``Original`` when showing pre-edit
+#: values), so the value is column 2 — it was column 1 before the split, and
+#: ``_collect_metric_edits`` reads it by this name so the two stay in step.
+_METRIC_VALUE_COL = 2
+
+
 class ViewerWindow(QtWidgets.QMainWindow):
     """Standalone viewer window. Wraps :class:`ViewerPanel` with menus
     and a status bar so ``run_viewer.py`` (and the bundled
@@ -2205,11 +2212,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # the new one for any CHANGED row (operator: "when adjusting values,
         # keep the original values alongside the new one").  When absent the
         # table stays the historic 2 columns.
+        # FOUR columns, matching the live experiment table (operator: "Have
+        # metric be the spelled out term, symbol for variables, value, and
+        # unit").  The rows are still built as legacy ``(label, value)`` pairs
+        # and split at render time by the SAME ``_metric_row_parts`` helper the
+        # live table uses, so the two can never drift.
+        from .widgets import _metric_row_parts
         _have_orig = bool(originals)
-        self.metric_table.setColumnCount(3 if _have_orig else 2)
+        _ncols = 5 if _have_orig else 4
+        self.metric_table.setColumnCount(_ncols)
         self.metric_table.setHorizontalHeaderLabels(
-            ["Metric", "Value", "Original"] if _have_orig
-            else ["Metric", "Value"])
+            ["Metric", "Symbol", "Value", "Unit", "Original"] if _have_orig
+            else ["Metric", "Symbol", "Value", "Unit"])
+        _VAL_COL = _METRIC_VALUE_COL          # 2 — the editable column
         self.metric_table.setRowCount(len(rows))
         # Whether the Value column is currently hand-editable (the edit bar's
         # "Edit values" checkbox).  Only rows tagged with a field name (a
@@ -2220,10 +2235,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         for i, row in enumerate(rows):
             k, v = row[0], row[1]
             field = row[2] if len(row) > 2 else None
-            key_item = QtWidgets.QTableWidgetItem(str(k))
-            key_item.setFlags(_RO)
-            self.metric_table.setItem(i, 0, key_item)
-            val_item = QtWidgets.QTableWidgetItem(str(v))
+            _term, _sym, _val, _unit = _metric_row_parts(str(k), str(v))
+            for _c, _txt in ((0, _term), (1, _sym), (3, _unit)):
+                _it = QtWidgets.QTableWidgetItem(_txt)
+                _it.setFlags(_RO)
+                self.metric_table.setItem(i, _c, _it)
+            val_item = QtWidgets.QTableWidgetItem(_val)
             if field:
                 # Stash the CaptureMetrics field name so a hand-edit round-trips
                 # (see ``_collect_metric_edits``).  Editable only when toggled.
@@ -2234,7 +2251,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 val_item.setFlags(flags)
             else:
                 val_item.setFlags(_RO)
-            self.metric_table.setItem(i, 1, val_item)
+            self.metric_table.setItem(i, _VAL_COL, val_item)
             if _have_orig:
                 # Original value — shown only when it differs from the new one
                 # (an unchanged row leaves the cell blank).  Always read-only.
@@ -2248,10 +2265,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
                         QtGui.QPalette.ColorRole.PlaceholderText))
                 except Exception:
                     pass
-                self.metric_table.setItem(i, 2, orig_item)
-        self.metric_table.resizeColumnToContents(0)
-        if _have_orig:
-            self.metric_table.resizeColumnToContents(1)
+                # LAST column (index 4) — the Value column is 2 now.
+                self.metric_table.setItem(i, _ncols - 1, orig_item)
+        for _c in range(_ncols):
+            self.metric_table.resizeColumnToContents(_c)
 
     def _set_param_table(self, rows: List[tuple]) -> None:
         self.param_table.setRowCount(len(rows))
@@ -2400,7 +2417,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         n = 0
         tbl = self.metric_table
         for r in range(tbl.rowCount()):
-            it = tbl.item(r, 1)
+            it = tbl.item(r, _METRIC_VALUE_COL)
             if it is None:
                 continue
             field = it.data(QtCore.Qt.ItemDataRole.UserRole)

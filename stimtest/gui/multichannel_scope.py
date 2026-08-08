@@ -75,6 +75,16 @@ TRACE_RECIP_DEDT = "1/(dV/dt)"
 # the colour map don't KeyError; it's just no longer in the toggle/inset set.
 ALL_DERIV_TRACES = (TRACE_DEDT,)
 
+# IDEAL (programmed) current — the pattern the stimulator was ASKED to deliver,
+# reconstructed on the capture's time axis (``metrics.ideal_current_ua``).
+# Already used by the driving-energy integral (gotcha #117) and drawn on the
+# exported / POLARIS figure; this makes it toggleable DURING a run so the
+# operator can compare it against I_mon live.  I_mon carries switching spikes
+# and a turn-on skew at small pulse widths, so the two diverging is the quick
+# read on whether the delivered current matches the program.
+TRACE_IIDEAL = "I_ideal"
+ALL_IDEAL_TRACES = (TRACE_IIDEAL,)
+
 
 def _subscript_trace_name(trace: str) -> str:
     """``"V_mon"`` -> ``"<i>V</i><sub>mon</sub>"`` for HTML-rendering
@@ -201,6 +211,9 @@ TRACE_COLOURS = {
     # dashed line disambiguates measured-vs-corrected (see set_traces styles).
     TRACE_EACT_CORR: "#009E73",   # E′act — active interface (bluish-green)
     TRACE_ERET_CORR: "#D55E00",   # E′ret — return interface (vermillion)
+    # Ideal current shares I_mon's hue — the DASHED line disambiguates
+    # programmed-vs-measured, the same convention the corrected pair uses.
+    TRACE_IIDEAL: "#00B4C8",
     # Derivative overlays — distinct from the trace-palette hues (purple arc).
     TRACE_DEDT: "#7E2F8E",        # dV/dt          — purple
     TRACE_RECIP_DEDT: "#CC79A7",  # 1/(dV/dt)      — reddish-purple
@@ -218,6 +231,9 @@ DEFAULT_TRACE_AXIS = {
     # them independently of E_act / E_ret via their own toggle-bar combo.
     TRACE_EACT_CORR: AXIS_LEFT,
     TRACE_ERET_CORR: AXIS_LEFT,
+    # Ideal current defaults OFF — it is a comparison overlay, not part of the
+    # normal view; when enabled it shares I_mon's RIGHT axis (same units).
+    TRACE_IIDEAL: AXIS_NA,
     # Derivative overlays default OFF (N/A) — the operator opts into them; when
     # on, they're normalized to the left (voltage) axis, not its true scale.
     TRACE_DEDT: AXIS_NA,
@@ -228,7 +244,8 @@ DEFAULT_TRACE_AXIS = {
 # pair is only AVAILABLE for continuous-sinusoidal captures (see
 # ``MultiChannelScope.set_corrected_shape``); the derivative pair is always
 # available (any capture has a differentiable V_mon).
-ALL_TOGGLE_TRACES = ALL_TRACES + ALL_CORRECTED_TRACES + ALL_DERIV_TRACES
+ALL_TOGGLE_TRACES = (ALL_TRACES + ALL_CORRECTED_TRACES
+                     + ALL_IDEAL_TRACES + ALL_DERIV_TRACES)
 
 
 class _ChannelPage(QtWidgets.QWidget):
@@ -855,6 +872,36 @@ class _ChannelPage(QtWidgets.QWidget):
                     traces[k] = _ei_r
                     axis[k] = _ret_axis
                     _corr_styles[k] = "dash"
+        # --- IDEAL (programmed) current overlay ---------------------------
+        # The current the stimulator was ASKED to deliver, on this capture's
+        # time axis.  Prefer the array ``compute_metrics`` already stamped on
+        # the capture; fall back to rebuilding it (a capture loaded from a
+        # legacy .npz, or one whose metrics were never computed).  Same units
+        # and axis as I_mon so the two overlay directly — dashed, so which is
+        # measured and which is programmed is unambiguous.
+        _ideal_axis = axis_map.get(TRACE_IIDEAL, AXIS_NA)
+        if _ideal_axis != AXIS_NA or TRACE_IIDEAL in _inset_roles:
+            _ideal = getattr(cap, "i_ideal_ua", None)
+            if _ideal is not None and getattr(_ideal, "size", 0):
+                _ideal = np.asarray(_ideal, dtype=float)
+            else:
+                _ideal = None
+                try:
+                    from ..metrics import ideal_current_ua, pulse_onset_us
+                    if cap.pattern is not None and cap.time_us is not None:
+                        _on = pulse_onset_us(cap.time_us, cap.i_mon_ua,
+                                             cap.v_mon_v)
+                        _ideal = np.asarray(
+                            ideal_current_ua(cap.time_us, cap.pattern,
+                                             onset_us=_on), dtype=float)
+                except Exception:
+                    _ideal = None
+            if _ideal is not None and _ideal.size == int(cap.time_us.size):
+                k = self._trace_label(TRACE_IIDEAL)
+                traces[k] = (_ideal * (100.0 / _area_um2) if _use_density
+                             else _ideal)
+                axis[k] = _ideal_axis
+                _corr_styles[k] = "dash"
         # --- Derivative overlays (Harris 2019): dV/dt + 1/(dV/dt) from the
         # active trace (V_mon preferred, else E_act), drawn as a NORMALIZED
         # overlay — scaled to the V_mon amplitude, centred at 0 (SHAPE ONLY;
@@ -910,7 +957,7 @@ class _ChannelPage(QtWidgets.QWidget):
         if not hasattr(self, "_trace_colours_cache"):
             self._trace_colours_cache = {
                 self._trace_label(t): TRACE_COLOURS[t]
-                for t in (ALL_TRACES + ALL_CORRECTED_TRACES + ALL_DERIV_TRACES)}
+                for t in ALL_TOGGLE_TRACES}
         # Declarative update — ``set_traces(remove_missing=True)``
         # both updates the curves we want and drops the curves we
         # don't, in a single pass.  Avoids the destroy-and-recreate
@@ -1128,7 +1175,8 @@ class MultiChannelScope(QtWidgets.QWidget):
         # four (+ the always-available derivative overlays); ``set_available_traces``
         # narrows the base once the experiment tab pushes its alias map, and
         # ``_recompute_available`` re-adds the derivatives.
-        self._available_traces: set = set(ALL_TRACES) | set(ALL_DERIV_TRACES)
+        self._available_traces: set = (set(ALL_TRACES) | set(ALL_DERIV_TRACES)
+                               | set(ALL_IDEAL_TRACES))
         # BASE availability (from the alias map) vs the CORRECTED interface
         # pair (E′act / E′ret), which is only available when a continuous-
         # sinusoidal capture is being shown (``set_corrected_shape``).  The
@@ -1537,6 +1585,9 @@ class MultiChannelScope(QtWidgets.QWidget):
         # differentiable) as long as a source trace (V_mon or E_act) is present.
         if TRACE_VMON in avail or TRACE_EACT in avail:
             avail.update(ALL_DERIV_TRACES)
+            # The programmed current exists for ANY capture carrying a
+            # pattern, so it is always offered.
+            avail.update(ALL_IDEAL_TRACES)
         self._available_traces = avail
         # Show / hide the per-trace controls (label + axis combo) as a unit.
         # An unavailable trace keeps its saved axis choice; only the runtime

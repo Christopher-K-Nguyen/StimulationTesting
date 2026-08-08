@@ -22,12 +22,15 @@ water window.
 The read is now a MEDIAN over a window centred on the same point, which divides
 the jitter sensitivity by the sample count.
 
-⚠ PARTIAL.  Measured on the real archive this takes CH08 from FOUR
-misclassifications to one, and leaves every known-bad electrode flagged.  But
-an electrode sitting EXACTLY on ``_ACCESS_FRAC_LOW`` can still flip — a more
-robust read cannot fix a knife-edge threshold on its own.  Eliminating it needs
-the margin/hysteresis dimension (classify from an aggregate over the channel,
-or require a margin before changing class), which is NOT done here.
+Paired with a BORDERLINE band (``_ACCESS_FRAC_BORDERLINE``): just below the
+threshold the decision defers to the effective impedance instead, which
+separates good electrodes from dead ones by ~50x (CH08 ~5.7 kΩ vs 268 kΩ-1.7 MΩ)
+rather than access_frac's ~1.3x.  A robust read alone could not fix a
+knife-edge threshold; the two together do.
+
+Measured on the real archives: CH08 goes from FOUR misclassifications to ZERO
+(uniformly normal across all 18 captures), and every known-bad electrode
+(CH02/CH03/CH10/CH13) is still flagged open/broken.
 """
 from __future__ import annotations
 
@@ -98,6 +101,36 @@ def test_a_true_no_step_capacitor_is_still_caught():
     m2 = (t > 220.0) & (t <= 420.0)
     v[m1] = -1.61 * (t[m1] / 200.0)            # pure linear ramp from zero
     v[m2] = -1.61 + 1.61 * ((t[m2] - 220.0) / 200.0)
+    cls, _ = classify_response_and_ceff(
+        t, v, _pat(), onset_us=0.0,
+        driving_v=float(np.max(np.abs(v))), compliance_v=9.0)
+    assert cls != "normal", cls
+
+
+def test_knife_edge_electrode_no_longer_flips():
+    """The CH08 case itself: an IR step sitting ON the threshold, with a
+    healthy impedance.  Before the borderline band this alternated class with
+    the onset jitter; now the impedance decides and it is stable."""
+    # ±1 SAMPLE (0.08 µs here) — the jitter actually observed between adjacent
+    # captures on the bench (CH08 #9 onset -0.08 vs #10 -0.16).
+    #
+    # ``ir_frac`` is set so the swept access_frac spans ~0.082-0.112, matching
+    # the real CH08, whose measured range across every capture was
+    # 0.0796-0.1431 — i.e. it straddled _ACCESS_FRAC_LOW (0.10) but never fell
+    # below the borderline floor (0.075).  That is the regime the band exists
+    # for.  RESIDUAL BOUND, stated plainly: an electrode whose access_frac
+    # crosses the FLOOR within one sample can still change class; the band
+    # widens the stable region, it does not make the threshold disappear.
+    classes = {round(sh, 3): _classify(sh, ir_frac=0.18)
+               for sh in (-0.08, 0.0, 0.08)}
+    assert set(classes.values()) == {"normal"}, classes
+
+
+def test_borderline_rescue_needs_a_healthy_impedance():
+    """The band must not become a blanket amnesty — a high-impedance electrode
+    with the same weak IR step stays BAD.  ``peak`` drives the effective
+    impedance (V/I) at the fixed test current."""
+    t, v = _trace(0.0, ir_frac=0.16, peak=60.0)     # 60 V at 281 uA ≈ 213 kΩ
     cls, _ = classify_response_and_ceff(
         t, v, _pat(), onset_us=0.0,
         driving_v=float(np.max(np.abs(v))), compliance_v=9.0)
