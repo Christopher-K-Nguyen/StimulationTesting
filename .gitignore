@@ -94,7 +94,13 @@ email_config.json
 # CHANGELOG.md, docstrings) stay tracked as normal.
 CLAUDE.md
 EXTENSION_PLUGIN_DESIGN.md
-# LOG_ANALYSIS.md is the rolling log-file findings report — kept
+# LOG_ANALYSIS.md
+
+# HANDOFF.md is the SESSION handoff for picking this repo up in a new agent
+# session (current state, what just changed and why, what is open, the
+# environment traps).  Same class as CLAUDE.md — agent memory, not public repo
+# content — so it is untracked and must be copied across by hand.
+HANDOFF.md is the rolling log-file findings report — kept
 # private so internal observations about bench-session glitches,
 # perf hot-spots, and recurring errors don't ship to GitHub.
 # Findings here either get distilled into CLAUDE.md gotchas (when
