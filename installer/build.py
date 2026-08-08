@@ -473,6 +473,33 @@ def _sha256(path: Path) -> str:
     return h.hexdigest().upper()
 
 
+def _make_folder(folder: Path, files) -> None:
+    """Mirror the delivery set into a PLAIN FOLDER beside the ZIP.
+
+    Operator: "Besides making the installers in ZIP, have it in folders in case
+    the ZIP file changes with every change."  A ZIP is a single opaque blob —
+    re-uploading it replaces the whole file on every build, so anyone syncing
+    or linking it sees a full re-download and any in-progress download breaks.
+    A folder updates FILE BY FILE: the shared link points at a directory whose
+    contents change in place, so only the installer .exe actually re-syncs.
+
+    Same version-LESS naming rule as the ZIP (see ``package_release``) — the
+    folder name must stay stable across releases or the shared link dies.
+    Stale members from a previous build are removed so the folder never
+    accumulates an old installer alongside the new one.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    keep = {Path(f).name for f in files}
+    for old in folder.iterdir():
+        if old.is_file() and old.name not in keep:
+            try:
+                old.unlink()
+            except OSError as exc:
+                print(f"[package] ⚠ could not remove stale {old.name}: {exc}")
+    for f in files:
+        shutil.copy2(str(f), str(folder / Path(f).name))
+
+
 def _make_zip(zip_path: Path, files) -> None:
     import zipfile
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -625,8 +652,8 @@ Solzbacher Lab, University of Utah
 
 
 def package_release(app_version: str, out_dir: Path) -> None:
-    """Assemble the delivery ZIP(s): installer + README + manual (+ the CWRU
-    whitelist note).  Re-renders the README/whitelist to the current version
+    """Assemble the delivery ZIP(s) AND a matching plain FOLDER: installer +
+    README + manual (+ the CWRU whitelist note).  Re-renders the README/whitelist to the current version
     with freshly-computed SHA-256 so they never drift from the actual .exe.
     Runs AFTER Inno Setup (and after signing, so the signed .exe is zipped).
     Skips gracefully if no installer for this version exists; warns loudly if
@@ -676,6 +703,10 @@ def package_release(app_version: str, out_dir: Path) -> None:
         _make_zip(zp, members)
         print(f"[package] {zp.name}  ({zp.stat().st_size/1e6:.0f} MB): "
               + ", ".join(Path(m).name for m in members))
+        fp = out_dir / "PULSAR"
+        _make_folder(fp, members)
+        print(f"[package] {fp.name}/  (folder mirror): "
+              + ", ".join(Path(m).name for m in members))
 
     if cwru_exe.exists():
         wl = out_dir / "PULSAR-CWRU-IT-whitelist-request.txt"
@@ -686,6 +717,10 @@ def package_release(app_version: str, out_dir: Path) -> None:
         members = [cwru_exe, readme, wl] + _cwru_manual()
         _make_zip(zc, members)
         print(f"[package] {zc.name}  ({zc.stat().st_size/1e6:.0f} MB): "
+              + ", ".join(Path(m).name for m in members))
+        fc = out_dir / "PULSAR-CWRU"
+        _make_folder(fc, members)
+        print(f"[package] {fc.name}/  (folder mirror): "
               + ", ".join(Path(m).name for m in members))
 
 

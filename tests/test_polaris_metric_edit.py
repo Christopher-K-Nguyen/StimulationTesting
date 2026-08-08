@@ -208,7 +208,8 @@ def test_polaris_metric_table_is_four_columns(tmp_path, qtbot=None):
     from stimtest.gui.viewer import ViewerPanel, _METRIC_VALUE_COL
     p = ViewerPanel()
     p._set_metric_table([("<i>Q</i><sub>ph</sub> [nC]", "181.72"),
-                         ("Pulse rate [pps]", "200")])
+                         ("Pulse rate [pps]", "200"),
+                         ("Limit reached?", "yes")])
     t = p.metric_table
     assert t.columnCount() == 4
     assert [t.horizontalHeaderItem(i).text() for i in range(4)] == [
@@ -217,10 +218,14 @@ def test_polaris_metric_table_is_four_columns(tmp_path, qtbot=None):
     assert "<i>Q</i>" in t.item(0, 1).text()
     assert t.item(0, _METRIC_VALUE_COL).text() == "181.72"
     assert t.item(0, 3).text() == "nC"
-    # a phrase row has no symbol
+    # a phrase row still gets its symbol when one exists (operator: pulse rate
+    # is f_stim, pulse period T_stim)
     assert t.item(1, 0).text() == "Pulse rate"
-    assert t.item(1, 1).text() == ""
+    assert "<i>f</i><sub>stim</sub>" in t.item(1, 1).text()
     assert t.item(1, 3).text() == "pps"
+    # ...and a row with no symbol at all leaves the column empty
+    assert t.item(2, 0).text() == "Potential limit reached"
+    assert t.item(2, 1).text() == ""
 
 
 def test_polaris_original_column_moves_to_the_end():

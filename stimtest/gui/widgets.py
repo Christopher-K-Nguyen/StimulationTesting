@@ -3011,6 +3011,8 @@ _METRIC_TERMS = {
     "R": "Fitted resistance",
     "C": "Fitted capacitance",
     "f": "Pulse frequency",
+    "fstim": "Pulse rate",
+    "Tstim": "Pulse period",
     "φ": "Phase angle",
     "τ": "Time constant",
 }
@@ -3026,9 +3028,11 @@ _METRIC_PHRASES = {
     "Faradaic charge fraction": ("Faradaic charge fraction", ""),
     "Faradaic onset": ("Faradaic onset", ""),
     "Driving energy": ("Driving energy", ""),
-    "Pulse rate": ("Pulse rate", ""),
-    "Pulse period": ("Pulse period", ""),
-    "Pulse frequency": ("Pulse frequency", "<i>f</i>"),
+    # Operator: pulse rate is f_stim, pulse period is T_stim — the stimulus
+    # rate and its reciprocal, matching the I_stim / J_stim / Q_ph family.
+    "Pulse rate": ("Pulse rate", "<i>f</i><sub>stim</sub>"),
+    "Pulse period": ("Pulse period", "<i>T</i><sub>stim</sub>"),
+    "Pulse frequency": ("Pulse frequency", "<i>f</i><sub>stim</sub>"),
     "Limit reached?": ("Potential limit reached", ""),
     "Limit exceeded?": ("Potential limit exceeded", ""),
     "Compliance exceeded?": ("Voltage compliance exceeded", ""),
